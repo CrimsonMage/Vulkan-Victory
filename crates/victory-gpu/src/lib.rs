@@ -39,8 +39,8 @@ mod frametime;
 pub mod cores;
 #[cfg(windows)]
 mod host;
-#[cfg(windows)]
-mod indirect;
+#[cfg(all(windows, test))]
+mod warp_tests;
 #[cfg(windows)]
 mod views;
 #[cfg(windows)]

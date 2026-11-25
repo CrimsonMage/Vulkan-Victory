@@ -572,20 +572,12 @@ pub(crate) struct HostList {
     /// In a frame sampled by pipeline: the list's timestamps
     /// (`crate::frametime`).
     stamps: Mutex<Option<crate::frametime::ListStamps>>,
-    /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted, and after
-    /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// The same words in the card's own memory ([`card_budget`]), which the
-    /// clamp uses instead when there is one: zeroed in the list before its
-    /// first clamp, its notes copied to `budget` when the list closes.
-    card_budget: OnceLock<Option<ID3D12Resource>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The list as `ID3D12GraphicsCommandList6`, for mesh dispatches: asked
     /// once, not at every mesh draw (a QueryInterface into the driver).
     list6: OnceLock<Option<ID3D12GraphicsCommandList6>>,
+    /// The list as `ID3D12GraphicsCommandList7`, for the global barrier
+    /// that orders writes before every later use ([`HostList::writes_barrier`]).
+    list7: OnceLock<Option<ID3D12GraphicsCommandList7>>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -710,7 +702,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
 }
 
 /// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// compiler.
 pub(crate) fn compile(
     source: &str,
     entry: windows::core::PCSTR,
@@ -1361,14 +1353,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
-    /// Whether the indirect-work budget is zeroed for this recording (a
-    /// step on the CPU, or in the list for the card's copy).
-    budget_zeroed: bool,
-    /// The indirect scratch buffer (`HostList::indirect_args`, by its
-    /// interface pointer) that a clamp in this recording left readable as
-    /// indirect arguments; 0 if none. It stays readable until the next
-    /// clamp into it ([`HostList::indirect_state`]).
-    indirect_readable: usize,
+    /// Buffer ranges declared as written by shaders since the last title
+    /// copy (host copy, address, bytes), as `refreshed` is for refreshes:
+    /// a dispatch declares the same views as the dispatch before it, and
+    /// each declaration was a step at submission and an announcement after.
+    declared: crate::fast::FastSet<(usize, usize, usize)>,
 }
 
 impl Deferred {
@@ -2292,10 +2281,8 @@ impl Host {
                 prelude: OnceLock::new(),
                 pipelines: Mutex::default(),
                 stamps: Mutex::default(),
-                budget: OnceLock::new(),
-                card_budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
                 list6: OnceLock::new(),
+                list7: OnceLock::new(),
             })
         }
     }
@@ -3403,11 +3390,6 @@ impl Host {
 impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
-        let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
-            self.indirect_common(&scratch);
-        }
-        self.card_budget_out();
         crate::frametime::close(&self.list, &self.stamps);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -3766,6 +3748,41 @@ impl HostList {
         self.list6.get_or_init(|| self.list.cast().ok()).as_ref()
     }
 
+    /// Orders every write recorded so far (shaders, copies) before every
+    /// later use of what they wrote, indirect arguments and vertex input
+    /// included: the title's barriers on buffers mean that much. A plain
+    /// unordered access barrier reaches only later shaders, not the
+    /// argument fetch of an indirect execution, which reads the title's
+    /// records where its passes wrote them.
+    pub(crate) fn writes_barrier(&self) {
+        let list7 = self.list7.get_or_init(|| self.list.cast().ok());
+        let Some(list7) = list7 else {
+            // SAFETY: an open list; a barrier that names no resource.
+            unsafe { self.list.ResourceBarrier(&[uav_barrier()]) };
+            return;
+        };
+        let global = D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_ALL,
+            SyncAfter: D3D12_BARRIER_SYNC_ALL,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
+                | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
+                | D3D12_BARRIER_ACCESS_INDEX_BUFFER
+                | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
+                | D3D12_BARRIER_ACCESS_COPY_SOURCE
+                | D3D12_BARRIER_ACCESS_COPY_DEST,
+        };
+        let group = D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &global },
+        };
+        // SAFETY: an open list; one global barrier that lives through the call.
+        unsafe { list7.Barrier(&[group]) };
+    }
+
     /// Notes what the command about to be recorded does, for the frame
     /// capture's list of commands (`crate::capture::op`).
     #[cfg(feature = "diagnostics")]
@@ -3814,6 +3831,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.declared.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3844,15 +3862,20 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once per range until a title copy intervenes.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.declared.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -3912,179 +3935,6 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
-        let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches): zeroed too.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                for k in 0..3 {
-                    words.add(k).write_volatile(0);
-                }
-            })));
-            drop(deferred);
-            if let Some(card) = card {
-                self.zero_card_budget(card);
-            }
-        }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
-    }
-
-    /// The budget's words in the card's own memory, if the list can zero
-    /// them itself (`WriteBufferImmediate`). The clamp charges the budget
-    /// with atomics, which in mapped memory would each cross the bus.
-    fn make_card_budget(&self) -> Option<ID3D12Resource> {
-        self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
-        Some(buffer)
-    }
-
-    /// Records, before the list's first clamp, the zeroing of the card's
-    /// copy of the budget: common, written as a copy, then left for
-    /// unordered access until the list closes ([`HostList::card_budget_out`]).
-    fn zero_card_budget(&self, card: &ID3D12Resource) {
-        let Ok(list2) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
-            return;
-        };
-        // SAFETY: a live buffer.
-        let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
-            Dest: at + offset,
-            Value: 0,
-        });
-        // SAFETY: an open list; the buffer is the list's own and in the
-        // common state at the start of every recording.
-        unsafe {
-            self.list.ResourceBarrier(&[transition(
-                card,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            )]);
-            list2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
-            self.list.ResourceBarrier(&[transition(
-                card,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
-        }
-    }
-
-    /// Before the list closes, if this recording charged the card's copy
-    /// of the budget: its notes on mesh records go to the mapped words
-    /// (read at the next submission), and it goes back to common.
-    fn card_budget_out(&self) {
-        if !self.deferred().budget_zeroed {
-            return;
-        }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
-        else {
-            return;
-        };
-        // SAFETY: an open list; both buffers are the list's own. The
-        // mapped one is promoted from common to the copy destination.
-        unsafe {
-            self.list.ResourceBarrier(&[transition(
-                card,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
-            self.list.ResourceBarrier(&[transition(
-                card,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-        }
-    }
-
-    /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
-        let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
-        {
-            return Some(buffer.clone());
-        }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
-        let alloc = prev
-            .saturating_mul(2)
-            .max(needed)
-            .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
-        if let Some((old_buf, _)) = old {
-            // It ends the list common, as every scratch buffer does.
-            self.indirect_common(&old_buf);
-            self.keep(&old_buf);
-        }
-        Some(buffer)
-    }
-
-    /// Moves `scratch` back to the common state if a clamp left it readable
-    /// as indirect arguments ([`HostList::indirect_readable`]): where the
-    /// list's first clamp expects it. Done before the list closes and before
-    /// a bigger scratch buffer replaces it: one barrier per list (where
-    /// there was one per indirect execution), and the list ends as it
-    /// begins however it is submitted.
-    fn indirect_common(&self, scratch: &ID3D12Resource) {
-        {
-            let mut deferred = self.deferred();
-            if deferred.indirect_readable != scratch.as_raw() as usize {
-                return;
-            }
-            deferred.indirect_readable = 0;
-        }
-        let barrier = transition(
-            scratch,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        );
-        // SAFETY: an open list and a live buffer this recording left in
-        // `INDIRECT_ARGUMENT`.
-        unsafe { self.list.ResourceBarrier(&[barrier]) };
-    }
-
-    /// The state the list's indirect scratch buffer `scratch` is in at this
-    /// point of the recording: indirect arguments if a clamp in this
-    /// recording left it so ([`HostList::indirect_readable`]), otherwise
-    /// common: the state a buffer is made in, and the one a recording
-    /// leaves it in when it closes or replaces it ([`HostList::indirect_common`]).
-    pub(crate) fn indirect_state(&self, scratch: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
-        if self.deferred().indirect_readable == scratch.as_raw() as usize {
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
-        } else {
-            D3D12_RESOURCE_STATE_COMMON
-        }
-    }
-
-    /// A clamp recorded in this list left `scratch` readable as indirect
-    /// arguments. It stays so for every execution that reads it, until the
-    /// next clamp moves it back to unordered access.
-    pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
-        self.deferred().indirect_readable = scratch.as_raw() as usize;
-    }
-
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         // Every COM interface starts with IUnknown's methods: the pointer
@@ -4112,8 +3962,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.declared.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -5172,6 +5024,19 @@ impl Host {
                 None
             }
         }
+    }
+}
+
+/// An unordered access barrier on every resource.
+fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
     }
 }
 

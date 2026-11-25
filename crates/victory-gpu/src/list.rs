@@ -742,16 +742,6 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     }
 }
 
-/// An unordered access barrier on every resource: earlier shader writes
-/// finish before later work reads or writes.
-const UAV_BARRIER: Barrier = Barrier {
-    kind: 2,
-    flags: 0,
-    first: std::ptr::null(),
-    second: 0,
-    last: 0,
-};
-
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     timed!(Barrier);
@@ -761,17 +751,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
+        let host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-        }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -785,6 +768,14 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+        }
+        // Buffers have host copies, not resources the barrier can name:
+        // a barrier on one orders every write before it with every use
+        // after it (indirect executions read the title's records in place).
+        if barriers.iter().any(|b| {
+            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+        }) {
+            list.writes_barrier();
         }
     }
     0
@@ -844,20 +835,11 @@ fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> b
     }
     s.refresh(list, from, len);
     d.gpu_writes(list, to, len);
-    // Ordered with the shader writes before and after it.
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-        },
-    };
+    // Ordered with the writes before and the uses after it.
+    list.writes_barrier();
     // SAFETY: an open list; two live buffers, the ranges inside them.
-    unsafe {
-        list.list.ResourceBarrier(std::slice::from_ref(&barrier));
-        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
-        list.list.ResourceBarrier(std::slice::from_ref(&barrier));
-    }
+    unsafe { list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len) };
+    list.writes_barrier();
     crate::unified::count(crate::unified::Stat::GpuCopy);
     true
 }
@@ -2045,8 +2027,8 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
+/// first, so only their ordering matters: one barrier that orders every
+/// write before every later use (`HostList::writes_barrier`).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     timed!(Barrier);
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
@@ -2054,11 +2036,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.writes_barrier();
     }
     #[cfg(not(windows))]
     let _ = (this, count);
