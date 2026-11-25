@@ -83,6 +83,7 @@ pub use unified::{on as unified_on, title_region, title_section, title_section_g
 pub use views::title_memory_view;
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    mapping_lock_held, remapping_over, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };

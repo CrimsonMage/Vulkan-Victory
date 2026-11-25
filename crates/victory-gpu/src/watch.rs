@@ -911,7 +911,51 @@ pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    HELD.with(|h| h.set(h.get() + 1));
+    Remapping(guard)
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(h.get() - 1));
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(h.get() - 1));
+    }
+}
+
+thread_local! {
+    /// How many holds of [`MAPPING`] this thread has.
+    static HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds the lock of mapping changes, either way: it
+/// must not wait for a change to end ([`remapping_over`]).
+pub fn mapping_lock_held() -> bool {
+    HELD.with(|h| h.get() > 0)
+}
+
+/// Waits, at most `ms` milliseconds, until no change of what title memory
+/// shows is under way; false if one still is. For a title thread that
+/// touched a page in the moment the runtime had taken its view away to map
+/// it again (the console changes its page table in one step): it may then
+/// carry on. Not for a thread that holds the lock ([`mapping_lock_held`]).
+pub fn remapping_over(ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(guard) = MAPPING.try_read() {
+            drop(guard);
+            return true;
+        }
+        if start.elapsed().as_millis() as u64 >= ms {
+            return false;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -922,7 +966,9 @@ pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    HELD.with(|h| h.set(h.get() + 1));
+    Reading(guard)
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
