@@ -19,6 +19,7 @@ The relay (`VICTORY_RELAY`) was ON by default (stage 2), and with it
 | `VICTORY_BVH_BUILDER` | off | lets the ray-tracing structure builder run |
 | `VICTORY_CARD_CAP_MB` | from adapter | ceiling on card memory the layer uses |
 | `VICTORY_SHARED_CAP_MB` | from adapter | ceiling on PC memory mapped for the card |
+| `VICTORY_TEXTURE_QUALITY` | `medium` under 10 GB of card memory, else `high` | `high`, `medium`, `low`: host copies of textures the title fills leave out 0, 1 or 2 of their largest levels (`quality.rs`) |
 | `VICTORY_D3D12_DEBUG` | off | D3D12 debug layer (diagnostics builds) |
 | `VICTORY_PC_DXC` | SDK dxc | test-only: dxc.exe for pipeline tests |
 

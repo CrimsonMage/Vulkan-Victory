@@ -151,6 +151,12 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The bytes of the card's memory copies of title buffers take, for the
+/// memory line.
+pub(crate) fn card_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed) + CARD_BYTES[1].load(Ordering::Relaxed)
+}
+
 // The texture queue leaves room on the card for the card copies of title
 // buffers that are not made yet ([`card_room_kept`]). The copies are made in
 // one burst when the world loads, and the texture queue fills the card

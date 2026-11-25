@@ -2582,6 +2582,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                // Texture quality (`crate::quality`): the host copy leaves
+                // out the console's largest levels; the view starts at the
+                // same level of the texture, lower in the host's chain.
+                let dropped = crate::resource::host_dropped(resource);
+                if dropped > 0
+                    && let Some(desc) = desc.as_mut()
+                {
+                    // SAFETY: a live resource.
+                    let kept = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    crate::quality::shift_view(desc, dropped, kept);
+                }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level is shown from the first level that is the title's
                 // and has memory, if the title's view starts before it (a
