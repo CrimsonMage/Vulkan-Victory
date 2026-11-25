@@ -30,6 +30,19 @@ the twin; it implements only what is truly console-only.
 | XUser, XStore, saves, networking | PC GDK twins or local stand-ins; no network | `xuser.rs`, `xstore.rs`, `xgamesave.rs`, `net.rs` | works |
 | Console CPU instructions the PC lacks (CLZERO, MONITORX, INSERTQ ...) | Trapped and emulated | `victory-loader` | works |
 
+## Targets
+
+- **At least 30 fps everywhere**: menus, loading, cutscenes and the world.
+  More is better (the title's own cap is 30; see workstream 10 for 60).
+- **Low memory**: as little card memory and system memory as the content
+  needs, not a mirror of everything.
+- **Iterate**: measure (`frame time:` line, card/PC memory), cut the
+  biggest cost, repeat.
+- **Content is streamed on demand and then stays put**: the title loads it
+  once (DirectStorage, file reads) and does not churn it. So do work once,
+  at the moment the title announces new data, and never re-check, re-hash,
+  re-copy or re-translate it per frame.
+
 ## Rules
 
 - Prefer an explicit API point over detecting side effects in memory.
