@@ -75,7 +75,7 @@ comparing. If something seems to need that, it is in the wrong class.
 
 ## Gate
 
-`/mnt/data/victory/autorun.sh <name> 600 "$(cat /mnt/data/victory/keys-start.txt)"`
+`VICTORY_CONSOLE=series-s /mnt/data/victory/autorun.sh <name> 300 "$(cat /mnt/data/victory/keys-start.txt)"` (5 minutes)
 on the diagnostics build, with the GPU-memory watchdog: it boots, reaches
 the world, saves captures and logs frame time and card memory. A change
 lands on `integrate` only if the run reaches as far as before, with no
@@ -205,5 +205,9 @@ driver errors and no new crash, and the captures look no worse.
   from the title's PSO cache. Not taken: bypassing vkd3d, its windows.
 - 2026-11-25: window copy-out corrupted title memory (title crash at frame
   ~900); copy-out off by default (VICTORY_GATHER_COPYOUT).
+- 2026-11-25: run p15 (windows gathered on the card, copy-out off): stable;
+  steps 250 → 11 ms, in submissions 270 → 39 ms, not-in-place fills 4.2 GB
+  → 55 MB; dispatch 555 → 132 ms; but bounded indirect windows cost
+  468 ms (short windows), being made nearly free.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
