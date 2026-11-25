@@ -859,6 +859,9 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        crate::memcap::note(crate::memcap::Use::Views, u64::from(size) * u64::from(step), || {
+            format!("a shader-visible {} heap of {size} slots", if sampler { "sampler" } else { "view" })
+        });
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((

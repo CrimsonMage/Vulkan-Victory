@@ -167,6 +167,183 @@ pub(crate) fn shared_room(host: &crate::host::Host, size: u64, over: u64) -> boo
     false
 }
 
+/// What a host allocation is for, in the allocation lines ([`note`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Use {
+    /// The host copy of a title texture the host writes (render target,
+    /// depth, unordered access): the card's memory.
+    Target,
+    /// A depth texture's colour twin and its depth plane's twin: the
+    /// card's memory (the buffer a stencil plane goes through is a
+    /// card buffer).
+    Twin,
+    /// The host copy of a texture the title fills: the card's memory.
+    Texture,
+    /// Other buffers in the card's memory (card copies of title buffers,
+    /// their hashes, indirect scratch).
+    CardBuffer,
+    /// Descriptor heaps shaders see (the system decides where).
+    Views,
+    /// Upload buffers: the PC's memory the card maps.
+    Upload,
+    /// Shared buffers (host copies of title memory): the PC's memory.
+    Shared,
+    /// Read-back buffers: the PC's memory.
+    ReadBack,
+    /// Title memory opened as a heap (`crate::unified`): the PC's memory,
+    /// pinned. Counted only; `unified` has its own line.
+    Opened,
+}
+
+const USES: usize = 9;
+
+impl Use {
+    const ALL: [Use; USES] = [
+        Use::Target,
+        Use::Twin,
+        Use::Texture,
+        Use::CardBuffer,
+        Use::Views,
+        Use::Upload,
+        Use::Shared,
+        Use::ReadBack,
+        Use::Opened,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Use::Target => "target",
+            Use::Twin => "twin",
+            Use::Texture => "texture",
+            Use::CardBuffer => "card-buffer",
+            Use::Views => "views",
+            Use::Upload => "upload",
+            Use::Shared => "shared",
+            Use::ReadBack => "read-back",
+            Use::Opened => "opened",
+        }
+    }
+
+    fn on_card(self) -> bool {
+        matches!(self, Use::Target | Use::Twin | Use::Texture | Use::CardBuffer | Use::Views)
+    }
+}
+
+/// Allocations of a [`Use`] since the start: how many and their bytes.
+static MADE: [[AtomicU64; 2]; USES] = [const { [const { AtomicU64::new(0) }; 2] }; USES];
+
+/// Allocations of each [`Use`] in one second of the clock: bytes, count.
+struct Second {
+    at: u64,
+    bytes: [u64; USES],
+    count: [u64; USES],
+}
+
+static SECOND: Mutex<Second> = Mutex::new(Second { at: 0, bytes: [0; USES], count: [0; USES] });
+
+/// Bytes of the card's memory the layer made since the system was last
+/// asked ([`card_used`]).
+static CARD_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// A host allocation of `bytes` for `what`: counted, and one line if it
+/// is 16 MiB or more (`object` names what it is for: the title object, or
+/// the caller). Allocations of 256 MiB or more within one second of the
+/// clock are summed up once that second is over ([`second`]).
+pub(crate) fn note(what: Use, bytes: u64, object: impl FnOnce() -> String) {
+    let Some((n, total)) = count(what, bytes) else {
+        return;
+    };
+    if bytes >= 16 * MB {
+        tracing::info!(
+            "host allocation: {} {:.1} MB {} for {}; {} so far: {} made, {} MB",
+            what.name(),
+            bytes as f64 / MB as f64,
+            if what.on_card() { "on the card" } else { "in the PC's memory" },
+            object(),
+            what.name(),
+            n,
+            total / MB
+        );
+    }
+}
+
+/// [`note`] without the line: what was made so far of `what` (count,
+/// bytes), `None` for nothing.
+pub(crate) fn count(what: Use, bytes: u64) -> Option<(u64, u64)> {
+    if bytes == 0 {
+        return None;
+    }
+    let i = what as usize;
+    let n = MADE[i][0].fetch_add(1, Relaxed) + 1;
+    let total = MADE[i][1].fetch_add(bytes, Relaxed) + bytes;
+    if what.on_card() {
+        CARD_SINCE.fetch_add(bytes, Relaxed);
+    }
+    second(Some((i, bytes)));
+    Some((n, total))
+}
+
+/// Adds to this second's allocations; when a second is over in which 256
+/// MiB or more were made, one line sums it up. Also once a second from the
+/// sweep ([`trim`]), so the last busy second is said too.
+fn second(add: Option<(usize, u64)>) {
+    let now = crate::host::now_ms() / 1000;
+    let over = {
+        let mut s = SECOND.lock().unwrap_or_else(|e| e.into_inner());
+        let over = (s.at != now).then(|| std::mem::replace(&mut *s, Second { at: now, bytes: [0; USES], count: [0; USES] }));
+        if let Some((i, bytes)) = add {
+            s.bytes[i] += bytes;
+            s.count[i] += 1;
+        }
+        over
+    };
+    let Some(s) = over else { return };
+    let all: u64 = s.bytes.iter().sum();
+    if all < 256 * MB {
+        return;
+    }
+    let card: u64 = Use::ALL.iter().filter(|u| u.on_card()).map(|&u| s.bytes[u as usize]).sum();
+    let mut parts = String::new();
+    for u in Use::ALL {
+        let i = u as usize;
+        if s.count[i] > 0 {
+            parts.push_str(&format!(
+                "; {} {} MB in {} ({} MB so far)",
+                u.name(),
+                s.bytes[i] / MB,
+                s.count[i],
+                MADE[i][1].load(Relaxed) / MB
+            ));
+        }
+    }
+    let system = crate::host::host().and_then(|h| h.video_memory());
+    tracing::info!(
+        "host allocations in one second: {} MB, {} MB of it on the card, {} MB in the PC's memory{}; the card {} MB in use by the system's count, the layer's line {} MB",
+        all / MB,
+        card / MB,
+        (all - card) / MB,
+        parts,
+        system.map_or(0, |v| v[1] / MB),
+        system.map_or(0, |v| v[0] / MB)
+    );
+}
+
+/// The card's memory in use as the system counted it at most a tenth of a
+/// second ago plus what the layer made on the card since (so a burst of
+/// creations between two askings is not missed), and the budget the
+/// layer goes by (`Host::video_memory`).
+pub(crate) fn card_used(host: &crate::host::Host) -> Option<(u64, u64)> {
+    static SEEN: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    if seen.0 == 0 || now >= seen.0 + 100 {
+        let [budget, used, ..] = host.video_memory()?;
+        *seen = (now.max(1), used, budget);
+        CARD_SINCE.store(0, Relaxed);
+    }
+    Some((seen.1 + CARD_SINCE.load(Relaxed), seen.2))
+}
+
 /// Which kind of buffer a pooled one is: they are made differently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
@@ -279,9 +456,11 @@ pub(crate) fn give(kind: Kind, buffer: ID3D12Resource) {
     drop(out);
 }
 
-/// Lets go of pooled buffers unused for [`POOL_IDLE_MS`]. Once a second,
-/// with the host's sweep.
+/// Lets go of pooled buffers unused for [`POOL_IDLE_MS`], and ends the
+/// allocation summary's second ([`second`]). Once a second, with the host's
+/// sweep.
 pub(crate) fn trim() {
+    second(None);
     let now = crate::host::now_ms();
     let out: Vec<Entry> = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());

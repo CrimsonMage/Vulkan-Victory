@@ -2597,6 +2597,28 @@ fn loose(address: u64, end: u64, unsized_ask: bool) -> Option<Arc<Shadow>> {
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // In a section's views the 4 MiB window often is not one run (the
+    // views are smaller, or end, or show pages of another section): then
+    // the run of the view the ask lies in, from the ask's 64 KiB page to
+    // where the run or the window ends, if it holds the ask. Without this
+    // every such ask took a 4 MiB copy in the PC's memory, and at the world
+    // start thousands of them hit the ceiling in one frame (147,000 refused
+    // in the run of 10:33).
+    if crate::unified::on() {
+        let from = address & !0xffff;
+        let reach = crate::views::run_reach(from as usize, (start + len - from) as usize) as u64;
+        if reach >= end - from {
+            if let Some(shadow) = map.get(&(from, reach)).filter(|s| !s.stale.load(Ordering::Relaxed)) {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            if let Some(shadow) = in_place(from, reach, true) {
+                note(&shadow);
+                map.insert((from, reach), shadow.clone());
+                return Some(shadow);
+            }
+        }
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

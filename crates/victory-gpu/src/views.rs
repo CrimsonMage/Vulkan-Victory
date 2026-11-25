@@ -111,6 +111,30 @@ pub(crate) fn section_run(start: usize, len: usize) -> Option<(usize, u64)> {
     Some((section, first))
 }
 
+/// How far from `start` (at most `most` bytes) one run of a section reaches
+/// ([`section_run`]): 0 for memory that is no view.
+pub(crate) fn run_reach(start: usize, most: usize) -> usize {
+    let v = views();
+    let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back() else {
+        return 0;
+    };
+    if base + bytes <= start {
+        return 0;
+    }
+    let end = start.saturating_add(most);
+    let (mut reach, mut next) = (base + bytes, offset + bytes as u64);
+    while reach < end {
+        match v.views.get(&reach) {
+            Some(&(b, s, o)) if s == section && o == next => {
+                reach += b;
+                next = o + b as u64;
+            }
+            _ => break,
+        }
+    }
+    reach.min(end) - start
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

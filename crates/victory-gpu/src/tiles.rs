@@ -180,6 +180,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 free: vec![(0, HEAP_TILES)],
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            crate::memcap::note(crate::memcap::Use::Texture, u64::from(HEAP_TILES) * TILE, || {
+                "a heap for texture levels given on demand".to_string()
+            });
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
                     pool[index] = Some(fresh);

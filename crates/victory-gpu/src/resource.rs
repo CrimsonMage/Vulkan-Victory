@@ -1262,11 +1262,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
-        // At the hard line of `crate::memcap` a texture the title fills
-        // gets no host copy now (its draws go without it, as when a
-        // creation fails); the sweep frees idle copies and a later use
-        // makes it. Render targets and textures the host writes are still
-        // made: what they hold exists nowhere else.
+        // At the hard line of `crate::memcap`, less the room kept for
+        // render targets, a texture the title fills gets no host copy now
+        // (its draws go without it, as when a creation fails); the sweep
+        // frees idle copies and a later use makes it. Render targets and
+        // textures the host writes are still made: what they hold exists
+        // nowhere else, so their room is kept instead.
         if fills(&r.desc) && card_full_lately() {
             CARD_FULL_REFUSED.fetch_add(1, Relaxed);
             return None;
@@ -1340,6 +1341,32 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.filled = fills(&r.desc);
+        crate::memcap::note(
+            if host.filled { crate::memcap::Use::Texture } else { crate::memcap::Use::Target },
+            host.bytes,
+            || {
+                format!(
+                    "title texture {this:?} ({}x{}x{}, {} levels, format {}, flags {:#x}; {} {:#x})",
+                    r.desc.width,
+                    r.desc.height,
+                    r.desc.depth_or_array_size,
+                    r.desc.mip_levels,
+                    r.desc.format,
+                    r.desc.flags,
+                    match r.backing {
+                        Backing::Committed(_) => "committed, title memory",
+                        Backing::Placed { .. } => "placed in a title heap, title memory",
+                        Backing::Address(_) if r.host.placed.load(Relaxed) => "placed by a view, title memory",
+                        Backing::Address(_) => "at a title address",
+                    },
+                    r.data() as u64
+                )
+            },
+        );
+        if let Some(twin) = &twin {
+            let bytes = twin.colour.bytes + twin.plane.as_ref().map_or(0, |p| p.bytes);
+            crate::memcap::note(crate::memcap::Use::Twin, bytes, || format!("the colour twin of title texture {this:?}"));
+        }
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1414,14 +1441,20 @@ pub(crate) fn room() -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: 3,072 MB, or three tenths of the card's `budget` if that
-/// is less, less what such copies hold now.
+/// not made yet: 3,072 MB, or half the card's `budget` if that is less,
+/// less what such copies hold now. Host copies of textures the title fills
+/// are not made into it either ([`card_full_lately`]).
 ///
-/// Three tenths: on a card of 8 GB the system's budget is about 5,500 MB
-/// (an RTX 5060 Ti under vkd3d-proton), and 3,072 MB kept for targets plus
-/// the room kept for buffer copies left the textures picked by index under
-/// a gigabyte before their line (20,000 slots waiting in that run). A card
-/// of 12 GB (budget about 10,200 MB) keeps the 3,072 as before.
+/// Half: on the 8 GB card the layer's budget is 4,567 MB (`crate::memcap`).
+/// Three tenths (1,370 MB, of which some 650 MB were made before the
+/// world) was too little: in the run of 2026-11-25 10:03 the host textures
+/// grew from 2,610 to 3,943 MB in the world's first frame (310 of them,
+/// the copies of textures the title fills refused at the line meanwhile),
+/// the card's use as the system counts it from 3,765 to 5,181 MB, and in
+/// the runs after it the card went to 7.7 of 8.1 GB and the watchdog ended
+/// them. A card of 12 GB (budget about 8,600 MB) keeps the 3,072 as
+/// before. The price: before the world, textures the title fills get that
+/// much less of the card (they are made later, when room comes back).
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1438,7 +1471,7 @@ pub(crate) fn room() -> bool {
 #[cfg(windows)]
 pub(crate) fn targets_room_kept(budget: u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    let most = (3072u64 << 20).min(budget / 10 * 3);
+    let most = (3072u64 << 20).min(budget / 2);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
@@ -1449,23 +1482,16 @@ pub(crate) fn targets_room_kept(budget: u64) -> u64 {
 #[cfg(windows)]
 pub(crate) static CARD_FULL_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether the card's memory in use has reached the budget the layer goes
-/// by (`Host::video_memory`, capped by `crate::memcap`), as it was at most
-/// a tenth of a second ago.
+/// Whether the card's memory in use (as the system counted it at most a
+/// tenth of a second ago, plus what the layer made on the card since:
+/// `crate::memcap::card_used`) has reached the budget the layer goes by
+/// (`Host::video_memory`) less the room kept for render targets not made
+/// yet ([`targets_room_kept`]).
 #[cfg(windows)]
 pub(crate) fn card_full_lately() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tenth = crate::host::now_ms() / 100 + 1;
-    let last = LAST.load(Relaxed);
-    if last >> 1 == tenth {
-        return last & 1 != 0;
-    }
-    let full = crate::host::host()
-        .and_then(|h| h.video_memory())
-        .is_some_and(|[budget, used, ..]| budget > 0 && used >= budget);
-    LAST.store((tenth << 1) | u64::from(full), Relaxed);
-    full
+    crate::host::host()
+        .and_then(crate::memcap::card_used)
+        .is_some_and(|(used, budget)| budget > 0 && used + targets_room_kept(budget) >= budget)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question

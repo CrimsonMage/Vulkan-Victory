@@ -199,6 +199,7 @@ fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Hom
             Ok(heap) => {
                 STATS[0].fetch_add(1, Ordering::Relaxed);
                 STATS[1].fetch_add(unit.len, Ordering::Relaxed);
+                crate::memcap::count(crate::memcap::Use::Opened, unit.len);
                 tracing::info!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, ms = format_args!("{ms:.0}"), "unified: title memory opened as a heap");
                 State::Open(heap, unit.len + K64)
             }

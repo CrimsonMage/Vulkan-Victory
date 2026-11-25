@@ -4266,7 +4266,9 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    #[track_caller]
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let caller = std::panic::Location::caller();
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -4297,7 +4299,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memcap::note(crate::memcap::Use::ReadBack, size, || format!("a read-back buffer ({caller})"));
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -4311,7 +4316,9 @@ impl Host {
     /// pool of buffers let go if one of that class is free; not made past
     /// the ceiling of the PC's memory mapped for the card (with 1 GiB more
     /// than shared buffers get: uploads are what the rest waits on).
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let caller = std::panic::Location::caller();
         let asked = size;
         let size = crate::memcap::class(crate::memcap::Kind::Upload, size);
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Upload, size, asked) {
@@ -4356,7 +4363,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memcap::note(crate::memcap::Use::Upload, size, || format!("an upload buffer ({caller})"));
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -4793,7 +4803,9 @@ impl Host {
     /// (zeroed, as a new one reads); not made past the ceiling of the PC's
     /// memory mapped for the card (`crate::memcap`): then `None`, as for a
     /// failed creation.
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let caller = std::panic::Location::caller();
         let size = size.max(1);
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Shared, size, size) {
             return Some(pooled);
@@ -4843,7 +4855,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memcap::note(crate::memcap::Use::Shared, size, || format!("a shared buffer ({caller})"));
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -4853,7 +4868,9 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let caller = std::panic::Location::caller();
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -4885,7 +4902,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memcap::note(crate::memcap::Use::CardBuffer, size, || format!("a buffer in the card's memory ({caller})"));
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
