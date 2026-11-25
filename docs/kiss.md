@@ -110,6 +110,7 @@ driver errors and no new crash, and the captures look no worse.
 | 18 | Per-draw recording cost | subagent | merged: per-thread lookups, lock-free slot check, fast hashers, in-place constant tables, slot chunks; per-call timing in the frame line |
 | 21 | Indirect and dispatch recording (~640 ms CPU/frame) | subagent | running |
 | 22 | Submission pass-through: last card copies in place, no merge wait, fences to the GPU | subagent | running |
+| 23 | Windows over scattered pool pages gathered on the card from the opened sections (GPU copies of runs of pages, again only on remaps and announced writes; written ranges copied back after the list); dispatches with only new root constants set their user data alone; dispatch binding split in the frame line | subagent | built, not yet run |
 | 19 | Memory: levels on demand by default, release on title frees, room-only eviction, big buffers in place | subagent | merged |
 | 20 | Later: `globallycoherent` UAVs for the BVH builder (XCL found the builder needs it) | — | after fps/memory |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
@@ -183,6 +184,13 @@ driver errors and no new crash, and the captures look no worse.
   0.43 ms per dispatch. Probe: tile mappings into opened sections read wrong
   data on this stack, so windows will be gathered from the section heaps on
   the GPU, refreshed only on remaps and announced writes.
+- 2026-11-25: windows over scattered pool pages are buffers on the card
+  that GPU copies gather from the opened section heaps before the list
+  that names them, for the pages the title remapped or announced written
+  (or shaders wrote through another view) since; what shaders write into
+  them is copied back into the sections after the list. No CPU fill at
+  submission. Whether a window opens in place whole is asked once until
+  a remap (it was asked at every ask).
 - 2026-11-25: whole-file mapping of archives failed (levels.rpf is 76 GB);
   streaming now does one positioned read of exactly each request's range.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed

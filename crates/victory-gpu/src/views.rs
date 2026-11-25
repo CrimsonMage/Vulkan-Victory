@@ -39,6 +39,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // Windows over these addresses look their pages up again.
+    crate::gather::remapped(at as u64, len as u64);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -111,6 +113,33 @@ pub(crate) fn section_run(start: usize, len: usize) -> Option<(usize, u64)> {
         next = o + b as u64;
     }
     Some((section, first))
+}
+
+/// The section and byte offset of the 64 KiB page at `page`, if one view
+/// shows all of it (`crate::unified::source`).
+pub(crate) fn section_page(page: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=page).next_back()?;
+    (page.checked_add(K64)? <= base + bytes).then(|| (section, offset + (page - base) as u64))
+}
+
+/// The views that overlap `[start, end)`, as (address, bytes, section,
+/// offset of the view's first byte in it).
+pub(crate) fn section_spans(start: usize, end: usize) -> Vec<(usize, usize, usize, u64)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let v = views();
+    let mut out = Vec::new();
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        out.push((base, bytes, section, offset));
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        out.push((base, bytes, section, offset));
+    }
+    out
 }
 
 /// How far from `start` (at most `most` bytes) one run of a section reaches

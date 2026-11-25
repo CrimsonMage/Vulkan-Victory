@@ -481,10 +481,38 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   textures over it detile again once it has finished
   (`unified::gpu_wrote`, `settle`). A view that the title maps anew marks
   its in-place buffers stale and the next ask places new ones.
+- **Windows over scattered pages** (`gather.rs`). The title maps its
+  physical-page pool page by page in scattered order (~62k single-page
+  views in run p13), so a 4 MiB window there is not one run of a section
+  and no buffer can be placed over it; an ask that fits in one run gets an
+  in-place buffer over that run as before. Otherwise the window is a
+  buffer on the card (the PC's memory past 85% of the card's budget)
+  that GPU copies fill from the opened section heaps, one
+  `CopyBufferRegion` per run of pages, in a list of ours run just before
+  the title list that names it, and only for its pages that are behind:
+  all of them the first time, then those the title maps anew
+  (`XMemMapPhysicalPages`, page-mapping copies, a view told:
+  `gather::remapped`), announces written (DirectStorage, file reads, title
+  copies on the CPU: `unified::written`), or that shaders wrote through
+  another view (an in-place buffer, another window: noted when the list
+  that writes is submitted, so the next list that names the window copies
+  them). After a list whose shaders write a window, a list of ours copies
+  the written ranges back into the section heaps, so the title and every
+  alias see them. Copies sit between global barriers on the one host
+  queue: queue order is the order. Pages no unit holds that the title has
+  not mapped, or shows by read-only stand-ins, read as zeros. Nothing is
+  filled on the CPU and the CPU never reads the window. Whether a window
+  opens in place whole is asked once per window until the title maps
+  there anew (it was asked at every ask: 34,553 refusals in run p13).
+  Gave up a page-table mirror: tile mappings into opened sections read
+  wrong data on this stack (probe, 2026-11-25).
+  shortcut: CPU writes the title makes into pool pages without saying so
+  reach a window only with the next announced change of those pages.
 - **Not in place** (since 2026-11-25 the only other kind; card copies,
   PC copies with snapshots, compares, merges and fetch-backs are gone):
   a buffer view whose bytes do not start on an element of its in-place
-  buffer (`shadow::exact`: placed buffers start on 64 KiB lines), and
+  buffer (`shadow::exact`: placed buffers start on 64 KiB lines), windows
+  with a writable page no unit holds, and
   memory that does not open, get a buffer of their own in the PC's memory
   that each submission naming it fills from title memory
   (`HostList::defer_upload`) and that is never copied back. Shader writes
@@ -534,7 +562,8 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   must not appear. A `why` with "silent fallback" means the import
   failed.
 - Every 10 s: `unified: N heaps opened (… MB of title memory), R refused;
-  buffers in place: … alive (… MB) …; title copies on the GPU …, on the
+  buffers in place: … alive (… MB) …; windows over scattered pages … alive
+  (… MB), … made; title copies on the GPU …, on the
   CPU after waiting for the card …; textures checked for an announced
   write …, by their hash …`. Good signs: R = 0, in-place buffers in the
   hundreds or thousands, "on the CPU after waiting" small next to "on the
@@ -567,7 +596,10 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   textures brought up to date T ms), waiting for the card W ms [why ms/n,
   …]; flights landed in L ms; title fence events set n/frame, D ms after
   the ask on average; buffers named by lists: in place (read over the bus)
-  X MB, not in place (filled at submission) Y MB; top pipelines (ms of a
+  X MB, not in place (filled at submission) Y MB, windows over scattered
+  pages (copies on the card) Z MB; window gathers n (M MB), scatters n (M
+  MB); dispatch binding ms/n: whole, skipped, tables, by-address memory,
+  root views; top pipelines (ms of a
   sampled frame, of A in all): name ms; …` (`frametime.rs`). All per
   frame. B and I come from GPU timestamps around each submission (B + I ≈
   the frame when the card is the limit only if I is small). The waits by
@@ -586,9 +618,13 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   lock and the flights in the air, waits included), `descriptors` (records
   the title copied into heaps as bytes), `upkeep` (the sweep, slots waiting
   for a texture, finished shader writes announced), `steps` (the lists'
-  CPU steps: fills, copies, textures; the timestamps), `execute`
-  (`ExecuteCommandLists` of a submission sent ahead; a waited one counts as
-  the `own` wait).
+  CPU steps: fills, copies, textures, the planning of window copies; the
+  timestamps), `execute` (`ExecuteCommandLists` of a submission sent
+  ahead; a waited one counts as the `own` wait). Window gathers and
+  scatters are GPU copies per frame (runs of pages) and their bytes. The
+  dispatch binding: whole bindings and the time they took (of it:
+  `tables`, `by-address memory`, `root views`), and `skipped` ones (bound
+  already, or only root constants changed: the user data is set again).
 - **Fences pass through.** Everything of ours runs on one host queue, in
   order. A title queue's `Wait` for a fence whose signal is already in the
   line of flights (`host::late_signalled`), and a list's wait for a memory

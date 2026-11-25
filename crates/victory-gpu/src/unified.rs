@@ -88,6 +88,10 @@ struct Units {
     /// first address; and the first addresses that did not open.
     loose: BTreeMap<usize, Loose>,
     loose_refused: HashMap<u64, u64>,
+    /// Buffers over [`CHUNK`]s of opened units' heaps, by unit and chunk
+    /// number: what the GPU copies of windows over scattered pages read
+    /// and write (`crate::gather`).
+    chunks: HashMap<(Home, u64), ID3D12Resource>,
     /// The probe's queue, for the canaries.
     rig: Option<Rig>,
 }
@@ -156,7 +160,11 @@ pub fn title_section(handle: usize, len: u64) {
 /// its heap lives on in the buffers placed in it until those go, as for a
 /// region the title frees ([`released`]).
 pub fn title_section_gone(handle: usize) {
-    let gone = units().sections.remove(&handle);
+    let gone = {
+        let mut u = units();
+        u.chunks.retain(|(home, _), _| *home != Home::Section(handle));
+        u.sections.remove(&handle)
+    };
     if let Some(unit) = gone {
         let_go(&unit, 1);
     }
@@ -188,6 +196,7 @@ pub(crate) fn released(at: usize, len: usize) {
         .map(|(base, _)| *base)
         .collect();
     for base in gone {
+        u.chunks.retain(|(home, _), _| *home != Home::Region(base));
         if let Some(unit) = u.regions.remove(&base) {
             let_go(&unit, 0);
         }
@@ -258,10 +267,92 @@ pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
     Some(Placed { buffer, gpu, bias, view })
 }
 
-#[derive(Clone, Copy)]
-enum Home {
+/// A unit: a region by its first address, a section by its handle.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) enum Home {
     Region(usize),
     Section(usize),
+}
+
+/// The pieces the buffers over units' heaps for window copies cover
+/// ([`span_buffer`]): a copy never crosses a chunk's end.
+pub(crate) const CHUNK: u64 = 256 << 20;
+
+/// Where the 64 KiB page of title memory at `page` lives, if in a unit: a
+/// section a view shows (the whole page in one view), else a region.
+pub(crate) fn source(page: u64) -> Option<(Home, u64)> {
+    if !on() || page >= TIB {
+        return None;
+    }
+    if let Some((section, offset)) = crate::views::section_page(page as usize) {
+        let u = units();
+        let unit = u.sections.get(&section)?;
+        return (offset + K64 <= unit.len && !matches!(unit.state, State::Refused)).then_some((Home::Section(section), offset));
+    }
+    let u = units();
+    let (&base, unit) = u.regions.range(..=page as usize).next_back()?;
+    let offset = page - base as u64;
+    (offset + K64 <= unit.len && !matches!(unit.state, State::Refused)).then_some((Home::Region(base), offset))
+}
+
+/// The units' bytes that title memory `[at, at + len)` is, as (unit,
+/// offset, bytes): the parts views of sections show, and the parts in
+/// regions. Memory in neither is left out.
+pub(crate) fn spans(at: u64, len: u64, out: &mut Vec<(Home, u64, u64)>) {
+    if !on() || len == 0 || at >= TIB {
+        return;
+    }
+    let end = at.saturating_add(len);
+    for (base, bytes, section, offset) in crate::views::section_spans(at as usize, end as usize) {
+        let (lo, hi) = ((base as u64).max(at), (base as u64 + bytes as u64).min(end));
+        if lo < hi {
+            out.push((Home::Section(section), offset + (lo - base as u64), hi - lo));
+        }
+    }
+    let u = units();
+    let first = u.regions.range(..=at as usize).next_back().map(|(&b, _)| b).unwrap_or(at as usize);
+    for (&base, unit) in u.regions.range(first..end as usize) {
+        let (lo, hi) = ((base as u64).max(at), (base as u64 + unit.len).min(end));
+        if lo < hi {
+            out.push((Home::Region(base), lo - base as u64, hi - lo));
+        }
+    }
+}
+
+/// A buffer over the chunk of `home`'s heap that holds `offset` (the unit
+/// opened now if it was not yet), and the offset of `offset` in it: for
+/// the GPU copies between windows and their pages (`crate::gather`). Kept
+/// until the unit goes.
+pub(crate) fn span_buffer(home: Home, offset: u64) -> Option<(ID3D12Resource, u64)> {
+    let chunk = offset / CHUNK;
+    let host = crate::host::host()?;
+    let mut u = units();
+    if let Some(buffer) = u.chunks.get(&(home, chunk)) {
+        return Some((buffer.clone(), offset - chunk * CHUNK));
+    }
+    let u = &mut *u;
+    let unit = match home {
+        Home::Region(base) => u.regions.get_mut(&base)?,
+        Home::Section(handle) => u.sections.get_mut(&handle)?,
+    };
+    let (heap, size) = open(&host.device, &mut u.rig, unit, home)?;
+    let first = chunk * CHUNK;
+    if first >= size {
+        return None;
+    }
+    let width = CHUNK.min(size - first);
+    let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    let buffer = place_resource(&host.device, &heap, first, &buffer_desc(width, flags), D3D12_RESOURCE_STATE_COMMON).ok()?;
+    u.chunks.insert((home, chunk), buffer.clone());
+    Some((buffer, offset - first))
+}
+
+/// Whether the 64 KiB page at `page` is committed memory the title may
+/// write (a page with no unit that a window cannot take from one): not
+/// for pages that are not there or read-only (the filler page's
+/// stand-ins, `xmem`), which read as zeros in a window.
+pub(crate) fn private_page(page: u64) -> bool {
+    usable(page as usize, K64 as usize).is_ok()
 }
 
 /// The unit's heap and its bytes, opening it the first time.
@@ -686,6 +777,8 @@ fn epochs() -> std::sync::MutexGuard<'static, Epochs> {
 pub(crate) fn written(at: usize, len: usize) {
     if on() && len > 0 {
         epochs().write(at as u64, len as u64);
+        // Windows over those pages take them again (`crate::gather`).
+        crate::gather::written(at as u64, len as u64);
     }
 }
 
@@ -777,8 +870,10 @@ pub(crate) fn tick() {
     let (live, live_bytes) = crate::shadow::in_place_live();
     let own = crate::shadow::own_made();
     let ranges = epochs().len();
+    let windows = crate::gather::live();
     tracing::info!(
         "unified: {} heaps opened ({} MB of title memory), {} refused; buffers in place: {} alive ({} MB), {} placed since the start ({} MB); \
+         windows over scattered pages (copies on the card gathered from their pages) {} alive ({} MB), {} made; \
          not in place (buffers of their own, filled at each submission that names them) {} made ({} MB), lists whose shaders wrote one {}; \
          windows let go {}; title copies on the GPU {}, on the CPU after waiting for the card {}; textures checked for an announced write {}, \
          by their hash {}; announced-write ranges kept {}",
@@ -789,6 +884,9 @@ pub(crate) fn tick() {
         live_bytes >> 20,
         s[3],
         s[4] >> 20,
+        windows[0],
+        windows[1] >> 20,
+        windows[2],
         own[0],
         own[1] >> 20,
         own[2],

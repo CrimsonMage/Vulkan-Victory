@@ -38,6 +38,8 @@ mod frametime;
 #[cfg(windows)]
 pub mod cores;
 #[cfg(windows)]
+mod gather;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

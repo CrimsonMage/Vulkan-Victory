@@ -1215,6 +1215,10 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of title memory in place.
     GpuWrite(usize, usize),
+    /// Shaders write a range (address, bytes) of a window over scattered
+    /// pages (`crate::gather`): scattered back into its pages after the
+    /// list.
+    WindowWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1253,6 +1257,9 @@ struct Deferred {
     /// declares the same views as the dispatch before it, and each
     /// declaration was a step at submission.
     declared: crate::fast::FastSet<(usize, usize)>,
+    /// Windows over scattered pages the list names (`crate::gather`):
+    /// their pages the title changed since are copied in before it runs.
+    windows: Vec<std::sync::Arc<crate::shadow::Shadow>>,
 }
 
 impl Deferred {
@@ -1531,7 +1538,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList]) -> Option<Blocked>
                     }
                 }
                 Step::Run(_) => return Some(Blocked::Run),
-                Step::Fill(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Fill(..) | Step::GpuWrite(..) | Step::WindowWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -1808,7 +1815,7 @@ fn declared_writes(runs: &[&HostList]) -> Declared {
     for list in runs {
         let deferred = list.deferred();
         let ranges = deferred.copies.iter().filter_map(|step| match *step {
-            Step::GpuWrite(address, len) => Some((address, address + len)),
+            Step::GpuWrite(address, len) | Step::WindowWrite(_, address, len) => Some((address, address + len)),
             _ => None,
         });
         join_ranges(&mut back, ranges);
@@ -2181,10 +2188,20 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            // Windows over scattered pages: what the title changed of their
+            // pages is copied in before the list, what its shaders wrote
+            // into them is copied out after it (`crate::gather`).
+            let [before, after] = list.window_copies();
+            if let Some(before) = before {
+                lists.push(Some(before));
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            if let Some(after) = after {
+                lists.push(Some(after));
+            }
         }
         // What its shaders write in place, announced once it has finished.
         let back = declared_writes(runs);
@@ -2786,35 +2803,74 @@ impl HostList {
         let list7 = self
             .list7
             .get_or_init(|| enhanced_barriers().then(|| self.list.cast().ok()).flatten());
-        let Some(list7) = list7 else {
-            // shortcut: without enhanced barriers, a barrier that names no
-            // resource (drivers that lack them order everything with it).
-            // SAFETY: an open list; a barrier that names no resource.
-            unsafe { self.list.ResourceBarrier(&[uav_barrier()]) };
-            return;
-        };
-        let global = D3D12_GLOBAL_BARRIER {
-            SyncBefore: D3D12_BARRIER_SYNC_ALL,
-            SyncAfter: D3D12_BARRIER_SYNC_ALL,
-            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
-            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
-                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
-                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
-                | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
-                | D3D12_BARRIER_ACCESS_INDEX_BUFFER
-                | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
-                | D3D12_BARRIER_ACCESS_COPY_SOURCE
-                | D3D12_BARRIER_ACCESS_COPY_DEST,
-        };
-        let group = D3D12_BARRIER_GROUP {
-            Type: D3D12_BARRIER_TYPE_GLOBAL,
-            NumBarriers: 1,
-            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &global },
-        };
-        // SAFETY: an open list; one global barrier that lives through the call.
-        unsafe { list7.Barrier(&[group]) };
+        order_writes(&self.list, list7.as_ref());
     }
 
+    /// The copies around the list for the windows over scattered pages it
+    /// names and writes (`crate::gather::around`): before it, after it.
+    fn window_copies(&self) -> [Option<ID3D12CommandList>; 2] {
+        let (named, writes, in_place) = {
+            let deferred = self.deferred();
+            let writes: Vec<_> = deferred
+                .copies
+                .iter()
+                .filter_map(|step| match step {
+                    Step::WindowWrite(shadow, address, len) => Some((shadow.clone(), *address as u64, *len as u64)),
+                    _ => None,
+                })
+                .collect();
+            if deferred.windows.is_empty() && writes.is_empty() && !crate::gather::any() {
+                return [None, None];
+            }
+            let in_place: Vec<(u64, u64)> = deferred
+                .copies
+                .iter()
+                .filter_map(|step| match *step {
+                    Step::GpuWrite(address, len) => Some((address as u64, len as u64)),
+                    _ => None,
+                })
+                .collect();
+            (deferred.windows.clone(), writes, in_place)
+        };
+        crate::gather::around(&named, &writes, &in_place)
+    }
+}
+
+/// Orders every write recorded so far in `list` (shaders, copies) before
+/// every later use, indirect arguments and vertex input included
+/// ([`HostList::writes_barrier`]); `list7` is `list` with enhanced
+/// barriers, if the device has them.
+pub(crate) fn order_writes(list: &ID3D12GraphicsCommandList, list7: Option<&ID3D12GraphicsCommandList7>) {
+    let Some(list7) = list7 else {
+        // shortcut: without enhanced barriers, a barrier that names no
+        // resource (drivers that lack them order everything with it).
+        // SAFETY: an open list; a barrier that names no resource.
+        unsafe { list.ResourceBarrier(&[uav_barrier()]) };
+        return;
+    };
+    let global = D3D12_GLOBAL_BARRIER {
+        SyncBefore: D3D12_BARRIER_SYNC_ALL,
+        SyncAfter: D3D12_BARRIER_SYNC_ALL,
+        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+        AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+            | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+            | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
+            | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
+            | D3D12_BARRIER_ACCESS_INDEX_BUFFER
+            | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
+            | D3D12_BARRIER_ACCESS_COPY_SOURCE
+            | D3D12_BARRIER_ACCESS_COPY_DEST,
+    };
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_GLOBAL,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &global },
+    };
+    // SAFETY: an open list; one global barrier that lives through the call.
+    unsafe { list7.Barrier(&[group]) };
+}
+
+impl HostList {
     /// Notes what the command about to be recorded does, for the frame
     /// capture's list of commands (`crate::capture::op`).
     #[cfg(feature = "diagnostics")]
@@ -2883,6 +2939,24 @@ impl HostList {
         let mut deferred = self.deferred();
         if deferred.uploaded.insert((id, src as usize, len)) {
             deferred.copies.push(Step::Fill(dst as usize, src as usize, len));
+        }
+    }
+
+    /// The list names a window over scattered pages (`crate::gather`), for
+    /// the first time since its reset.
+    pub(crate) fn name_window(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().windows.push(shadow.clone());
+    }
+
+    /// Shaders of the list write `[address, address + len)` of a window
+    /// over scattered pages: copied back into its pages after the list
+    /// (`crate::gather`), and declared as a write in place is. Once per
+    /// range until a title copy intervenes.
+    pub(crate) fn defer_window_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let mut deferred = self.deferred();
+        // Title addresses lie below bit 63: another key than a write in place.
+        if deferred.declared.insert((address | 1 << 63, len)) {
+            deferred.copies.push(Step::WindowWrite(shadow.clone(), address, len));
         }
     }
 
@@ -3027,8 +3101,9 @@ impl HostList {
                     work();
                 }
                 Step::Host(work) => work(),
-                // Collected for the submission ([`declared_writes`]).
-                Step::GpuWrite(..) => {}
+                // Collected for the submission ([`declared_writes`],
+                // `HostList::window_copies`).
+                Step::GpuWrite(..) | Step::WindowWrite(..) => {}
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         let t = std::time::Instant::now();
@@ -3913,7 +3988,7 @@ impl Host {
 
 /// Whether the device takes enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`),
 /// asked once.
-fn enhanced_barriers() -> bool {
+pub(crate) fn enhanced_barriers() -> bool {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     *ENHANCED.get_or_init(|| {
         let Some(host) = host() else { return false };

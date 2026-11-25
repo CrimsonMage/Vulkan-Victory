@@ -165,6 +165,15 @@ pub(crate) struct State {
     /// list's [`HostList::epoch`] when it was done, and whether a view the
     /// draw read was of the depth target it only tests.
     bound: [Option<(usize, u64, bool)>; 2],
+    /// As `bound`, but kept when only root constants change: the host
+    /// pipeline and the list's epoch of the last whole binding of a
+    /// dispatch whose single stage reads root constants only as user data
+    /// (no table picked by a constant, no memory by address). Such a
+    /// dispatch with new constants sets its user data again and nothing
+    /// else ([`State::constants_only`]): the title's runs of dispatches of
+    /// one pipeline that differ in their constants were bound whole for
+    /// each.
+    consts: [Option<(usize, u64)>; 2],
 }
 
 impl Drop for State {
@@ -185,6 +194,7 @@ impl State {
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
         self.bound = [None; 2];
+        self.consts = [None; 2];
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -378,6 +388,7 @@ impl State {
         }
         if self.heaps != was {
             self.bound = [None; 2];
+            self.consts = [None; 2];
         }
     }
 
@@ -385,6 +396,13 @@ impl State {
     /// kind binds anew ([`State::bound`]). Setting what is set already
     /// changes nothing.
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
+        self.consts[usize::from(compute)] = None;
+        self.constants(compute)
+    }
+
+    /// As [`State::roots`], to change root constants: a dispatch whose
+    /// constants are user data only sets them again ([`State::consts`]).
+    fn constants(&mut self, compute: bool) -> &mut Vec<Root> {
         self.bound[usize::from(compute)] = None;
         if compute {
             &mut self.compute
@@ -413,10 +431,10 @@ impl State {
         {
             return;
         }
-        let roots = self.roots(compute);
-        if !matches!(roots.get(s), Some(Root::Constants(_))) {
-            set(roots, slot, Root::Constants(Vec::new()));
+        if !matches!(self.roots_ref(compute).get(s), Some(Root::Constants(_))) {
+            set(self.roots(compute), slot, Root::Constants(Vec::new()));
         }
+        let roots = self.constants(compute);
         if let Root::Constants(c) = &mut roots[s] {
             if c.len() < end {
                 c.resize(end, 0);
@@ -796,14 +814,24 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        use crate::frametime::{Part, part};
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        let began = crate::fast::ticks();
         if self.bound_already(list, p, compute) {
+            if compute {
+                part(Part::Skipped, began);
+            }
+            return true;
+        }
+        if compute && self.constants_only(list, p) {
+            part(Part::Skipped, began);
             return true;
         }
         let kind = usize::from(compute);
         self.bound[kind] = None;
+        self.consts[kind] = None;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -857,7 +885,11 @@ impl State {
             // In the list's own vector: no allocation per draw.
             let mut made = std::mem::take(&mut self.made);
             made.clear();
+            let at = crate::fast::ticks();
             self.tables(list, &t.used, &t.host.root_indexed_views, compute, &mut made);
+            if compute {
+                part(Part::Tables, at);
+            }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -869,47 +901,21 @@ impl State {
             let writes = t.stores;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                let at = crate::fast::ticks();
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                if compute {
+                    part(Part::Memory, at);
+                }
                 Some(ready)
             } else {
                 None
             };
-            if let Some((param, dwords)) = stage.user_data {
-                // On the stack (root constants are at most 64 dwords).
-                let (mut stack, mut spilled) = ([0u32; 64], Vec::new());
-                let values: &mut [u32] = if dwords <= 64 {
-                    &mut stack[..dwords as usize]
-                } else {
-                    spilled.resize(dwords as usize, 0);
-                    &mut spilled
-                };
-                for u in &t.host.user_data {
-                    if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
-                        continue;
-                    }
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
-                }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
-            }
+            self.user_data(list, stage, &made, memory.as_ref(), compute);
             self.made = made;
+            let roots_began = crate::fast::ticks();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1016,6 +1022,9 @@ impl State {
                     return false;
                 }
             }
+            if compute {
+                part(Part::Roots, roots_began);
+            }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -1027,7 +1036,87 @@ impl State {
         });
         if !by_address {
             self.bound[kind] = Some((p.pso.as_raw() as usize, list.epoch(), TESTED_DEPTH.get().1));
+            if compute && p.stages.len() == 1 && p.stages[0].translated().host.root_indexed_views.is_empty() {
+                self.consts[kind] = Some((p.pso.as_raw() as usize, list.epoch()));
+            }
         }
+        if compute {
+            part(Part::Whole, began);
+        }
+        true
+    }
+
+    /// Sets a stage's user data (the root constants the translated shader
+    /// reads): the title's root arguments, the offsets of the tables
+    /// `made` afresh, and the host's own words.
+    fn user_data(
+        &self,
+        list: &HostList,
+        stage: &crate::pipeline::host::Stage,
+        made: &[(u8, u32)],
+        memory: Option<&crate::memory::Ready>,
+        compute: bool,
+    ) {
+        let t = stage.translated();
+        let l = &list.list;
+        if let Some((param, dwords)) = stage.user_data {
+            // On the stack (root constants are at most 64 dwords).
+            let (mut stack, mut spilled) = ([0u32; 64], Vec::new());
+            let values: &mut [u32] = if dwords <= 64 {
+                &mut stack[..dwords as usize]
+            } else {
+                spilled.resize(dwords as usize, 0);
+                &mut spilled
+            };
+            for u in &t.host.user_data {
+                if let RootType::Other(kind) = u.root {
+                    values[u.index as usize] =
+                        self.host_word(compute, kind, u.slot, u.dword, memory);
+                    continue;
+                }
+                let fresh = made
+                    .iter()
+                    .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                values[u.index as usize] = match fresh {
+                    Some(&(_, offset)) => offset,
+                    None => self.user_value(compute, u.slot, u.root, u.dword),
+                };
+            }
+            // SAFETY: an open list; `values` covers the parameter.
+            unsafe {
+                if compute {
+                    l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                } else {
+                    l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                }
+            }
+        }
+    }
+
+    /// For a dispatch: whether only root constants changed since the last
+    /// whole binding of `p` ([`State::consts`]); its user data is then set
+    /// again from them, with the offsets of the tables that binding made.
+    fn constants_only(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let pso = p.pso.as_raw() as usize;
+        let Some((was, epoch)) = self.consts[1] else {
+            return false;
+        };
+        let [stage] = &p.stages[..] else {
+            return false;
+        };
+        if was != pso || epoch != list.epoch() || self.host_roots[1] != p.root.as_raw() as usize || self.host_heaps != self.heaps {
+            return false;
+        }
+        if self.host_pipeline != pso {
+            // SAFETY: an open list and a live pipeline (the list keeps it
+            // from its first setting).
+            unsafe { list.list.SetPipelineState(&p.pso) };
+            self.host_pipeline = pso;
+        }
+        let made = std::mem::take(&mut self.made);
+        self.user_data(list, stage, &made, None, true);
+        self.made = made;
+        self.bound[1] = Some((pso, epoch, false));
         true
     }
 

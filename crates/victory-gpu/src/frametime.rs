@@ -47,7 +47,8 @@ const WAITS_NAMED: [&str; 8] = ["lock", "settle", "reads", "step", "copy-in", "l
 static WAITS: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 8];
 
 /// Plain sums ([`Sum`]).
-static SUMS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static SUMS: [AtomicU64; SUMS_N] = [const { AtomicU64::new(0) }; SUMS_N];
+const SUMS_N: usize = 13;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Sum {
@@ -68,6 +69,17 @@ pub(crate) enum Sum {
     CopyBytes,
     /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
     TextureNs,
+    /// Bytes of windows over scattered pages (`crate::gather`, copies on
+    /// the card of the title's pages) named by lists, once per list.
+    WindowBytes,
+    /// Copies into such windows from their pages (runs of pages the title
+    /// changed), and their bytes.
+    Gathers,
+    GatherBytes,
+    /// Copies of what shaders wrote into such windows back into their
+    /// pages, and their bytes.
+    Scatters,
+    ScatterBytes,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
@@ -104,6 +116,35 @@ static PHASE_SUMS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 pub(crate) fn phase(phase: Phase, since: u64) -> u64 {
     let now = crate::fast::ticks();
     PHASE_SUMS[phase as usize].fetch_add(now.wrapping_sub(since), Relaxed);
+    now
+}
+
+/// Parts of a dispatch's binding (`draw.rs` `State::bind` for compute),
+/// for the split of "dispatch" in the line: ticks and how many.
+#[derive(Clone, Copy)]
+pub(crate) enum Part {
+    /// Bindings done whole, and those left out as bound already (no ticks).
+    Whole,
+    Skipped,
+    /// The descriptors the stages read through tables (views made, buffers
+    /// named, textures readable).
+    Tables,
+    /// Title memory by address (`crate::memory::ready`).
+    Memory,
+    /// Root views (constant, shader resource and unordered access).
+    Roots,
+}
+
+const PARTS: usize = 5;
+const PARTS_NAMED: [&str; PARTS] = ["whole", "skipped", "tables", "by-address memory", "root views"];
+static PART_SUMS: [[AtomicU64; 2]; PARTS] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; PARTS];
+
+/// The part `part` of a dispatch's binding ran from `since`
+/// (`crate::fast::ticks`) until now; returns now.
+pub(crate) fn part(part: Part, since: u64) -> u64 {
+    let now = crate::fast::ticks();
+    PART_SUMS[part as usize][0].fetch_add(now.wrapping_sub(since), Relaxed);
+    PART_SUMS[part as usize][1].fetch_add(1, Relaxed);
     now
 }
 
@@ -663,6 +704,11 @@ pub(crate) fn frame() {
             calls.push_str(&format!(" {name} {:.1}/{:.0}", per(ns), n as f64 / frames));
         }
     }
+    let mut dispatch = String::from("dispatch binding ms/n:");
+    for (k, name) in PARTS_NAMED.iter().enumerate() {
+        let (ticks, n) = (take(&PART_SUMS[k][0]), take(&PART_SUMS[k][1]));
+        dispatch.push_str(&format!(" {name} {:.1}/{:.0}", per(crate::fast::ticks_to_ns(ticks)), n as f64 / frames));
+    }
     let (mut card, mut pipes) = (String::from("no GPU timestamps"), String::new());
     if let Some(g) = gpu().as_mut() {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / g.frequency as f64 / frames;
@@ -688,7 +734,8 @@ pub(crate) fn frame() {
     tracing::info!(
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
          in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
-         on average; buffers named by lists: in place (read over the bus) {:.0} MB, not in place (filled at submission) {:.0} MB; {pipes}",
+         on average; buffers named by lists: in place (read over the bus) {:.0} MB, not in place (filled at submission) {:.0} MB, windows over scattered pages \
+         (copies on the card) {:.0} MB; window gathers {:.1} ({:.1} MB), scatters {:.1} ({:.1} MB); {dispatch}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
@@ -699,5 +746,10 @@ pub(crate) fn frame() {
         if fence_set > 0 { sums[Sum::FenceUs as usize] as f64 / 1000.0 / fence_set as f64 } else { 0.0 },
         sums[Sum::InPlaceBytes as usize] as f64 / frames / 1e6,
         sums[Sum::CopyBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::WindowBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::Gathers as usize] as f64 / frames,
+        sums[Sum::GatherBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::Scatters as usize] as f64 / frames,
+        sums[Sum::ScatterBytes as usize] as f64 / frames / 1e6,
     );
 }

@@ -80,8 +80,12 @@ struct Memory {
     heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
-    /// Pages asked for this frame that are not the title's memory.
+    /// Pages asked for lately that are not the title's memory, and when
+    /// they were last forgotten (ms): a constant that only looks like an
+    /// address is asked about by every dispatch, and the kernel's answer
+    /// (`texture::committed`) was asked again every frame.
     refused: std::collections::HashSet<u64>,
+    refused_at: u64,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -117,6 +121,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            refused_at: 0,
         })
     }
 
@@ -260,7 +265,12 @@ pub(crate) fn ready(
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
-        m.refused.clear();
+        // Memory the title commits later is found within two seconds.
+        let now = crate::host::now_ms();
+        if now >= m.refused_at + 2_000 {
+            m.refused.clear();
+            m.refused_at = now;
+        }
         m.take_faults();
     }
     let numbered = m.copies.len();

@@ -6,18 +6,25 @@
 //! watched and nothing compared. A title GPU address inside the buffer is
 //! the same offset in the host buffer (plus [`Shadow::offset`]'s bias).
 //!
+//! A window over the title's scattered pages (a 4 MiB window that is not
+//! one run of one section) is a buffer on the card gathered from the
+//! pages' opened heaps by GPU copies, again only for pages the title
+//! remaps or announces written, and scattered back into them after a list
+//! whose shaders write it ([`crate::gather`]): the pages stay its home.
+//!
 //! What cannot be placed so has one fallback, a buffer of its own in the
 //! PC's memory that each submission naming it fills from title memory
 //! (`HostList::defer_upload`) and that nothing ever copies back:
 //! - a view whose bytes do not start on an element of its buffer ([`exact`]);
 //! - memory `crate::unified` refuses to open (logged there, and here once
-//!   per buffer of 64 KiB or more).
+//!   per buffer of 64 KiB or more), and windows with pages that lie in no
+//!   unit.
 //!
 //! Shader writes into such a buffer stay in it until the next fill and
 //! never reach title memory ([`Shadow::gpu_writes`] says so, counted).
 //! Every other kind of title memory has one home, the title's own pages.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +63,9 @@ pub(crate) struct Shadow {
     /// change ([`in_place_remapped`]), and then `stale` is set and the
     /// next ask places a new buffer.
     stale: AtomicBool,
+    /// A window over scattered pages, gathered on the card from them
+    /// ([`crate::gather`]).
+    gather: Option<crate::gather::Gather>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is title memory or a
@@ -72,6 +82,9 @@ impl Drop for Shadow {
         }
         if self.pooled {
             crate::memcap::give(crate::memcap::Kind::Shared, self.buffer.clone());
+        }
+        if let Some(gather) = &self.gather {
+            crate::gather::forget(self.id, self.start, gather);
         }
     }
 }
@@ -91,7 +104,30 @@ impl Shadow {
             in_place: false,
             bias: 0,
             stale: AtomicBool::new(false),
+            gather: None,
         }
+    }
+
+    /// A window over scattered pages `[start, start + len)`, gathered on
+    /// the card from the pages' heaps ([`crate::gather`]), if every page of
+    /// it the title has lies in a unit.
+    fn gathered(start: u64, len: u64) -> Option<Arc<Shadow>> {
+        let gather = crate::gather::Gather::new(start, len)?;
+        let (buffer, pooled) = crate::gather::window_buffer(len)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
+        shadow.pooled = pooled;
+        shadow.gather = Some(gather);
+        let shadow = Arc::new(shadow);
+        crate::gather::register(&shadow);
+        Some(shadow)
+    }
+
+    /// The window's pages and their state, for a window over scattered
+    /// pages.
+    pub(crate) fn gather(&self) -> Option<&crate::gather::Gather> {
+        self.gather.as_ref()
     }
 
     /// A buffer of its own in the PC's memory for `[start, start + len)`
@@ -158,12 +194,17 @@ impl Shadow {
             list.keep(&self.buffer);
             let sum = if self.in_place {
                 crate::frametime::Sum::InPlaceBytes
+            } else if self.gather.is_some() {
+                // Its pages the title changed are copied in on the card
+                // before the list runs.
+                list.name_window(self);
+                crate::frametime::Sum::WindowBytes
             } else {
                 crate::frametime::Sum::CopyBytes
             };
             crate::frametime::add(sum, self.len);
         }
-        if self.in_place {
+        if self.in_place || self.gather.is_some() {
             return;
         }
         let address = address.clamp(self.start, self.start + self.len);
@@ -186,6 +227,11 @@ impl Shadow {
         self.refresh(list, address, len);
         if self.in_place {
             list.defer_gpu_write(address as usize, len as usize);
+            return;
+        }
+        if self.gather.is_some() {
+            // Copied back into its pages after the list.
+            list.defer_window_write(self, address as usize, len as usize);
             return;
         }
         let n = LOST.fetch_add(1, Ordering::Relaxed) + 1;
@@ -293,6 +339,19 @@ fn in_place(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (lists and slots that hold the old ones keep them alive until done).
 pub(crate) fn in_place_remapped(at: usize, len: usize) {
     let (at, end) = (at as u64, (at + len) as u64);
+    // Windows over these addresses look their pages up again, and whether a
+    // window opens in place whole is asked again.
+    crate::gather::remapped(at, end - at);
+    {
+        let mut split = SPLIT.lock().unwrap_or_else(|e| e.into_inner());
+        if !split.is_empty() {
+            // (A window of two cells starts a cell lower.)
+            let gone: Vec<u64> = split.range((at & !(WINDOW - 1)).saturating_sub(WINDOW)..end).copied().collect();
+            for start in gone {
+                split.remove(&start);
+            }
+        }
+    }
     let mut guard = VIEWED.lock().unwrap_or_else(|e| e.into_inner());
     let (viewed, longest) = &mut *guard;
     if viewed.is_empty() {
@@ -395,7 +454,11 @@ fn recent(address: u64, end: u64) -> Option<Arc<Shadow>> {
             if h.changed != changed || address < h.from || address >= h.until || end <= h.above || end > h.end {
                 return None;
             }
-            h.shadow.upgrade().filter(|s| !s.stale.load(Ordering::Relaxed))
+            let shadow = h.shadow.upgrade().filter(|s| !s.stale.load(Ordering::Relaxed))?;
+            // In use (a window outside buffers is let go when idle,
+            // [`let_go_idle`]).
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            Some(shadow)
         })
     })
 }
@@ -437,8 +500,22 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         above = above.max(e.end);
     }
     let Some(key) = key else {
+        // Memory outside buffers: the window's answer holds for the asks
+        // inside it that the same walk would find no buffer for ([`Hit`]).
+        let changed = BUFFERS_CHANGED.load(Ordering::Relaxed);
+        let until = map.range((address, usize::MAX)..).find(|(k, _)| k.0 > address).map_or(u64::MAX, |(k, _)| k.0);
         drop(map);
-        return loose(address, end);
+        let found = loose(address, end)?;
+        let (start, len) = found.span();
+        remember(Hit {
+            changed,
+            from: first.unwrap_or(0).max(start),
+            until: until.min(start + len),
+            above,
+            end: start + len,
+            shadow: Arc::downgrade(&found),
+        });
+        return Some(found);
     };
     let changed = BUFFERS_CHANGED.load(Ordering::Relaxed);
     let until = map.range((address, usize::MAX)..).find(|(k, _)| k.0 > address).map_or(u64::MAX, |(k, _)| k.0);
@@ -510,18 +587,39 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         Some(shadow.clone())
     };
+    // The whole window: in place, or over its scattered pages, made before
+    // (it holds every ask in it, also a root view's, whose length is not
+    // known).
     if let Some(shadow) = take(&mut map, (start, len)) {
         return Some(shadow);
     }
-    if let Some(shadow) = in_place(start, len) {
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+    // Asked once per window until the title maps there anew (it was asked
+    // at every ask: a walk of the views and, every two seconds, of the
+    // pages' protections, all under the units' lock, 34,553 refusals in run
+    // p13).
+    if !SPLIT.lock().unwrap_or_else(|e| e.into_inner()).contains(&start) {
+        if let Some(shadow) = in_place(start, len) {
+            map.insert((start, len), shadow.clone());
+            return Some(shadow);
+        }
+        SPLIT.lock().unwrap_or_else(|e| e.into_inner()).insert(start);
     }
     // In a section's views the 4 MiB window often is not one run (the
     // views are smaller, or end, or show pages of another section): then
     // the run of the view the ask lies in, from the ask's 64 KiB page to
-    // where the run or the window ends, if it holds the ask.
+    // where the run or the window ends, if it holds the ask: one made
+    // before, else a new one.
     let from = address & !0xffff;
+    let held = map
+        .range((start, 0)..=(from, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|((at, bytes), s)| s.in_place && at + bytes >= end && !s.stale.load(Ordering::Relaxed))
+        .map(|(_, s)| s.clone());
+    if let Some(shadow) = held {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(shadow);
+    }
     let reach = crate::views::run_reach(from as usize, (start + len - from) as usize) as u64;
     if reach >= end - from {
         if let Some(shadow) = take(&mut map, (from, reach)) {
@@ -532,10 +630,19 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
             return Some(shadow);
         }
     }
-    let shadow = not_in_place(start, len, len, "window outside buffers")?;
+    // The window over its scattered pages, gathered on the card from them
+    // (`crate::gather`); a buffer of its own if some page lies in no unit.
+    let shadow = match Shadow::gathered(start, len) {
+        Some(shadow) => shadow,
+        None => not_in_place(start, len, len, "window outside buffers")?,
+    };
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
+
+/// Windows (by start) known not to open in place whole ([`loose`]), until
+/// the title maps there anew ([`in_place_remapped`]).
+static SPLIT: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 /// Buffers of their own for single buffer views' bytes ([`exact`]), by
 /// (start, bytes), each with the asking that last took it; and the askings
