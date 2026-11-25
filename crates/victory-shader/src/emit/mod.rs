@@ -82,11 +82,9 @@
 
 mod bitcode;
 mod container;
-#[cfg(all(test, any(windows, victory_native_d3d12)))]
-mod diff_tests;
-#[cfg(all(test, any(windows, victory_native_d3d12)))]
+#[cfg(all(test, windows))]
 mod intersect_tests;
-#[cfg(all(any(windows, victory_native_d3d12), any(test, feature = "host")))]
+#[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod own_bits;
@@ -94,13 +92,13 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
-#[cfg(any(windows, victory_native_d3d12))]
+#[cfg(windows)]
 pub mod validator;
-#[cfg(all(test, any(windows, victory_native_d3d12)))]
+#[cfg(all(test, windows))]
 mod valu_tests;
-#[cfg(all(test, any(windows, victory_native_d3d12)))]
+#[cfg(all(test, windows))]
 mod waterfall_tests;
-#[cfg(all(test, any(windows, victory_native_d3d12)))]
+#[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
 
@@ -631,8 +629,10 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -687,7 +687,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
-        #[cfg(any(windows, victory_native_d3d12))]
+        #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
@@ -838,7 +838,7 @@ mod tests {
     }
 
     /// A pixel shader writing a constant colour.
-    #[cfg(any(windows, victory_native_d3d12))]
+    #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(windows, victory_native_d3d12))]
+    #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");
@@ -885,22 +885,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
         };
-        let file = |var: &str, stage| {
-            std::env::var(var).ok().map(|p| super::HostShader {
-                stage,
-                dxil: std::fs::read(p).unwrap(),
-                user_data: Vec::new(),
-                samplers: Vec::new(),
-                static_samplers: Vec::new(),
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-                root_indexed_views: Vec::new(),
-            })
-        };
-        let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
-        let vs = file("VICTORY_REF_VS", crate::HwStage::Vs)
-            .unwrap_or_else(|| super::host::stub_vs(&ps).unwrap());
+        let vs = super::host::stub_vs(&ps).unwrap();
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
@@ -927,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(windows, victory_native_d3d12))]
+    #[cfg(windows)]
     fn constant_color_validates() {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
@@ -1001,7 +986,7 @@ mod tests {
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
-            #[cfg(any(windows, victory_native_d3d12))]
+            #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
                 super::validator::Validator::default_path().as_deref(),
             ) {
@@ -1170,14 +1155,15 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
         let mut dxil = l.dxil;
-        #[cfg(any(windows, victory_native_d3d12))]
+        #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut dxil).unwrap();
         }
-        #[cfg(any(windows, victory_native_d3d12))]
+        #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
@@ -1315,7 +1301,7 @@ mod atomic_tests {
             );
             let required = 0x1040_8000; // heap atomics, typed atomics, Int64Ops
             assert_eq!(features & required, if wide { required } else { 0 });
-            #[cfg(any(windows, victory_native_d3d12))]
+            #[cfg(windows)]
             if let Ok(mut v) =
                 validator::Validator::load(validator::Validator::default_path().as_deref())
             {
@@ -1410,7 +1396,7 @@ mod barycentric_tests {
     }
 
     fn validate(shader: &HostShader) {
-        #[cfg(any(windows, victory_native_d3d12))]
+        #[cfg(windows)]
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {

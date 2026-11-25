@@ -34,25 +34,5 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
-# Linux against native vkd3d-proton (`--cfg victory_native_d3d12`, set by the
-# native build's cargo config together with the patched bindings crates).
-[target.'cfg(victory_native_d3d12)'.dependencies]
-windows = { workspace = true, optional = true, features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D12",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-] }
-
-[target.'cfg(victory_native_d3d12)'.dev-dependencies]
-windows = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D12",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-] }
-
 [lints]
 workspace = true

@@ -332,7 +332,7 @@ mod tests {
             assert_eq!((i.col, i.cols, i.comp), (o.col, o.cols, o.comp));
         }
         assert_eq!((outs[3].kind, outs[3].row), (10, Some(3)));
-        #[cfg(any(windows, victory_native_d3d12))]
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -356,7 +356,7 @@ mod tests {
 
     /// A vertex shader that passes a position and a float4 through, and a
     /// pixel shader that writes the float4.
-    #[cfg(any(windows, victory_native_d3d12))]
+    #[cfg(windows)]
     fn pass_through() -> (super::super::HostShader, super::super::HostShader) {
         let position = SigElement {
             interp: 4,
@@ -428,7 +428,7 @@ mod tests {
     /// is drawn and the interpolant continues into the fourth corner's
     /// half; without it part of the target is not drawn.
     #[test]
-    #[cfg(any(windows, victory_native_d3d12))]
+    #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
         use super::super::host::{Draw, Host};
         let Ok(host) = Host::new(false) else {
