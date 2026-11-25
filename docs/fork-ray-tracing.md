@@ -56,11 +56,11 @@ shaders and emulates the one instruction.
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
-   also keeps the builder's stores out of title memory, for a first test). A
-   partly working builder wrote garbage bounds into title memory and crashed
-   the title.
-
+   none run (`VICTORY_BVH_BUILDER=1` asks for it). A partly working builder
+   wrote garbage bounds into title memory and crashed the title (run 98).
+   `VICTORY_BVH_QUARANTINE` is gone (removed with the copy-back paths in
+   4e70c14): with unified memory the builder's stores land in title memory in
+   place, so there is no copy left to keep them in.
 6. **Every ray a miss, behind a switch** (`VICTORY_BVH_MISS=1`, off by
    default). The node test returns no child for a box node and a miss for
    anything else, and reads no node memory. Each traversal then ends right
@@ -71,6 +71,20 @@ shaders and emulates the one instruction.
    constant ambient light (`ambient.rs`) defaults to off, so that the title's
    own probe resolve shows; `VICTORY_AMBIENT=<level>` still sets one. Do not
    combine it with `VICTORY_BVH_BUILDER=1`.
+7. **Device-coherent memory for programs that sync across groups.** The
+   builder's bottom-up pass reads child bounds other groups wrote (XCL: child
+   pointers come out wrong unless title memory is globally coherent in compute;
+   Leonida: device-scope acquire/release atomics). A compute program that writes
+   memory and either is one of the builder's (a spilled user-data table) or
+   invalidates the GPU's L1 (`buffer_gl1_inv`, the console compiler's
+   device-scope acquire) is emitted with: buffer UAVs (root views, heap views,
+   title memory by address) `globallycoherent`; the UAV fence in its
+   `s_barrier`s also when it writes only by address (`global_*`/`flat_*`), so
+   the barrier is device-scope; a `DeviceMemoryBarrier` before each buffer or
+   global atomic (release; the console's `s_waitcnt_vscnt` is dropped with the
+   waits) and at each `buffer_gl0_inv`/`buffer_gl1_inv` (acquire)
+   (`emit/shader.rs` `annotate`, `emit/lower.rs` `device_fence`). Programs that
+   only read (the trace programs) keep L1 caching.
 
 ## Findings, 2026-11-25
 

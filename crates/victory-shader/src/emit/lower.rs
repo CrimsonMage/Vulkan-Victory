@@ -1166,9 +1166,12 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        // (title memory by address too: `global_*` and `flat_*` stores and atomics)
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            let n = i.name();
+            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. })
+                && (n.contains("store") || n.contains("atomic"))
+                && !n.starts_with("scratch_")
         });
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
@@ -1182,6 +1185,14 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
+            // Compute programs that sync with other groups through memory: the
+            // structure builder's (its programs have a spilled user-data table)
+            // and any whose code invalidates the GPU's L1 (`buffer_gl1_inv`, the
+            // console compiler's device-scope acquire). Their buffer UAVs are
+            // globally coherent, their barriers device-scope, and their
+            // atomics fenced (`Lower::device_fence`).
+            s.coherent = writes_uavs
+                && (crate::spill::is_spilled(x.native) || insts().any(|i| i.name() == "buffer_gl1_inv"));
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
@@ -4561,6 +4572,14 @@ impl<'a> Lower<'a> {
             let mode = self.s.m.i32(MEETING_MODE);
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+        if matches!(inst.fields, Fields::Buffer { .. } | Fields::Flat { .. })
+            && name.contains("atomic")
+            && !name.starts_with("scratch_")
+        {
+            // the release before an atomic another group may meet (the
+            // console's `s_waitcnt_vscnt` before it is dropped with the waits)
+            self.device_fence();
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -9893,6 +9912,19 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// In a program that syncs with other groups through memory
+    /// (`Shader::coherent`): a device-scope memory fence on UAVs
+    /// (`DeviceMemoryBarrier`, no thread sync), the console's release and
+    /// acquire around the atomics another group meets. Nothing otherwise.
+    fn device_fence(&mut self) {
+        if !self.s.coherent {
+            return;
+        }
+        let mode = self.s.m.i32(2);
+        let void = self.s.t.void;
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -9911,7 +9943,9 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; in a program
+            // that syncs through memory it is the acquire after an atomic.
+            self.device_fence();
             return Ok(());
         }
         if *lds || *tfe {

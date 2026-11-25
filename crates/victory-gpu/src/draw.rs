@@ -324,6 +324,9 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+/// Looks at a placed texture's slot that found its memory mapped but
+/// holding only zeros (no host copy made), since the start.
+static HEAP_TEXTURES_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
@@ -1863,6 +1866,32 @@ impl State {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);
+                }
+                // Mapped but holding only zeros (the title maps a texture's
+                // pages before DirectStorage fills them, and maps a page of
+                // zeros where a texture has no data): no data has arrived,
+                // so no host copy and no card memory yet. Looked at again
+                // as a slot whose memory is not there (1, 2, 4, ... frames,
+                // at most about four seconds); the first look that finds
+                // data uploads it. Not a slot that has its host copy
+                // already (the title may have cleared that texture), not a
+                // buffer, and not memory the card writes (a view over a
+                // target's memory shows the target: `resource::alias_of`).
+                const BUFFER: u32 = 1;
+                if resource[0] != BUFFER
+                    && !heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle))
+                    && crate::texture::holds_only_zeros(address, len)
+                    && !crate::resource::card_writes_in(address, len)
+                {
+                    let n = HEAP_TEXTURES_EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() && n >= 64 {
+                        tracing::info!(
+                            looks = n,
+                            "textures picked by index whose memory holds only zeros get no card memory until data arrives"
+                        );
+                    }
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
                 }
             }
             // A texture object the host renders to or writes holds the

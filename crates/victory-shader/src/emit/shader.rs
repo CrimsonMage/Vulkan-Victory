@@ -157,6 +157,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Buffer UAVs are `globallycoherent` (see [`Shader::annotate`]).
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -213,6 +215,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -380,6 +383,19 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // A buffer UAV of a program that syncs with other groups through
+        // memory (`coherent`) is `globallycoherent`: its loads and stores
+        // reach the device's level of the cache, as on the console, where
+        // the memory a program syncs through is coherent in the GPU's L2.
+        // The structure builder's bottom-up pass reads the child bounds
+        // other groups wrote; with group-local caching they came out wrong
+        // (XCL: child pointers wrong unless title memory is globally
+        // coherent in compute).
+        let props0 = if self.coherent && props0 & 0x1000 != 0 && matches!(props0 & 0xFF, 10..=12) {
+            props0 | 0x4000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -563,6 +579,9 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                // as the handles' annotation (`annotate`)
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -576,7 +595,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

@@ -681,6 +681,25 @@ victory holds for title memory follows it.
   tiles given … MB (kept off the card … MB), pool … MB in … heaps …; host
   copies with memory for all levels holding levels the title does not: …`.
   The gate line's "textures the title fills" now includes the pool's heaps.
+- **Card memory only once data is there** (`draw.rs` `heap_textures`).
+  Host copies are made at first use, never at creation (`resource.rs`
+  `hosted`), and vkd3d-proton already suballocates committed textures under
+  8 MiB from shared chunks (so the allocation-count limit Leonida hit with
+  one allocation per image does not apply here; placing them in 64 MiB heaps
+  of ours would round each to 64 KiB, as placed textures without tight
+  alignment are on this stack). What remained: the pass over textures picked
+  by index made a host copy, and uploaded zeros, for every placed texture
+  whose memory was mapped, filled or not. A placed texture whose memory
+  holds only zeros where `texture::fingerprint` looks (all of it up to
+  48 KiB, else three 16 KiB windows) now gets no host copy and is looked at
+  again like one not mapped (1, 2, 4 ... frames, at most about four
+  seconds); not a slot already made (a texture the title cleared), not a
+  buffer, not memory the card writes (`resource::card_writes_in`: views over
+  a target's memory show the target). Line, at 64, 128, 256 ... looks:
+  `textures picked by index whose memory holds only zeros get no card
+  memory until data arrives looks=N`. Shortcut: a texture that is all
+  zeros by content reads through a null view (zeros, alpha 0 where the
+  format has none) instead of its copy.
 - **Release at the API point** (`release.rs`): `VirtualFree` (hooked for the
   title, `xmem::memory`), `XMemFreeDefault`, `XMemMapPhysicalPages` with no
   pages and page-mapping copies to nothing call

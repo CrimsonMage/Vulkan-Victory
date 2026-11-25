@@ -112,7 +112,7 @@ driver errors and no new crash, and the captures look no worse.
 | 22 | Submission pass-through: last card copies in place, no merge wait, fences to the GPU | subagent | running |
 | 23 | Windows over scattered pool pages gathered on the card from the opened sections (GPU copies of runs of pages, again only on remaps and announced writes; written ranges copied back after the list); dispatches with only new root constants set their user data alone; dispatch binding split in the frame line | subagent | built, not yet run |
 | 19 | Memory: levels on demand by default, release on title frees, room-only eviction, big buffers in place | subagent | merged |
-| 20 | Later: `globallycoherent` UAVs for the BVH builder (XCL found the builder needs it) | — | after fps/memory |
+| 20 | `globallycoherent` UAVs, device-scope barriers and fenced atomics for compute programs that sync across groups (the BVH builder's, and any with `buffer_gl1_inv`); builder still off by default (`VICTORY_BVH_BUILDER=1` to try). Placed textures picked by index whose memory holds only zeros get no host copy until data arrives | subagent | built, not yet run |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
