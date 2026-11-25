@@ -4152,7 +4152,9 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        let t = std::time::Instant::now();
                         staging.refresh();
+                        crate::frametime::add_since(crate::frametime::Sum::TextureNs, t);
                     }
                 }
             }

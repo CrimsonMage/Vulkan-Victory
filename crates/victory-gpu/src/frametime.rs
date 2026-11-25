@@ -55,7 +55,7 @@ const WAITS_NAMED: [&str; 11] = ["lock", "settle", "reads", "step", "merge", "co
 static WAITS: [[AtomicU64; 2]; 11] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 11];
 
 /// Plain sums ([`Sum`]).
-static SUMS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static SUMS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Sum {
@@ -76,6 +76,11 @@ pub(crate) enum Sum {
     InPlaceBytes,
     /// Bytes of copies in the card's memory named by lists, once per list.
     CardBytes,
+    /// Nanoseconds in the title's recording calls into our lists (state,
+    /// draws, dispatches), summed over its threads.
+    RecordNs,
+    /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
+    TextureNs,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
@@ -302,11 +307,14 @@ fn collect(g: &mut Gpu) {
         if a == 0 || c < a || b < a || c < b {
             continue;
         }
-        g.busy += c - a;
-        g.check += c - b;
+        // Counted once where spans overlap (a stamp taken before the work
+        // ahead of it has finished).
+        let (a, b) = (a.max(g.last_end), b.max(g.last_end));
         if g.last_end != 0 && a > g.last_end {
             g.idle += a - g.last_end;
         }
+        g.busy += c.saturating_sub(a);
+        g.check += c.saturating_sub(b);
         g.last_end = g.last_end.max(c);
     }
     let mut k = 0;
@@ -529,11 +537,13 @@ pub(crate) fn frame() {
     }
     let fence_set = sums[Sum::FenceSet as usize];
     tracing::info!(
-        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; in submissions {:.1} ms ({:.1} of them), waiting for the card {:.1} ms \
-         [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
+        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed); \
+         in submissions {:.1} ms ({:.1} of them; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, card copies {:.0} MB; {pipes}",
+        per(sums[Sum::RecordNs as usize]),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
+        per(sums[Sum::TextureNs as usize]),
         per(waited),
         per(sums[Sum::LandNs as usize]),
         per(sums[Sum::FetchNs as usize]),
