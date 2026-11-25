@@ -141,12 +141,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -442,64 +440,8 @@ impl Scheduler {
     }
 }
 
-/// The walls trace (`VICTORY_WALLS_TRACE`): 0 or unset: off; 1: a line for
-/// every read request that fails, with its file; 2: for every request (the
-/// list of a launch's reads, by file and offset, is what a launch with the
-/// first room's walls and one without are compared by).
-fn walls_trace() -> u8 {
-    static ON: OnceLock<u8> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
-    })
-}
-
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-
-/// The walls trace's line for a request that is done.
-fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
-    let level = walls_trace();
-    if level == 0 || (level == 1 && result.is_ok()) {
-        return;
-    }
-    let file = if request.options & MEMORY_SOURCE != 0 {
-        "memory".to_string()
-    } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
-    };
-    let hr = match result {
-        Ok(()) => 0,
-        Err(hr) => *hr as u32,
-    };
-    tracing::info!(
-        file,
-        offset = request.offset,
-        source_size = request.source_size,
-        destination_size = request.destination_size,
-        to_pages = request.options & PAGE_DESTINATION != 0,
-        options = format_args!("{:#x}", request.options),
-        ms = started.elapsed().as_millis() as u64,
-        ok = result.is_ok(),
-        hr = format_args!("{hr:#010x}"),
-        "walls trace: a read request is done"
-    );
-}
-
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
-    // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
-    // title's threads (`victory_gpu::framelog::keep_on_slow_cores`; off by
-    // default until it is measured).
-    #[cfg(windows)]
-    {
-        static SLOW: OnceLock<bool> = OnceLock::new();
-        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
-            victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
-        }
-    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -509,7 +451,6 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
-        walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -1080,8 +1021,7 @@ fn into_destination(
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
-        // read was under way took what was there before. Counted; acted on
-        // only with `VICTORY_PAGE_WRITES=all`.
+        // read was under way took what was there before.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
         return filled;
     }
@@ -1111,20 +1051,16 @@ fn into_destination(
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
-    });
+    // the request fails (12 tries, about 0.9 s in all). Runs 175-178 lost
+    // 12 to 446 reads a launch here, all in one second of the loading; the
+    // one build that tried again (run 165) lost none of 13.
+    const RETRIES: u32 = 12;
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0u32;
-    while !written && tries < retries {
+    while !written && tries < RETRIES {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
         written = super::xmem::write_physical(pages, offset, &data[..n]);
@@ -1151,7 +1087,7 @@ fn into_destination(
             tries,
             given_up,
             on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+            "dstorage: retries used up"
         );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten

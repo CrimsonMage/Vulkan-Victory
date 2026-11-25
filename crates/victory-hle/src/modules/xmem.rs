@@ -652,7 +652,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// Bytes `[offset, offset + len)` of `pages` have been written through a
 /// view of our own: the GPU side is told at every title address that
 /// shows them (`victory_gpu::title_memory_written`; what it does with it
-/// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
+/// is the GPU side's to say). Call when
 /// the bytes are there, and without the page table's lock ([`shown_at`]
 /// takes and leaves it).
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
