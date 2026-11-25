@@ -26,8 +26,7 @@ use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+use windows_sys::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

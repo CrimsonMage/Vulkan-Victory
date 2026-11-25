@@ -38,7 +38,7 @@ const FACTORY: Guid = Guid::new(
     0x4884,
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+use windows_sys::Win32::Foundation::E_NOINTERFACE;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.

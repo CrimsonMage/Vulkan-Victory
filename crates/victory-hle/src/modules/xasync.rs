@@ -27,11 +27,8 @@ pub const PROVIDER: Guid = Guid {
 };
 
 pub const E_PENDING: HRESULT = 0x8000_000A_u32 as i32;
-pub const E_ABORT: HRESULT = 0x8000_4004_u32 as i32;
-pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
-pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+pub use windows_sys::Win32::Foundation::{E_ABORT, E_ILLEGAL_METHOD_CALL, E_INVALIDARG, E_NOTIMPL};
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
-pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
 
 const WORK: u32 = 0;
 const COMPLETION: u32 = 1;

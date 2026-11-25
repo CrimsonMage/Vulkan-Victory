@@ -24,8 +24,7 @@ use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+use windows_sys::Win32::Foundation::{E_OUTOFMEMORY, E_POINTER};
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
