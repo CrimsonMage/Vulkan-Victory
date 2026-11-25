@@ -28,7 +28,7 @@ the twin; it implements only what is truly console-only.
 | Bink 2 video | The title's own Bink DLL, with XAudio2 passed through | title DLL | works |
 | GameInput, window, lifecycle | GameInput on PC; a Win32 window | `gameinput.rs`, `lifecycle.rs` | works |
 | XUser, XStore, saves, networking | PC GDK twins or local stand-ins; no network | `xuser.rs`, `xstore.rs`, `xgamesave.rs`, `net.rs` | works |
-| Console CPU instructions the PC lacks (CLZERO, MONITORX, INSERTQ ...) | Trapped and emulated | `victory-loader` | works |
+| Console CPU instructions the PC lacks (CLZERO, MONITORX, INSERTQ ...) | Rewritten as plain x86 at the first trap (stubs for clzero loops and INSERTQ; PAUSE/NOP for MONITORX/MWAITX); emulated only as fallback | `victory-loader` | works |
 
 ## Targets
 
