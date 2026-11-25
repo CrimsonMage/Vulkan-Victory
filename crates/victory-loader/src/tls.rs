@@ -138,13 +138,13 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
     Ok(block as usize)
 }
 
-/// One writable page within `rel32` reach of `[base, base + size)`. Leaked:
-/// title code calls into it for the life of the process.
-fn near(base: usize, size: usize) -> Result<*mut u8> {
+/// One writable page within `rel32` reach of `[base, base + size)` (for TLS thunks and
+/// console-instruction stubs). Leaked: title code calls into it for the life of the process.
+pub(crate) fn near(base: usize, size: usize) -> Result<*mut u8> {
     const GRANULE: usize = 0x1_0000;
     // The search spans 1 GiB each side, so every call site stays in reach.
     if size >= 1 << 30 {
-        bail!("image too large for TLS thunks within rel32 reach");
+        bail!("image too large for code within rel32 reach");
     }
     let above = (base + size).next_multiple_of(GRANULE);
     for k in 0..(1usize << 14) {
@@ -167,7 +167,7 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
             }
         }
     }
-    bail!("no free page near the image for TLS thunks")
+    bail!("no free page near the image")
 }
 
 #[cfg(test)]

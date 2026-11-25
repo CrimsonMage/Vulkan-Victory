@@ -1,15 +1,22 @@
-//! Instructions the console's CPU (Zen 2) has and an Intel PC's lacks, emulated: the title's
-//! code raises STATUS_ILLEGAL_INSTRUCTION on them (the title zeroes memory with a `clzero` loop at
-//! its first frames), and the vectored handler steps over them here.
+//! Instructions the console's CPU (Zen 2) has and an Intel PC's lacks: the title's code raises
+//! STATUS_ILLEGAL_INSTRUCTION on them (it zeroes memory with `clzero` loops all through a
+//! frame, spin-waits with MONITORX / MWAITX, packs fields with INSERTQ), and the vectored
+//! handler emulates them here. Each such site is then rewritten, once, as the plain x86 code
+//! it stands for (`console_insn_stub.rs`), so it does not trap again: under Wine a trap costs
+//! a signal and an exception dispatch, tens of microseconds, and the title met ~21,000 a
+//! second in its world. What has no rewrite stays emulated at every trap.
 //!
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! `console_insn_decode.rs`) and `eh.rs` `emulate_console_only`.
 
 #[path = "console_insn_decode.rs"]
 mod decode;
+#[path = "console_insn_stub.rs"]
+mod stub;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
@@ -100,9 +107,27 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    // A copy: the rewrite below changes the bytes at `rip`.
+    let mut copy = [0u8; 16];
+    // SAFETY: `n` (at most 16) bytes at `rip` are readable.
+    copy[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(rip as *const u8, n) });
+    let code = &copy[..n];
+    let Some((what, len)) = decode::decode(code) else {
+        // Rewritten by another thread after this one fetched the old bytes: run it again.
+        return match find(rip) {
+            Some(site) if matches!(site.state.load(Relaxed), REWRITTEN | REWRITING) => {
+                count(site);
+                CONTINUE_EXECUTION
+            }
+            _ => 0,
+        };
+    };
+    if what != ConsoleOnly::Ud2
+        && let Some(site) = site(rip, &what)
+    {
+        count(site);
+        rewrite(site, rip, &what, &code[..len]);
+    }
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -114,18 +139,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     }
     match what {
         ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
-            }
-        }
+        // nothing to write back on the PC (rewritten as a NOP above)
+        ConsoleOnly::Clwb => {}
         ConsoleOnly::Monitorx => {}
         ConsoleOnly::Mwaitx => std::hint::spin_loop(),
         ConsoleOnly::Clzero => {
@@ -212,6 +227,348 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     }
     ctx.Rip += len as u64;
     CONTINUE_EXECUTION
+}
+
+/// What traps, by kind of instruction (indexes of [`KINDS`]).
+const KINDS: [&str; 9] = ["clzero", "clzero loop", "monitorx", "mwaitx", "insertq", "extrq", "rdpru", "rdpid", "clwb"];
+
+fn kind(what: &ConsoleOnly) -> u8 {
+    match what {
+        ConsoleOnly::Clzero | ConsoleOnly::Ud2 => 0,
+        ConsoleOnly::ClzeroLoop { .. } => 1,
+        ConsoleOnly::Monitorx => 2,
+        ConsoleOnly::Mwaitx => 3,
+        ConsoleOnly::Insertq { .. } => 4,
+        ConsoleOnly::Extrq { .. } => 5,
+        ConsoleOnly::Rdpru => 6,
+        ConsoleOnly::Rdpid(_) => 7,
+        ConsoleOnly::Clwb => 8,
+    }
+}
+
+/// Traps since the start, by kind.
+static TRAPS: [AtomicU64; KINDS.len()] = [const { AtomicU64::new(0) }; KINDS.len()];
+
+/// A trapping instruction: where, how often, what it is, and whether it was rewritten.
+struct Site {
+    at: AtomicUsize,
+    traps: AtomicU64,
+    kind: AtomicU8,
+    state: AtomicU8,
+}
+
+/// [`Site::state`]: not looked at yet, rewritten, left to the emulation, being rewritten.
+const UNTRIED: u8 = 0;
+const REWRITTEN: u8 = 1;
+const EMULATED: u8 = 2;
+const REWRITING: u8 = 3;
+
+/// Sites by address (open addressing); one past the last free slot is emulated, uncounted.
+const SLOTS: usize = 1024;
+static SITES: [Site; SLOTS] = [const {
+    Site {
+        at: AtomicUsize::new(0),
+        traps: AtomicU64::new(0),
+        kind: AtomicU8::new(0),
+        state: AtomicU8::new(UNTRIED),
+    }
+}; SLOTS];
+
+fn slot(at: usize) -> usize {
+    ((at as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SLOTS.trailing_zeros())) as usize
+}
+
+/// The site at `at`, if it trapped before.
+fn find(at: usize) -> Option<&'static Site> {
+    (0..SLOTS)
+        .map(|k| &SITES[(slot(at) + k) % SLOTS])
+        .take_while(|s| s.at.load(Relaxed) != 0)
+        .find(|s| s.at.load(Relaxed) == at)
+}
+
+/// The site at `at`, taken on its first trap.
+fn site(at: usize, what: &ConsoleOnly) -> Option<&'static Site> {
+    for k in 0..SLOTS {
+        let s = &SITES[(slot(at) + k) % SLOTS];
+        match s.at.compare_exchange(0, at, Relaxed, Relaxed) {
+            Ok(_) => {
+                s.kind.store(kind(what), Relaxed);
+                return Some(s);
+            }
+            Err(taken) if taken == at => return Some(s),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+fn count(site: &Site) {
+    site.traps.fetch_add(1, Relaxed);
+    TRAPS[site.kind.load(Relaxed) as usize % KINDS.len()].fetch_add(1, Relaxed);
+}
+
+/// Pages of stubs: (address, bytes used).
+struct Stubs([(usize, usize); 16]);
+
+const STUB_PAGE: usize = 4096;
+
+impl Stubs {
+    /// Room for `len` bytes of stub that `site` jumps to and that jumps back to `site`.
+    fn room(&mut self, site: usize, len: usize) -> Option<&mut (usize, usize)> {
+        use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+        let fits = |&(page, used): &(usize, usize)| {
+            page != 0 && used + len <= STUB_PAGE && stub::jmp(site, page + used).is_some() && stub::jmp(page + used + len, site).is_some()
+        };
+        if let Some(i) = self.0.iter().position(fits) {
+            return Some(&mut self.0[i]);
+        }
+        let free = self.0.iter().position(|&(page, _)| page == 0)?;
+        let page = crate::tls::near(site & !0xFFFF, 0x1_0000).ok()? as usize;
+        let mut old = 0;
+        // SAFETY: the fresh page of ours.
+        if unsafe { VirtualProtect(page as *const _, STUB_PAGE, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+            return None;
+        }
+        self.0[free] = (page, 0);
+        fits(&self.0[free]).then_some(&mut self.0[free])
+    }
+}
+
+/// Rewrites the instruction at `at` (its bytes `code`, decoded to `what`) on its first trap,
+/// so it traps no more. Other threads may be running the code around it: [`write_code`]
+/// lets them fetch either the old instruction, which traps and is emulated (or, already
+/// being rewritten, run again), or the new one. A stub replaces a whole instruction, or a
+/// whole `clzero` loop, which the emulation steps over at once, so no thread is ever inside.
+fn rewrite(site: &Site, at: usize, what: &ConsoleOnly, code: &[u8]) {
+    static STUBS: std::sync::Mutex<Stubs> = std::sync::Mutex::new(Stubs([(0, 0); 16]));
+    if site.state.load(Relaxed) != UNTRIED {
+        return;
+    }
+    if !image_code(at) {
+        // not an image's code (a test's buffer): left as it is
+        site.state.store(EMULATED, Relaxed);
+        return;
+    }
+    // Another thread is rewriting: this site waits for its next trap.
+    let Ok(mut stubs) = STUBS.try_lock() else { return };
+    if site.state.load(Relaxed) != UNTRIED {
+        return;
+    }
+    site.state.store(REWRITING, Relaxed);
+    let how = match stub::rewrite(what, code) {
+        Some(stub::Rewrite::InPlace(bytes)) => write_code(at, &bytes).then_some("in place"),
+        Some(stub::Rewrite::Stub) => (|| {
+            let room = stubs.room(at, 128)?;
+            let to = room.0 + room.1;
+            let bytes = stub::stub(what, code, at, to)?;
+            let jump = stub::jmp(at, to)?;
+            // SAFETY: free bytes of a stub page of ours, which nothing runs before the jump.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, bytes.len()) };
+            room.1 += bytes.len().next_multiple_of(16);
+            write_code(at, &jump).then_some("jump to a stub")
+        })(),
+        None => None,
+    };
+    site.state.store(if how.is_some() { REWRITTEN } else { EMULATED }, Relaxed);
+    let title = crate::threads::title_address(at).map(|a| format!(" (title {a:#x})")).unwrap_or_default();
+    match how {
+        Some(how) => tracing::info!(instruction = ?what, how, "console CPU instruction at {at:#x}{title} rewritten as plain x86 code"),
+        None => tracing::info!(instruction = ?what, "console CPU instruction at {at:#x}{title} has no rewrite: emulated at each trap"),
+    }
+}
+
+/// Whether `at` is executable code of a mapped image.
+fn image_code(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let found = unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } != 0;
+    found && m.Type == MEM_IMAGE && m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) != 0
+}
+
+/// Writes `bytes` over the code at `at` so that a thread running it meanwhile fetches either
+/// the old instruction or the new one: in one atomic store when they lie in an aligned 16
+/// bytes; across two, the head first becomes `jmp $` (EB FE), which holds a thread that
+/// arrives meanwhile, then the tail is written, then the head. False if nothing was written
+/// (the head is a single byte, or the page could not be made writable).
+fn write_code(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let n = bytes.len();
+    let head = 16 - at % 16;
+    if n > head && (head < 2 || n - head > 16) {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: the code's own pages, made writable for the stores and restored after.
+    if unsafe { VirtualProtect(at as *const _, n, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    // SAFETY: writable now, each store in an aligned 16 bytes.
+    unsafe {
+        if n <= head {
+            store(at, bytes);
+        } else {
+            store(at, &[0xEB, 0xFE]);
+            store(at + head, &bytes[head..]);
+            store(at, &bytes[..head]);
+        }
+    }
+    // SAFETY: restores the protection found; the range is the code just written.
+    unsafe {
+        VirtualProtect(at as *const _, n, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, n);
+    }
+    true
+}
+
+/// `bytes` at `at` in one atomic store: of the aligned 8 bytes that hold them, else of the
+/// aligned 16 (`lock cmpxchg16b`).
+///
+/// # Safety
+/// `bytes` lie in an aligned 16 bytes of writable memory at `at`.
+unsafe fn store(at: usize, bytes: &[u8]) {
+    let (n, off) = (bytes.len(), at % 16);
+    let splice = |was: &mut [u8]| {
+        let from = at % was.len();
+        was[from..from + n].copy_from_slice(bytes);
+    };
+    if at % 8 + n <= 8 {
+        // SAFETY: aligned and writable, as the caller says.
+        let word = unsafe { AtomicU64::from_ptr((at & !7) as *mut u64) };
+        let _ = word.fetch_update(Relaxed, Relaxed, |was| {
+            let mut b = was.to_le_bytes();
+            splice(&mut b);
+            Some(u64::from_le_bytes(b))
+        });
+        return;
+    }
+    debug_assert!(off + n <= 16);
+    let p = (at & !15) as *mut u128;
+    // SAFETY: as the caller says (an exchange that changes nothing reads the 16 bytes whole).
+    let mut was = unsafe { exchange16(p, 0, 0) };
+    loop {
+        let mut b = was.to_le_bytes();
+        splice(&mut b);
+        // SAFETY: as above.
+        let found = unsafe { exchange16(p, was, u128::from_le_bytes(b)) };
+        if found == was {
+            return;
+        }
+        was = found;
+    }
+}
+
+/// `lock cmpxchg16b`: `*p = new` if it holds `old`; returns what it held.
+///
+/// # Safety
+/// `p` is 16-byte aligned and writable.
+unsafe fn exchange16(p: *mut u128, old: u128, new: u128) -> u128 {
+    let (low, high): (u64, u64);
+    // SAFETY: as the caller says; rbx (which the compiler reserves) is swapped in and back.
+    unsafe {
+        std::arch::asm!(
+            "xchg {new_low}, rbx",
+            "lock cmpxchg16b xmmword ptr [{p}]",
+            "mov rbx, {new_low}",
+            p = in(reg) p,
+            new_low = inout(reg) new as u64 => _,
+            in("rcx") (new >> 64) as u64,
+            inout("rax") old as u64 => low,
+            inout("rdx") (old >> 64) as u64 => high,
+        );
+    }
+    u128::from(high) << 64 | u128::from(low)
+}
+
+/// Exceptions dispatched to handlers since the start: access violations on reads (and
+/// executes), on writes, illegal instructions, others. Under Wine a fault it settles itself
+/// (a write to a write-watched page) is a signal that never gets here.
+static DISPATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+unsafe extern "system" fn count_exception(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, EXCEPTION_ILLEGAL_INSTRUCTION};
+    // SAFETY: the system passes the exception being dispatched.
+    let r = unsafe { &*(*info).ExceptionRecord };
+    let i = match r.ExceptionCode {
+        EXCEPTION_ACCESS_VIOLATION if r.NumberParameters >= 1 && r.ExceptionInformation[0] == 1 => 1,
+        EXCEPTION_ACCESS_VIOLATION => 0,
+        EXCEPTION_ILLEGAL_INSTRUCTION => 2,
+        _ => 3,
+    };
+    DISPATCHED[i].fetch_add(1, Relaxed);
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Starts the line every 10 s on console CPU instructions: traps by kind, the sites and how
+/// many were rewritten, the busiest (at their address in the title's file), and the
+/// exceptions dispatched (which tells the faults the runtime's handlers take from those Wine
+/// settles itself). Silent until the first trap.
+pub(crate) fn start_counting() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("console-insn-stats".into()).spawn(|| {
+            use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler};
+            let mut before = ([0u64; KINDS.len()], [0u64; 4]);
+            let mut counter: *mut std::ffi::c_void = std::ptr::null_mut();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                // First in line again (handlers added since go before it), to see them all.
+                // SAFETY: a handler that only counts.
+                unsafe {
+                    if !counter.is_null() {
+                        RemoveVectoredExceptionHandler(counter);
+                    }
+                    counter = AddVectoredExceptionHandler(1, Some(count_exception));
+                }
+                let traps: [u64; KINDS.len()] = std::array::from_fn(|i| TRAPS[i].load(Relaxed));
+                let dispatched: [u64; 4] = std::array::from_fn(|i| DISPATCHED[i].load(Relaxed));
+                if traps.iter().sum::<u64>() == 0 {
+                    continue;
+                }
+                tracing::info!("{}", stats_line(&traps, &before.0, &dispatched, &before.1));
+                before = (traps, dispatched);
+            }
+        });
+    });
+}
+
+fn stats_line(traps: &[u64; KINDS.len()], before: &[u64; KINDS.len()], dispatched: &[u64; 4], dispatched_before: &[u64; 4]) -> String {
+    let d: Vec<u64> = traps.iter().zip(before).map(|(n, b)| n - b).collect();
+    let by_kind: Vec<String> = (0..KINDS.len()).filter(|&i| d[i] > 0).map(|i| format!("{} {}", KINDS[i], d[i])).collect();
+    let mut sites: Vec<(u64, usize, u8, u8)> = SITES
+        .iter()
+        .filter(|s| s.at.load(Relaxed) != 0)
+        .map(|s| (s.traps.load(Relaxed), s.at.load(Relaxed), s.kind.load(Relaxed), s.state.load(Relaxed)))
+        .collect();
+    let rewritten = sites.iter().filter(|s| s.3 == REWRITTEN).count();
+    sites.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
+    let busiest: Vec<String> = sites
+        .iter()
+        .take(5)
+        .map(|&(n, at, kind, state)| {
+            let place = crate::threads::title_address(at).map_or_else(|| crate::crash::locate(at), |a| format!("{a:#x}"));
+            let state = ["", " (rewritten)", " (emulated)", ""][state as usize % 4];
+            format!("{place} {} {n}{state}", KINDS[kind as usize % KINDS.len()])
+        })
+        .collect();
+    let e: Vec<u64> = dispatched.iter().zip(dispatched_before).map(|(n, b)| n - b).collect();
+    format!(
+        "console CPU instructions: {} traps in 10 s ({}), {} since the start at {} sites ({} rewritten); busiest: {}; \
+         exceptions dispatched in 10 s: access violations {} ({} on writes), illegal instructions {}, other {}",
+        d.iter().sum::<u64>(),
+        if by_kind.is_empty() { "none".into() } else { by_kind.join(", ") },
+        traps.iter().sum::<u64>(),
+        sites.len(),
+        rewritten,
+        busiest.join(", "),
+        e[0] + e[1],
+        e[1],
+        e[2],
+        e[3],
+    )
 }
 
 #[cfg(test)]
