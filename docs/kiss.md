@@ -176,5 +176,14 @@ driver errors and no new crash, and the captures look no worse.
   (re-made 18,790 → 629). Recording cost is almost all ExecuteIndirect
   (~0.1 ms × 4,550) and Dispatch (~0.05–0.14 ms × 3,190); draws are cheap.
   Submissions still serialise (enter/merge ~120 ms).
+- 2026-11-25: run p13 (submission pass-through, bounded indirect windows,
+  read-based streaming merged): stable, no GPU errors; RSS 21.6 → 16.7 GB;
+  card 4.06 GB; indirect 180–510 → 70 ms. Left: 4.2 GB/frame of windows over
+  scattered pool pages refilled at every submission (steps 250 ms) and
+  0.43 ms per dispatch. Probe: tile mappings into opened sections read wrong
+  data on this stack, so windows will be gathered from the section heaps on
+  the GPU, refreshed only on remaps and announced writes.
+- 2026-11-25: whole-file mapping of archives failed (levels.rpf is 76 GB);
+  streaming now does one positioned read of exactly each request's range.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
