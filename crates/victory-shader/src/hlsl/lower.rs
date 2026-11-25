@@ -136,6 +136,7 @@ struct L<'a> {
 
 /// Lowers the program; retries with phis whose incoming values have no HLSL
 /// form treated as missing.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower(
     native: &NativeProgram,
     p: &Program,
@@ -3494,7 +3495,7 @@ impl<'a> L<'a> {
         let at16 = |l: &mut Self, base: usize, k: usize| -> Result<String, Why> {
             if a16 {
                 let x = addr_u(l, base + k / 2)?;
-                Ok(if k % 2 == 0 { format!("({x} & 0xffffu)") } else { format!("({x} >> 16)") })
+                Ok(if k.is_multiple_of(2) { format!("({x} & 0xffffu)") } else { format!("({x} >> 16)") })
             } else {
                 addr_u(l, base + k)
             }
@@ -4133,7 +4134,7 @@ impl<'a> L<'a> {
             let _ = writeln!(src, "static const uint code_table[{}] = {{ {} }};", code.len(), code.join(", "));
         }
         // Entry.
-        let (profile, head, ret_decl) = match self.stage {
+        let (profile, head) = match self.stage {
             HwStage::Ps => {
                 let mut s = String::from("struct PSIn {\n");
                 for (id, e) in sig_order(&self.inputs, self.sorted) {
@@ -4154,7 +4155,6 @@ impl<'a> L<'a> {
                 (
                     "ps_6_6",
                     format!("{s}{attrs}PSOut main(PSIn i) {{\n  PSOut o = (PSOut)0;\n"),
-                    (),
                 )
             }
             HwStage::Cs => {
@@ -4174,7 +4174,6 @@ impl<'a> L<'a> {
                         t[2],
                         params.join(", ")
                     ),
-                    (),
                 )
             }
             HwStage::Vs => {
@@ -4193,7 +4192,7 @@ impl<'a> L<'a> {
                     let _ = writeln!(s, "  {ty} o{id} : {}{};", sem_name(e), sem_index(e));
                 }
                 s.push_str("};\n");
-                ("vs_6_6", format!("{s}VSOut main(VSIn i) {{\n  VSOut o = (VSOut)0;\n"), ())
+                ("vs_6_6", format!("{s}VSOut main(VSIn i) {{\n  VSOut o = (VSOut)0;\n"))
             }
             HwStage::Ms => {
                 let m = self.mesh.clone().ok_or(ShaderError::Malformed("a mesh program without its limits"))?;
@@ -4241,11 +4240,10 @@ impl<'a> L<'a> {
                     params.join(", "),
                     m.threads
                 );
-                ("ms_6_6", head, ())
+                ("ms_6_6", head)
             }
             _ => return Err(ShaderError::Unsupported { offset: 0, what: "a stage the HLSL prototype lacks" }),
         };
-        let _ = ret_decl;
         src.push_str(&head);
         for (n, ty) in &decls {
             if ty.is_empty() {
