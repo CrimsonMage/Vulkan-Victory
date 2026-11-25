@@ -75,6 +75,8 @@ driver errors and no new crash, and the captures look no worse.
 | 15 | Frame-time breakdown (`frame time:` line every 5 s) and removal of four needless full card drains | subagent | merged (28ccc38), built, not yet run |
 | 17 | Console CPU instructions: ~21,000 SIGILL traps/s (CLZERO, MONITORX/MWAITX, INSERTQ) emulated per trap; patch each site once | subagent | running |
 | 18 | Per-draw recording cost (~0.28 ms CPU per draw: shadow::find under a contended mutex, bind, descriptor mirroring, SipHash) | subagent | running |
+| 19 | Memory: texture levels on demand by default, render targets on shared pages keyed by title address, open only committed runs (not whole regions) | subagent | running |
+| 20 | Later: `globallycoherent` UAVs for the BVH builder (XCL found the builder needs it) | — | after fps/memory |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
@@ -122,5 +124,12 @@ driver errors and no new crash, and the captures look no worse.
   title threads recording into our lists ~620 ms summed; submissions
   ~100 ms; card waits ~49 ms; landing 72 ms (54 ms fetching shader writes
   back). The process takes ~11,000 signals/s, mostly SIGILL.
+- 2026-11-25: XCL study (GPL-2.0-only: ideas only, no code into GPL-3.0
+  victory). Worth taking: translate title addresses by arithmetic over
+  spanning buffers per opened heap (no per-draw lookup); settle descriptors
+  at view creation; never fetch shader writes back; pass fences through to
+  the GPU; back render targets with shared pages keyed by title address.
+  Not worth taking: its card-memory mirror of title memory (doubles memory;
+  wouldn't fit 8 GB), its per-frame write-watch for textures.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
