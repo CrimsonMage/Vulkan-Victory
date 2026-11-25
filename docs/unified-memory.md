@@ -538,6 +538,25 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   zeros the title shows at many places`.
 - The gate line (`… fps, … ms/frame …; card memory …`) gives the result;
   compare with a run at `VICTORY_UNIFIED=0` in the same place.
+- Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms (compare
+  of card copies C), idle I; S submissions/frame (U untimed); title threads
+  recording into our lists R ms (summed); in submissions P ms (… of them;
+  textures brought up to date T ms), waiting for the card W ms [why ms/n,
+  …]; flights landed in L ms (fetching shader writes back F ms, M MB);
+  title fence events set n/frame, D ms after the ask on average; buffers
+  named by lists: in place (read over the bus) X MB, card copies Y MB; top
+  pipelines (ms of a sampled frame, of A in all): name ms; …`
+  (`frametime.rs`). All per frame. B and I come from GPU timestamps around
+  each submission (B + I ≈ the frame when the card is the limit only if I
+  is small); C is our hash compare of the big heap's card copy. The waits
+  by why: `lock` (submission lock), `settle` (a waited submission, e.g. a
+  saved frame), `reads` (preparing reads what flights write), `step`
+  (`CopyMemoryToMemoryX` on the CPU), `merge` (title bytes under shader
+  writes), `copy-in` (a CPU copy into title memory), `results` (compare
+  ring full), `lists` (256 lists in the air), `fence` (the title blocks
+  without an event), `own` (the card running a waited submission). The
+  pipelines are sampled every 30th frame with a timestamp at each pipeline
+  change of the title's lists.
 
 ### Risks of this build
 
