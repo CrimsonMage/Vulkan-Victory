@@ -82,11 +82,11 @@
 
 mod bitcode;
 mod container;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, victory_native_d3d12)))]
 mod diff_tests;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, victory_native_d3d12)))]
 mod intersect_tests;
-#[cfg(all(windows, any(test, feature = "host")))]
+#[cfg(all(any(windows, victory_native_d3d12), any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod own_bits;
@@ -94,13 +94,13 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
-#[cfg(windows)]
+#[cfg(any(windows, victory_native_d3d12))]
 pub mod validator;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, victory_native_d3d12)))]
 mod valu_tests;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, victory_native_d3d12)))]
 mod waterfall_tests;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, victory_native_d3d12)))]
 mod wave64_tests;
 mod wave;
 
@@ -879,7 +879,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
-        #[cfg(windows)]
+        #[cfg(any(windows, victory_native_d3d12))]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     /// A pixel shader writing a constant colour.
-    #[cfg(windows)]
+    #[cfg(any(windows, victory_native_d3d12))]
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
@@ -1060,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, victory_native_d3d12))]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");
@@ -1102,20 +1102,24 @@ mod tests {
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
-        let mut wrong = ps.dxil[4..20].to_vec();
-        wrong[0] ^= 1;
-        for digest in [&[0u8; 16][..], &wrong] {
-            let mut other = ps.clone();
-            other.dxil[4..20].copy_from_slice(digest);
-            assert!(
-                host.pipeline(&vs, &other).is_err(),
-                "digest {digest:02x?} accepted"
-            );
+        // Windows only: native vkd3d-proton does not check the hash.
+        #[cfg(windows)]
+        {
+            let mut wrong = ps.dxil[4..20].to_vec();
+            wrong[0] ^= 1;
+            for digest in [&[0u8; 16][..], &wrong] {
+                let mut other = ps.clone();
+                other.dxil[4..20].copy_from_slice(digest);
+                assert!(
+                    host.pipeline(&vs, &other).is_err(),
+                    "digest {digest:02x?} accepted"
+                );
+            }
         }
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, victory_native_d3d12))]
     fn constant_color_validates() {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
@@ -1189,7 +1193,7 @@ mod tests {
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
-            #[cfg(windows)]
+            #[cfg(any(windows, victory_native_d3d12))]
             if let Ok(mut v) = super::validator::Validator::load(
                 super::validator::Validator::default_path().as_deref(),
             ) {
@@ -1359,13 +1363,13 @@ mod tests {
         })
         .unwrap();
         let mut dxil = l.dxil;
-        #[cfg(windows)]
+        #[cfg(any(windows, victory_native_d3d12))]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut dxil).unwrap();
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, victory_native_d3d12))]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
@@ -1503,7 +1507,7 @@ mod atomic_tests {
             );
             let required = 0x1040_8000; // heap atomics, typed atomics, Int64Ops
             assert_eq!(features & required, if wide { required } else { 0 });
-            #[cfg(windows)]
+            #[cfg(any(windows, victory_native_d3d12))]
             if let Ok(mut v) =
                 validator::Validator::load(validator::Validator::default_path().as_deref())
             {
@@ -1598,7 +1602,7 @@ mod barycentric_tests {
     }
 
     fn validate(shader: &HostShader) {
-        #[cfg(windows)]
+        #[cfg(any(windows, victory_native_d3d12))]
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {

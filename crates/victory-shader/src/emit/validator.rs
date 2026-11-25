@@ -8,7 +8,15 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+#[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+// Linux: the validator is DXC's `libdxil.so`, named by `VICTORY_DXIL`.
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut c_void;
+    fn dlsym(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+}
 
 type Hresult = i32;
 
@@ -122,6 +130,10 @@ impl Validator {
         if let Some(p) = std::env::var_os("VICTORY_DXIL") {
             return Some(p.into());
         }
+        #[cfg(not(windows))]
+        return None;
+        #[cfg(windows)]
+        {
         let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
         let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
             .ok()?
@@ -131,24 +143,49 @@ impl Validator {
             .collect();
         versions.sort();
         versions.pop()
+        }
     }
 
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
-        let name: Vec<u16> = path
-            .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
-            .to_string_lossy()
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        // SAFETY: plain Win32 calls with a NUL-terminated name.
-        unsafe {
-            let module = LoadLibraryW(name.as_ptr());
-            if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+        #[cfg(not(windows))]
+        let create = {
+            let path = path.ok_or("no validator: set VICTORY_DXIL to libdxil.so")?;
+            let name = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+                .map_err(|e| e.to_string())?;
+            // SAFETY: dlopen/dlsym with NUL-terminated names (2 = RTLD_NOW).
+            unsafe {
+                let module = dlopen(name.as_ptr(), 2);
+                if module.is_null() {
+                    return Err(format!("cannot load {}", path.display()));
+                }
+                let create = dlsym(module, c"DxcCreateInstance".as_ptr());
+                if create.is_null() {
+                    return Err("libdxil.so lacks DxcCreateInstance".to_owned());
+                }
+                create
             }
-            let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
-                .ok_or("dxil.dll lacks DxcCreateInstance")?;
+        };
+        #[cfg(windows)]
+        let create = {
+            let name: Vec<u16> = path
+                .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            // SAFETY: plain Win32 calls with a NUL-terminated name.
+            unsafe {
+                let module = LoadLibraryW(name.as_ptr());
+                if module.is_null() {
+                    return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                }
+                GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
+                    .ok_or("dxil.dll lacks DxcCreateInstance")?
+            }
+        };
+        // SAFETY: the export has this signature; valid out pointer.
+        unsafe {
             let create: CreateInstance = std::mem::transmute(create);
             let mut object = std::ptr::null_mut();
             let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);

@@ -183,6 +183,14 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // A console has no pointer and the title's window class has no cursor,
+    // so the host pointer vanishes over the window (and stays gone for a
+    // remote desktop viewer). Show the arrow over the client area.
+    if message == wm::WM_SETCURSOR && (lparam & 0xFFFF) as u32 == wm::HTCLIENT {
+        // SAFETY: the system's arrow, a shared cursor that is never freed.
+        unsafe { wm::SetCursor(wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW)) };
+        return 1;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

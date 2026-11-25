@@ -456,6 +456,25 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        if bytes.is_empty() {
+            // An empty library is asked for with a null pointer: an empty
+            // slice's pointer is not null, and a host that checks (vkd3d)
+            // refuses a pointer with no length as an invalid argument.
+            let mut made = std::ptr::null_mut();
+            // SAFETY: the device's own method, called as the binding does,
+            // with no blob; `made` receives a reference we then own.
+            return unsafe {
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                    &mut made,
+                )
+                .ok()?;
+                <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(made).cast()
+            };
+        }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()

@@ -47,6 +47,8 @@ opus-pure = "0.2.4"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+# Set by the Linux-native build (D3D12 through native vkd3d-proton).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(victory_native_d3d12)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
