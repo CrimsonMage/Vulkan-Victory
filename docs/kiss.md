@@ -47,6 +47,22 @@ the twin; it implements only what is truly console-only.
   right then (after in-flight work lands). Idle eviction under budget
   pressure is only a safety net.
 
+## Unified memory on split hardware
+
+The console has one memory; the PC has RAM and video memory joined by a bus.
+Every piece of title memory falls into one of four kinds, and each kind has
+exactly one home, the one a PC game would give it:
+
+| Who writes / who reads | Home on the PC | What victory does |
+|---|---|---|
+| CPU writes often, GPU reads (constants, dynamic vertices, command data) | system RAM, read in place by the GPU (upload heap) | open the title's memory as a heap; nothing copied, nothing tracked |
+| Streamed once, GPU reads (textures, static geometry) | video memory (default heap) | upload once when the title says it arrived; free when it unloads |
+| GPU writes, GPU reads (render targets, scratch) | video memory only | never copied back |
+| GPU writes, CPU reads (queries, read-backs) | system RAM (read-back heap) | the GPU writes into title memory in place |
+
+No class is mirrored in both places and kept in sync by watching or
+comparing. If something seems to need that, it is in the wrong class.
+
 ## Rules
 
 - Prefer an explicit API point over detecting side effects in memory.
