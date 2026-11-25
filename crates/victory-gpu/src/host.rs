@@ -569,6 +569,9 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// In a frame sampled by pipeline: the list's timestamps
+    /// (`crate::frametime`).
+    stamps: Mutex<Option<crate::frametime::ListStamps>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -1839,7 +1842,9 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
             return false;
         }
     }
+    let t = std::time::Instant::now();
     settle_now();
+    crate::frametime::waited(crate::frametime::Wait::Value, t);
     wait.met()
 }
 
@@ -1979,7 +1984,11 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                let landing = std::time::Instant::now();
+                host.relay_land(items, &mut fetch);
+                crate::frametime::add_since(crate::frametime::Sum::LandNs, landing);
+            }
             Err(target) => {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
@@ -2215,6 +2224,7 @@ impl Host {
                 twins: Mutex::default(),
                 prelude: OnceLock::new(),
                 pipelines: Mutex::default(),
+                stamps: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -2326,7 +2336,10 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead. Its compare then stores the
     /// hashes it makes (see [`flagged_pieces`] and `crate::shadow::relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    ///
+    /// `first`: a list to run before everything of the submission (its first
+    /// timestamp); taken if a list of ours is run now.
+    fn card_before(&self, runs: &[&HostList], flown: bool, first: &mut Option<ID3D12CommandList>) -> Option<CardPlan> {
         use std::sync::Arc;
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
@@ -2425,7 +2438,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.queue.ExecuteCommandLists(&[first.take(), Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -2640,6 +2653,8 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let fetching = std::time::Instant::now();
+        crate::frametime::add(crate::frametime::Sum::FetchBytes, total);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -2668,6 +2683,7 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})")),
         };
+        crate::frametime::add_since(crate::frametime::Sum::FetchNs, fetching);
         let mut title = Vec::new();
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
@@ -2836,6 +2852,8 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
         };
         let (allocator, list) = &work.fetch;
+        let fetching = std::time::Instant::now();
+        crate::frametime::add(crate::frametime::Sum::FetchBytes, total);
         // SAFETY: the list's last run was waited for; live buffers; the
         // fence and event are ours, under the submission lock.
         let ran = unsafe {
@@ -2857,6 +2875,7 @@ impl Host {
         if let Err(e) = ran {
             fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
         }
+        crate::frametime::add_since(crate::frametime::Sum::FetchNs, fetching);
         let mut title = Vec::new();
         for &(i, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them; the
@@ -2916,7 +2935,9 @@ impl Host {
         RELAY_MOVED.notify_one();
         if most {
             // Until there are fewer, not until there are none.
+            let t = std::time::Instant::now();
             relay_wait(|line| line.lists < late_most());
+            crate::frametime::waited(crate::frametime::Wait::Lists, t);
         } else {
             LINE_MOVED.notify_one();
         }
@@ -2962,20 +2983,35 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let entered = std::time::Instant::now();
+        let sent = self.submit_timed(runs, late);
+        crate::frametime::add_since(crate::frametime::Sum::SubmitNs, entered);
+        crate::frametime::add(crate::frametime::Sum::Submits, 1);
+        sent
+    }
+
+    fn submit_timed<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        use crate::frametime::{Wait, waited};
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let entered = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        waited(Wait::Lock, entered);
         // Flights in the air: a submission that is waited for waits for them
         // first, one sent ahead only if preparing it reads what they write.
+        let t = std::time::Instant::now();
         if !late {
             settle();
+            waited(Wait::Settle, t);
         } else if let Some(why) = late_blocked(runs) {
             if why == Blocked::Read {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(|line| blocked_by(&line.written, runs, false).is_none());
+                waited(Wait::Reads, t);
             } else {
                 settle();
+                waited(Wait::Step, t);
             }
         }
         // Descriptors the title copied into placed heaps directly, before
@@ -2990,7 +3026,9 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+            let t = std::time::Instant::now();
             settle();
+            waited(Wait::Sweep, t);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
@@ -3029,7 +3067,9 @@ impl Host {
         // and the asking is made again: the copy-back wrote title memory,
         // which other copies of it must see.
         if behind && stale_under_flights(runs) {
+            let t = std::time::Instant::now();
             settle();
+            waited(Wait::Merge, t);
             crate::watch::ask_once(&ranges);
         }
         for list in runs {
@@ -3049,11 +3089,33 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         if late && self.card_results_low() {
+            let t = std::time::Instant::now();
             settle();
+            waited(Wait::Results, t);
         }
-        let card = self.card_before(runs, late);
+        // Timestamps (`crate::frametime`): before everything of the
+        // submission (with the sends to card copies, if any), after its
+        // lists, after the compare.
+        let [first, after_lists, after_check] = match crate::frametime::begin(this_submission) {
+            Some([a, b, c]) => [Some(a), Some(b), Some(c)],
+            None => [None, None, None],
+        };
+        let mut first = first;
+        let card = self.card_before(runs, late, &mut first);
+        if first.is_some() {
+            lists.insert(0, first);
+        }
+        if after_lists.is_some() {
+            lists.push(after_lists);
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        if after_check.is_some() {
+            lists.push(after_check);
+        }
+        for list in runs {
+            crate::frametime::submitted(&list.stamps, this_submission);
         }
         *submitted += 1;
         if late {
@@ -3114,6 +3176,7 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted);
         }
+        waited(Wait::Own, prepared);
         let back = declared_writes(runs);
         hand_back(&back);
         if let Some(card) = card {
@@ -3263,6 +3326,7 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
+        crate::frametime::close(&self.list, &self.stamps);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -3278,6 +3342,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::frametime::reset(&self.stamps);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -3643,6 +3708,7 @@ impl HostList {
 
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
+        crate::frametime::pipeline(&self.list, &self.stamps, name);
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
@@ -3976,7 +4042,9 @@ impl HostList {
                     // buffers run on the card, `list.rs`).
                     if crate::unified::in_unit(dst, len) && flying() {
                         crate::unified::count(crate::unified::Stat::CpuCopyWaited);
+                        let t = std::time::Instant::now();
                         settle();
+                        crate::frametime::waited(crate::frametime::Wait::CopyIn, t);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -4424,6 +4492,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        crate::frametime::frame();
         self.frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {

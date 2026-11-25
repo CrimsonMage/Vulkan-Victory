@@ -32,6 +32,8 @@ pub mod dxgi;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+mod frametime;
+#[cfg(windows)]
 pub mod cores;
 #[cfg(windows)]
 mod host;

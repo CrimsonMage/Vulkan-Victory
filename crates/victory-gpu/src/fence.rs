@@ -28,8 +28,9 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// and when they were asked for (`now_us`, for the frame-time line).
+    waiters: Mutex<Vec<(u64, usize, u64)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -93,7 +94,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         {
             drop(waiters);
+            let t = std::time::Instant::now();
             crate::host::settle_now();
+            crate::frametime::waited(crate::frametime::Wait::Fence, t);
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
@@ -103,18 +106,30 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    waiters.push((value, event as usize, now_us()));
     S_OK
 }
+fn now_us() -> u64 {
+    #[cfg(windows)]
+    return crate::host::now_us();
+    #[cfg(not(windows))]
+    0
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            #[cfg(windows)]
+            {
+                crate::frametime::add(crate::frametime::Sum::FenceSet, 1);
+                crate::frametime::add(crate::frametime::Sum::FenceUs, now_us().saturating_sub(asked));
+            }
         }
         !reached
     });
