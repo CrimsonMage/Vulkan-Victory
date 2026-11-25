@@ -15,7 +15,6 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -147,7 +146,7 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: Mutex<Option<crate::fast::FastMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
 /// How a texture the host writes is copied through a buffer into the
 /// texture of a view the title placed in its memory in another format
@@ -195,7 +194,7 @@ const ALIAS_PARTS: u32 = 54;
 
 
 /// The copy buffers of [`alias`], by the placed view's texture.
-static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+static THROUGH: Mutex<Option<crate::fast::FastMap<usize, Arc<Through>>>> = Mutex::new(None);
 
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
@@ -220,7 +219,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
+        let map = map.get_or_insert_with(Default::default);
         match map.get(&(placed as usize)) {
             Some(through) => through.clone(),
             None => {
@@ -482,7 +481,7 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<crate::fast::FastSet<usize>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
@@ -1297,7 +1296,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let dropped = crate::resource::host_dropped(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    let map = map.get_or_insert_with(Default::default);
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }

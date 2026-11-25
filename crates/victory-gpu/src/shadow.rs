@@ -2467,18 +2467,90 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    map.remove(&(start, resource));
+    BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+/// Changes of [`BUFFERS`]' keys (buffers registered and released), made
+/// under its lock: what each thread's recent answers ([`Hit`]) hold for.
+static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// One answer of [`lookup`] a thread had lately, and the asks it holds
+/// for: an ask `[a, b)` gets the same buffer while `from <= a < until`
+/// (the walk down from `a` then meets the same keys in the same order)
+/// and `above < b <= end` (the keys met before this buffer end below `b`,
+/// and this one holds it), as long as no key changed. Kept weakly: a
+/// thread's answers keep no copy alive.
+struct Hit {
+    changed: u64,
+    from: u64,
+    until: u64,
+    above: u64,
+    end: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+/// Answers a thread keeps, replaced in turn.
+const RECENT: usize = 16;
+
+#[derive(Default)]
+struct Recent {
+    hits: [Option<Hit>; RECENT],
+    next: usize,
+}
+
+thread_local! {
+    /// The title's recording threads ask for the same few buffers draw
+    /// after draw (vertex and index streams, constants in its big heap):
+    /// the lock and the walk for each ask were a third of their time in
+    /// the profile of 2026-11-25, and that lock, taken by five or six
+    /// threads at once, much of what they waited for.
+    static RECENT_HITS: std::cell::RefCell<Recent> = std::cell::RefCell::default();
+}
+
+/// [`lookup`] answered from the thread's recent answers, if one holds the
+/// ask, no key changed since, and its copy is alive and not stale.
+fn recent(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let changed = BUFFERS_CHANGED.load(Ordering::Acquire);
+    RECENT_HITS.with(|recent| {
+        let recent = recent.try_borrow().ok()?;
+        recent.hits.iter().flatten().find_map(|h| {
+            if h.changed != changed || address < h.from || address >= h.until || end <= h.above || end > h.end {
+                return None;
+            }
+            h.shadow.upgrade().filter(|s| !s.stale.load(Ordering::Relaxed))
+        })
+    })
+}
+
+/// Keeps `hit` among the thread's recent answers.
+fn remember(hit: Hit) {
+    RECENT_HITS.with(|recent| {
+        let Ok(mut recent) = recent.try_borrow_mut() else {
+            return;
+        };
+        if recent.hits.iter().flatten().any(|h| h.changed != hit.changed) {
+            // Answers from before a change hold for nothing now.
+            *recent = Recent::default();
+        }
+        let at = recent.next;
+        recent.hits[at] = Some(hit);
+        recent.next = (at + 1) % RECENT;
+    });
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -2489,24 +2561,43 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 fn lookup(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if let Some(shadow) = recent(address, end) {
+        return Some(shadow);
+    }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    // The walk down from the ask's address, as before, noting the first
+    // key met and the highest end of those passed over ([`Hit`]).
+    let (mut first, mut above, mut key) = (None, 0u64, None);
+    for (k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+        first.get_or_insert(k.0);
+        if e.end >= end {
+            key = Some(*k);
+            break;
+        }
+        above = above.max(e.end);
+    }
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1);
     };
+    let changed = BUFFERS_CHANGED.load(Ordering::Relaxed);
+    let until = map
+        .range((address, usize::MAX)..)
+        .find(|(k, _)| k.0 > address)
+        .map_or(u64::MAX, |(k, _)| k.0);
+    let from = first.unwrap_or(key.0);
     let entry = map.get_mut(&key)?;
     if entry.shadow.as_ref().is_some_and(|s| s.stale.load(Ordering::Relaxed)) {
         entry.shadow = None;
     }
+    // Big buffers too (the title's 174 MB GPU heap): their copy in the
+    // card's memory cost a hash compare after every submission that wrote
+    // them and a fetch of what shaders wrote that waited behind every
+    // later submission on the queue (54 ms a frame, 2026-11-25), while the
+    // card stood idle three quarters of the frame. A card copy is left
+    // only where the memory cannot be opened.
     if entry.shadow.is_none()
         && crate::unified::on()
-        && entry.end - key.0 < crate::unified::BIG
         && let Some(shadow) = in_place(key.0, entry.end - key.0, false)
     {
         entry.shadow = Some(shadow);
@@ -2561,7 +2652,18 @@ fn lookup(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    let found = entry.shadow.clone()?;
+    let end = entry.end;
+    drop(map);
+    remember(Hit {
+        changed,
+        from,
+        until,
+        above,
+        end,
+        shadow: Arc::downgrade(&found),
+    });
+    Some(found)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (

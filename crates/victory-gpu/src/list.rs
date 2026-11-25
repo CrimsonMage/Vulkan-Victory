@@ -146,9 +146,9 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    let t = std::time::Instant::now();
+    let t = crate::fast::ticks();
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
-    crate::frametime::add_since(crate::frametime::Sum::RecordNs, t);
+    crate::frametime::recorded(crate::fast::ticks().wrapping_sub(t));
 }
 
 /// Records work of our own into title list `this` where the title's

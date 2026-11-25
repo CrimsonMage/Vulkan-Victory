@@ -103,8 +103,31 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// The clock is read again on a thread's 32nd call or its first in a new
+/// frame, not on every call: draws note a use of every texture and copy
+/// they read (thousands a frame on each recording thread), and the clock
+/// is a call into the Unix side under Proton. A use is thus noted up to
+/// one frame (or 32 calls) early, never late; [`long_ago`] wants frames
+/// and seconds both, so nothing in use looks idle by it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    use std::cell::Cell;
+    thread_local! {
+        /// The frame, calls since the clock was read, tenths then.
+        static LAST: Cell<(u64, u32, u64)> = const { Cell::new((u64::MAX, 0, 0)) };
+    }
+    let frame = crate::frame::current();
+    let tenths = LAST.with(|last| {
+        let (seen, calls, tenths) = last.get();
+        if seen == frame && calls < 32 {
+            last.set((seen, calls + 1, tenths));
+            return tenths;
+        }
+        let tenths = (now_ms() / 100) & 0xffff_ffff;
+        last.set((frame, 0, tenths));
+        tenths
+    });
+    (frame << 32) | tenths
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -563,7 +586,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<crate::fast::FastMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -588,7 +611,7 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
-type States = std::collections::HashMap<
+type States = crate::fast::FastMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
@@ -1347,9 +1370,9 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fast::FastSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fast::FastSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4068,8 +4091,13 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+        // Every COM interface starts with IUnknown's methods: the pointer
+        // is one, and a reference (AddRef) is all keeping needs, without
+        // a QueryInterface into the driver.
+        let raw = object.as_raw();
+        // SAFETY: a live interface pointer, borrowed for the clone.
+        if let Some(object) = unsafe { windows::core::IUnknown::from_raw_borrowed(&raw) } {
+            self.deferred().kept.push(object.clone());
         }
     }
 

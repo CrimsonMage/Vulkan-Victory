@@ -41,11 +41,6 @@ use crate::unified_probe::{Rig, buffer_desc, hr, place as place_resource};
 const K64: u64 = 64 << 10;
 /// Title addresses lie below this; host memory lies above.
 const TIB: u64 = 1 << 40;
-/// Title buffers of this size and up keep their copy in the card's memory
-/// (`shadow.rs` `card_for`): the title's big GPU heap (174 MB) is read by
-/// most of its shaders, and the card reads its own memory at 199 GB/s
-/// against 12.6 GB/s from the PC's (probe, RTX 5060 Ti on PCIe 4 x8).
-pub(crate) const BIG: u64 = 16 << 20;
 
 /// `VICTORY_UNIFIED`, see the module comment.
 pub(crate) fn level() -> u8 {

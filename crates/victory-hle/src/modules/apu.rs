@@ -314,9 +314,8 @@ pub extern "system" fn XApuEnqueueCommand(
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
 fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
-    let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
-    let (output, output_length) = (command.output, command.output_length);
+    let output = command.output;
     result.input = input;
     result.input_length = input_length;
     result.output = output;
@@ -326,8 +325,31 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    // Scratch kept on the thread: 46 KB zeroed for every packet otherwise.
+    // (Each packet the title queues is decoded once, here; the decoder's
+    // state runs from packet to packet, so none can be left out.)
+    thread_local! {
+        static PCM: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    PCM.with(|pcm| match pcm.try_borrow_mut() {
+        Ok(mut pcm) => decode_into(decoder, options, command, packet, &mut pcm, result),
+        Err(_) => decode_into(decoder, options, command, packet, &mut Vec::new(), result),
+    });
+}
+
+/// [`process`] with `pcm` as scratch.
+fn decode_into(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    packet: &[u8],
+    pcm: &mut Vec<f32>,
+    result: &mut ApuResult,
+) {
+    let channels = decoder.channels();
+    let (output, output_length) = (command.output, command.output_length);
+    pcm.resize(MAX_FRAMES * channels, 0.0);
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;

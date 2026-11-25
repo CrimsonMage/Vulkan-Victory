@@ -74,15 +74,38 @@ pub(crate) enum Sum {
     InPlaceBytes,
     /// Bytes of copies in the card's memory named by lists, once per list.
     CardBytes,
-    /// Nanoseconds in the title's recording calls into our lists (state,
-    /// draws, dispatches), summed over its threads.
-    RecordNs,
+    /// Ticks (`crate::fast::ticks`) in the title's recording calls into our
+    /// lists (state, draws, dispatches), summed over its threads
+    /// ([`recorded`]).
+    RecordTicks,
     /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
     TextureNs,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
     SUMS[sum as usize].fetch_add(n, Relaxed);
+}
+
+/// A recording call of the title took `ticks` (`crate::fast::ticks`).
+/// Summed on the thread and added to [`Sum::RecordTicks`] every 64 calls:
+/// one shared counter bumped by six threads at every call was a cache
+/// line passed between cores a dozen times a draw. What a thread holds
+/// back is at most 63 calls, a few hundred microseconds in a 5 s line.
+pub(crate) fn recorded(ticks: u64) {
+    use std::cell::Cell;
+    thread_local! {
+        static HELD: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
+    }
+    HELD.with(|held| {
+        let (sum, calls) = held.get();
+        let (sum, calls) = (sum + ticks, calls + 1);
+        if calls >= 64 {
+            add(Sum::RecordTicks, sum);
+            held.set((0, 0));
+        } else {
+            held.set((sum, calls));
+        }
+    });
 }
 
 /// `since` until now, as nanoseconds of `sum`.
@@ -475,7 +498,11 @@ static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 /// and the line every five seconds.
 pub(crate) fn frame() {
     let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
-    let w = w.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, count: 0 });
+    let w = w.get_or_insert_with(|| {
+        // The rate of the recording ticks is measured from here on.
+        crate::fast::start_clock();
+        Window { since: Instant::now(), frames: 0, count: 0 }
+    });
     w.frames += 1;
     w.count += 1;
     {
@@ -544,7 +571,7 @@ pub(crate) fn frame() {
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed); \
          in submissions {:.1} ms ({:.1} of them; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, card copies {:.0} MB; {pipes}",
-        per(sums[Sum::RecordNs as usize]),
+        per(crate::fast::ticks_to_ns(sums[Sum::RecordTicks as usize])),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
         per(sums[Sum::TextureNs as usize]),
