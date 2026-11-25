@@ -132,6 +132,8 @@ pub(crate) fn shared_room(host: &crate::host::Host, size: u64, over: u64) -> boo
         let now = crate::host::now_ms();
         if fresh || seen.0 == 0 || now >= seen.0 + 100 {
             let [_, _, _, shared] = host.video_memory_raw()?;
+            // The title's own memory opened as heaps is not ours to cap.
+            let shared = shared.saturating_sub(crate::unified::opened_bytes());
             *seen = (now.max(1), shared);
             SHARED_SINCE.store(0, Relaxed);
         }

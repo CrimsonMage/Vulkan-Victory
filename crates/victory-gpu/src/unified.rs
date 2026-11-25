@@ -103,6 +103,13 @@ pub(crate) enum Stat {
     TextureByHash = 8,
 }
 
+/// Bytes of title memory opened as host heaps so far: the system counts
+/// them as PC memory mapped for the card, but they are the title's own
+/// memory, not allocations of ours (`crate::memcap` leaves them out).
+pub(crate) fn opened_bytes() -> u64 {
+    STATS[1].load(Ordering::Relaxed)
+}
+
 pub(crate) fn count(stat: Stat) {
     STATS[stat as usize].fetch_add(1, Ordering::Relaxed);
 }
