@@ -2546,21 +2546,12 @@ impl State {
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
-    /// in place, where the title's passes wrote them (the console's records
-    /// are the host's: draw, indexed draw, dispatch and mesh dispatch, three
-    /// group counts). The title's barrier between its pass and the
-    /// execution orders the two (`HostList::writes_barrier`). False if it
-    /// cannot run on the host.
-    ///
-    /// shortcut: records are not bounded. A pass of the title we drop or
-    /// translate wrongly leaves whatever the memory held, and a garbage
-    /// record runs as asked (until the host resets the display driver).
-    /// They were clamped by a compute pass of ours before every execution
-    /// until the world frame spent ~0.1 ms of recording on each of its
-    /// ~4,500 executions and the card drained twice around every one.
-    /// shortcut: a mesh record's second and third group counts are run as
-    /// written (the clamp cut them to at most 1); the title's mesh programs
-    /// are one-dimensional, and its direct mesh dispatches run with 1 for both.
+    /// where the title's passes wrote them, bounded first a window of
+    /// records at a time (`crate::indirect`; the console's records are the
+    /// host's: draw, indexed draw, dispatch and mesh dispatch, three group
+    /// counts). The title's barrier between its pass and the execution
+    /// orders the two (`HostList::writes_barrier`). False if it cannot run
+    /// on the host.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -2634,6 +2625,18 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // Bounded first (`crate::indirect`): a pass of ours, if one is
+        // recorded, sets a compute root signature and pipeline of its own.
+        let window = (kind, stride, max);
+        let Some((bounded, from, pass)) =
+            crate::indirect::bounded(list, window, args.gpu(arguments), args.left(arguments))
+        else {
+            return false;
+        };
+        if pass {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -2648,13 +2651,14 @@ impl State {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         // SAFETY: an open list with everything set; the host copies are
-        // kept alive by the list (`refresh`), and the signature is cached.
+        // kept alive by the list (`refresh`), the bounded copy by the list's
+        // window, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                offset,
+                &bounded,
+                from,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 count_offset,
             )

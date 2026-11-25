@@ -581,6 +581,10 @@ pub(crate) struct HostList {
     /// Counts what makes a draw's or dispatch's preparation differ from
     /// the same one's before ([`HostList::epoch`]).
     epoch: std::sync::atomic::AtomicU64,
+    /// Barriers that order writes ([`HostList::writes_barrier`]) recorded.
+    barriers: std::sync::atomic::AtomicU64,
+    /// Bounded indirect records (`crate::indirect`).
+    indirect: Mutex<crate::indirect::Window>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1920,6 +1924,8 @@ impl Host {
                 list6: OnceLock::new(),
                 list7: OnceLock::new(),
                 epoch: std::sync::atomic::AtomicU64::new(0),
+                barriers: std::sync::atomic::AtomicU64::new(0),
+                indirect: Mutex::default(),
             })
         }
     }
@@ -2378,6 +2384,7 @@ impl Host {
 impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.indirect().close(&self.list);
         crate::frametime::close(&self.list, &self.stamps);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -2391,6 +2398,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.indirect().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2451,6 +2459,16 @@ impl HostList {
     /// it stays.
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Barriers that order writes recorded so far ([`HostList::writes_barrier`]).
+    pub(crate) fn barriers(&self) -> u64 {
+        self.barriers.load(Ordering::Relaxed)
+    }
+
+    /// The list's bounded indirect records (`crate::indirect`).
+    pub(crate) fn indirect(&self) -> std::sync::MutexGuard<'_, crate::indirect::Window> {
+        self.indirect.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn changed(&self) {
@@ -2764,6 +2782,7 @@ impl HostList {
     /// argument fetch of an indirect execution, which reads the title's
     /// records where its passes wrote them.
     pub(crate) fn writes_barrier(&self) {
+        self.barriers.fetch_add(1, Ordering::Relaxed);
         let list7 = self
             .list7
             .get_or_init(|| enhanced_barriers().then(|| self.list.cast().ok()).flatten());

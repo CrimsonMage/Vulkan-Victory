@@ -316,7 +316,7 @@ void work() {
         /// A compute pass of ours of one group, and the pipeline back.
         Compute,
         /// The same between two waits for every earlier shader write, as
-        /// the indirect-argument clamp (removed) recorded them.
+        /// the per-execution indirect-argument clamp recorded them.
         ComputeWithWaits,
     }
 
