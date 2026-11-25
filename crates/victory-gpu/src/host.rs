@@ -4499,17 +4499,44 @@ impl Meter {
     }
 }
 
+/// A plane the title presents: its host texture, the host state that is
+/// in (and stays in), and what of it the title shows where, as it names
+/// them (`crate::queue::Plane`).
+pub(crate) struct Shown {
+    pub(crate) texture: ID3D12Resource,
+    pub(crate) state: u32,
+    pub(crate) source: Option<[i32; 4]>,
+    pub(crate) placement: Option<[f32; 4]>,
+}
+
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on).
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) {
+    /// Shows the title's planes, bottom first, as frame `frame` (saved if
+    /// captures are on). One plane shown whole (the title's final image,
+    /// Series X) is copied into the swap chain as it is, which takes its
+    /// size and format. Otherwise (Series S: the scene at 1920x1080 under
+    /// the interface at 3840x2160) the swap chain takes the largest
+    /// plane's size and the planes are drawn into it, scaled to their
+    /// places (`crate::compose`).
+    pub(crate) fn present(&self, planes: &[&Shown], frame: u64) {
+        let Some(&bottom) = planes.first() else { return };
         // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
+        let desc = unsafe { bottom.texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let drawn: Vec<&Shown> = if planes.len() == 1 && crate::compose::whole(bottom) {
+            Vec::new()
+        } else {
+            planes.iter().copied().filter(|p| crate::compose::readable(&p.texture)).collect()
+        };
+        let drawn = if !drawn.is_empty() && crate::compose::ready(format) { drawn } else { Vec::new() };
+        let (width, height) = drawn
+            .iter()
+            // SAFETY: live resources.
+            .map(|p| unsafe { p.texture.GetDesc() })
+            .max_by_key(|d| d.Width * u64::from(d.Height))
+            .map_or((desc.Width as u32, desc.Height), |d| (d.Width as u32, d.Height));
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -4537,6 +4564,7 @@ impl Host {
                         height,
                         format = format.0,
                         frame,
+                        planes = drawn.len(),
                         "the swap chain's buffers were made again for another size or format"
                     );
                     self.log_video_memory("right after the swap chain's buffers were made again");
@@ -4547,8 +4575,8 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        let state = |plane: &Shown| D3D12_RESOURCE_STATES(plane.state as i32);
+        // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -4578,29 +4606,59 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            const PRESENT: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PRESENT;
+            const COPY_SOURCE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            const TARGET: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            // A saved frame is read back from what is shown: the plane
+            // copied, or the back buffer drawn.
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let wanted = crate::capture::wanted(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let wanted = false;
+            #[cfg(feature = "diagnostics")]
+            let mut capture = None;
+            if drawn.is_empty() {
+                list.ResourceBarrier(&[
+                    transition(&bottom.texture, state(bottom), COPY_SOURCE),
+                    transition(&back, PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                list.CopyResource(&back, &bottom.texture);
+                #[cfg(feature = "diagnostics")]
+                if wanted {
+                    capture = crate::capture::read_back(&self.device, list, &bottom.texture);
+                }
+                list.ResourceBarrier(&[
+                    transition(&bottom.texture, COPY_SOURCE, state(bottom)),
+                    transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, PRESENT),
+                ]);
+            } else {
+                let read = D3D12_RESOURCE_STATES(crate::compose::READ as i32);
+                let moved = |to_read: bool| -> Vec<D3D12_RESOURCE_BARRIER> {
+                    drawn
+                        .iter()
+                        .filter(|p| state(p) != read)
+                        .map(|p| {
+                            let (from, to) = if to_read { (state(p), read) } else { (read, state(p)) };
+                            transition(&p.texture, from, to)
+                        })
+                        .collect()
+                };
+                let mut barriers = moved(true);
+                barriers.push(transition(&back, PRESENT, TARGET));
+                list.ResourceBarrier(&barriers);
+                crate::compose::record(list, &back, format, (width, height), &drawn);
+                let shown = if wanted { COPY_SOURCE } else { PRESENT };
+                let mut barriers = moved(false);
+                barriers.push(transition(&back, TARGET, shown));
+                list.ResourceBarrier(&barriers);
+                #[cfg(feature = "diagnostics")]
+                if wanted {
+                    capture = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, COPY_SOURCE, PRESENT)]);
+                }
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (frame, wanted);
             copy.close();
             match slot {
                 Some(i) => {

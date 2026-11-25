@@ -363,13 +363,23 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane, 72 bytes, as the title fills them (title+0x248232d,
+/// presented at title+0x24824c1: up to two, 0x48 apart): frame token, the
+/// plane's resources, per resource the rectangle of it shown (left, top,
+/// right, bottom texels), where the plane goes on the screen (left, top,
+/// right, bottom as fractions of it; the title passes 0, 0, 1, 1), then a
+/// word from the title's plane record and words it leaves zero.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source: *const [i32; 4],
+    placement: *const [f32; 4],
+    color_space: u32,
+    rest: [u32; 7],
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -527,10 +537,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the title's planes in our window: each plane's first resource,
+/// its rectangle scaled to the plane's place on the screen, later planes
+/// over earlier ones (`Host::present`). With one plane the console's
+/// display shows the title's final image; with two, its scaler puts the
+/// first (the scene, in a smaller size) under the second (the interface
+/// at the display's size), as the title does on Series S.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -577,25 +589,84 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
+    if let Some(host) = crate::host::host() {
+        // A state the host texture is not left in: what it was in comes
+        // back, and goes back after.
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        let given: &[Plane] = if plane_parameters.is_null() {
+            &[]
+        } else {
+            // SAFETY: the title passes `planes` plane descriptions.
+            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
+        };
+        log_planes(frame, given);
+        let mut shown: Vec<(This, crate::host::Shown)> = Vec::new();
+        for plane in given {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if shown.iter().any(|(r, _)| *r == resource) {
+                continue;
+            }
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            // SAFETY: given, a rectangle and a placement per resource.
+            let (source, placement) = unsafe { (plane.source.as_ref(), plane.placement.as_ref()) };
+            let plane = crate::host::Shown {
+                texture: texture.clone(),
+                state,
+                source: source.copied(),
+                placement: placement.copied(),
+            };
+            shown.push((resource, plane));
+        }
+        let planes: Vec<_> = shown.iter().map(|(_, plane)| plane).collect();
+        host.present(&planes, frame);
+        for (resource, plane) in &shown {
+            crate::resource::host_transition(*resource, plane.state);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+/// Logs the planes the title presents, at the first present and whenever
+/// their number, sizes or placement change (a few times at most).
+#[cfg(windows)]
+fn log_planes(frame: u64, given: &[Plane]) {
+    use std::fmt::Write;
+    let mut text = String::new();
+    for (i, plane) in given.iter().enumerate() {
+        let _ = write!(text, "plane {i}: {} resources", plane.count);
+        if plane.count > 0 && !plane.resources.is_null() {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                // SAFETY: a live resource.
+                let desc = unsafe { texture.GetDesc() };
+                let _ = write!(text, ", the first {}x{} format {}", desc.Width, desc.Height, desc.Format.0);
+            }
+        }
+        // SAFETY: given, a rectangle and a placement per resource.
+        let (source, placement) = unsafe { (plane.source.as_ref(), plane.placement.as_ref()) };
+        let _ = write!(
+            text,
+            ", shown {source:?} at {placement:?}, word {:#x}, then {:x?}; ",
+            plane.color_space, plane.rest
+        );
+    }
+    static LAST: std::sync::Mutex<(String, u32)> = std::sync::Mutex::new((String::new(), 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0 != text && last.1 < 16 {
+        last.1 += 1;
+        tracing::info!(frame, planes = given.len(), "the title presents {text}");
+        last.0 = text;
+    }
 }
 /// A run of destination pages: how they are mapped (0 pool pages from
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
