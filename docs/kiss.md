@@ -90,9 +90,11 @@ driver errors and no new crash, and the captures look no worse.
 | 13 | Series S: compose the title's two display planes (compose.rs) | subagent | merged: menus, loading and credits show |
 | 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f): Series S world renders lit (run s7, frame 1890) |
 | 15 | Frame-time breakdown (`frame time:` line every 5 s) and removal of four needless full card drains | subagent | merged (28ccc38), built, not yet run |
-| 17 | Console CPU instructions: ~21,000 SIGILL traps/s (CLZERO, MONITORX/MWAITX, INSERTQ) emulated per trap; patch each site once | subagent | running |
-| 18 | Per-draw recording cost (~0.28 ms CPU per draw: shadow::find under a contended mutex, bind, descriptor mirroring, SipHash) | subagent | running |
-| 19 | Memory: texture levels on demand by default, render targets on shared pages keyed by title address, open only committed runs (not whole regions) | subagent | running |
+| 17 | Console CPU instructions: patch each site once | subagent | merged: 21,000 traps/s → 8 in a whole run |
+| 18 | Per-draw recording cost | subagent | merged: per-thread lookups, lock-free slot check, fast hashers, in-place constant tables, slot chunks; per-call timing in the frame line |
+| 21 | Indirect and dispatch recording (~640 ms CPU/frame) | subagent | running |
+| 22 | Submission pass-through: last card copies in place, no merge wait, fences to the GPU | subagent | running |
+| 19 | Memory: levels on demand by default, release on title frees, room-only eviction, big buffers in place | subagent | merged |
 | 20 | Later: `globallycoherent` UAVs for the BVH builder (XCL found the builder needs it) | — | after fps/memory |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
@@ -152,5 +154,11 @@ driver errors and no new crash, and the captures look no worse.
   would save only ~52 MB, so it is dropped. Found: the 174 MB heap is split
   at a 256 MiB piece edge and stays a card copy (134 ms fetch-back); idle
   eviction churns (18,790 copies re-made); RSS grew to 21.6 GB.
+- 2026-11-25: run p10: the 174 MB heap (write-combined view memory) and two
+  smaller big buffers open in place; card copies named per frame 14 GB →
+  209 MB; fetch-back 140 → 76 ms; card memory 3.7 GB; eviction churn fixed
+  (re-made 18,790 → 629). Recording cost is almost all ExecuteIndirect
+  (~0.1 ms × 4,550) and Dispatch (~0.05–0.14 ms × 3,190); draws are cheap.
+  Submissions still serialise (enter/merge ~120 ms).
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
