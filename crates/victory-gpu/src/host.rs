@@ -151,29 +151,6 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
-/// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
-pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
-    let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
-    };
-    if budget == 0 {
-        return NORMAL_MS;
-    }
-    let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
-        HIGH_MS
-    } else if used_pct >= 75 {
-        MODERATE_MS
-    } else {
-        NORMAL_MS
-    }
-}
-
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
@@ -5388,25 +5365,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
-    }
-
-    #[test]
-    fn vram_idle_ms_scales_with_pressure() {
-        use super::vram_idle_ms;
-        let gib = 1024 * 1024 * 1024;
-        // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
-        // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
     }
 
     #[test]

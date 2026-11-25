@@ -21,12 +21,12 @@
 //! probe once at the first sweep (`unified_probe.rs`); 3, also the probe's
 //! tile-mapping test.
 //!
-//! Title memory is opened piece by piece at its first GPU use (`SLICE`),
-//! never committing a page for it, and let go when the title frees it
-//! (`crate::release`). Every piece is checked once when it is opened:
-//! vkd3d-proton gives memory of its own, and says nothing, when an import
-//! fails; the GPU must read through the heap what the CPU sees there
-//! (`check`).
+//! A region or a section is opened whole at its first GPU use, and let go
+//! when the title frees it (`crate::release`). Every heap is checked once
+//! when it is opened: vkd3d-proton gives memory of its own, and says
+//! nothing, when an import fails. `xmem` leaves a page of its own after
+//! each region and each section (the canary page), where the CPU writes a
+//! pattern the GPU must read back through the heap.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -55,42 +55,21 @@ pub fn on() -> bool {
     level() != 0
 }
 
-/// Title memory is opened piece by piece, at the first GPU use in each
-/// piece, never a whole region or section at once: a piece is at most the
-/// slice of this grid around that use (absolute addresses for a region,
-/// offsets for a section), stretched only to hold the use itself. Opening
-/// pins the piece (resident for good), so memory the GPU never reads in
-/// place (render targets and textures the title keeps there, regions
-/// reserved for later) is never pinned.
-const SLICE: u64 = 256 << 20;
-
-/// An opened piece of a unit.
-struct Piece {
-    len: u64,
-    heap: ID3D12Heap,
+/// Whether a unit is opened.
+enum State {
+    Untried,
+    Open(ID3D12Heap, u64),
+    Refused,
 }
 
-/// A region or a section: the title's bytes (a canary page of ours follows
-/// them) and the pieces of it opened so far.
+/// A region or a section: the title's bytes (the canary page follows them)
+/// and whether it is opened. A unit is opened whole, at the first GPU use of
+/// an address in it, so a title buffer never lies across two heaps (opening
+/// 256 MiB pieces instead left the title's 174 MB GPU heap across a piece
+/// edge, a card copy, and pinned no less: run p7 opened 6,565 of 6,713 MB).
 struct Unit {
     len: u64,
-    /// Opened pieces by offset in the unit; they never overlap.
-    pieces: BTreeMap<u64, Piece>,
-    /// Ranges that did not open, by offset: end, and the moment (ms) from
-    /// which to try again (`u64::MAX`: never).
-    refused: BTreeMap<u64, (u64, u64)>,
-    /// A region looked over once for the opening line ([`survey`]).
-    surveyed: bool,
-}
-
-impl Unit {
-    fn new(len: u64) -> Unit {
-        Unit { len, pieces: BTreeMap::new(), refused: BTreeMap::new(), surveyed: false }
-    }
-
-    fn opened(&self) -> u64 {
-        self.pieces.values().map(|p| p.len).sum()
-    }
+    state: State,
 }
 
 #[derive(Default)]
@@ -99,6 +78,10 @@ struct Units {
     regions: BTreeMap<usize, Unit>,
     /// `xmem` sections by handle.
     sections: HashMap<usize, Unit>,
+    /// Big buffers outside the units, opened by themselves ([`loose`]), by
+    /// first address; and the first addresses that did not open.
+    loose: BTreeMap<usize, Loose>,
+    loose_refused: std::collections::HashSet<u64>,
     /// The probe's queue, for the canaries.
     rig: Option<Rig>,
 }
@@ -113,20 +96,17 @@ fn units() -> std::sync::MutexGuard<'static, Units> {
     UNITS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Since the start: pieces opened and the bytes open now, refused, buffers
+/// Since the start: units opened and the bytes open now, refused, buffers
 /// placed and their bytes, title copies done on the GPU, CPU copies that
 /// waited for flights, textures checked by an announced write, by their
 /// hash.
 static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// For the opening line ([`tick`]): bytes open now in regions and in
-/// sections; bytes of the units touched (a piece opened in them); of the
-/// regions touched, bytes committed and bytes only reserved when first
-/// looked over; asks that ran over a piece's edge (kept as copies); asks
-/// over pages that are not committed (copies); pieces put off because no
-/// word of them could tell the title's memory from other memory; bytes let
-/// go because the title freed the memory.
-static OPENING: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// sections; bytes committed for the import (pages the title had only
+/// reserved); bytes let go because the title freed the memory; bytes open
+/// now for big buffers outside the units ([`loose`]).
+static OPENING: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 pub(crate) enum Stat {
     GpuCopy = 5,
@@ -144,7 +124,7 @@ pub(crate) fn opened_bytes() -> u64 {
 
 /// Bytes of opened title memory let go because the title freed it.
 pub(crate) fn released_bytes() -> u64 {
-    OPENING[8].load(Ordering::Relaxed)
+    OPENING[3].load(Ordering::Relaxed)
 }
 
 pub(crate) fn count(stat: Stat) {
@@ -154,78 +134,67 @@ pub(crate) fn count(stat: Stat) {
 /// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
 /// of 64 KiB), with a committed canary page of its own right after it.
 pub fn title_region(at: usize, len: usize) {
-    let old = units().regions.insert(at, Unit::new(len as u64));
+    let old = units().regions.insert(at, Unit { len: len as u64, state: State::Untried });
     if let Some(old) = old {
-        let_go(&old, true);
+        let_go(&old, 0);
     }
 }
 
 /// `xmem` made a section for physical pages, `len` bytes of the title's
 /// and a canary page after them.
 pub fn title_section(handle: usize, len: u64) {
-    units().sections.insert(handle, Unit::new(len));
+    units().sections.insert(handle, Unit { len, state: State::Untried });
 }
 
-/// The section's handle is closed (its pages are all freed): its pieces
-/// are let go; the heaps live on in the buffers placed in them until those
-/// go, as for a region the title frees ([`released`]).
+/// The section's handle is closed (its pages are all freed): it is let go;
+/// its heap lives on in the buffers placed in it until those go, as for a
+/// region the title frees ([`released`]).
 pub fn title_section_gone(handle: usize) {
     let gone = units().sections.remove(&handle);
     if let Some(unit) = gone {
-        let_go(&unit, false);
+        let_go(&unit, 1);
     }
 }
 
-/// Counts a unit's pieces as let go (dropping it drops our heaps).
-fn let_go(unit: &Unit, region: bool) {
-    let bytes = unit.opened();
-    if bytes > 0 {
-        STATS[1].fetch_sub(bytes, Ordering::Relaxed);
-        OPENING[if region { 0 } else { 1 }].fetch_sub(bytes, Ordering::Relaxed);
-        OPENING[8].fetch_add(bytes, Ordering::Relaxed);
+/// Counts an opened unit as let go (`kind`: 0 region, 1 section); dropping
+/// it drops our reference to its heap.
+fn let_go(unit: &Unit, kind: usize) {
+    if let State::Open(..) = unit.state {
+        STATS[1].fetch_sub(unit.len, Ordering::Relaxed);
+        OPENING[kind].fetch_sub(unit.len, Ordering::Relaxed);
+        OPENING[3].fetch_add(unit.len, Ordering::Relaxed);
     }
 }
 
-/// The title freed or decommitted `[at, at + len)` (`crate::release`): the
-/// region it lies in goes if all of it is freed, else the pieces that lie
-/// inside it whole. Placed buffers hold their heap, so the heap goes when
-/// the last of them does.
+/// The title freed or decommitted `[at, at + len)` (`crate::release`): a
+/// region that lies in it whole goes. Placed buffers hold their heap, so
+/// the heap goes when the last of them does.
 pub(crate) fn released(at: usize, len: usize) {
     if !on() || at as u64 >= TIB || len == 0 {
         return;
     }
     let end = at.saturating_add(len);
     let mut u = units();
-    let bases: Vec<usize> = u
+    let gone: Vec<usize> = u
         .regions
-        .range(..end)
-        .rev()
-        .take_while(|(base, unit)| **base + unit.len as usize > at)
+        .range(at..end)
+        .filter(|(base, unit)| **base + unit.len as usize <= end)
         .map(|(base, _)| *base)
         .collect();
-    for base in bases {
-        let Some(unit) = u.regions.get_mut(&base) else { continue };
-        if at <= base && base + unit.len as usize <= end {
-            if let Some(unit) = u.regions.remove(&base) {
-                let_go(&unit, true);
-            }
-            continue;
-        }
-        let (lo, hi) = ((at.max(base) - base) as u64, (end.min(base + unit.len as usize) - base) as u64);
-        let inside: Vec<u64> = unit.pieces.range(lo..hi).filter(|(o, p)| **o + p.len <= hi).map(|(o, _)| *o).collect();
-        let mut bytes = 0;
-        for o in inside {
-            if let Some(p) = unit.pieces.remove(&o) {
-                bytes += p.len;
-            }
-        }
-        unit.refused.retain(|&o, &mut (e, _)| e <= lo || o >= hi);
-        if bytes > 0 {
-            STATS[1].fetch_sub(bytes, Ordering::Relaxed);
-            OPENING[0].fetch_sub(bytes, Ordering::Relaxed);
-            OPENING[8].fetch_add(bytes, Ordering::Relaxed);
+    for base in gone {
+        if let Some(unit) = u.regions.remove(&base) {
+            let_go(&unit, 0);
         }
     }
+    let gone: Vec<usize> = u.loose.range((at & !(K64 as usize - 1))..end).filter(|(lo, l)| **lo + l.len as usize <= end.next_multiple_of(K64 as usize)).map(|(lo, _)| *lo).collect();
+    for lo in gone {
+        if let Some(l) = u.loose.remove(&lo) {
+            STATS[1].fetch_sub(l.len, Ordering::Relaxed);
+            OPENING[4].fetch_sub(l.len, Ordering::Relaxed);
+            OPENING[3].fetch_add(l.len, Ordering::Relaxed);
+        }
+    }
+    u.loose_refused.retain(|&lo| lo < at as u64 || lo >= end as u64);
 }
 
 /// A buffer placed over title memory.
@@ -240,8 +209,7 @@ pub(crate) struct Placed {
 }
 
 /// A buffer placed over title memory `[start, start + len)`, if the memory
-/// is a region or one run of a section and its piece opens (opened on
-/// first use).
+/// is a region or one run of a section that opens (opened on first use).
 pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
     if !on() || start >= TIB || len == 0 {
         return None;
@@ -252,26 +220,26 @@ pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
     let run = crate::views::section_run(start as usize, len as usize);
     let mut u = units();
     let u = &mut *u;
-    let (heap, lo, size, offset) = match run {
+    let (heap, size, offset) = match run {
         Some((section, offset)) => {
             let unit = u.sections.get_mut(&section)?;
             if offset.checked_add(len)? > unit.len {
                 return None;
             }
-            let (heap, lo, size) = piece(device, &mut u.rig, unit, Home::Section(section), offset, len)?;
-            (heap, lo, size, offset)
+            let (heap, size) = open(device, &mut u.rig, unit, Home::Section(section))?;
+            (heap, size, offset)
         }
-        None => {
-            let (&base, unit) = u.regions.range_mut(..=start as usize).next_back()?;
-            if end > base as u64 + unit.len {
-                return None;
+        None => match u.regions.range_mut(..=start as usize).next_back() {
+            Some((&base, unit)) if start < base as u64 + unit.len => {
+                if end > base as u64 + unit.len {
+                    return None;
+                }
+                let (heap, size) = open(device, &mut u.rig, unit, Home::Region(base))?;
+                (heap, size, start - base as u64)
             }
-            let offset = start - base as u64;
-            let (heap, lo, size) = piece(device, &mut u.rig, unit, Home::Region(base), offset, len)?;
-            (heap, lo, size, offset)
-        }
+            _ => loose(device, u, start, end)?,
+        },
     };
-    let offset = offset - lo;
     let aligned = offset & !(K64 - 1);
     let bias = offset - aligned;
     let width = (bias + len).next_multiple_of(K64).min(size - aligned);
@@ -290,215 +258,128 @@ enum Home {
     Section(usize),
 }
 
-/// The opened piece of `unit` that holds `[offset, offset + len)`: its
-/// heap, its first byte's offset in the unit and its bytes; opened now if
-/// there is none. `None`: the ask runs over the edge of a piece, lies on
-/// pages that are not committed, or its piece does not open (the caller
-/// copies).
-fn piece(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Home, offset: u64, len: u64) -> Option<(ID3D12Heap, u64, u64)> {
-    let end = offset + len;
-    if let Some((&lo, p)) = unit.pieces.range(..=offset).next_back()
-        && offset < lo + p.len
-    {
-        if end <= lo + p.len {
-            return Some((p.heap.clone(), lo, p.len));
-        }
-        OPENING[5].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let now = crate::host::now_ms();
-    if let Some((_, &(stop, until))) = unit.refused.range(..end).next_back()
-        && stop > offset
-        && now < until
-    {
-        return None;
-    }
-    // The slice of the grid around the ask, stretched to hold the ask, and
-    // clipped to the pieces beside it.
-    let origin = match home {
-        Home::Region(base) => base as u64,
-        Home::Section(_) => 0,
-    };
-    let grid = (origin + offset) & !(SLICE - 1);
-    let mut lo = (grid.max(origin) - origin).min(offset & !(K64 - 1));
-    let mut hi = (grid + SLICE - origin).max(end.next_multiple_of(K64)).min(unit.len);
-    if let Some((&before, p)) = unit.pieces.range(..offset).next_back() {
-        lo = lo.max(before + p.len);
-    }
-    if let Some((&after, _)) = unit.pieces.range(offset..).next() {
-        if after < end {
-            OPENING[5].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        hi = hi.min(after);
-    }
-    if let Home::Region(base) = home {
-        if !unit.surveyed {
-            unit.surveyed = true;
-            survey(base, unit.len);
-        }
-        // Only pages the title committed: none is committed for the import.
-        match committed_run(base, lo, hi, offset, end) {
-            Some((a, b)) => (lo, hi) = (a, b),
-            None => {
-                OPENING[6].fetch_add(1, Ordering::Relaxed);
-                unit.refused.insert(offset, (end, now + 2_000));
-                return None;
+/// The unit's heap and its bytes, opening it the first time.
+fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Home) -> Option<(ID3D12Heap, u64)> {
+    if let State::Untried = unit.state {
+        let started = std::time::Instant::now();
+        // SAFETY: the unit's memory, as `xmem` made it, and its canary page.
+        let opened = unsafe { open_unit(device, rig, unit.len, home) };
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (what, at, kind) = match home {
+            Home::Region(at) => ("region", at, 0),
+            Home::Section(handle) => ("section", handle, 1),
+        };
+        unit.state = match opened {
+            Ok(heap) => {
+                STATS[0].fetch_add(1, Ordering::Relaxed);
+                STATS[1].fetch_add(unit.len, Ordering::Relaxed);
+                OPENING[kind].fetch_add(unit.len, Ordering::Relaxed);
+                crate::memcap::count(crate::memcap::Use::Opened, unit.len);
+                tracing::info!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, ms = format_args!("{ms:.0}"), "unified: title memory opened as a heap");
+                State::Open(heap, unit.len + K64)
             }
-        }
+            Err(why) => {
+                STATS[2].fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, why, "unified: title memory NOT opened; its buffers keep copies");
+                State::Refused
+            }
+        };
     }
-    if lo > offset || hi < end || hi <= lo {
-        OPENING[5].fetch_add(1, Ordering::Relaxed);
+    match &unit.state {
+        State::Open(heap, size) => Some((heap.clone(), *size)),
+        _ => None,
+    }
+}
+
+/// Title buffers of this size and up that lie in no `xmem` unit (memory a
+/// committed resource got from the title's allocator, like its 174 MB GPU
+/// heap at 0xb9c0000, run p7) are opened as a heap of their own, over the
+/// 64 KiB pages that hold them: else they stay a copy in the card's memory,
+/// compared and fetched back after every submission that writes them.
+const LOOSE_MIN: u64 = 16 << 20;
+
+/// A heap opened over the pages of one big buffer outside the units.
+struct Loose {
+    len: u64,
+    heap: ID3D12Heap,
+}
+
+/// The heap of a big buffer outside the units that holds `[start, end)`:
+/// the heap, its bytes, and the offset of `start` in it; opened now for a
+/// buffer of [`LOOSE_MIN`] bytes or more over committed read-write pages.
+fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(ID3D12Heap, u64, u64)> {
+    if let Some((&at, l)) = u.loose.range(..=start as usize).next_back()
+        && end <= at as u64 + l.len
+    {
+        return Some((l.heap.clone(), l.len, start - at as u64));
+    }
+    if end - start < LOOSE_MIN {
+        return None;
+    }
+    let (lo, hi) = (start & !(K64 - 1), end.next_multiple_of(K64));
+    if u.loose_refused.contains(&lo) {
+        return None;
+    }
+    // Not over another one.
+    if u.loose.range(..hi as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > lo) {
         return None;
     }
     let started = std::time::Instant::now();
-    // SAFETY: the unit's memory as `xmem` made it; `[lo, hi)` lies in it.
-    let opened = unsafe { open_piece(device, rig, home, lo, hi - lo, offset - lo) };
-    let ms = started.elapsed().as_secs_f64() * 1000.0;
-    let (what, at) = match home {
-        Home::Region(at) => ("region", at),
-        Home::Section(handle) => ("section", handle),
-    };
-    match opened {
-        Ok(Some(heap)) => {
-            let bytes = hi - lo;
-            if unit.pieces.is_empty() {
-                OPENING[2].fetch_add(unit.len, Ordering::Relaxed);
-            }
-            STATS[0].fetch_add(1, Ordering::Relaxed);
-            STATS[1].fetch_add(bytes, Ordering::Relaxed);
-            OPENING[if matches!(home, Home::Region(_)) { 0 } else { 1 }].fetch_add(bytes, Ordering::Relaxed);
-            crate::memcap::count(crate::memcap::Use::Opened, bytes);
-            tracing::info!(
-                what,
-                at = format_args!("{at:#x}"),
-                offset_mb = lo >> 20,
-                mb = bytes >> 20,
-                unit_mb = unit.len >> 20,
-                ms = format_args!("{ms:.0}"),
-                "unified: title memory opened as a heap"
-            );
-            unit.pieces.insert(lo, Piece { len: bytes, heap: heap.clone() });
-            Some((heap, lo, bytes))
+    // SAFETY: the pages are checked committed and read-write first.
+    let opened = unsafe {
+        if !committed_rw(lo as usize, (hi - lo) as usize) {
+            Err("pages not all committed and read-write".to_owned())
+        } else {
+            touch(lo as *mut u8, (hi - lo) as usize);
+            device
+                .cast::<ID3D12Device13>()
+                .and_then(|d| d.OpenExistingHeapFromAddress1::<ID3D12Heap>(lo as *const _, (hi - lo) as usize))
+                .map_err(|e| format!("OpenExistingHeapFromAddress1: {e}"))
+                .and_then(|heap| match check(device, &mut u.rig, &heap, lo as *const u8, hi - lo, start - lo) {
+                    Ok(true) => Ok(heap),
+                    Ok(false) => Err("nothing in it to check it by".to_owned()),
+                    Err(why) => Err(why),
+                })
         }
-        Ok(None) => {
-            // Nothing in it tells the title's bytes from other memory yet:
-            // asked again in a while.
-            OPENING[7].fetch_add(1, Ordering::Relaxed);
-            unit.refused.insert(lo, (hi, now + 2_000));
-            None
+    };
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    match opened {
+        Ok(heap) => {
+            let len = hi - lo;
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            STATS[1].fetch_add(len, Ordering::Relaxed);
+            OPENING[4].fetch_add(len, Ordering::Relaxed);
+            crate::memcap::count(crate::memcap::Use::Opened, len);
+            tracing::info!(what = "buffer", at = format_args!("{lo:#x}"), mb = len >> 20, ms = format_args!("{ms:.0}"), "unified: title memory opened as a heap");
+            u.loose.insert(lo as usize, Loose { len, heap: heap.clone() });
+            Some((heap, len, start - lo))
         }
         Err(why) => {
             STATS[2].fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                what,
-                at = format_args!("{at:#x}"),
-                offset_mb = lo >> 20,
-                mb = (hi - lo) >> 20,
-                why,
-                "unified: title memory NOT opened; its buffers keep copies"
-            );
-            unit.refused.insert(lo, (hi, u64::MAX));
+            tracing::warn!(what = "buffer", at = format_args!("{lo:#x}"), mb = (hi - lo) >> 20, why, "unified: title memory NOT opened; its buffers keep copies");
+            u.loose_refused.insert(lo);
             None
         }
     }
 }
 
-/// Once per region, at its first piece: its committed and reserved bytes
-/// (the opening of before committed and pinned all of it).
-fn survey(base: usize, len: u64) {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let end = base + len as usize;
-    let mut at = base;
-    while at < end {
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: a query into our structure.
-        if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
-            return;
-        }
-        let stop = (info.BaseAddress as usize + info.RegionSize).min(end).max(at + 4096);
-        match info.State {
-            MEM_COMMIT => OPENING[3].fetch_add((stop - at) as u64, Ordering::Relaxed),
-            MEM_RESERVE => OPENING[4].fetch_add((stop - at) as u64, Ordering::Relaxed),
-            _ => 0,
-        };
-        at = stop;
-    }
-}
-
-/// Of the region at `base`, the run of committed read-write pages within
-/// `[lo, hi)` that holds `[offset, end)`, cut inward to 64 KiB; `None` if
-/// a page of the ask is not committed.
-fn committed_run(base: usize, lo: u64, hi: u64, offset: u64, end: u64) -> Option<(u64, u64)> {
+/// Whether every page of `[at, at + len)` is committed read-write.
+fn committed_rw(at: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
-    let mut at = lo;
-    let mut run: Option<u64> = None;
-    while at < hi {
+    let end = at + len;
+    let mut p = at;
+    while p < end {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: a query into our structure.
-        if unsafe { VirtualQuery((base as u64 + at) as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
-            return None;
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+            || info.State != MEM_COMMIT
+            || info.Protect != PAGE_READWRITE
+        {
+            return false;
         }
-        let stop = (info.BaseAddress as u64 + info.RegionSize as u64).saturating_sub(base as u64).min(hi).max(at + 4096);
-        if info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE {
-            run.get_or_insert(at);
-        } else {
-            if at >= end {
-                // The run that holds the ask ends here.
-                break;
-            }
-            run = None;
-            if stop > offset {
-                // A page of the ask is not committed.
-                return None;
-            }
-        }
-        at = stop;
+        p = (info.BaseAddress as usize + info.RegionSize).max(p + 4096);
     }
-    let from = run?;
-    let to = at.min(hi);
-    (from <= offset && to >= end).then(|| (from.next_multiple_of(K64), to & !(K64 - 1)))
-}
-
-/// Opens `[lo, lo + len)` of a region or a section as a heap, and checks it
-/// ([`check`]); `hint`: where in it the GPU is about to read. `Ok(None)`:
-/// opened, but nothing in it could tell the title's memory from other
-/// memory yet.
-unsafe fn open_piece(device: &ID3D12Device, rig: &mut Option<Rig>, home: Home, lo: u64, len: u64, hint: u64) -> Result<Option<ID3D12Heap>, String> {
-    let open = |at: *const u8| {
-        device
-            .cast::<ID3D12Device13>()
-            // SAFETY: committed memory of `len` bytes at `at`.
-            .and_then(|d| unsafe { d.OpenExistingHeapFromAddress1::<ID3D12Heap>(at.cast(), len as usize) })
-            .map_err(|e| format!("OpenExistingHeapFromAddress1: {e}"))
-    };
-    // SAFETY (the whole function): the unit's memory as `xmem` made it.
-    unsafe {
-        match home {
-            Home::Region(base) => {
-                let at = (base as u64 + lo) as *mut u8;
-                touch(at, len as usize);
-                let heap = open(at)?;
-                Ok(check(device, rig, &heap, at, len, hint)?.then_some(heap))
-            }
-            Home::Section(handle) => {
-                // A view of the piece alone, opened and let go again, as
-                // vkd3d-proton does with a whole section
-                // (`OpenExistingHeapFromFileMapping`): the driver keeps the
-                // pages pinned, and they are the pages every view shows.
-                let view = mem::MapViewOfFile(handle as _, mem::FILE_MAP_WRITE, (lo >> 32) as u32, lo as u32, len as usize);
-                if view.Value.is_null() {
-                    return Err("no view of the piece".to_owned());
-                }
-                crate::mapstat::mapped(crate::mapstat::Site::Canary, len as usize);
-                let at = view.Value.cast::<u8>();
-                let checked = open(at).and_then(|heap| Ok(check(device, rig, &heap, at, len, hint)?.then_some(heap)));
-                mem::UnmapViewOfFile(view);
-                crate::mapstat::unmapped(crate::mapstat::Site::Canary, len as usize);
-                checked
-            }
-        }
-    }
+    true
 }
 
 /// Writes every page of `[at, at + len)` once in place (an atomic add of 0,
@@ -571,6 +452,7 @@ unsafe fn check(device: &ID3D12Device, rig: &mut Option<Rig>, heap: &ID3D12Heap,
     }
 }
 
+
 /// A canary pattern no memory holds by chance.
 fn pattern() -> [u8; 16] {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
@@ -579,6 +461,94 @@ fn pattern() -> [u8; 16] {
         *b = (t.rotate_left(i as u32 * 5) as u8) ^ (0xa5u8.wrapping_add(i as u8 * 37));
     }
     out
+}
+
+/// Opens a region or a section as a heap and checks it with its canary
+/// page.
+unsafe fn open_unit(device: &ID3D12Device, rig: &mut Option<Rig>, len: u64, home: Home) -> Result<ID3D12Heap, String> {
+    let total = len + K64;
+    let canary = pattern();
+    // SAFETY (the whole function): the unit's memory as `xmem` made it.
+    unsafe {
+        let (heap, view) = match home {
+            Home::Region(base) => {
+                ready_region(base, total as usize)?;
+                let heap = device
+                    .cast::<ID3D12Device13>()
+                    .and_then(|d| d.OpenExistingHeapFromAddress1::<ID3D12Heap>(base as *const _, total as usize))
+                    .map_err(|e| format!("OpenExistingHeapFromAddress1: {e}"))?;
+                std::ptr::copy_nonoverlapping(canary.as_ptr(), (base + len as usize) as *mut u8, 16);
+                (heap, None)
+            }
+            Home::Section(handle) => {
+                let heap = device
+                    .cast::<ID3D12Device3>()
+                    .and_then(|d| d.OpenExistingHeapFromFileMapping::<ID3D12Heap>(windows::Win32::Foundation::HANDLE(handle as *mut _)))
+                    .map_err(|e| format!("OpenExistingHeapFromFileMapping: {e}"))?;
+                let view = mem::MapViewOfFile(handle as _, mem::FILE_MAP_WRITE, (len >> 32) as u32, len as u32, K64 as usize);
+                if view.Value.is_null() {
+                    return Err("no view of the canary page".to_owned());
+                }
+                crate::mapstat::mapped(crate::mapstat::Site::Canary, K64 as usize);
+                std::ptr::copy_nonoverlapping(canary.as_ptr(), view.Value.cast::<u8>(), 16);
+                (heap, Some(view))
+            }
+        };
+        let check = (|| {
+            if rig.is_none() {
+                *rig = Some(Rig::new(device).map_err(|e| format!("no queue for the canary: {e}"))?);
+            }
+            let rig = rig.as_mut().ok_or("no queue")?;
+            let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+            let probe = place_resource(device, &heap, len, &buffer_desc(K64, flags), D3D12_RESOURCE_STATE_COMMON);
+            let probe = probe.map_err(|e| format!("no buffer on the canary page: {}", hr::<()>(&Err(e))))?;
+            let got = rig.fetch(&probe, 0, 16).map_err(|e| format!("canary not read: {e}"))?;
+            if got[..] == canary[..] {
+                Ok(())
+            } else {
+                Err("the heap is not the title's memory (the driver's silent fallback): canary differs".to_owned())
+            }
+        })();
+        if let Some(view) = view {
+            mem::UnmapViewOfFile(view);
+            crate::mapstat::unmapped(crate::mapstat::Site::Canary, K64 as usize);
+        }
+        check.map(|()| heap)
+    }
+}
+
+/// Makes every page of a region committed and writable for the import:
+/// reserved pages are committed (counted: run p7 found none), and every
+/// page is written once in place (an atomic add of 0, which changes no byte
+/// whatever another thread does) so that pages a write watch keeps
+/// read-only become writable and can be pinned. Refuses pages the title
+/// protected otherwise.
+unsafe fn ready_region(base: usize, total: usize) -> Result<(), String> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualQuery};
+    let end = base + total;
+    let mut at = base;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our structure.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return Err(format!("no answer for {at:#x}"));
+        }
+        let stop = (info.BaseAddress as usize + info.RegionSize).min(end);
+        match info.State {
+            MEM_COMMIT if info.Protect == PAGE_READWRITE => {}
+            // SAFETY: reserved pages of the region.
+            MEM_RESERVE if !unsafe { VirtualAlloc(at as *const _, stop - at, MEM_COMMIT, PAGE_READWRITE) }.is_null() => {
+                OPENING[2].fetch_add((stop - at) as u64, Ordering::Relaxed);
+            }
+            state => return Err(format!("pages at {at:#x} are state {state:#x}, protection {:#x}", info.Protect)),
+        }
+        for page in (at..stop).step_by(4096) {
+            // SAFETY: committed read-write memory of the title's.
+            unsafe { (*(page as *const std::sync::atomic::AtomicU8)).fetch_add(0, Ordering::Relaxed) };
+        }
+        at = stop;
+    }
+    Ok(())
 }
 
 // Announced writes, for the host textures (`texture.rs`).
@@ -693,25 +663,14 @@ pub(crate) fn tick() {
         ranges
     );
     let o: Vec<u64> = OPENING.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    let pieces: usize = {
-        let u = units();
-        u.regions.values().chain(u.sections.values()).map(|u| u.pieces.len()).sum()
-    };
     tracing::info!(
-        "unified opening: title memory open now {} MB in {} pieces (regions {} MB, sections {} MB) of {} MB in the units touched; \
-         the regions touched had {} MB committed and {} MB only reserved when first looked over (opened whole before, all of it \
-         committed and pinned); asks kept as copies: over a piece's edge {}, over pages not committed {}; pieces put off (nothing to \
-         check them by yet) {}; let go because the title freed the memory {} MB",
+        "unified opening: title memory open now {} MB (regions {} MB, sections {} MB, big buffers outside them {} MB); pages \
+         committed for the import {} MB; let go because the title freed the memory {} MB",
         s[1] >> 20,
-        pieces,
         o[0] >> 20,
         o[1] >> 20,
+        o[4] >> 20,
         o[2] >> 20,
         o[3] >> 20,
-        o[4] >> 20,
-        o[5],
-        o[6],
-        o[7],
-        o[8] >> 20,
     );
 }

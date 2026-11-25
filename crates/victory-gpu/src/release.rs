@@ -58,6 +58,7 @@ pub fn title_memory_released(at: usize, len: usize) {
 
 /// Every ten seconds, from the sweep: the release line.
 pub(crate) fn tick() {
+    watch_process_memory();
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
     let last = LAST.load(Relaxed);
@@ -96,4 +97,112 @@ pub(crate) fn tick() {
         alive[1] >> 20,
         staged >> 20,
     );
+}
+
+/// Every thirty seconds, on a thread of its own: where the process's
+/// resident memory is, as Linux counts it (`/proc/self/smaps`, read through
+/// Wine's `Z:` drive; off where that does not exist). Split by title
+/// addresses (below 1 TiB: the title's regions, its section views, its own
+/// heaps) and host addresses (above: victory, vkd3d-proton, Wine), anonymous
+/// against shared (sections, `memfd`), the NVIDIA driver's mappings, and
+/// files; then the largest mappings. Run p7 had 21.6 GB resident against
+/// about 14 GB before, with title memory opened as heaps the same.
+pub(crate) fn watch_process_memory() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-procmem".into()).spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                match std::fs::read_to_string(r"Z:\proc\self\smaps") {
+                    Ok(text) => tracing::info!("{}", process_memory(&text)),
+                    Err(e) => {
+                        tracing::info!(error = %e, "process memory: /proc/self/smaps cannot be read; no process memory line");
+                        return;
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// A mapping of `/proc/self/smaps` being read: start, bytes, path, resident
+/// kB, anonymous kB.
+type Mapping = (u64, u64, String, u64, u64);
+
+/// The process memory line from the text of `/proc/self/smaps`.
+fn process_memory(text: &str) -> String {
+    const TIB: u64 = 1 << 40;
+    // Resident kB: title anonymous, title shared, host anonymous, host
+    // shared, driver, files.
+    let mut kb = [0u64; 6];
+    let mut all = 0u64;
+    let mut maps = 0u64;
+    let mut top: Vec<(u64, u64, u64, String)> = Vec::new();
+    let mut cur: Option<Mapping> = None;
+    let mut finish = |cur: Option<Mapping>, kb: &mut [u64; 6], all: &mut u64| {
+        let Some((start, bytes, path, rss, anon)) = cur else { return };
+        *all += rss;
+        let shared = rss.saturating_sub(anon);
+        if path.starts_with("/dev/nvidia") || path.starts_with("/dev/dri") {
+            kb[4] += rss;
+        } else if start < TIB {
+            kb[0] += anon;
+            kb[1] += shared;
+        } else if path.is_empty() || path.starts_with('[') || path.starts_with("/memfd:") || path.ends_with("(deleted)") {
+            kb[2] += anon;
+            kb[3] += shared;
+        } else {
+            kb[5] += rss;
+        }
+        if rss >= 64 << 10 {
+            top.push((rss, start, bytes, path));
+        }
+    };
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if let Some((a, b)) = first.split_once('-')
+            && let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))
+        {
+            finish(cur.take(), &mut kb, &mut all);
+            maps += 1;
+            let path = words.skip(4).collect::<Vec<_>>().join(" ");
+            cur = Some((a, b.saturating_sub(a), path, 0, 0));
+            continue;
+        }
+        let value = words.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        match (first, cur.as_mut()) {
+            ("Rss:", Some(c)) => c.3 = value,
+            ("Anonymous:", Some(c)) => c.4 = value,
+            _ => {}
+        }
+    }
+    finish(cur.take(), &mut kb, &mut all);
+    drop(finish);
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let largest: Vec<String> = top
+        .iter()
+        .take(8)
+        .map(|(rss, start, bytes, path)| {
+            format!("{start:#x} {} of {} MB {}", rss >> 10, bytes >> 20, if path.is_empty() { "anon" } else { path })
+        })
+        .collect();
+    format!(
+        "process memory (Linux): resident {} MB in {} mappings; title addresses: anonymous {} MB, shared {} MB; host addresses: \
+         anonymous {} MB, shared {} MB; NVIDIA driver mappings {} MB; files {} MB; of ours in the PC's memory: title memory opened \
+         as heaps {} MB, staging {} MB, spare staging {} MB, buffers pooled {} MB; largest (resident of size): {}",
+        all >> 10,
+        maps,
+        kb[0] >> 10,
+        kb[1] >> 10,
+        kb[2] >> 10,
+        kb[3] >> 10,
+        kb[4] >> 10,
+        kb[5] >> 10,
+        crate::unified::opened_bytes() >> 20,
+        crate::texture::staging_bytes().0 >> 20,
+        crate::texture::staging_bytes().1 >> 20,
+        crate::memcap::pooled() >> 20,
+        largest.join("; ")
+    )
 }

@@ -445,45 +445,33 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   the title's, and announces each (`title_section`, `title_section_gone`
   when its handle closes). Opening a 512 MiB section pins only that much.
 - **Opening** (`unified.rs` `place`, at the first GPU use of an address in
-  a unit). A region: its reserved pages are committed, every page is
-  written once in place with an atomic add of 0 (so pages a write watch
-  keeps read-only can be pinned), then `OpenExistingHeapFromAddress1`
-  over the region and its canary page. A section:
-  `OpenExistingHeapFromFileMapping`. Then the canary: the CPU writes a
-  16-byte pattern on the canary page, the GPU reads it back through the
-  heap (the probe's own queue), and they must match. A mismatch is
-  vkd3d-proton's silent fallback; the unit is refused, logged, and its
-  buffers keep copies.
+  a unit), whole, so that no title buffer lies across two heaps. A region:
+  its reserved pages are committed (counted in the opening line; run p7
+  found none), every page is written once in place with an atomic add of 0
+  (so pages a write watch keeps read-only can be pinned), then
+  `OpenExistingHeapFromAddress1` over the region and its canary page. A
+  section: `OpenExistingHeapFromFileMapping`. Then the canary: the CPU
+  writes a 16-byte pattern on the canary page, the GPU reads it back
+  through the heap (the probe's own queue), and they must match. A mismatch
+  is vkd3d-proton's silent fallback; the unit is refused, logged, and its
+  buffers keep copies. (Opening 256 MiB pieces instead, tried in run p7,
+  pinned 6,565 of 6,713 MB all the same and split buffers at piece edges.)
+- **Big buffers outside the units** (`unified.rs` `loose`): a title buffer
+  of 16 MiB or more in memory no unit holds (a committed resource's memory
+  from the title's allocator: the 174 MB GPU heap at 0xb9c0000 in run p7)
+  is opened as a heap of its own over its 64 KiB pages, checked by a word
+  the GPU must read as the CPU sees it, and let go when that memory is
+  freed.
 - **Buffers in place** (`shadow.rs`). A title buffer of any size, or a
-- **Opening** (`unified.rs` `place`, `piece`), piece by piece: at the
-  first GPU use of an address, the 256 MiB slice around it (absolute
-  addresses for a region, section offsets for a section), stretched only to
-  hold that use and cut to the pieces already open beside it. In a region
-  only committed read-write pages are opened (the run of them that holds the
-  use); no page is committed for the import, and an ask over pages that are
-  not committed keeps its copy. The pages are written once in place with an
-  atomic add of 0 (so pages a write watch keeps read-only can be pinned),
-  then `OpenExistingHeapFromAddress1` over the piece. A section piece: a
-  view of the piece alone is mapped, opened with
-  `OpenExistingHeapFromAddress1` and unmapped again (what vkd3d-proton's
-  `OpenExistingHeapFromFileMapping` does with the whole section). The check:
-  the GPU reads a word the CPU sees as not zero (in the ask, then at 64
-  places) and must find the same; if all are zero a pattern is put in a zero
-  word for the GPU to read and taken out again at once. A mismatch is
-  vkd3d-proton's silent fallback; the piece is refused, logged, and its
-  buffers keep copies. Until 2026-11-25 a whole region (its reserved pages
-  committed) or a whole 512 MiB section was opened at once: 6.7 GB pinned
-  in the Series S world (2.4 GB of regions, 4.3 GB of sections).
-- **Buffers in place** (`shadow.rs`). A title buffer under 16 MiB, or a
   4 MiB window of title memory outside buffers, whose memory lies in one
-  opened region or one run of one section, becomes a buffer placed over
-  the title's own bytes (on the 64 KiB line below them; `Shadow::offset`
-  counts the bias). For it, `refresh` only keeps the buffer alive with
-  the list, a submission takes no snapshot, nothing is copied back, no
-  write watch is asked. Shader writes are still declared, so that what the
-  CPU prepares while a submission runs waits where it writes (`host.rs`
-  `late_blocked`). A view that the title maps anew marks its in-place
-  buffers stale and the next ask places new ones.
+  opened region, one run of one section or one opened big buffer, becomes
+  a buffer placed over the title's own bytes (on the 64 KiB line below
+  them; `Shadow::offset` counts the bias). For it, `refresh` only keeps the
+  buffer alive with the list, a submission takes no snapshot, nothing is
+  copied back, no write watch is asked. Shader writes are still declared,
+  so that what the CPU prepares while a submission runs waits where it
+  writes (`host.rs` `late_blocked`). A view that the title maps anew marks
+  its in-place buffers stale and the next ask places new ones.
 - **What stays a copy**: since 2026-11-25 the title's 174 MB GPU heap is in
   place too. Its copy in the card's memory cost a hash compare after every
   submission that wrote it and a fetch of what shaders wrote that waited
@@ -610,12 +598,10 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
 Content is streamed in once and stays until the title unloads it; what
 victory holds for title memory follows it.
 
-- **Pieces, not units** (section 12, Opening): only what the GPU reads in
-  place is pinned. Line every 10 s: `unified opening: title memory open now
-  … MB in … pieces (regions …, sections …) of … MB in the units touched; the
-  regions touched had … MB committed and … MB only reserved …; asks kept as
-  copies: over a piece's edge …, over pages not committed …; pieces put off
-  …; let go because the title freed the memory … MB`.
+- **Units open whole** (section 12, Opening). Line every 10 s: `unified
+  opening: title memory open now … MB (regions …, sections …, big buffers
+  outside them …); pages committed for the import … MB; let go because the
+  title freed the memory … MB`.
 - **Levels on demand** (`tiles.rs`) is the only path on a card with tiled
   resources tier 2, with texture quality applied to the reserved copy. Line:
   `levels on demand (on): … textures made level by level, their levels … MB,
@@ -630,7 +616,11 @@ victory holds for title memory follows it.
   and no slot holds them, else when none does; running submissions keep
   them until they land), and opened pieces there go (a heap lives until its
   last placed buffer). Released resources free their host copy at once, as
-  before. The idle sweep is the net under the budget. Line: `memory release
+  before. Eviction is for room only: while the card's memory in use is at
+  90% of the layer's budget or more, idle copies go, the least recently
+  used first, down to 85%, never one used in the last 5 s (and 4 frames);
+  idle copies used to go after 5 s whatever the room (run p7: 43,095 let
+  go, 18,790 made again). Line: `memory release
   since the start: because the title freed or unmapped memory … MB …,
   because the title released resources … MB …; by idle eviction … MB …;
   made again after either …; host copies alive …`. "Made again" growing
@@ -641,3 +631,9 @@ victory holds for title memory follows it.
   memory another one covers; sharing card pages by title address would
   save about … MB`. The large targets of the 13:53 log (15 of 16 MB or
   more) do not overlap.
+- **Process memory** (`release.rs`, every 30 s, Linux view through `Z:`):
+  `process memory (Linux): resident … MB in … mappings; title addresses:
+  anonymous …, shared …; host addresses: anonymous …, shared …; NVIDIA
+  driver mappings …; files …; of ours in the PC's memory: …; largest …`.
+  Run p7 had 21.6 GB resident against about 14 GB before; this line says
+  where.

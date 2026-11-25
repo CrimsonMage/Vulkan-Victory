@@ -994,6 +994,11 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // A big buffer's memory opened by itself goes with it
+        // (`crate::unified`, loose heaps; buffers placed in it keep it
+        // until they go).
+        #[cfg(windows)]
+        crate::unified::released(self.ptr.as_ptr() as usize, self.layout.size());
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -1678,53 +1683,76 @@ pub(crate) fn room_lately() -> bool {
 #[cfg(windows)]
 const ROOM_PERCENT: u64 = 90;
 
-/// Lets go of the host copies of textures the title fills that nothing
-/// names any more: placed textures were never released (one host texture
-/// per address and description ever viewed: 18,639 of them, 2.5 GB, after
-/// nine minutes of run 24), nor those of texture objects before the title
-/// released them. A host copy goes when
-/// - the title fills the texture ([`fills`]) and the host never copied
-///   into it: its contents are in title memory;
-/// - only the resource holds it: no list not yet reset names it (a list
-///   holds the copies of the textures it uses, `HostList::transition`);
-/// - only the host copy holds the host texture: no descriptor slot views
-///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
-///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// Lets go of host copies of textures the title fills, for room. Content is
+/// streamed in once and stays until the title unloads it (its frees and
+/// unmaps let go of what lay there at once: [`released`]); a host copy is
+/// let go here only
+/// - if the title freed its memory while a list or a slot still held the
+///   copy (`Hosted::freed`), as soon as none does; or
+/// - for room: while the card's memory in use reaches [`ROOM_PERCENT`] of
+///   the budget the layer goes by, the least recently used first, down to
+///   [`EVICT_TO_PERCENT`], never one used in the last [`KEEP_MS`] (and
+///   [`KEEP_FRAMES`] frames).
 ///
-/// The next use makes the host copy anew and uploads the title's memory
-/// again (its staging state goes with it). The title resource stays: its
-/// address is what views and lists name.
+/// Only a copy that can be made again from title memory: the title fills
+/// the texture ([`fills`]) and the host never copied into it; and only one
+/// nothing else holds: no list not yet reset names it (a list holds the
+/// copies of the textures it uses, `HostList::transition`) and no
+/// descriptor slot views it (`HostHeap::kept`). The next use makes it anew
+/// and uploads the title's memory again.
+///
+/// Every idle copy went after five seconds before, room or not: 43,095 let
+/// go and 18,790 made again in run p7, in a world at 1.7 frames a second.
 /// shortcut: [`host_resource`] hands out the host texture without holding
 /// it; a thread that asked for it and has not yet recorded its use (which
-/// makes the list or the slot hold it) is protected by that idle time alone.
-/// Every caller uses it at once, within the title's call.
+/// makes the list or the slot hold it) is protected by [`KEEP_MS`] alone.
 /// Called before a submission starts, by the thread that submits.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    // How much to let go for room (0: the card has room).
+    let wanted = crate::host::host().and_then(crate::memcap::card_used).map_or(0, |(used, budget)| {
+        if budget > 0 && used >= budget / 100 * ROOM_PERCENT {
+            used - budget / 100 * EVICT_TO_PERCENT
+        } else {
+            0
+        }
+    });
     let all = textures();
+    // Candidates: (last use, texture, freed).
+    let mut chosen: Vec<(u64, usize, bool)> = Vec::new();
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        let freed = r.host.freed.load(Relaxed);
+        if !fills(&r.desc) || (!freed && wanted == 0) || crate::texture::host_wrote(at) {
             continue;
         }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let used = r.host.used.load(Relaxed);
+        let free = made.as_ref().is_some_and(|(host, _)| {
+            std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1
+        });
+        if free && (freed || crate::host::long_ago(used, KEEP_MS, KEEP_FRAMES)) {
+            chosen.push((used, at, freed));
+        }
+    }
+    // The ones the title freed first, then the least recently used.
+    chosen.sort_unstable_by_key(|&(used, _, freed)| (!freed, used));
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    for (_, at, freed) in chosen {
+        if !freed && bytes >= wanted {
+            break;
+        }
+        // SAFETY: as above, under the same lock.
+        let r = unsafe { &*(at as *const Resource) };
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let freed = r.host.freed.load(Relaxed);
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                (freed || crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES))
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+            let free = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1
             });
-            if idle {
+            if free {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -1733,35 +1761,44 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            if r.host.freed.swap(false, Relaxed) {
-                // Its memory was freed by the title: released by the title,
-                // once nothing held it.
-                crate::release::count(crate::release::Why::Freed, host.card_bytes());
-                crate::host::retire(host);
-                continue;
-            }
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.card_bytes(), Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
-            }
+        let Some((host, _)) = gone else { continue };
+        r.host.gone.store(true, Relaxed);
+        if r.host.freed.swap(false, Relaxed) {
+            // Its memory was freed by the title: released by the title,
+            // once nothing held it.
+            crate::release::count(crate::release::Why::Freed, host.card_bytes());
             crate::host::retire(host);
+            continue;
         }
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.card_bytes(), Relaxed);
+        went += 1;
+        bytes += host.card_bytes();
+        first.get_or_insert(at);
+        crate::host::retire(host);
     }
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go for room ({} KiB), the least recently used first; the first: title texture {:#x}",
                 bytes >> 10,
                 first.unwrap_or(0)
             )
         });
     }
 }
+
+/// [`let_go_idle`] lets go for room down to this share of the budget, in
+/// percent.
+#[cfg(windows)]
+const EVICT_TO_PERCENT: u64 = 85;
+
+/// A host copy used this recently is never let go for room (milliseconds,
+/// and frames).
+#[cfg(windows)]
+const KEEP_MS: u64 = 5_000;
+#[cfg(windows)]
+const KEEP_FRAMES: u64 = 4;
 
 /// The title freed, decommitted or unmapped `[at, at + len)`
 /// (`crate::release`): the host copies of textures the title fills whose
