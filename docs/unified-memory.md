@@ -23,7 +23,11 @@ This document replaces all of that with one rule:
 The home is **system memory opened as host heaps**, not a GPU-upload heap.
 Section 1 says why; the rest is the design, the deletion list and a staged
 plan with a test per stage. The probe that checks the facts on the PC is in
-`crates/victory-gpu/src/unified.rs` (`VICTORY_UNIFIED=1`).
+`crates/victory-gpu/src/unified_probe.rs` (`VICTORY_UNIFIED=2`). Stages 1
+to 3 are implemented and on by default; section 12 says what was built,
+what the probe measured, and how to read the log. Sections 1 to 11 are the
+design as written before the probe ran (its level numbers are the old
+ones).
 
 ## 1. What the host allows
 
@@ -287,6 +291,8 @@ translation, `memcap.rs`, the frame and present path.
 
 ## 9. Staged migration
 
+(As planned before the probe; the levels now are those of section 12.)
+
 One switch, `VICTORY_UNIFIED`, with levels; each level includes the ones
 below. The coordinator runs each test in-game. Default 0 changes nothing.
 
@@ -397,3 +403,142 @@ section). If the alias answers are true, stages 1 and 2 are about 600 lines
 on top of the existing in-place plumbing and give the decisive measurement:
 copy cost gone, bus cost in its place. Stage 3 removes write watching,
 stage 4 deletes about 17,000 lines.
+
+## 12. As built (stages 1–3, on by default)
+
+### What the probe measured
+
+RTX 5060 Ti 8 GB, PCIe 4 x8, Proton with vkd3d-proton master
+(`VICTORY_UNIFIED=1` of the first probe build):
+
+- A committed section opened with `OpenExistingHeapFromFileMapping`: two
+  aliases below 1 TiB agree, the GPU reads through both and writes back
+  through both, by copy and by shader. A texture placed in it is refused
+  (`E_INVALIDARG`). Private memory opened with
+  `OpenExistingHeapFromAddress1`: the GPU reads it.
+- GPU-upload heap: buffers *and* textures (placed and committed) work,
+  against what `vulkaninfo` suggested, but the mapping lies at
+  `0x7fe7d0000000`, above 1 TiB. The custom L1 write-combine heap is the
+  same.
+- The card reads 12.6 GB/s from an opened section, 193 GB/s from a
+  GPU-upload heap, 199 GB/s from its own memory. The CPU writes a
+  GPU-upload mapping at 6.6 GB/s.
+
+The address settles it: title memory cannot be a GPU-upload heap under
+Proton. It stays in the PC's memory and is opened, as section 1 planned.
+
+### The switch
+
+`VICTORY_UNIFIED`: unset or `1`, on; `0`, the copies and write watching of
+before (the way back, for comparing in-game); `2`, on plus the probe at the
+first sweep; `3`, also the probe's tile-mapping test. The probe lives in
+`unified_probe.rs`; `VICTORY_UNIFIED_PROBE_MB` and
+`VICTORY_UNIFIED_PROBE_BIG_MB` as before.
+
+### What happens
+
+- **xmem** (Proton only, unified on). An `XMemVirtualAlloc` region at an
+  address of our choosing is reserved 64 KiB longer: the extra page is a
+  canary page of ours, committed, and the region is announced
+  (`victory_gpu::title_region`). `XMemAllocatePhysicalPages` makes
+  sections of at most 512 MiB (8192 pages), each with a canary page after
+  the title's, and announces each (`title_section`, `title_section_gone`
+  when its handle closes). Opening a 512 MiB section pins only that much.
+- **Opening** (`unified.rs` `place`, at the first GPU use of an address in
+  a unit). A region: its reserved pages are committed, every page is
+  written once in place with an atomic add of 0 (so pages a write watch
+  keeps read-only can be pinned), then `OpenExistingHeapFromAddress1`
+  over the region and its canary page. A section:
+  `OpenExistingHeapFromFileMapping`. Then the canary: the CPU writes a
+  16-byte pattern on the canary page, the GPU reads it back through the
+  heap (the probe's own queue), and they must match. A mismatch is
+  vkd3d-proton's silent fallback; the unit is refused, logged, and its
+  buffers keep copies.
+- **Buffers in place** (`shadow.rs`). A title buffer under 16 MiB, or a
+  4 MiB window of title memory outside buffers, whose memory lies in one
+  opened region or one run of one section, becomes a buffer placed over
+  the title's own bytes (on the 64 KiB line below them; `Shadow::offset`
+  counts the bias). For it, `refresh` only keeps the buffer alive with
+  the list, a submission takes no snapshot, nothing is copied back, no
+  write watch is asked. Shader writes are still declared, so that what the
+  CPU prepares while a submission runs waits where it writes (`host.rs`
+  `late_blocked`). A view that the title maps anew marks its in-place
+  buffers stale and the next ask places new ones.
+- **What stays a copy**: title buffers of 16 MiB and more keep their copy in
+  the card's memory (the title's 174 MB GPU heap: most shaders read it,
+  and the card reads its own memory 16 times faster than the PC's; this
+  path moved about 0.1 MB a frame in the last runs). Also memory that is
+  no xmem unit (VIctory's own allocations at title addresses), ranges over
+  scattered pages, single-view copies (`exact`), and units that were
+  refused.
+- **Title copies** (`list.rs` `copy_on_card`). A `CopyBufferRegion` or
+  buffer `CopyResource` whose destination is in place runs on the card,
+  in the list where the title put it, between UAV barriers, as on the
+  console. The source is whatever host buffer holds its bytes. Other title
+  copies stay on the CPU at submission; one whose destination lies in a
+  unit first waits for the submissions in flight (they may be reading it).
+- **Textures by events** (`texture.rs` `refresh_now`, `unified_map.rs`).
+  Announced writes are kept as ranges with the number of their newest
+  write: DirectStorage completion (plain and page destinations), file
+  reads (`ReadFile`, `fread`), page mappings, title copies done on the CPU,
+  and shader writes through in-place buffers once their submission has
+  finished (`unified::settle`, at each submission and texture check). A
+  texture detiles again only if a newer announced write lies over it, plus
+  one hash every 64th frame by turns. A texture no announced write ever
+  touched is filled by the title's CPU: its content hash decides, every
+  frame while it changes, every 8th frame once it holds still. No write
+  watch is asked and no guard is set for texture memory.
+
+### Expected effect
+
+- **Frame time:** the per-frame refresh of buffer copies, the snapshots and
+  the CPU compares of what shaders wrote go for every in-place buffer:
+  those were the 315 ms of copies and the 1.7 s of copy-back per frame of
+  the first world frames in the last runs. Title copies into in-place
+  buffers move from the submitting thread to the card. In exchange, every
+  shader read of an in-place buffer crosses the bus at about 12.6 GB/s:
+  watch the GPU time per frame.
+- **Card memory:** down by the copies of title buffers under 16 MiB and of
+  the windows (they no longer exist); the big heap's copy stays.
+- **PC memory:** every opened unit is pinned whole: the regions the GPU
+  touches (up to about 6 GB on the Series X profile) and the 512 MiB
+  sections it touches. The copies in PC memory go.
+
+### Log lines
+
+- `unified: title memory opened as a heap what=region|section at=… mb=…
+  ms=…`: once per unit; `ms` is the cost of pinning it.
+- `unified: title memory NOT opened; its buffers keep copies … why=…`:
+  must not appear. A `why` with "silent fallback" means the import
+  failed.
+- Every 10 s: `unified: N heaps opened (… MB of title memory), R refused;
+  buffers in place: … alive (… MB) …; title copies on the GPU …, on the
+  CPU after waiting for the card …; textures checked for an announced
+  write …, by their hash …`. Good signs: R = 0, in-place buffers in the
+  hundreds or thousands, "on the CPU after waiting" small next to "on the
+  GPU".
+- The gate line (`… fps, … ms/frame …; card memory …`) gives the result;
+  compare with a run at `VICTORY_UNIFIED=0` in the same place.
+
+### Risks of this build
+
+1. **Bus bandwidth.** In-place buffers are read over PCIe 4 x8. If the GPU
+   time per frame rises, look at which buffers are read most (stage 5 of
+   section 9: copy big read-mostly buffers to the card at DirectStorage
+   completion, with the GPU-upload heap as the staging ring; not built).
+2. **Pinning.** Opening a 2 GB region pins and touches 2 GB at once, under
+   the units' lock: a stall of seconds the first time, and that much PC
+   memory for good.
+3. **Write ordering the copies used to hide.** In-flight submissions now
+   read title memory live. The title's own CPU writes are ordered by its
+   fences (signalled only after landing). VIctory's CPU-side writes are
+   ordered by `late_blocked` and the copy wait; a bottom-of-pipe value
+   written at landing (`Late::Write`) is as late as before.
+4. **CPU-filled textures in memory DirectStorage once filled** are found
+   only by the 64th-frame hash (about two seconds late).
+5. **Remapped views under live descriptor slots** keep the old buffer until
+   the slot is written again or the draw-time check sees another buffer.
+6. **Regions freed and reused** by the title would keep the old heap (the
+   title was not seen freeing them; xmem has no free hook yet).
+7. Native Windows is not covered: opening is Proton-only; on Windows the
+   copies stay.

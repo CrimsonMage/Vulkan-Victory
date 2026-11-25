@@ -87,6 +87,30 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// If `[start, start + len)` shows one run of a section (views that continue
+/// each other in address and in the section's bytes): the section and the
+/// byte offset of `start` in it (`crate::unified`, which opens sections as
+/// heaps). `None` for memory that is no view, or pages scattered in it.
+pub(crate) fn section_run(start: usize, len: usize) -> Option<(usize, u64)> {
+    let end = start.checked_add(len.max(1))?;
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=start).next_back()?;
+    if base + bytes <= start {
+        return None;
+    }
+    let first = offset + (start - base) as u64;
+    let (mut reach, mut next) = (base + bytes, offset + bytes as u64);
+    while reach < end {
+        let &(b, s, o) = v.views.get(&reach)?;
+        if s != section || o != next {
+            return None;
+        }
+        reach += b;
+        next = o + b as u64;
+    }
+    Some((section, first))
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

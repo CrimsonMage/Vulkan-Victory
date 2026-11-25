@@ -237,6 +237,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // Host textures over it detile again (`crate::unified`).
+    crate::unified::written(at, len);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
@@ -249,6 +251,25 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+}
+
+/// Shaders wrote title memory `[at, at + len)` in place (unified memory,
+/// once their submission has finished): the copies that remain of it take
+/// those pages again, as after a write the kernel reports.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    // As in `wrote`: an asking that stands moves with it.
+    if j.kept {
+        j.ahead_asked = now;
+    }
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
@@ -817,6 +838,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // An announced write: host textures over it detile again.
+    crate::unified::written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -909,6 +932,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    // Unified memory: textures there detile again, and buffers placed over
+    // the old pages give way to new ones.
+    crate::unified::written(at, len);
+    crate::shadow::in_place_remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::views::views_gone(at, len);
     let mut g = guards();

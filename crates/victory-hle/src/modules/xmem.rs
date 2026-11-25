@@ -136,13 +136,18 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // Unified memory (`victory_gpu::unified`, Proton): a region of our
+    // choosing may become a host heap the GPU reads in place, checked by a
+    // canary page of ours right after the title's bytes.
+    let unified = constrained && kind & MEM_RESERVE_PLACEHOLDER == 0 && on_wine() && victory_gpu::unified_on();
+    let title_bytes = size.next_multiple_of(PAGE);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
-            size,
+            if unified { title_bytes + PAGE } else { size },
             kind,
             protect,
             if constrained {
@@ -161,6 +166,13 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if unified && !at.is_null() {
+        let canary = (at as usize + title_bytes) as *const c_void;
+        // SAFETY: the last page of the reservation just made, ours.
+        if !unsafe { VirtualAlloc(canary, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            victory_gpu::title_region(at as usize, title_bytes);
+        }
     }
     at
 }
@@ -351,6 +363,7 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_section_gone(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -408,55 +421,80 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    // Unified memory (`victory_gpu::unified`, Proton): each section may
+    // become a host heap the GPU reads in place. Sections of at most
+    // `UNIFIED_SECTION` pages, so that opening one pins only that much of
+    // the PC's memory, each with a canary page of ours after the title's.
+    let unified = on_wine() && victory_gpu::unified_on();
+    let chunk = if unified { UNIFIED_SECTION } else { n };
+    let mut sections = Vec::new();
+    let mut done = 0;
+    while done < n {
+        let pages_here = chunk.min(n - done);
+        let bytes = pages_here * PAGE + if unified { PAGE } else { 0 };
+        // A pagefile-backed section, its pages committed when first mapped
+        // or written (`commit`): the title asks for 6.1 GiB at once, which
+        // a busy host often cannot commit (error 1450).
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (bytes as u64 >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // The sections made so far close with `sections`.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        if unified {
+            victory_gpu::title_section(handle as usize, (pages_here * PAGE) as u64);
+        }
+        sections.push((Arc::new(Section(handle)), pages_here));
+        done += pages_here;
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut k = 0;
+    for (section, pages_here) in &sections {
+        for index in 0..*pages_here {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + k * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(k).write(number) };
+            k += 1;
+        }
     }
     1
 }
+
+/// Pages per section with unified memory: 512 MiB.
+const UNIFIED_SECTION: usize = 8192;
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds

@@ -2001,7 +2001,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -2118,7 +2118,7 @@ fn read_backs(list: &HostList) {
 fn hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -2999,6 +2999,9 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it.
         crate::shadow::preparing(this_submission);
+        // Unified memory: the shader writes of submissions that finished
+        // are announced (textures over them detile again).
+        crate::unified::settle();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut batch = Batch::default();
         // One write-watch asking for everything the submission refreshes:
@@ -3965,6 +3968,14 @@ impl HostList {
             match step {
                 &Step::Copy(dst, src, len) => {
                     batch.title_written();
+                    // Unified memory: submissions still running may read the
+                    // destination in place; on the console this copy would
+                    // run after them (the title's copies between in-place
+                    // buffers run on the card, `list.rs`).
+                    if crate::unified::in_unit(dst, len) && flying() {
+                        crate::unified::count(crate::unified::Stat::CpuCopyWaited);
+                        settle();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);

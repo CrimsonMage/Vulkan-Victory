@@ -129,6 +129,10 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Unified memory: the frame the content was last found changed, and
+    /// whether it was checked at all.
+    changed: Option<u64>,
+    checked: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -867,7 +871,39 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        let frame = crate::frame::current();
+        if crate::unified::on() {
+            // Unified memory: detiled again after a write the title
+            // announces (DirectStorage, a file read, a page mapping, a
+            // title copy, a shader write: `crate::unified::newest`), never
+            // by watching or guarding the memory.
+            let newest = crate::unified::newest(start, size);
+            let turn = |every: u64| frame.wrapping_add((start >> 16) as u64).is_multiple_of(every);
+            let due = if newest == 0 {
+                // No announced write ever touched it: the title fills it
+                // with the CPU (a movie frame, a glyph atlas). Its hash
+                // says: every frame while it changes, every eighth frame,
+                // by turns, once it holds still.
+                crate::unified::count(crate::unified::Stat::TextureByHash);
+                !last.checked || last.changed.is_some_and(|f| frame < f + 30) || turn(8)
+            } else {
+                // Newer than the last detiling; and every 64th frame, by
+                // turns, whatever: a CPU write after an announced one is
+                // found within about two seconds.
+                crate::unified::count(crate::unified::Stat::TextureByEvent);
+                newest > last.asked || turn(64)
+            };
+            if !due {
+                return 0;
+            }
+            if newest > last.asked {
+                // Pages arrived or changed: a partly mapped texture is read
+                // now, not at its next turn.
+                last.partial = None;
+            }
+            last.asked = last.asked.max(newest);
+            last.checked = true;
+        } else if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -889,7 +925,9 @@ impl Staging {
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
-        if let Some((now, written)) = crate::watch::writes(start, start + size, true) {
+        if !crate::unified::on()
+            && let Some((now, written)) = crate::watch::writes(start, start + size, true)
+        {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -913,7 +951,6 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
@@ -925,6 +962,7 @@ impl Staging {
                     return;
                 }
                 last.hash = Some(hash);
+                last.changed = Some(frame);
                 if read.iter().all(|&b| b == 0) {
                     return;
                 }
@@ -940,6 +978,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
+        last.changed = Some(frame);
         self.detile(tiled);
         size
     }
