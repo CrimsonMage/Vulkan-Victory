@@ -17,11 +17,11 @@
 //! (`intermapRegisterDmaMapping`), failed to allocate, and took the whole
 //! machine down on an unmap.
 //!
-//! What this does, all on by default (`VICTORY_MEMCAP=0`: none of it):
+//! What this does:
 //! - the card's budget every rule of the layer sees ([`clamp_budget`],
 //!   through `Host::video_memory`) is at most a ceiling made from the
 //!   adapter's real dedicated memory ([`card_cap`]), and always leaves
-//!   [`card_reserve`] of the system's own budget free;
+//!   [`CARD_RESERVE`] of the system's own budget free;
 //! - buffers in the PC's memory that the card maps (upload and shared
 //!   ones) are not made past [`shared_cap`]: the pool is emptied first,
 //!   then the buffer is refused (the caller's path for a failed creation:
@@ -31,18 +31,12 @@
 //!   holds them and the submissions that ran meanwhile have finished, so
 //!   the driver sees far fewer allocations, mappings and unmappings.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 const MB: u64 = 1 << 20;
-
-/// Whether the ceilings and the pool are on (`VICTORY_MEMCAP=0`: off).
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMCAP").is_none_or(|v| v != "0"))
-}
 
 fn env_mb(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mb| mb * MB)
@@ -56,15 +50,14 @@ static DEDICATED: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn set_dedicated(bytes: u64) {
     DEDICATED.store(bytes, Relaxed);
     tracing::info!(
-        "memory ceilings (VICTORY_MEMCAP{}): the adapter has {} MB of its own memory; the layer's use of it stays under {} MB \
-         (VICTORY_CARD_CAP_MB) and {} MB under the system's budget (VICTORY_CARD_RESERVE_MB); the PC's memory mapped for the card \
-         stays under {} MB (VICTORY_SHARED_CAP_MB); buffers let go are pooled up to {} MB (VICTORY_BUFFER_POOL_MB, 0: no pool)",
-        if on() { "=1" } else { "=0: all off" },
+        "memory ceilings: the adapter has {} MB of its own memory; the layer's use of it stays under {} MB \
+         (VICTORY_CARD_CAP_MB) and {} MB under the system's budget; the PC's memory mapped for the card \
+         stays under {} MB (VICTORY_SHARED_CAP_MB); buffers let go are pooled up to {} MB",
         bytes / MB,
         card_cap().map_or(0, |c| c / MB),
-        card_reserve() / MB,
+        CARD_RESERVE / MB,
         shared_cap().map_or(0, |c| c / MB),
-        pool_most() / MB,
+        POOL_MOST / MB,
     );
 }
 
@@ -87,30 +80,23 @@ pub(crate) fn card_cap() -> Option<u64> {
     Some(d.saturating_sub(headroom).max(d / 4))
 }
 
-/// What of the system's own budget for the card stays free:
-/// `VICTORY_CARD_RESERVE_MB` (1,024). Under vkd3d that budget is about our
-/// use plus what is free on the card, so this keeps that much free.
-pub(crate) fn card_reserve() -> u64 {
-    static RESERVE: OnceLock<u64> = OnceLock::new();
-    *RESERVE.get_or_init(|| env_mb("VICTORY_CARD_RESERVE_MB").unwrap_or(1024 * MB).min(4096 * MB))
-}
+/// What of the system's own budget for the card stays free. Under vkd3d
+/// that budget is about our use plus what is free on the card, so this
+/// keeps that much free.
+const CARD_RESERVE: u64 = 1024 * MB;
 
 /// The card budget the layer's rules see for the system's `budget`: at
-/// most [`card_cap`], and [`card_reserve`] under the system's.
+/// most [`card_cap`], and [`CARD_RESERVE`] under the system's.
 pub(crate) fn clamp_budget(budget: u64) -> u64 {
-    if !on() || budget == 0 {
+    if budget == 0 {
         return budget;
     }
-    let mut b = budget.saturating_sub(card_reserve()).max(budget / 4);
+    let mut b = budget.saturating_sub(CARD_RESERVE).max(budget / 4);
     if let Some(cap) = card_cap() {
         b = b.min(cap);
     }
-    CLAMPED.fetch_add(u64::from(b < budget), Relaxed);
     b
 }
-
-/// Looks at the budget that the ceiling lowered.
-static CLAMPED: AtomicU64 = AtomicU64::new(0);
 
 /// The most of the PC's memory mapped for the card (upload and shared
 /// buffers, as the system counts this process's use of it):
@@ -129,8 +115,8 @@ pub(crate) fn shared_cap() -> Option<u64> {
 static SHARED_SEEN: Mutex<(u64, u64)> = Mutex::new((0, 0));
 static SHARED_SINCE: AtomicU64 = AtomicU64::new(0);
 
-/// Buffers refused at the ceiling, and their bytes; pool emptyings for it.
-static REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Buffers refused at the ceiling.
+static REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a new buffer of `size` bytes in the PC's memory that the card
 /// maps may be made: under [`shared_cap`] (plus `over`, for the upload
@@ -138,9 +124,6 @@ static REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// the system was last asked (every tenth of a second at most). At the
 /// ceiling the pool is emptied first; refused only if that is not enough.
 pub(crate) fn shared_room(host: &crate::host::Host, size: u64, over: u64) -> bool {
-    if !on() {
-        return true;
-    }
     let Some(cap) = shared_cap() else {
         return true;
     };
@@ -163,7 +146,6 @@ pub(crate) fn shared_room(host: &crate::host::Host, size: u64, over: u64) -> boo
     }
     // Free what the pool keeps and ask again.
     if drain() > 0 {
-        REFUSED[2].fetch_add(1, Relaxed);
         if let Some(now) = used(true)
             && now + size <= cap + over
         {
@@ -171,8 +153,7 @@ pub(crate) fn shared_room(host: &crate::host::Host, size: u64, over: u64) -> boo
             return true;
         }
     }
-    let n = REFUSED[0].fetch_add(1, Relaxed) + 1;
-    REFUSED[1].fetch_add(size, Relaxed);
+    let n = REFUSED.fetch_add(1, Relaxed) + 1;
     if n <= 16 || n.is_multiple_of(256) {
         tracing::warn!(
             "memory ceiling: a buffer of {} KiB in the PC's memory for the card refused: {} MB of it in use, the ceiling {} MB \
@@ -210,12 +191,8 @@ pub(crate) fn class(kind: Kind, size: u64) -> u64 {
     }
 }
 
-/// The most bytes the pool keeps: `VICTORY_BUFFER_POOL_MB` (512; 0: no
-/// pool). Nothing bigger than 64 MiB is kept.
-fn pool_most() -> u64 {
-    static MOST: OnceLock<u64> = OnceLock::new();
-    *MOST.get_or_init(|| if on() { env_mb("VICTORY_BUFFER_POOL_MB").unwrap_or(512 * MB) } else { 0 })
-}
+/// The most bytes the pool keeps. Nothing bigger than 64 MiB is kept.
+const POOL_MOST: u64 = 512 * MB;
 
 /// How long a pooled buffer is kept unused, in milliseconds.
 const POOL_IDLE_MS: u64 = 20_000;
@@ -240,17 +217,10 @@ unsafe impl Send for Pool {}
 
 static POOL: Mutex<Pool> = Mutex::new(Pool { entries: Vec::new(), bytes: 0 });
 
-/// Taken from the pool and their bytes, made anew (pool on) and their
-/// bytes, given to the pool, let go of from it (full, idle or emptied).
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-
 /// A pooled buffer of `kind` and exactly `size` bytes (a [`class`]) that
 /// nothing else holds and no running submission can still use, with its
 /// mapping; zeroed over `zero` bytes, as a new one reads.
 pub(crate) fn take(kind: Kind, size: u64, zero: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    if pool_most() == 0 {
-        return None;
-    }
     let finished = crate::host::submissions_finished();
     let buffer = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,11 +232,7 @@ pub(crate) fn take(kind: Kind, size: u64, zero: u64) -> Option<(ID3D12Resource, 
                 pool.bytes -= size;
                 pool.entries.swap_remove(at).buffer
             }
-            None => {
-                STATS[2].fetch_add(1, Relaxed);
-                STATS[3].fetch_add(size, Relaxed);
-                return None;
-            }
+            None => return None,
         }
     };
     let mut data = std::ptr::null_mut();
@@ -278,8 +244,6 @@ pub(crate) fn take(kind: Kind, size: u64, zero: u64) -> Option<(ID3D12Resource, 
     // SAFETY: the buffer's mapping holds `size` bytes, and nothing else
     // holds the buffer.
     unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, zero.min(size) as usize) };
-    STATS[0].fetch_add(1, Relaxed);
-    STATS[1].fetch_add(size, Relaxed);
     Some((buffer, data.cast()))
 }
 
@@ -287,10 +251,7 @@ pub(crate) fn take(kind: Kind, size: u64, zero: u64) -> Option<(ID3D12Resource, 
 /// `Host::shared_buffer`, `kind`) lets it go: kept for [`take`] if the
 /// pool has room, else freed (when its last reference goes, as before).
 pub(crate) fn give(kind: Kind, buffer: ID3D12Resource) {
-    let most = pool_most();
-    if most == 0 {
-        return;
-    }
+    let most = POOL_MOST;
     // SAFETY: a plain query.
     let size = unsafe { buffer.GetDesc() }.Width;
     if size > 64 * MB || size > most {
@@ -307,7 +268,6 @@ pub(crate) fn give(kind: Kind, buffer: ID3D12Resource) {
             since: crate::host::now_ms(),
             started: crate::host::submissions_started(),
         });
-        STATS[4].fetch_add(1, Relaxed);
         // The oldest first.
         while pool.bytes > most && !pool.entries.is_empty() {
             let e = pool.entries.remove(0);
@@ -315,7 +275,6 @@ pub(crate) fn give(kind: Kind, buffer: ID3D12Resource) {
             out.push(e);
         }
     }
-    STATS[5].fetch_add(out.len() as u64, Relaxed);
     // Freed outside the lock (a buffer still held elsewhere lives on).
     drop(out);
 }
@@ -332,7 +291,6 @@ pub(crate) fn trim() {
         pool.bytes = pool.entries.iter().map(|e| e.size).sum();
         old
     };
-    STATS[5].fetch_add(out.len() as u64, Relaxed);
     drop(out);
 }
 
@@ -343,47 +301,9 @@ pub(crate) fn drain() -> u64 {
         pool.bytes = 0;
         std::mem::take(&mut pool.entries)
     };
-    STATS[5].fetch_add(out.len() as u64, Relaxed);
     let bytes = out.iter().map(|e| e.size).sum();
     drop(out);
     bytes
-}
-
-/// The line for the memory log: the ceilings, what the system says, and
-/// what the pool did since the start.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn line(host: &crate::host::Host) {
-    let raw = host.video_memory_raw().unwrap_or_default();
-    let (kept, kept_bytes) = {
-        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.entries.len(), pool.bytes)
-    };
-    let s: Vec<u64> = STATS.iter().map(|a| a.load(Relaxed)).collect();
-    tracing::info!(
-        "memory ceilings: the card {} MB in use, the system's budget {} MB, the layer's line {} MB (ceiling {} MB, {} MB kept free; \
-         {} looks lowered; {} host copies of textures the title fills not made at the line); the PC's memory mapped for the card {} MB in use of a ceiling of {} MB, {} buffers refused {} MB, the pool \
-         emptied for it {} times; buffer pool: {} kept {} MB, {} taken from it {} MB, {} made anew {} MB, {} given back, {} let go",
-        raw[1] / MB,
-        raw[0] / MB,
-        clamp_budget(raw[0]) / MB,
-        card_cap().map_or(0, |c| c / MB),
-        card_reserve() / MB,
-        CLAMPED.load(Relaxed),
-        crate::resource::CARD_FULL_REFUSED.load(Relaxed),
-        raw[3] / MB,
-        shared_cap().map_or(0, |c| c / MB),
-        REFUSED[0].load(Relaxed),
-        REFUSED[1].load(Relaxed) / MB,
-        REFUSED[2].load(Relaxed),
-        kept,
-        kept_bytes / MB,
-        s[0],
-        s[1] / MB,
-        s[2],
-        s[3] / MB,
-        s[4],
-        s[5],
-    );
 }
 
 #[cfg(test)]

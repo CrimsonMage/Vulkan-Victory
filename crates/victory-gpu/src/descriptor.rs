@@ -178,16 +178,8 @@ fn mirror(handle: u64) {
 /// slots a frame in the world of the title this fork works on, against a
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
-/// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
-        return;
-    }
-    let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -213,80 +205,16 @@ pub(crate) fn sync_heaps() {
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                        0..0
-                    } else {
-                        slots
-                    };
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
+                    // (`HostHeap::mirror_copied_page`).
+                    host.mirror_copied_page(slots, (start, step), from, &page_bytes);
                 }
                 page += crate::watch::PAGE;
             }
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
-        count.fetch_add(n, Relaxed);
-    }
-}
-
-/// Since the last frame line, of [`sync_heaps`]: changed pages of placed
-/// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
-#[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// With the frame line: what [`sync_heaps`] did per frame over `frames`.
-/// Nothing while no heap page changed.
-#[cfg(windows)]
-pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if pages == 0 {
-        return;
-    }
-    tracing::info!(
-        "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
-        pages as f64 / frames,
-        looked as f64 / frames,
-        mirrored as f64 / frames,
-        host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
-    );
-}
-
-/// Whether [`sync_heaps`] hands a changed page's records to the host heap
-/// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
-/// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
-/// by one, as before.
-#[cfg(windows)]
-fn page_at_once() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -541,17 +469,6 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
 
-/// Whether constant buffer views and views of placed memory are named whole
-/// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
-/// makes every view a table entry, as before.
-fn inline() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
-}
-
-/// Views named whole in their records since the start: constant buffer
-/// views, views of placed memory (for the memory line).
-static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -669,31 +586,27 @@ impl Views {
 }
 
 /// The two words that name `view` in a record: the view itself where its
-/// kind allows ([`Views`]), else its table entry.
+/// kind allows ([`Views`]: constant buffer views and views of placed
+/// memory are named whole in their records), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
-    use std::sync::atomic::Ordering::Relaxed;
-    if inline() {
-        match &view {
-            View::Constant(address, size) => {
-                if let Some(words) = constant_words(*address, *size) {
-                    NAMED_WHOLE[0].fetch_add(1, Relaxed);
-                    return words;
-                }
+    match &view {
+        View::Constant(address, size) => {
+            if let Some(words) = constant_words(*address, *size) {
+                return words;
             }
-            View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
-                    // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
-                        NAMED_WHOLE[1].fetch_add(1, Relaxed);
-                        return placed_words(shape, address);
-                    }
-                }
-            }
-            _ => {}
         }
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                // Nearly every placed view has a shape seen before.
+                let known = views_read().shape_index.get(&shape).copied();
+                let shape = known.or_else(|| views_write().shape(shape));
+                if let Some(shape) = shape {
+                    return placed_words(shape, address);
+                }
+            }
+        }
+        _ => {}
     }
     // A view written before keeps its entry and generation.
     if let Some(words) = views_read().entry_of(&view) {
@@ -708,43 +621,6 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
-}
-
-/// For the memory line: the distinct views kept ([`Views`]), those of them
-/// free for reuse, and the bytes the table and its index hold for them (an
-/// estimate: an entry of the table, and one of the index with its share of
-/// a tree node; the shapes likewise); then the entries that are constant
-/// buffer views and views of placed memory (those that did not fit a
-/// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
-/// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
-    use std::sync::atomic::Ordering::Relaxed;
-    let views = views_read();
-    let each = size_of::<(View, u32)>() as u64;
-    let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
-    [
-        views.list.len() as u64,
-        views.free.len() as u64,
-        views.list.capacity() as u64 * each
-            + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
-        constants,
-        placed,
-        views.shapes.len() as u64,
-        NAMED_WHOLE[0].load(Relaxed),
-        NAMED_WHOLE[1].load(Relaxed),
-    ]
 }
 
 impl View {
@@ -1349,9 +1225,6 @@ mod tests {
     /// table; one shape stands for all the placed views alike.
     #[test]
     fn views_at_new_addresses_add_no_entries() {
-        if !inline() {
-            return;
-        }
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;

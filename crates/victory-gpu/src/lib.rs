@@ -19,11 +19,7 @@
 mod capture;
 #[cfg(windows)]
 mod ambient;
-#[cfg(windows)]
-mod cardmeter;
 pub mod console;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -34,26 +30,20 @@ pub mod dxgi;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
-pub mod framelog;
+pub mod cores;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
-mod inplace;
+mod views;
 pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod plaincopy;
-#[cfg(windows)]
 mod primitive;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod query;
 pub mod queue;
-#[cfg(windows)]
-mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -80,7 +70,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use views::title_memory_view;
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,

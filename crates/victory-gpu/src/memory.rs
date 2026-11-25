@@ -94,9 +94,8 @@ pub(crate) struct Ready {
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
-        let make = |dwords: u64, what: &str| {
+        let make = |dwords: u64| {
             let (buffer, data) = host.shared_buffer(dwords * 4)?;
-            crate::host::name(&buffer, || format!("title memory by address: {what}"));
             // SAFETY: a fresh mapping of at least that many bytes.
             unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
             // SAFETY: a live buffer.
@@ -105,8 +104,8 @@ impl Memory {
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
-            directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            directory: make(u64::from(MEMORY_PAGES) * 2)?,
+            faults: make(u64::from(MEMORY_FAULTS))?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,

@@ -28,7 +28,7 @@ pub(crate) struct HostHeap {
     made: Mutex<Vec<u64>>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    /// ([`HostHeap::mirror_copied_page`]; 0: never looked at). Made on first use.
     copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -156,7 +156,7 @@ pub(crate) fn levels_waiting(start: u64) {
 /// view of a texture that takes exactly that span. A console title need
 /// not clear a descriptor when it streams a texture out, so a newer view
 /// that cannot be there together with an older one is all that says the
-/// older one is stale ([`Rule`] says when that is). Views of one span with
+/// older one is stale (`Spans::note` says when that is). Views of one span with
 /// different descriptions (the formats of one family, say) are one
 /// texture's.
 ///
@@ -169,8 +169,6 @@ pub(crate) fn levels_waiting(start: u64) {
 /// No host heap is needed, so it is tested without one.
 #[derive(Default)]
 pub(crate) struct Spans {
-    /// When a newer view makes an older one stale.
-    rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, u64>,
     /// The level each slot's view starts at ([`Spans::shows`]).
@@ -181,30 +179,10 @@ pub(crate) struct Spans {
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
 }
 
-/// When a view the title writes makes an older view of other memory stale.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
-    /// with another length, or within the older one's first [`HEAD`]
-    /// bytes (or the older within its own). No two textures share the
-    /// block of their smallest levels. A view that only reaches into the
-    /// address range of an older texture's larger levels says nothing.
-    #[default]
-    Start,
-    /// Whenever their spans at full size overlap (the rule until run
-    /// 188, where it made null the slots of textures packed as above:
-    /// each view written took its neighbours out of the queue and off the
-    /// card, for good). `VICTORY_STALE_TEXTURES=overlap`.
-    Overlap,
-    /// Never; a view that would be stale under [`Rule::Overlap`] is left
-    /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`, as before.
-    Never,
-}
-
-/// The first bytes of a placed texture that are its own under
-/// [`Rule::Start`]: the 4 KiB block its smallest levels share. (Of 129
-/// pairs of overlapping neighbours in the listings of runs 188 and 189,
-/// none starts closer than 0x2000 to the one before it.)
+/// The first bytes of a placed texture that are its own: the 4 KiB block
+/// its smallest levels share. (Of 129 pairs of overlapping neighbours in
+/// the listings of runs 188 and 189, none starts closer than 0x2000 to the
+/// one before it.)
 const HEAD: u64 = 4096;
 
 impl Spans {
@@ -235,9 +213,14 @@ impl Spans {
 
     /// Slot `index` holds a view of a texture in `[start, end)`. `newer`:
     /// the title wrote it now, so the slots whose views cannot be there
-    /// with it ([`Rule`]) are stale: they are returned, and forgotten.
-    /// Otherwise (a draw made the slot from what it held), and under
-    /// [`Rule::Never`], a view that clashes with other spans is left out.
+    /// with it are stale: they are returned, and forgotten. A view makes an
+    /// older view of other memory stale when it starts where the older one
+    /// starts: at the same address with another length, or within the
+    /// older one's first [`HEAD`] bytes (or the older within its own). No
+    /// two textures share the block of their smallest levels; a view that
+    /// only reaches into the address range of an older texture's larger
+    /// levels says nothing. Otherwise (a draw made the slot from what it
+    /// held) a view that clashes with other spans is left out.
     fn note(&mut self, index: u32, start: u64, end: u64, newer: bool) -> Vec<u32> {
         let same = |span: Option<&(u64, std::collections::BTreeSet<u32>)>| span.is_some_and(|s| s.0 == end);
         if self.by_slot.get(&index) == Some(&start) && same(self.by_start.get(&start)) {
@@ -247,22 +230,18 @@ impl Spans {
         if end <= start {
             return Vec::new();
         }
-        let rule = self.rule;
         // The spans the view cannot be there with.
-        let clashing: Vec<u64> = match rule {
-            Rule::Start => self
-                .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
-            Rule::Overlap | Rule::Never => self.overlapping(start, end),
-        };
+        let clashing: Vec<u64> = self
+            .by_start
+            .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+            .map(|(at, _)| *at)
+            .collect();
         let mut stale = Vec::new();
         for at in clashing {
             if at == start && same(self.by_start.get(&at)) {
                 continue;
             }
-            if !newer || rule == Rule::Never {
+            if !newer {
                 return stale;
             }
             if let Some((old_end, slots)) = self.by_start.remove(&at) {
@@ -277,7 +256,6 @@ impl Spans {
                         stale_start = format_args!("{at:#x}"),
                         stale_end = format_args!("{old_end:#x}"),
                         stale_slots = slots.len(),
-                        rule = ?rule,
                         "a placed texture view makes older views of other memory stale"
                     );
                 }
@@ -426,20 +404,6 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): where it starts in the block of their smallest levels, by
-/// default; `VICTORY_STALE_TEXTURES=0`: never, as before;
-/// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
-/// until run 188.
-fn stale_rule() -> Rule {
-    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("0") => Rule::Never,
-        Ok("overlap") => Rule::Overlap,
-        _ => Rule::Start,
-    })
-}
-
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
 /// about to write it through the kernel (`crate::watch`): the placed
 /// textures there may have arrived, gone, or changed with no descriptor
@@ -491,14 +455,6 @@ const TABLED_READ: u32 = 1 << 31;
 /// them through a table.
 pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// Whether slots draws read through tables leave the queue of textures
-/// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
-/// before.
-fn tabled_out() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
-}
 
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,25 +727,6 @@ fn view_stride(view: &View) -> Option<u32> {
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
-/// For device-removed reports: where host GPU address `va` lies against
-/// the host descriptor heaps.
-pub(crate) fn near_heaps(va: u64) -> String {
-    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
-        };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
-    }
-    text
-}
-
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -939,7 +876,6 @@ impl HostHeap {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1054,10 +990,6 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -1086,16 +1018,8 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
             return None;
         };
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
@@ -1126,20 +1050,6 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
-    }
-
-    /// Every title slot of the queue that is due at `frame`, and whether
-    /// it was uploaded before (in part, or whole and waiting for another
-    /// look): for the card accounting line
-    /// (`crate::resource::card_accounting`).
-    pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
-            .collect()
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -1460,22 +1370,21 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
-                    TABLED_WRITES[1].fetch_add(1, Relaxed);
-                }
+            // Slots draws read through tables leave the queue of textures
+            // picked by index.
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.slots.remove(&index).is_some() {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
             }
         }
     }
 
     /// Whether title slot `index` was a table's within the last
-    /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
-    /// to be queued as any other).
+    /// [`TABLED_FRAMES`] frames before `frame`.
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -1489,7 +1398,7 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
-        let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
+        let stamp = self.tabled_stamp(index);
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
         // texture, so its write waits for that draw.
@@ -1577,7 +1486,6 @@ impl HostHeap {
                 Some((start, end, first)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
-                    placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
                     stale
@@ -1794,63 +1702,7 @@ impl HostHeap {
         }
     }
 
-    /// For a slot on a page of the title's heap that changed with no call
-    /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
-    /// `handle` are not the ones this last saw there. True if it did.
-    ///
-    /// The page says only that something on it was written, and `mirror`
-    /// by itself would take every buffer or placed-texture record on it for
-    /// newly written each time (it leaves such a slot unmade until a draw
-    /// or a pass uses it): the texture queue's entry for the slot would
-    /// start again, and the buffer pass would look at 2,048 slots for one
-    /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
-    /// kernel, which fails on a page the title unmapped meanwhile where a
-    /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
-        if index >= self.count {
-            return false;
-        }
-        // A slot draws read through a table lately is left to its draws,
-        // as the passes over slots picked by index leave it
-        // (`texture_slots_remapped`, `slots_written_under`): the title
-        // writes its per-draw tables into the same heap every frame, and
-        // each draw makes what its table shows in a slot of its own. Those
-        // were most of the 26,000 to 43,000 records a frame this pass
-        // mirrored in run 200 and in the play session after it, each then
-        // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
-            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
-            *last = print;
-        }
-        self.mirror(index, handle, false);
-        true
-    }
-
-    /// [`HostHeap::mirror_copied`] for every record of one changed page of
+    /// Mirrors the records of one changed page of
     /// the title's heap (`super::sync_heaps`): title slots `slots`, the
     /// record of slot `i` at title address `start + i * step`, and `page`
     /// the bytes read from title address `from` on. Returns the records
@@ -1872,7 +1724,7 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
-        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let frame = crate::frame::current();
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
         {
@@ -1891,7 +1743,7 @@ impl HostHeap {
                     continue;
                 };
                 looked += 1;
-                // None past the host heap's slots, as `mirror_copied`.
+                // None past the host heap's slots, as elsewhere.
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
@@ -1904,7 +1756,7 @@ impl HostHeap {
                 }
                 // A table's slot lately: left to its draws, and looked at
                 // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
+                if self.tabled_lately(index as u32, frame) {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
@@ -1982,7 +1834,6 @@ impl HostHeap {
             // read as nothing for as long as it waited in the queue, every
             // time it got sharper.
             if later
-                && keep_views()
                 && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
@@ -2156,14 +2007,6 @@ pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     }
 }
 
-/// Whether a buffer view is brought up to date in the host copy its slot
-/// shows ([`buffer_copy`]). On by default; `VICTORY_VIEW_EXTENT=0` looks the
-/// copy up by the view's range alone, as before.
-fn view_extent() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_EXTENT").is_none_or(|v| v != "0"))
-}
-
 /// The host copy buffer view `view` reads, and the title range (address,
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
@@ -2192,8 +2035,7 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     {
         return Some((own, start, bytes));
     }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+    if let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
@@ -2225,16 +2067,8 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
-/// Whether the pass over records copied in as bytes also mirrors slots
-/// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
-/// off by default: [`HostHeap::mirror_copied`]).
-fn sync_tables() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
-}
-
 /// Since the last frame line: slots on changed heap pages that
-/// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
+/// [`HostHeap::mirror_copied_page`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
@@ -2256,14 +2090,6 @@ fn record_print(record: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
-/// Whether a buffer view off its buffer's elements gets a copy of its own
-/// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
-/// before).
-fn own_copy_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY").is_none_or(|v| v != "0"))
-}
-
 /// The title memory (start, bytes) of a buffer view that cannot be made on
 /// the host copy of its buffer: `count` elements of `element` bytes from
 /// element `first` of the buffer at `base`, which lies `offset` bytes into
@@ -2275,7 +2101,7 @@ fn own_copy_on() -> bool {
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
 fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+    own_bytes_if(true, offset, base, first, count, element, stride, unknown)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2905,13 +2731,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether a slot written with another view of the placed texture it
-/// shows keeps showing the old one until the new is made;
-/// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
-fn keep_views() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
-}
 
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
@@ -3311,7 +3130,6 @@ mod tests {
     #[test]
     fn packed_neighbours_stay() {
         let mut spans = Spans::default();
-        assert_eq!(spans.rule, Rule::Start);
         let at = 0xb_86bf_8000u64;
         let (a, b, c) = (at, at + 0x2000, at + 0x6000);
         assert!(spans.note(105_998, a, a + 0x2c000, true).is_empty());
@@ -3452,54 +3270,6 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
-    }
-
-    /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
-    /// overlaps others is left out of the spans, as before.
-    #[test]
-    fn never_stale_leaves_overlapping_views_out() {
-        let mut spans = Spans { rule: Rule::Never, ..Default::default() };
-        assert!(spans.note(1, 0x1000, 0x3000, true).is_empty());
-        assert!(spans.note(2, 0x2000, 0x4000, true).is_empty());
-        assert!(spans.note(3, 0x1000, 0x2000, true).is_empty());
-        assert_eq!(spans.slots_in(0, u64::MAX), [1]);
-    }
-
-    /// The rule until run 188 (`VICTORY_STALE_TEXTURES=overlap`): a view
-    /// written over memory that older views describe otherwise makes
-    /// those stale; views of the same span are one texture's.
-    #[test]
-    fn a_newer_view_of_other_memory_makes_the_older_stale() {
-        let mut spans = Spans { rule: Rule::Overlap, ..Default::default() };
-        // Three textures side by side, the first in two slots.
-        assert!(spans.note(1, 0x1000, 0x3000, true).is_empty());
-        assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
-        assert!(spans.note(3, 0x3000, 0x4000, true).is_empty());
-        assert!(spans.note(4, 0x8000, 0x9000, true).is_empty());
-        // The same slot written with the same span again: nothing changes.
-        assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
-        assert_eq!(spans.slots_in(0x2000, 0x3800), [1, 2, 3]);
-        assert_eq!(spans.slots_in(0x4000, 0x8000), [] as [u32; 0]);
-        // A draw makes a slot whose view overlaps them: left out, nothing stale.
-        assert!(spans.note(9, 0x2000, 0x3800, false).is_empty());
-        assert_eq!(spans.slots_in(0x2000, 0x3800), [1, 2, 3]);
-        // The title writes a texture over the end of the first and all of
-        // the second: their three slots are stale.
-        let mut stale = spans.note(5, 0x2000, 0x4000, true);
-        stale.sort_unstable();
-        assert_eq!(stale, [1, 2, 3]);
-        assert_eq!(spans.slots_in(0, u64::MAX), [5, 4]);
-        // Another start in the same memory: stale in turn. Another length
-        // from the same start too.
-        assert_eq!(spans.note(6, 0x2800, 0x3000, true), [5]);
-        assert_eq!(spans.note(7, 0x2800, 0x2c00, true), [6]);
-        // A slot that moves to another texture leaves its span behind.
-        assert!(spans.note(7, 0x8000, 0x9000, true).is_empty());
-        assert_eq!(spans.slots_in(0x2800, 0x2c00), [] as [u32; 0]);
-        assert_eq!(spans.slots_in(0x8000, 0x8001), [4, 7]);
-        spans.forget(4);
-        spans.forget(7);
-        assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

@@ -424,16 +424,9 @@ fn work(scheduler: &'static Scheduler) {
             continue;
         };
         drop(lanes);
-        let started = std::time::Instant::now();
         let result = execute(&job.request);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
-        {
-            use victory_gpu::framelog::{T, add};
-            add(T::DiskReads, 1);
-            add(T::DiskBytes, u64::from(job.request.destination_size));
-            add(T::DiskUs, started.elapsed().as_micros() as u64);
-        }
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }

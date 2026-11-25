@@ -21,7 +21,6 @@
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
 //! still being loaded 46 s into the opening cutscene.
-//! `VICTORY_LIBRARY_LOCK=1`: one call at a time, as before.
 //!
 //! The library's file is mapped, not read into memory ([`Blob`]): the host
 //! keeps pointing into the bytes it was made from for as long as it lives,
@@ -31,10 +30,9 @@
 //! system can drop them without writing them anywhere. A save writes the
 //! new library through a mapping of the new file in the same way (a buffer
 //! of the library's size was made, filled and written out at each save).
-//! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 //!
 //! The mapped file's handle stays open for as long as the mapping lives
-//! ([`holds`]). A save renames the new library over the file this run has
+//! A save renames the new library over the file this run has
 //! mapped, and with the handle closed Windows then gives up the old file's
 //! contents: every page of the mapping that is not in memory at that
 //! moment, or leaves memory later (the trim below, or Windows taking pages
@@ -45,7 +43,7 @@
 //! library run 77 saved from such pages was refused by run 78). Measured
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
-//! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//! open (the test below).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -74,28 +72,17 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the library's file is mapped ([`Blob`]) and saved through a
-/// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
-fn mapped() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_none_or(|v| v != "0"))
-}
-
-/// Whether the mapped library file's handle is kept open while it is
-/// mapped (see the module's notes: without it a save in the same run turns
-/// the mapping's pages into zeros as they leave memory). On by default;
-/// `VICTORY_LIBRARY_HANDLE=0` closes it after mapping, as before.
-fn holds() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_HANDLE").is_none_or(|v| v != "0"))
-}
+// The library's file is mapped ([`Blob`]) and saved through a mapping, and
+// the mapped file's handle is kept open while it is mapped (see the
+// module's notes: without it a save in the same run turns the mapping's
+// pages into zeros as they leave memory).
 
 /// A whole file mapped into memory: read-only (the library's file) or
 /// writable (the file a save fills). Unmapped when dropped.
 struct Mapped {
     at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
-    /// The file, for a mapping made by [`Mapped::open`] ([`holds`]): open
+    /// The file, for a mapping made by [`Mapped::open`]: open
     /// until after the view is unmapped, so that the file a rename took
     /// the name from keeps its contents for the view.
     _file: Option<std::fs::File>,
@@ -137,7 +124,7 @@ impl Mapped {
     /// The file at `path`, mapped for reading; `None` if it is not there,
     /// is empty or cannot be mapped.
     fn open(path: &std::path::Path) -> Option<Mapped> {
-        Mapped::open_holding(path, holds())
+        Mapped::open_holding(path, true)
     }
 
     /// As [`Mapped::open`]; `hold` says whether the file stays open with
@@ -193,8 +180,8 @@ impl Drop for Mapped {
 enum Blob {
     /// No file (an empty library).
     None,
-    /// The file read into memory (`VICTORY_LIBRARY_MAP=0`, tests, or a file
-    /// that could not be mapped).
+    /// The file read into memory (tests, or a file that could not be
+    /// mapped).
     Held(Vec<u8>),
     /// The file itself, mapped.
     Mapped(Mapped),
@@ -209,9 +196,7 @@ impl Blob {
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
-        if mapped()
-            && let Some(file) = Mapped::open(&path)
-        {
+        if let Some(file) = Mapped::open(&path) {
             return Blob::Mapped(file);
         }
         match std::fs::read(&path) {
@@ -310,11 +295,7 @@ pub(crate) fn removal_note() -> String {
         return text;
     }
     let ago = |ms: u64| crate::host::now_ms().saturating_sub(ms) as f64 / 1000.0;
-    let _ = write!(
-        text,
-        "; its file is mapped ({len} bytes), the handle {}",
-        if holds() { "kept open" } else { "closed (VICTORY_LIBRARY_HANDLE=0)" }
-    );
+    let _ = write!(text, "; its file is mapped ({len} bytes), the handle kept open");
     match REPLACED[0].load(Ordering::Relaxed) {
         0 => text.push_str("; this run has not replaced the file"),
         n => {
@@ -361,14 +342,9 @@ pub(crate) fn removal_note() -> String {
 /// while nothing else wants the memory, and come back on the next read.
 /// Called once a second by the sweep; does its work on a thread of its own
 /// (hundreds of thousands of pages), once after each burst of loads.
-/// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
-    static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
-    if at == 0
-        || TRIMMED.load(Ordering::Relaxed)
-        || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
-    {
+    if at == 0 || TRIMMED.load(Ordering::Relaxed) {
         return;
     }
     let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
@@ -418,14 +394,6 @@ fn same_name(name: &str) -> MutexGuard<'static, ()> {
     static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
     let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
     LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
-fn one_call() -> Option<MutexGuard<'static, ()>> {
-    static ON: OnceLock<bool> = OnceLock::new();
-    static CALLING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
-        .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -540,7 +508,6 @@ pub(crate) fn pipeline(
     };
     let began = std::time::Instant::now();
     let loaded = {
-        let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
@@ -572,7 +539,6 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
-    let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -606,7 +572,6 @@ pub(crate) fn save(now: bool) {
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
     let bytes = {
-        let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
@@ -663,13 +628,10 @@ pub(crate) fn save(now: bool) {
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
 /// a mapping of that file, so that the bytes are the file's pages and not
 /// 1.3 GB more of the process's own memory for the seconds a save takes;
-/// through a buffer where the file cannot be mapped (and with
-/// `VICTORY_LIBRARY_MAP=0`).
+/// through a buffer where the file cannot be mapped.
 fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<()> {
     let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
-    if mapped()
-        && let Some(mut file) = Mapped::create(tmp, size)
-    {
+    if let Some(mut file) = Mapped::create(tmp, size) {
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
@@ -682,7 +644,7 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// Renames the written library `tmp` over the library's file in `dir`. This
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
-/// is open ([`holds`]; with none, only the pages in memory at that moment
+/// is open (with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
@@ -769,7 +731,7 @@ mod tests {
         let old: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
         std::fs::write(&path, &old).unwrap();
         let blob = Blob::of(dir.path());
-        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        assert!(matches!(blob, Blob::Mapped(_)));
         assert_eq!(blob.bytes(), &old[..]);
         // A save while the old file is mapped.
         let tmp = path.with_extension("tmp");
