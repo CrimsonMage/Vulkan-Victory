@@ -62,8 +62,8 @@ driver errors and no new crash, and the captures look no worse.
 | # | Work | Owner | State |
 |---|---|---|---|
 | 1 | Prune `victory-gpu` switches and statistics | subagent | running |
-| 2 | Prune `victory-shader` switches; equivalence sample of 1,000 shaders | subagent | running |
-| 3 | Prune HLE, loader, formats, app | subagent | merged (08c435a): switches 38 → 7, −1,886 lines; one console-instruction emulator; gate g1 running |
+| 2 | Prune `victory-shader` switches | subagent | merged (d645fb8): switches 25 → 1, −2,526 lines; all 25,985 containers translate byte-identically; gate g2 running |
+| 3 | Prune HLE, loader, formats, app | subagent | merged (08c435a): switches 38 → 7, −1,886 lines; one console-instruction emulator; gate g1 passed |
 | 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | done: `docs/unified-memory.md`; probe merged, gate run pending |
 | 5 | HLSL + DXC shader backend (`VICTORY_SHADER_BACKEND=hlsl`) | subagent | running |
 | 6 | Merge 1–3, gate run | coordinator | waiting |
