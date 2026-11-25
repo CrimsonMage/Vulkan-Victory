@@ -326,27 +326,8 @@ struct Voice {
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
-    trace: Trace,
-}
-
-/// What a voice did, for the debug log when it is disabled.
-struct Trace {
-    since: Instant,
     /// Samples per channel written to the ring.
     produced: usize,
-    /// Blocks the title took (command 18), how often, and how often it
-    /// found the ring less than full.
-    taken: usize,
-    takes: u32,
-    partial_takes: u32,
-    frames: u32,
-    bad_frames: u32,
-    /// The loudest sample written.
-    peak: i16,
-    /// Milliseconds after enabling when the input ran out (the first time).
-    ended_ms: Option<u128>,
-    /// How often the input ran out and the title gave more afterwards.
-    resumed: u32,
 }
 
 struct Xma {
@@ -424,47 +405,16 @@ impl Xma {
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-                resumed: 0,
-            },
+            produced: 0,
         });
         drop(slot);
         wake_decoder();
     }
 
     fn disable(&self, index: u32) {
-        let Some(context) = self.context(index) else {
-            return;
-        };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
-            return;
-        };
-        let t = &voice.trace;
-        tracing::debug!(
-            index,
-            ms = t.since.elapsed().as_millis(),
-            produced = t.produced,
-            taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
-            takes = t.takes,
-            partial_takes = t.partial_takes,
-            frames = t.frames,
-            bad_frames = t.bad_frames,
-            peak = t.peak,
-            input_ended_ms = ?t.ended_ms,
-            resumed = t.resumed,
-            read_bit = context.field(2, 0, 26),
-            input_bits = context.field(0, 0, 12) * xma::PACKET_BYTES as u32 * 8,
-            "XMA voice disabled"
-        );
+        if self.context(index).is_some() {
+            lock(&self.voices[index as usize]).take();
+        }
     }
 
     /// Moves the title's read block on, which frees output space.
@@ -473,7 +423,7 @@ impl Xma {
             return;
         };
         // The decoder writes the same words.
-        let mut slot = lock(&self.voices[index as usize]);
+        let slot = lock(&self.voices[index as usize]);
         let size = context.field(0, 22, 5).max(1);
         // The count is the title's: reduced first, so the sum stays small.
         let read = (context.field(9, 0, 5) + blocks % size) % size;
@@ -481,31 +431,18 @@ impl Xma {
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
         }
-        if let Some(voice) = &mut *slot {
-            let t = &mut voice.trace;
-            t.taken += blocks as usize;
-            t.takes += 1;
-            t.partial_takes += u32::from(blocks < size);
-        }
         drop(slot);
         wake_decoder();
     }
 
     /// Fills every enabled context's output as far as it has room.
     fn pump(&self) {
-        let start = Instant::now();
-        let mut active = 0;
         for index in 0..self.voices.len() as u32 {
             if let (Some(context), Some(voice)) =
                 (self.context(index), &mut *lock(&self.voices[index as usize]))
             {
                 pump(context, voice);
-                active += 1;
             }
-        }
-        let took = start.elapsed();
-        if took.as_millis() >= 4 {
-            tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
     }
 }
@@ -526,10 +463,9 @@ fn pump(context: Context, voice: &mut Voice) {
         };
         for pair in out.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
-        voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        voice.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         if write == context.field(9, 0, 5) {
@@ -554,11 +490,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         // title's frames are), and whatever the title times by its
         // position stopped with it. The decoder was reset by its flush.
         voice.ended = false;
-        voice.trace.resumed += 1;
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            tracing::info!("an XMA voice ran out of input and was given more: decoding goes on (logged once)");
-        });
         if context.field(2, 26, 5) == INPUT_INVALID {
             context.set_field(2, 26, 6, 0);
         }
@@ -574,7 +505,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
                 voice.pcm.extend(tail);
             }
             voice.ended = true;
-            voice.trace.ended_ms.get_or_insert(voice.trace.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
             return !voice.pcm.is_empty();
@@ -605,18 +535,8 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
     let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
-    voice.trace.frames += 1;
     if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
-        voice.trace.bad_frames += 1;
-        if voice.trace.bad_frames <= 2 {
-            tracing::debug!(
-                at,
-                bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
-                %e,
-                "XMA frame did not decode"
-            );
-        }
+        tracing::debug!(at, bits = frame.bits, %e, "XMA frame did not decode");
     }
     let mut next = frame.next.unwrap_or(0);
     let loops = context.field(0, 12, 8);
@@ -813,11 +733,6 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
-    static SEEN: Mutex<u64> = Mutex::new(0);
-    if command < 64 && *lock(&SEEN) & 1 << command == 0 {
-        *lock(&SEEN) |= 1 << command;
-        tracing::info!(command, "first coprocessor command of this kind");
-    }
     let mut state = state(this);
     let word = |at: usize| -> Option<u32> {
         // SAFETY: the command's data starts with these u32 fields.
@@ -1055,7 +970,7 @@ mod tests {
             }
         }
         // Six frames and the flushed tail: 3,328 samples, 26 blocks.
-        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.trace.produced);
+        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.produced);
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
