@@ -517,17 +517,6 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   write …, by their hash …`. Good signs: R = 0, in-place buffers in the
   hundreds or thousands, "on the CPU after waiting" small next to "on the
   GPU".
-- Every 10 s: `views: in 10 s mapped N (pages …, alias …, remnant …,
-  section …, canary …) showing P pages, unmapped U (…), already as asked
-  K (…); placeholder splits S, merges M, maps refused F; views alive V (W
-  of one page)`. Under Proton each map and unmap is a wineserver request
-  that walks every view of the process, so N + U per second times V is
-  the wineserver's load. `xmem` maps a run of consecutive pages as one
-  view, leaves a view that already shows what the title asks, and writes
-  DirectStorage page destinations through one view per section kept for
-  good (`section`, once per section). F must be 0. A high W is the title
-  mapping one page at many places (`CopyPageMappingsBatchX` ranges of one
-  page, `alias`), which a section can only show with a view per place.
 - The gate line (`… fps, … ms/frame …; card memory …`) gives the result;
   compare with a run at `VICTORY_UNIFIED=0` in the same place.
 
