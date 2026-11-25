@@ -215,7 +215,7 @@ impl Dxc {
 
     /// Compiles `source` (entry `main`) for `profile`: the signed DXIL
     /// container, or DXC's messages.
-    pub fn compile(&self, source: &str, profile: &str) -> Result<Vec<u8>, String> {
+    pub fn compile(&self, source: &str, profile: &str, enable_16bit: bool) -> Result<Vec<u8>, String> {
         thread_local! {
             static COMPILER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         }
@@ -225,7 +225,10 @@ impl Dxc {
             }
             Ok(slot.get() as Object)
         })?;
-        let args: Vec<Vec<WChar>> = compile_args(profile).iter().map(|a| wide(a)).collect();
+        let mut args: Vec<Vec<WChar>> = compile_args(profile).iter().map(|a| wide(a)).collect();
+        if enable_16bit {
+            args.push(wide("-enable-16bit-types"));
+        }
         let ptrs: Vec<*const WChar> = args.iter().map(|a| a.as_ptr()).collect();
         let buffer = DxcBuffer {
             ptr: source.as_ptr().cast(),

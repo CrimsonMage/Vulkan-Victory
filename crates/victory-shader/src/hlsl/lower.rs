@@ -117,8 +117,19 @@ struct L<'a> {
     mask_fail: HashSet<Value>,
     mesh: Option<Mesh>,
     prim_use: Vec<u8>,
+    /// The program needs host waves of the console's 32 lanes.
+    wave32: bool,
+    /// Values some instruction other than a memory access reads, or a join
+    /// takes (made on first use).
+    numbers: Option<HashSet<Value>>,
+    /// Heap indices of descriptors chosen by control flow, by join block.
+    desc_phis: HashMap<(usize, bool), String>,
     /// Signature elements declared in register order ([`sig_order`]).
     sorted: bool,
+    /// The console's 16-bit signature elements declared 16-bit
+    /// (`float16_t`, DXC's `-enable-16bit-types`) rather than 32-bit: DXC then
+    /// packs them apart from 32-bit ones, as the console's compiler did.
+    half_io: bool,
 }
 
 /// Lowers the program; retries with phis whose incoming values have no HLSL
@@ -132,13 +143,14 @@ pub(super) fn lower(
     inputs: Vec<Sig>,
     outputs: Vec<Sig>,
     mesh: Option<Mesh>,
-    sorted: bool,
+    form: u8,
 ) -> Result<Hlsl, ShaderError> {
     let mut bad = HashSet::new();
     for _ in 0..64 {
         let mut l = L::new(native, p, st, io, res, inputs.clone(), outputs.clone(), &bad);
         l.mesh = mesh.clone();
-        l.sorted = sorted;
+        l.sorted = form & 1 != 0;
+        l.half_io = form & 2 != 0;
         l.prim_use = vec![0; mesh.as_ref().map_or(0, |m| m.prims.len())];
         match l.run() {
             Ok(()) => {}
@@ -276,7 +288,11 @@ impl<'a> L<'a> {
             mask_fail: HashSet::new(),
             mesh: None,
             prim_use: Vec::new(),
+            wave32: false,
+            numbers: None,
+            desc_phis: HashMap::new(),
             sorted: false,
+            half_io: false,
         }
     }
 
@@ -290,7 +306,16 @@ impl<'a> L<'a> {
         self.native.wave64 && self.stage == HwStage::Cs
     }
 
+    /// Host lanes are the console's: a wave32 compute program, run with
+    /// 32-lane waves (`[WaveSize(32)]` once it reads lane masks as numbers).
+    fn console_lanes(&self) -> bool {
+        self.stage == HwStage::Cs && !self.native.wave64
+    }
+
     fn cross_lane(&mut self, what: Why) {
+        if self.console_lanes() {
+            self.wave32 = true;
+        }
         if self.wide_waves() {
             self.approximate.insert(what);
         }
@@ -412,6 +437,16 @@ impl<'a> L<'a> {
             Operand::Scalar { code: NULL, .. } => Ok("0u".into()),
             Operand::Scalar { code, .. } => {
                 let v = inst.read(Reg::S(code)).ok_or("an unread operand")?;
+                // A lane mask read as a number where host lanes are the
+                // console's: its ballot.
+                if self.console_lanes() && !matches!(self.vals.get(&v), Some(Val::U(_) | Val::B(_))) {
+                    if let Some(&low) = self.st.highs.get(&v) {
+                        return Ok(self.mask_data(low)?.1);
+                    }
+                    if self.st.masks.contains_key(&v) {
+                        return Ok(self.mask_data(v)?.0);
+                    }
+                }
                 self.u(v)
             }
             Operand::Vector { reg, .. } => {
@@ -553,6 +588,20 @@ impl<'a> L<'a> {
             }
             // As the bitcode backend: lanes it adds only feed derivatives.
             Atom::Quad(_) => Ok("true".into()),
+            // A mask held as a number, where host lanes are the console's: the
+            // lane tests its own bit.
+            Atom::Opaque(v) if self.console_lanes() => {
+                let x = match self.vals.get(&v) {
+                    Some(Val::U(x)) => x.clone(),
+                    _ => return Err("an opaque lane mask"),
+                };
+                self.wave32 = true;
+                Ok(format!("((({x}) >> WaveGetLaneIndex()) & 1u) != 0u"))
+            }
+            Atom::Constant(k) if self.console_lanes() => {
+                self.wave32 = true;
+                Ok(format!("(({}u >> WaveGetLaneIndex()) & 1u) != 0u", k as u32))
+            }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
@@ -570,6 +619,9 @@ impl<'a> L<'a> {
         let &b = self.st.masks.get(&v).ok_or("a lane mask read as data")?;
         let e = self.boolean(b)?;
         self.cross_lane("a lane mask read as data");
+        if self.console_lanes() {
+            self.wave32 = true;
+        }
         let n = self.fresh("w", "uint4");
         self.line(&format!("{n} = WaveActiveBallot({e});"));
         Ok((format!("{n}.x"), if self.native.wave64 { format!("{n}.y") } else { "0u".into() }))
@@ -803,7 +855,11 @@ impl<'a> L<'a> {
         } else {
             format!("i.a{id}.{}", ["x", "y", "z", "w"][usize::from(c)])
         };
-        if e.comp == 3 { format!("asuint({field})") } else { format!("uint({field})") }
+        match e.comp {
+            3 if e.native16 && self.half_io => format!("asuint(float({field}))"),
+            3 => format!("asuint({field})"),
+            _ => format!("uint({field})"),
+        }
     }
 
     // ---- instructions ----
@@ -1008,7 +1064,7 @@ impl<'a> L<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || lo.is_some_and(|v| self.st.masks.contains_key(&v)) {
+        if inst.write(Reg::S(EXEC)).is_some() || lo.is_some_and(|v| self.st.masks.contains_key(&v)) && !self.console_lanes() {
             // Lane masks live as booleans; their dwords are no numbers here.
             return Err("a lane mask read as data");
         }
@@ -1328,9 +1384,7 @@ impl<'a> L<'a> {
             return Err("title memory by address");
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
-            // A descriptor load: its dwords are no numbers here (the
-            // resources it names are reached by its address).
-            return Err("a descriptor's dwords read as data");
+            return self.descriptor_data(inst, site);
         };
         let count: u32 = match rest {
             "" => 1,
@@ -1414,6 +1468,137 @@ impl<'a> L<'a> {
                 let t = self.fresh("c", "uint");
                 self.line(&format!("{t} = {h}.d[({a} + {}u) >> 4][(({a} + {}u) >> 2) & 3u];", 4 * j, 4 * j));
                 self.write(inst, Reg::S(code + j as u8), t, &None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A descriptor load. Its dwords are no numbers here (the resources it
+    /// names are reached by its address), except the sizes the console
+    /// compiler reads out of them instead of querying (an image's width,
+    /// height, depth and levels, a buffer's record count): those are rebuilt
+    /// from the host view's dimensions in the GFX10 layout, as
+    /// `emit::lower::descriptor_data` does. The others stay missing.
+    fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        const DEAD_WORD: Why = "a descriptor's dwords read as data";
+        let Fields::Smem { data: Some(Operand::Scalar { code, .. }), .. } = inst.fields else {
+            return Err("a scalar memory read as data");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar memory read as data"),
+        };
+        // Is any dword read as a number at all? (Most descriptor loads only
+        // name resources.)
+        if self.numbers.is_none() {
+            let mut n = HashSet::new();
+            for b in &self.p.blocks {
+                for i in &b.insts {
+                    if !matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }) {
+                        n.extend(i.reads.iter().map(|r| r.1));
+                    }
+                }
+                for ph in &b.phis {
+                    n.extend(ph.args.iter().copied());
+                }
+            }
+            self.numbers = Some(n);
+        }
+        let numbers = self.numbers.as_ref().expect("made");
+        let read = inst.writes.iter().any(|w| numbers.contains(&w.1));
+        // What uses the descriptor tells the view's kind (an image or buffer
+        // instruction rather than a scalar buffer load).
+        let uses: Vec<(Site, u8)> = self
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == crate::resource::Role::Resource)
+            .filter_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let by_smem = |u: &(Site, u8)| matches!(self.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. });
+        let use_at = uses.iter().find(|u| !by_smem(u)).or(uses.first()).copied();
+        let mut words: Vec<(u32, String)> = Vec::new();
+        let mut first = 0u8;
+        if read && let Some((at, f)) = use_at {
+            first = f;
+            let src = Source::Loaded { load: site, first: f };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store") || un.contains("atomic") || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            match &ui.fields {
+                Fields::Image { dim, .. } if !un.starts_with("image_bvh") => {
+                    let (tex, ty, comps) = match dim {
+                        0 => ("Texture1D", 8, 1),
+                        1 => ("Texture2D", 9, 2),
+                        2 => ("Texture3D", 10, 3),
+                        4 => ("Texture1DArray", 12, 2),
+                        5 => ("Texture2DArray", 13, 3),
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    let t = if uav { format!("RW{tex}<float4>") } else { format!("{tex}<float4>") };
+                    let h = self.handle(site, &src, &t, false)?;
+                    let d = self.fresh("d", "uint4");
+                    let outs = match comps {
+                        1 => format!("{d}.x"),
+                        2 => format!("{d}.x, {d}.y"),
+                        _ => format!("{d}.x, {d}.y, {d}.z"),
+                    };
+                    if uav {
+                        self.line(&format!("{h}.GetDimensions({outs}); {d}.w = 1u;"));
+                    } else {
+                        self.line(&format!("{h}.GetDimensions(0u, {outs}, {d}.w);"));
+                    }
+                    let (height, depth) = match dim {
+                        0 => ("1u".to_owned(), "1u".to_owned()),
+                        1 => (format!("{d}.y"), "1u".into()),
+                        4 => ("1u".into(), format!("{d}.y")),
+                        _ => (format!("{d}.y"), format!("{d}.z")),
+                    };
+                    words.push((1, format!("(({d}.x - 1u) << 30)")));
+                    words.push((2, format!("((({d}.x - 1u) >> 2) & 0x3fffu) | (({height} - 1u) << 14)")));
+                    words.push((3, format!("({} | (({d}.w - 1u) << 16))", lit(0xFAC | ty << 28))));
+                    words.push((4, format!("({depth} - 1u)")));
+                }
+                Fields::Buffer { .. } | Fields::Smem { .. } if used.is_none_or(|u| u.kind != ResourceType::Cbv) => {
+                    if matches!(ui.fields, Fields::Smem { .. }) && used.is_none_or(|u| u.kind != ResourceType::Srv) {
+                        // A constant buffer: nothing of its descriptor is a number.
+                    } else {
+                        let ty = if uav { "RWByteAddressBuffer" } else { "ByteAddressBuffer" };
+                        let h = self.handle(site, &src, ty, false)?;
+                        let n = self.fresh("d", "uint");
+                        self.line(&format!("{h}.GetDimensions({n});"));
+                        let stride = used.map_or(0, |u| u.stride);
+                        // A raw view counts bytes; the record count is in elements.
+                        words.push((2, if stride > 1 { format!("({n} / {stride}u)") } else { n }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for k in 0..count {
+            let reg = Reg::S(code + k as u8);
+            let rel = k.wrapping_sub(u32::from(first));
+            match words.iter().find(|w| w.0 == rel) {
+                Some((_, x)) => {
+                    let t = self.fresh("t", "uint");
+                    self.line(&format!("{t} = {x};"));
+                    self.write(inst, reg, t, &None)?;
+                }
+                None => {
+                    if let Some(v) = inst.write(reg) {
+                        self.vals.insert(v, Val::Missing(DEAD_WORD));
+                    }
+                }
             }
         }
         Ok(())
@@ -1593,6 +1778,38 @@ impl<'a> L<'a> {
         }
     }
 
+    /// The heap index a descriptor chosen by control flow picks: each
+    /// incoming edge sets it (a predecessor's own choice, itself a join, gives
+    /// that join's variable, at most `depth` joins deep).
+    fn descriptor_phi(&mut self, block: usize, args: &[Source], sampler: bool, depth: u32) -> Result<String, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        if let Some(n) = self.desc_phis.get(&(block, sampler)) {
+            return Ok(n.clone());
+        }
+        let n = self.fresh("d", "uint");
+        let preds = self.p.blocks[block].preds.clone();
+        for (&q, arg) in preds.iter().zip(args) {
+            if self.rpo[q] == usize::MAX {
+                continue;
+            }
+            // (an edge not lowered yet, a loop's back edge: no value there)
+            if self.rpo[q] >= self.rpo[block] || !self.edges.contains_key(&(q, block)) {
+                return Err(WHY);
+            }
+            let index = match arg {
+                Source::Loaded { load, first } => self.heap_index(*load, *first, sampler)?,
+                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
+                    self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
+                }
+                _ => return Err(WHY),
+            };
+            let e = self.edges.get_mut(&(q, block)).expect("checked");
+            e.push_str(&format!("{n} = {index};\n"));
+        }
+        self.desc_phis.insert((block, sampler), n.clone());
+        Ok(n)
+    }
+
     /// A local variable of type `ty` for the descriptor `src` read at
     /// `site` (resources: `CB` is a constant buffer of 4,096 rows).
     fn handle(&mut self, site: Site, src: &Source, ty: &str, sampler: bool) -> Result<String, Why> {
@@ -1654,7 +1871,7 @@ impl<'a> L<'a> {
                 let (x, y) = (self.heap_index(a, fa, sampler)?, self.heap_index(b, fb, sampler)?);
                 (format!("({cond} ? {x} : {y})"), false)
             }
-            Source::Phi { .. } => return Err("a descriptor chosen by control flow"),
+            Source::Phi { block, args } => (self.descriptor_phi(*block, args, sampler, 8)?, false),
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => (self.lane_heap_index(src, sampler)?, true),
         };
         let limit = crate::emit::view_heap_limit();
@@ -2433,7 +2650,63 @@ impl<'a> L<'a> {
     }
 
     /// 16-bit VALU operations (results in the low half; the high half kept).
+    /// 16-bit integer operations: on the low halves, the low 16 bits kept in
+    /// the destination's half (op_sel bit 3: the high one).
+    fn int16(&mut self, inst: &Inst, name: &str, guard: &Option<String>) -> Option<Result<(), Why>> {
+        const INT: &[&str] = &[
+            "v_add_nc_u16",
+            "v_sub_nc_u16",
+            "v_subrev_nc_u16",
+            "v_mul_lo_u16",
+            "v_lshlrev_b16",
+            "v_lshrrev_b16",
+            "v_ashrrev_i16",
+            "v_max_u16",
+            "v_max_i16",
+            "v_min_u16",
+            "v_min_i16",
+        ];
+        if !INT.contains(&name) {
+            return None;
+        }
+        Some((|| {
+            let v = Self::vf(inst);
+            if v.sdwa.is_some() || v.dpp.is_some() || v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let sx = |x: &str| format!("(int({x} << 16) >> 16)");
+            let r = match name {
+                "v_add_nc_u16" => format!("({a} + {b})"),
+                "v_sub_nc_u16" => format!("({a} - {b})"),
+                "v_subrev_nc_u16" => format!("({b} - {a})"),
+                "v_mul_lo_u16" => format!("({a} * {b})"),
+                "v_lshlrev_b16" => format!("({b} << ({a} & 15u))"),
+                "v_lshrrev_b16" => format!("({b} >> ({a} & 15u))"),
+                "v_ashrrev_i16" => format!("uint({} >> ({a} & 15u))", sx(&b)),
+                "v_max_u16" => format!("max({a}, {b})"),
+                "v_min_u16" => format!("min({a}, {b})"),
+                "v_max_i16" => format!("uint(max({}, {}))", sx(&a), sx(&b)),
+                _ => format!("uint(min({}, {}))", sx(&a), sx(&b)),
+            };
+            let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("a 16-bit result outside a VGPR") };
+            let old = match inst.read(Reg::V(reg)) {
+                Some(o) => self.u(o)?,
+                None => "0u".into(),
+            };
+            let x = if v.opsel & 8 != 0 {
+                format!("(({old} & 0xffffu) | (({r}) << 16))")
+            } else {
+                format!("(({old} & 0xffff0000u) | (({r}) & 0xffffu))")
+            };
+            self.write(inst, Reg::V(reg), x, guard)
+        })())
+    }
+
     fn valu16(&mut self, inst: &Inst, name: &str, guard: &Option<String>) -> Option<Result<(), Why>> {
+        if let Some(r) = self.int16(inst, name, guard) {
+            return Some(r);
+        }
         let op = name.strip_suffix("_f16").filter(|_| name.starts_with("v_") && !name.starts_with("v_cmp") && !name.starts_with("v_interp"))?;
         let op = &op[2..];
         if matches!(op, "cvt_f32" | "fma_mixlo" | "fma_mixhi" | "cvt_pkrtz" | "pack_b32") || op.starts_with("cvt_") && op != "cvt_f16" {
@@ -2493,9 +2766,9 @@ impl<'a> L<'a> {
                 None => "0u".into(),
             };
             let x = if v.opsel & 8 != 0 {
-                format!("(({old} & 0xffffu) | (hw_f16_rne({r}) << 16))")
+                format!("(({old} & 0xffffu) | (f32tof16({r}) << 16))")
             } else {
-                format!("(({old} & 0xffff0000u) | hw_f16_rne({r}))")
+                format!("(({old} & 0xffff0000u) | (f32tof16({r}) & 0xffffu))")
             };
             self.write(inst, Reg::V(reg), x, guard)
         })())
@@ -2559,18 +2832,7 @@ impl<'a> L<'a> {
                 .position(|e| e.reg == Some(u32::from(attribute.row)) && ch >= e.col() && ch < e.col() + e.cols())
                 .ok_or("an input the signature lacks")?;
             let c = ch - l.inputs[id].col();
-            let declared = l.inputs[id].interp;
-            let (used, m) = l.input_use[id];
-            if let Some(m) = m
-                && m != mode
-            {
-                return Err("one input interpolated two ways");
-            }
-            if declared != 0 && declared != mode {
-                return Err("an input interpolated otherwise than declared");
-            }
-            l.input_use[id] = (used | 1 << c, Some(mode));
-            Ok(l.comp_expr(id, c, true))
+            l.use_input(id, c, mode)
         };
         let x = match packed {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
@@ -2593,16 +2855,7 @@ impl<'a> L<'a> {
                                 .position(|e| e.reg == Some(u32::from(row)) && ch >= e.col() && ch < e.col() + e.cols())
                                 .ok_or("an input the signature lacks")?;
                             let c = ch - l.inputs[id].col();
-                            let (used, m) = l.input_use[id];
-                            if m.is_some_and(|m| m != mode) {
-                                return Err("one input interpolated two ways");
-                            }
-                            let declared = l.inputs[id].interp;
-                            if declared != 0 && declared != mode {
-                                return Err("an input interpolated otherwise than declared");
-                            }
-                            l.input_use[id] = (used | 1 << c, Some(mode));
-                            Ok(Some(l.comp_expr(id, c, true)))
+                            l.use_input(id, c, mode).map(Some)
                         }
                         _ => Ok(None),
                     }
@@ -2629,6 +2882,21 @@ impl<'a> L<'a> {
             }
         };
         self.write(inst, Reg::V(reg), x, &None)
+    }
+
+    /// Channel `c` of pixel input `id` read with interpolation `mode`. A
+    /// constant element reads its provoking vertex whatever the instruction
+    /// (the hardware shades it flat); otherwise the element is declared with
+    /// the mode its reads use (a different packing shows in the signature
+    /// check).
+    fn use_input(&mut self, id: usize, c: u8, mode: u8) -> Result<String, Why> {
+        let mode = if self.inputs[id].interp == 1 { 1 } else { mode };
+        let (used, m) = self.input_use[id];
+        if m.is_some_and(|m| m != mode) {
+            return Err("one input interpolated two ways");
+        }
+        self.input_use[id] = (used | 1 << c, Some(mode));
+        Ok(self.comp_expr(id, c, true))
     }
 
     // ---- exports ----
@@ -3048,15 +3316,24 @@ impl<'a> L<'a> {
                 "swap" => "InterlockedExchange",
                 _ => return Err("an image atomic"),
             };
-            if dmask != 1 {
-                return Err("a 64-bit image atomic");
-            }
+            // One 32-bit channel, or a uint64_t in two (an R32G32_UINT view).
+            let wide = match dmask {
+                1 => false,
+                3 => true,
+                _ => return Err("an image atomic data mask"),
+            };
             let cs: Vec<String> = (0..coords).map(|k| at16(self, 0, k)).collect::<Result<_, _>>()?;
             let Operand::Vector { reg, .. } = *data else { return Err("image atomic data") };
-            let x = self.u(inst.read(Reg::V(reg)).ok_or("image atomic data")?)?;
-            let h = self.handle(site, src, &format!("RW{tex}<uint>"), false)?;
-            let old = self.fresh("t", "uint");
-            let keep = if cache.glc { self.u(inst.read(Reg::V(reg)).ok_or("image atomic data")?)? } else { "0u".into() };
+            let lo = self.u(inst.read(Reg::V(reg)).ok_or("image atomic data")?)?;
+            let (x, ty, ety) = if wide {
+                let hi = self.u(inst.read(Reg::V(reg + 1)).ok_or("image atomic data")?)?;
+                (format!("(uint64_t({lo}) | (uint64_t({hi}) << 32))"), "uint64_t", "uint64_t")
+            } else {
+                (lo.clone(), "uint", "uint")
+            };
+            let h = self.handle(site, src, &format!("RW{tex}<{ty}>"), false)?;
+            let old = self.fresh("t", ety);
+            let keep = if cache.glc { x.clone() } else { "0".into() };
             self.line(&format!("{old} = {keep};"));
             if let Some(g) = &guard {
                 self.line(&format!("if ({g}) {{"));
@@ -3065,8 +3342,14 @@ impl<'a> L<'a> {
             if guard.is_some() {
                 self.line("}");
             }
+            self.writes_uavs = true;
             if cache.glc {
-                self.write(inst, Reg::V(reg), old, &None)?;
+                if wide {
+                    self.write(inst, Reg::V(reg), format!("uint({old})"), &None)?;
+                    self.write(inst, Reg::V(reg + 1), format!("uint({old} >> 32)"), &None)?;
+                } else {
+                    self.write(inst, Reg::V(reg), old, &None)?;
+                }
             }
             return Ok(());
         }
@@ -3259,7 +3542,7 @@ impl<'a> L<'a> {
                 "image_get_lod" if self.pixel() && !cube => {
                     format!("float4({h}.CalculateLevelOfDetail({s}, {coord}), {h}.CalculateLevelOfDetailUnclamped({s}, {coord}), 0.0f, 0.0f)")
                 }
-                _ => return Err("an image sample form"),
+                _ => return Err(sname),
             };
             self.line(&format!("{r} = {call};"));
             if sname.starts_with("image_gather") {
@@ -3622,7 +3905,7 @@ impl<'a> L<'a> {
             HwStage::Ps => {
                 let mut s = String::from("struct PSIn {\n");
                 for (id, e) in sig_order(&self.inputs, self.sorted) {
-                    let ty = sig_type(e, true);
+                    let ty = sig_type(e, self.half_io);
                     let mode = match (e.sv, self.input_use[id].1, e.interp) {
                         (0, Some(m), _) | (0, None, m) => interp_keyword(m, e.comp),
                         _ => "",
@@ -3631,7 +3914,7 @@ impl<'a> L<'a> {
                 }
                 s.push_str("};\nstruct PSOut {\n");
                 for (id, e) in sig_order(&self.outputs, self.sorted) {
-                    let ty = sig_type(e, false);
+                    let ty = sig_type(e, self.half_io);
                     let _ = writeln!(s, "  {ty} o{id} : {}{};", sem_name(e), sem_index(e));
                 }
                 s.push_str("};\n");
@@ -3651,14 +3934,21 @@ impl<'a> L<'a> {
                 let params: Vec<String> = params.into_iter().cloned().collect();
                 (
                     "cs_6_6",
-                    format!("[numthreads({}, {}, {})]\nvoid main({}) {{\n", t[0], t[1], t[2], params.join(", ")),
+                    format!(
+                        "{}[numthreads({}, {}, {})]\nvoid main({}) {{\n",
+                        if self.wave32 { "[WaveSize(32)]\n" } else { "" },
+                        t[0],
+                        t[1],
+                        t[2],
+                        params.join(", ")
+                    ),
                     (),
                 )
             }
             HwStage::Vs => {
                 let mut s = String::from("struct VSIn {\n");
                 for (id, e) in sig_order(&self.inputs, self.sorted) {
-                    let ty = sig_type(e, true);
+                    let ty = sig_type(e, self.half_io);
                     let _ = writeln!(s, "  {ty} a{id} : {}{};", sem_name(e), sem_index(e));
                 }
                 for (k, v) in &self.system {
@@ -3667,7 +3957,7 @@ impl<'a> L<'a> {
                 }
                 s.push_str("};\nstruct VSOut {\n");
                 for (id, e) in sig_order(&self.outputs, self.sorted) {
-                    let ty = sig_type(e, false);
+                    let ty = sig_type(e, self.half_io);
                     let _ = writeln!(s, "  {ty} o{id} : {}{};", sem_name(e), sem_index(e));
                 }
                 s.push_str("};\n");
@@ -3677,13 +3967,13 @@ impl<'a> L<'a> {
                 let m = self.mesh.clone().ok_or(ShaderError::Malformed("a mesh program without its limits"))?;
                 let mut s = String::from("struct MSVert {\n");
                 for (id, e) in sig_order(&self.outputs, self.sorted) {
-                    let _ = writeln!(s, "  {} o{id} : {}{};", sig_type(e, false), sem_name(e), sem_index(e));
+                    let _ = writeln!(s, "  {} o{id} : {}{};", sig_type(e, self.half_io), sem_name(e), sem_index(e));
                 }
                 s.push_str("};\n");
                 if !m.prims.is_empty() {
                     s.push_str("struct MSPrim {\n");
                     for (id, e) in sig_order(&m.prims, self.sorted) {
-                        let _ = writeln!(s, "  {} p{id} : {}{};", sig_type(e, false), sem_name(e), sem_index(e));
+                        let _ = writeln!(s, "  {} p{id} : {}{};", sig_type(e, self.half_io), sem_name(e), sem_index(e));
                     }
                     s.push_str("};\n");
                 }
@@ -3758,10 +4048,13 @@ impl<'a> L<'a> {
             root_uavs: self.root_uavs.iter().copied().collect(),
             root_indexed_views: self.res.root_indexed_views.clone(),
         };
+        let enable_16bit =
+            self.half_io && self.inputs.iter().chain(&self.outputs).chain(self.mesh.iter().flat_map(|m| &m.prims)).any(|e| e.native16);
         Ok(Hlsl {
             stage: self.stage,
             source: src,
             profile,
+            enable_16bit,
             shader,
             approximate: self.approximate.into_iter().collect(),
         })
@@ -3929,15 +4222,17 @@ fn sem_index(e: &Sig) -> String {
     }
 }
 
-fn sig_type(e: &Sig, input: bool) -> String {
-    let _ = input;
+fn sig_type(e: &Sig, half_io: bool) -> String {
     if e.sv == 9 {
         return "bool".into();
     }
-    let base = match e.comp {
-        1 => "uint",
-        2 => "int",
-        _ => "float",
+    let base = match (e.comp, e.native16 && half_io) {
+        (1, false) => "uint",
+        (2, false) => "int",
+        (_, false) => "float",
+        (1, true) => "uint16_t",
+        (2, true) => "int16_t",
+        (_, true) => "float16_t",
     };
     let n = e.cols();
     if n == 1 { base.into() } else { format!("{base}{n}") }

@@ -46,6 +46,8 @@ pub struct Hlsl {
     pub source: String,
     /// DXC target profile (`ps_6_6`...).
     pub profile: &'static str,
+    /// Compiled with `-enable-16bit-types` (16-bit signature elements).
+    pub enable_16bit: bool,
     pub shader: HostShader,
     /// Cross-lane operations taken per host wave where the console's wave
     /// is wider (a console wave64 compute program on 32-lane hosts): what
@@ -67,6 +69,8 @@ pub(crate) struct Sig {
     /// Minimum precision (16-bit elements on the console are declared
     /// 32-bit on the host, as the bitcode backend does).
     pub half: bool,
+    /// A native 16-bit type (`float16_t`...) on the console.
+    pub native16: bool,
     /// DXIL interpolation mode from `PSV0` (0 if unknown).
     pub interp: u8,
 }
@@ -118,6 +122,7 @@ pub(crate) fn signature(part: &[u8]) -> Result<Vec<Sig>, ShaderError> {
             reg: (register != u32::MAX).then_some(register),
             mask: *part.get(at + 24).ok_or(ShaderError::Malformed("truncated"))?,
             half: (4..=6).contains(&raw) || u32_at(part, at + 28)? != 0,
+            native16: (4..=6).contains(&raw),
             interp: 0,
         });
     }
@@ -154,13 +159,16 @@ fn psv_input_modes(psv: &[u8]) -> Vec<u8> {
 /// The console program of `container` as HLSL, its signature elements
 /// declared in the console's order.
 pub fn emit(container: &[u8]) -> Result<Hlsl, ShaderError> {
-    emit_with(container, false)
+    emit_with(container, 0)
 }
 
-/// [`emit`]; `sorted`: signature elements declared in register order
-/// instead (DXC then packs some signatures as the console did that it
-/// packs otherwise from the console's order).
-pub fn emit_with(container: &[u8], sorted: bool) -> Result<Hlsl, ShaderError> {
+/// [`emit`] in another form: `form` bit 0 declares signature elements in
+/// register order instead (DXC then packs some signatures as the console
+/// did that it packs otherwise from the console's order), bit 1 declares
+/// the console's 16-bit elements 16-bit (DXC packs them apart from 32-bit
+/// ones, as the console did; the host signature then has 16-bit types).
+/// [`translate`] tries the forms in order: [`FORMS`].
+pub fn emit_with(container: &[u8], form: u8) -> Result<Hlsl, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c.part(FourCC::DXIL).ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
@@ -175,7 +183,7 @@ pub fn emit_with(container: &[u8], sorted: bool) -> Result<Hlsl, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_program(&c, &native, &p, &st, &io, &res, sorted)
+    emit_program(&c, &native, &p, &st, &io, &res, form)
 }
 
 /// [`emit`] with the earlier stages already run.
@@ -186,7 +194,7 @@ pub fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-    sorted: bool,
+    form: u8,
 ) -> Result<Hlsl, ShaderError> {
     let sig = |fourcc| -> Result<Vec<Sig>, ShaderError> {
         match c.part(fourcc) {
@@ -229,16 +237,23 @@ pub fn emit_program(
         }
         _ => None,
     };
-    lower::lower(native, p, st, io, res, inputs, outputs, mesh, sorted)
+    lower::lower(native, p, st, io, res, inputs, outputs, mesh, form)
 }
+
+/// The forms [`translate`] tries ([`emit_with`]): the console's order, then
+/// register order, each with 32-bit then 16-bit elements.
+pub const FORMS: [u8; 4] = [0, 1, 2, 3];
 
 /// Translates through HLSL and DXC: a [`HostShader`] like
 /// [`crate::emit::translate`]'s. `compiler` is the loaded DXC.
 pub fn translate(container: &[u8], compiler: &dxc::Dxc) -> Result<(HostShader, Hlsl), String> {
     let mut first = None;
-    for sorted in [false, true] {
-        let mut h = emit_with(container, sorted).map_err(|e| e.to_string())?;
-        let dxil = compiler.compile(&h.source, h.profile)?;
+    for form in FORMS {
+        let mut h = emit_with(container, form).map_err(|e| e.to_string())?;
+        if form & 2 != 0 && !h.enable_16bit {
+            continue;
+        }
+        let dxil = compiler.compile(&h.source, h.profile, h.enable_16bit)?;
         match check_signatures(container, &dxil) {
             Ok(()) => {
                 h.shader.dxil = dxil;
@@ -335,6 +350,63 @@ pub fn try_translate(container: &[u8]) -> Option<HostShader> {
                 eprintln!("HLSL backend: {e}; the bitcode backend translates");
             }
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::StageIo;
+
+    /// An `OSG1` part of one element: `SV_Target0`, float4.
+    fn target_signature() -> Vec<u8> {
+        let mut d = Vec::new();
+        let w = |d: &mut Vec<u8>, x: u32| d.extend_from_slice(&x.to_le_bytes());
+        w(&mut d, 1);
+        w(&mut d, 8);
+        // stream, name offset, index, system value, component type, register
+        for x in [0, 8 + 32, 0, 64, 3, 0] {
+            w(&mut d, x);
+        }
+        d.extend_from_slice(&[0xF, 0, 0, 0]);
+        w(&mut d, 0);
+        d.extend_from_slice(b"SV_Target\0\0\0");
+        d
+    }
+
+    /// A pixel program writing 1.0 to every channel of render target 0:
+    /// `v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm`.
+    #[test]
+    fn a_constant_colour_becomes_an_hlsl_pixel_shader() {
+        let words = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = target_signature();
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let h = emit_program(&c, &native, &p, &st, &io, &res, 0).unwrap();
+        assert_eq!(h.profile, "ps_6_6");
+        assert!(h.source.contains("float4 o0 : SV_Target0;"), "{}", h.source);
+        assert!(h.source.contains("o.o0.w = asfloat(0x3f800000u);"), "{}", h.source);
+        assert!(h.approximate.is_empty());
+        // With DXC at hand (`VICTORY_DXC`), it compiles and keeps the console's
+        // signature.
+        if std::env::var_os("VICTORY_DXC").is_some() {
+            let d = dxc::Dxc::load(dxc::default_path().as_deref()).unwrap();
+            let dxil = d.compile(&h.source, h.profile, h.enable_16bit).unwrap();
+            check_signatures(&bytes, &dxil).unwrap();
         }
     }
 }
