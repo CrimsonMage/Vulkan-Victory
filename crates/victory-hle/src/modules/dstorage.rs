@@ -130,11 +130,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
-    // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
-    };
+    let name = super::xgameruntime::wide_text(path).unwrap_or_default();
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");

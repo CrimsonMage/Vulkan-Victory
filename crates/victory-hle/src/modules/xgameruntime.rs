@@ -165,6 +165,15 @@ pub fn text(s: *const c_char) -> Option<String> {
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
+/// The title's NUL-terminated UTF-16 string, if any.
+pub fn wide_text(s: *const u16) -> Option<String> {
+    // SAFETY: the title passes a NUL-terminated string or null.
+    (!s.is_null()).then(|| unsafe {
+        let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(s, len))
+    })
+}
+
 /// A new registration token for callbacks we never call (events nobody
 /// raises offline).
 pub fn token() -> u64 {

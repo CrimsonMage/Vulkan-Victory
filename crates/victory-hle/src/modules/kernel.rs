@@ -38,11 +38,7 @@ fn narrow(text: *const u8) -> String {
 
 /// See [`narrow`].
 fn wide(text: *const u16) -> String {
-    // SAFETY: the title passes a NUL-terminated string.
-    unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-    }
+    super::xgameruntime::wide_text(text).unwrap_or_default()
 }
 
 /// A title image's path is its original file, not our cache copy;

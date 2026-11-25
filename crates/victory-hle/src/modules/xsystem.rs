@@ -168,15 +168,7 @@ mod device_type {
     }
 
     fn is(text: *const u16, expected: &str) -> bool {
-        if text.is_null() {
-            return false;
-        }
-        // SAFETY: the title passes a NUL-terminated string.
-        let text = unsafe {
-            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-        };
-        text.eq_ignore_ascii_case(expected)
+        crate::modules::xgameruntime::wide_text(text).is_some_and(|t| t.eq_ignore_ascii_case(expected))
     }
 
     /// Opens our key for its path; the key has no subkeys. `None`: not
