@@ -1241,6 +1241,25 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Whether the card writes title memory in `[address, address + len)`: a
+/// texture the host renders to or writes starts there ([`TARGETS_AT`]), or
+/// the host copy of one covers some of it ([`TARGET_SPANS`]), or the host
+/// copied into a texture there (`crate::texture::host_written_in`). What
+/// such memory shows exists on the card alone; title memory stays zeros.
+#[cfg(windows)]
+pub(crate) fn card_writes_in(address: u64, len: u64) -> bool {
+    let end = address.saturating_add(len);
+    if TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).range(address..end).next().is_some() {
+        return true;
+    }
+    let spans = TARGET_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    if spans.range(..(end, 0)).any(|(&(_, _), &(span_end, _))| span_end > address) {
+        return true;
+    }
+    drop(spans);
+    crate::texture::host_written_in(address, end)
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with

@@ -535,6 +535,13 @@ pub(crate) fn host_written(resource: This) {
 static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
     Mutex::new(std::collections::BTreeMap::new());
 
+/// Whether the host copied into a texture whose title memory overlaps
+/// `[start, end)` ([`host_written`]).
+pub(crate) fn host_written_in(start: u64, end: u64) -> bool {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    map.range(..end).any(|(&at, d)| at + d.0 > start)
+}
+
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host
 /// copied into ([`host_written`]). Its own host copy is filled from title
@@ -1228,6 +1235,35 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
     u64::from_le_bytes(first) | 1
+}
+
+/// Whether the title memory `[at, at + len)` holds only zeros where
+/// [`fingerprint`] looks (all of it up to 48 KiB, else 16 KiB at its start,
+/// middle and end; pages not there count as zeros): no data has arrived
+/// there yet. Stops at the first byte that is not zero.
+pub(crate) fn holds_only_zeros(at: u64, len: u64) -> bool {
+    const WINDOW: usize = 16 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(WINDOW, 0);
+        let mut zeros = |from: usize, bytes: usize| {
+            (0..bytes).step_by(WINDOW).all(|done| {
+                let n = WINDOW.min(bytes - done);
+                read[..n].fill(0);
+                crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from + done) as *const u8, n, false);
+                read[..n].iter().all(|&b| b == 0)
+            })
+        };
+        if len <= 3 * WINDOW {
+            zeros(0, len)
+        } else {
+            zeros(0, WINDOW) && zeros((len / 2) & !0xfff, WINDOW) && zeros(len - WINDOW, WINDOW)
+        }
+    })
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
