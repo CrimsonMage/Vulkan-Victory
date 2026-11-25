@@ -172,6 +172,24 @@ pub fn token() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Registers a callback for an event nothing raises offline (a user,
+/// licence, network hint or install progress that never changes): it is
+/// never called. `(this, queue, context, callback, out token)`.
+pub extern "system" fn register_never_called(
+    _: *const Object,
+    _queue: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    out: *mut u64,
+) -> HRESULT {
+    put(out, token())
+}
+
+/// Ends a [`register_never_called`] registration: `(this, token, wait)`.
+pub extern "system" fn unregister_never_called(_: *const Object, _token: u64, _wait: bool) -> bool {
+    true
+}
+
 /// Calls method `slot` (byte offset) of `object` as title code would.
 #[cfg(test)]
 pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {

@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text,
+    register_never_called,
 };
 use crate::runtime;
 
@@ -125,16 +126,6 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     );
 }
 
-/// The installation is complete, so progress never changes.
-extern "system" fn register_progress(
-    _: This,
-    _monitor: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
 
 /// 0: ready.
 // shortcut: every selector counts as installed, including ones the
@@ -278,7 +269,7 @@ static VTABLE: Methods<40> = Methods([
     close_monitor as *const (),         // 0x30
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
-    register_progress as *const (),     // 0x48
+    register_never_called as *const (), // 0x48
     missing::<10> as *const (),         // 0x50 unregister it
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60

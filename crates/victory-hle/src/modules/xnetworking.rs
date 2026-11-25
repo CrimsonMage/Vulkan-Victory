@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text,
+    register_never_called, unregister_never_called,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -124,19 +125,6 @@ extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRE
     put(out, OFFLINE)
 }
 
-/// The hint never changes offline, so the callback never runs.
-extern "system" fn register(
-    _: This,
-    _queue: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
-    true
-}
 
 static VTABLE: Methods<18> = Methods([
     missing::<0> as *const (),
@@ -155,8 +143,8 @@ static VTABLE: Methods<18> = Methods([
     missing::<13> as *const (),        // 0x68
     verify_certificate as *const (),   // 0x70
     connectivity_hint as *const (),    // 0x78
-    register as *const (),             // 0x80 hint changed (never)
-    unregister as *const (),           // 0x88
+    register_never_called as *const (), // 0x80 hint changed (never)
+    unregister_never_called as *const (), // 0x88
 ]);
 
 #[cfg(test)]
