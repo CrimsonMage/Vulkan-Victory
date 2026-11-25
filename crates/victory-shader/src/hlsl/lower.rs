@@ -35,13 +35,10 @@ enum Val {
 
 /// Loop limits as the bitcode backend sets them (`emit::lower::count_iteration`).
 fn loop_limit(stage: HwStage) -> u32 {
-    match crate::emit::loop_limit() {
-        n if n == crate::emit::DEFAULT_LOOP_LIMIT => match stage {
-            HwStage::Ps => 1 << 7,
-            HwStage::Cs => 1 << 12,
-            _ => 1 << 8,
-        },
-        n => n,
+    match stage {
+        HwStage::Ps => 1 << 7,
+        HwStage::Cs => 1 << 12,
+        _ => 1 << 8,
     }
 }
 
