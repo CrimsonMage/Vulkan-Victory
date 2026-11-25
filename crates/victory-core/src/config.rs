@@ -1,7 +1,8 @@
 //! Where the user's files live.
 //!
-//! Resolution order for each value: environment variable, then the config
-//! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
+//! Resolution order for each path: environment variable, then the config
+//! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default. The
+//! test-title list comes from the config file only.
 //! See `victory.example.toml` at the repository root.
 
 use std::path::{Path, PathBuf};
@@ -79,12 +80,6 @@ impl Config {
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let test_titles = match env("VICTORY_TEST_TITLES") {
-            Some(v) if !v.is_empty() => std::env::split_paths(&v)
-                .filter(|p| !p.as_os_str().is_empty())
-                .collect(),
-            _ => file.test_titles,
-        };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
             .map_or_else(|| default_dir("cache"), Ok)?;
@@ -95,7 +90,7 @@ impl Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
-            test_titles,
+            test_titles: file.test_titles,
             source,
         })
     }
@@ -163,29 +158,6 @@ mod tests {
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
-    }
-
-    #[test]
-    fn empty_test_titles_env_is_ignored() {
-        let file = FilePaths {
-            test_titles: vec!["from-file".into()],
-            ..Default::default()
-        };
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
-        assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
-    }
-
-    #[test]
-    fn test_titles_env_splits_paths() {
-        let value = std::env::join_paths(["first", "second"]).unwrap();
-        let file = FilePaths::default();
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
-        assert_eq!(
-            cfg.test_titles,
-            vec![PathBuf::from("first"), PathBuf::from("second")]
-        );
     }
 
     #[test]

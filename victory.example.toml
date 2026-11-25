@@ -15,5 +15,4 @@ game_dir = 'D:\victory-data\game'
 # data_dir = 'D:\victory-data\data'
 
 # Other Xbox Series titles used to test platform-level code.
-# env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
