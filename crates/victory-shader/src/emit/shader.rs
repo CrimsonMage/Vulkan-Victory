@@ -467,6 +467,13 @@ impl Shader {
                 }
             }
         }
+        // One return and one exit block per loop, as DXC's code has
+        // (`bitcode::cfg`): the converter Proton ships turns other loops
+        // into invalid SPIR-V. `VICTORY_SHADER_CFG=0` keeps the graph as
+        // the lowering made it.
+        if std::env::var_os("VICTORY_SHADER_CFG").is_none_or(|v| v != "0") {
+            self.m.single_exits();
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
