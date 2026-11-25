@@ -1446,12 +1446,17 @@ extern "system" fn clear_dsv(
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// are title memory. With unified memory a destination in place is copied
+/// on the card, in the list where the title put it, as on the console
+/// ([`copy_on_card`]); else at submission (if mapped), as a step of ours
+/// that waits until everything in the air has landed.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        // (Overlapping ranges are a memmove: on the CPU.)
+        && !((dst.saturating_add(len) <= src || src.saturating_add(len) <= dst) && copy_on_card(list, dst, src, len))
     {
         let len = len as usize;
         list.defer(move || {

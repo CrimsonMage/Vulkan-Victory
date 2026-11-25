@@ -1150,11 +1150,70 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
-    /// The dwords of `differs` taken by plans whose results were not read
-    /// yet.
+    /// Where the next plan's results go in `differs` (a ring: plans are
+    /// done with in the order they are made).
     taken: u32,
-    /// Plans made and not done with (`Host::card_done`).
-    out: u32,
+    /// Plans made and not done with (`Host::card_done`), oldest first: the
+    /// dwords of `differs` each holds, [start, end).
+    out: std::collections::VecDeque<(u32, u32)>,
+}
+
+/// Where in the compare's result ring (`cap` dwords, the next free one at
+/// `tail`, the plans out holding `out`) a plan's `need` dwords go: after
+/// the last plan's, or from the start again if the oldest plan's begin
+/// further on. `None` if they do not fit until plans are done with.
+fn ring_start(out: &std::collections::VecDeque<(u32, u32)>, tail: u32, need: u32, cap: u32) -> Option<u32> {
+    let Some(&(head, _)) = out.iter().find(|r| r.0 != r.1) else {
+        return (need <= cap).then_some(0);
+    };
+    if tail > head {
+        if tail + need <= cap {
+            Some(tail)
+        } else {
+            (need < head).then_some(0)
+        }
+    } else {
+        (tail + need < head).then_some(tail)
+    }
+}
+
+/// The most dwords in one piece that [`ring_start`] can give now.
+fn ring_room(out: &std::collections::VecDeque<(u32, u32)>, tail: u32, cap: u32) -> u32 {
+    match out.iter().find(|r| r.0 != r.1) {
+        None => cap,
+        Some(&(head, _)) if tail > head => (cap - tail).max(head.saturating_sub(1)),
+        Some(&(head, _)) => head.saturating_sub(tail + 1),
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::{ring_room, ring_start};
+    use std::collections::VecDeque;
+
+    /// Plans take their results one after the other, start over at the
+    /// beginning when the oldest one there is done with, and never overlap
+    /// one still out.
+    #[test]
+    fn results_go_round_without_overlapping_plans_out() {
+        let mut out = VecDeque::new();
+        assert_eq!(ring_start(&out, 70, 40, 100), Some(0));
+        assert_eq!(ring_start(&out, 0, 101, 100), None);
+        out.push_back((0, 40));
+        assert_eq!(ring_start(&out, 40, 50, 100), Some(40));
+        out.push_back((40, 90));
+        assert_eq!(ring_start(&out, 90, 20, 100), None, "neither after the last nor before the oldest");
+        assert_eq!(ring_room(&out, 90, 100), 10);
+        out.pop_front();
+        assert_eq!(ring_start(&out, 90, 20, 100), Some(0), "the oldest is done with: from the start");
+        out.push_back((0, 20));
+        assert_eq!(ring_start(&out, 20, 19, 100), Some(20));
+        assert_eq!(ring_start(&out, 20, 20, 100), None, "it would reach the oldest plan's first dword");
+        assert_eq!(ring_room(&out, 20, 100), 19);
+        // Plans that compared nothing hold no dwords.
+        let out = VecDeque::from([(5, 5), (5, 5)]);
+        assert_eq!(ring_start(&out, 5, 30, 100), Some(0));
+    }
 }
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
 // under the submission lock.
@@ -1163,11 +1222,17 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. The offsets are
+/// widened to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged
+/// for a byte just outside the range costs a fetch that finds nothing.
+///
+/// Each thread hashes every 64th 16 bytes of the piece (the group reads 1 KiB
+/// in one go), and the first thread hashes the 64 hashes in order. One
+/// thread per piece, reading its 64 KiB alone 16 bytes at a time, kept the
+/// card on a few dozen threads for every submission that wrote the title's
+/// 174 MB heap (2,720 pieces).
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1183,24 +1248,35 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
+uint4 mix(uint4 h, uint4 v) {
+    h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u ^ lane, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+        h = mix(h, now.Load4(at));
+    }
+    part[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane != 0u) return;
+    h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint k = 0u; k < 64u; k++) {
+        h = mix(h, part[k]);
     }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -2298,7 +2374,7 @@ impl Host {
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
-        const RESULTS: u64 = 1 << 20;
+        const RESULTS: u64 = 4 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -2322,7 +2398,7 @@ impl Host {
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
-                out: 0,
+                out: Default::default(),
             })
         }
     }
@@ -2434,7 +2510,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(run.pieces, 1, 1);
                         }
                     }
                     list.Close()?;
@@ -2455,8 +2531,8 @@ impl Host {
             lists: used,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        // results go behind those of plans still in the air, round the ring.
+        let mut spans_of: Vec<(Arc<crate::shadow::Shadow>, crate::shadow::CardSpan, bool)> = Vec::new();
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -2469,22 +2545,27 @@ impl Host {
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    span,
-                    at,
-                    compared,
-                });
-                if compared {
-                    at += span.pieces;
+                if let Some(span) = shadow.card_span(from, to) {
+                    spans_of.push((shadow.clone(), span, twin));
                 }
             }
         }
-        work.taken = at;
+        let need: u32 = spans_of.iter().filter(|s| s.2).map(|s| s.1.pieces).sum();
+        let start = ring_start(&work.out, work.taken, need, (work.differs.2 / 4) as u32);
+        let mut at = start.unwrap_or(work.taken);
+        for (shadow, span, twin) in spans_of {
+            let compared = twin && start.is_some();
+            let pieces = span.pieces;
+            plan.ranges.push(CardRange { shadow, span, at, compared });
+            if compared {
+                at += pieces;
+            }
+        }
+        let first = start.unwrap_or(work.taken);
+        work.out.push_back((first, if start.is_some() { at } else { first }));
+        if start.is_some() {
+            work.taken = at;
+        }
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
@@ -2518,7 +2599,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(r.span.pieces, 1, 1);
                     }
                     list.Close()?;
                     list.cast()
@@ -2530,25 +2611,29 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
-        work.out += 1;
         Some(plan)
     }
 
-    /// With [`relay`]: whether the compare's result area is half taken by
-    /// plans in the air. It starts from the beginning only when no plan is
-    /// out, so the caller lets the flights land first.
+    /// With [`relay`]: whether less than a quarter of the compare's result
+    /// ring is free in one piece, so the caller lets flights land first. (The
+    /// area used to start over only when no plan was out, which with
+    /// flights always in the air meant a full drain of the card every few
+    /// dozen submissions that write the title's big heap.)
     fn card_results_low(&self) -> bool {
         CARD_WORK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+            .is_some_and(|work| {
+                let cap = (work.differs.2 / 4) as u32;
+                ring_room(&work.out, work.taken, cap) < cap / 4
+            })
     }
 
     /// The plan's submission has run and its results were read
-    /// ([`Host::card_back`]): its lists are free for the next plan. Called
-    /// when nothing of ours is on the card, so the compare's results start
-    /// from the beginning again.
+    /// ([`Host::card_back`]): its lists are free for the next plan, and its
+    /// part of the result ring too. Plans are done with in the order they
+    /// were made (flights land in order).
     fn card_done(&self, plan: CardPlan) {
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
@@ -2557,10 +2642,8 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
-        work.out = work.out.saturating_sub(1);
-        // With the relay other plans may be on the card, their results
-        // not read yet: the area starts again only when none is out.
-        if work.out == 0 {
+        work.out.pop_front();
+        if work.out.is_empty() {
             work.taken = 0;
         }
     }
@@ -3017,21 +3100,15 @@ impl Host {
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         crate::descriptor::sync_heaps();
-        // Before this submission counts as started: what the sweep lets go
-        // of is named by no list, and nothing runs now. With the present
-        // sent ahead nothing else brings a moment with nothing in the air:
-        // one is made for the sweep every second and a half.
-        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !(late && flying()) {
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            let t = std::time::Instant::now();
-            settle();
-            waited(Wait::Sweep, t);
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
-        }
+        // Before this submission counts as started (the sweep self-limits
+        // to once a second). Nothing need be settled for it: what it lets go
+        // of is held by no list, and the lists of flights in the air are
+        // reset only once they have landed; what a descriptor slot or a
+        // finished list may still name goes through `retire`, which waits
+        // for the submissions running. (It settled every 1.5 s while
+        // flights were in the air, a full drain of the card every two or
+        // three frames of the world.)
+        sweep();
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.

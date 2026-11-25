@@ -32,8 +32,6 @@ pub(crate) enum Wait {
     Reads,
     /// A step of ours (`CopyMemoryToMemoryX` on the CPU) waits for all.
     Step,
-    /// The sweep's moment with nothing in the air, every 1.5 s.
-    Sweep,
     /// Title bytes under ranges flights' shaders write could not be merged.
     Merge,
     /// A title copy on the CPU into title memory flights may read.
@@ -51,11 +49,10 @@ pub(crate) enum Wait {
     Own,
 }
 
-const WAITS_NAMED: [&str; 12] =
-    ["lock", "settle", "reads", "step", "sweep", "merge", "copy-in", "results", "lists", "value", "fence", "own"];
+const WAITS_NAMED: [&str; 11] = ["lock", "settle", "reads", "step", "merge", "copy-in", "results", "lists", "value", "fence", "own"];
 
 /// Per [`Wait`]: nanoseconds and how many.
-static WAITS: [[AtomicU64; 2]; 12] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 12];
+static WAITS: [[AtomicU64; 2]; 11] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 11];
 
 /// Plain sums ([`Sum`]).
 static SUMS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
