@@ -61,9 +61,50 @@ shaders and emulates the one instruction.
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
+6. **Every ray a miss, behind a switch** (`VICTORY_BVH_MISS=1`, off by
+   default). The node test returns no child for a box node and a miss for
+   anything else, and reads no node memory. Each traversal then ends right
+   after its root node, whatever lies where the structures would be:
+   indirect-light and reflection rays take the title's own miss path (sky
+   probe), shadow rays are unoccluded. It also stops the title's loops from
+   walking up to 65,535 steps a wave through garbage. With it the
+   constant ambient light (`ambient.rs`) defaults to off, so that the title's
+   own probe resolve shows; `VICTORY_AMBIENT=<level>` still sets one. Do not
+   combine it with `VICTORY_BVH_BUILDER=1`.
+
+## Findings, 2026-11-25
+
+- The title talks to the builder through a DXR-shaped interface
+  (`XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo` with
+  `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS`,
+  `BuildRaytracingAccelerationStructureBatched2X`,
+  `RehydrateRaytracingAccelerationStructureBatched2X` for the static world
+  shipped in the `*_bvh4` packs, `CopyRaytracingAccelerationStructure`). So
+  the dynamic geometry is described to the layer after all. But the trace
+  programs' containers carry no DXIL bitcode, only console code: the
+  title's inline ray queries are compiled into a traversal loop (stack in
+  LDS, parent-pointer restart, instance nodes read at node + 48..108, the
+  root pointer read from the structure's header at + 48). Serving them with
+  host DXR needs that loop recognised in all 64 programs and replaced by a
+  `RayQuery`, with each program's outputs (hit distance, instance, primitive,
+  barycentrics) mapped back to its registers, and the static structures
+  decoded from console nodes into host geometry. Weeks of work.
+- The 35 builder programs the title creates all translate (49 of 52 in the
+  DLL; the 3 that do not are wave64 programs it does not use); none needs
+  64-bit image atomics, and none keeps 64-lane waves on a 32-lane host. The
+  builder stays off only because of `VICTORY_BVH_BUILDER`'s default.
+- The title has non-ray-traced variants of most passes
+  (`CS_ScreenProbes_TraceRays_Fallback`/`_Voxels`, `CS_DeferredGather_Fallback`,
+  `CS_Primary_Gather_Fallback`, `CS_PPR_RaytraceFallback`,
+  `CS_LaserLightShadowRaytracingFallback`, `CS_TraceShadowRays_ScreenSpaceOnly*`),
+  and its near sun shadows are rasterised cascades (`cascadeshadows_*`,
+  `CS_GenerateShadowMasks_Checkerboard_NoHair`). It picked some fallbacks for
+  a moment in run r11 (frame 1526); no setting or capability query that
+  selects them was found in the executable.
+
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
+- With `VICTORY_BVH_BUILDER=1` the builder stayed off in earlier runs: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
 - Five shadow-mask trace programs do not translate yet.

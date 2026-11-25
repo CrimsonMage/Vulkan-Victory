@@ -94,6 +94,24 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg: dst, .. } = *data else {
             return Err("a ray-tracing node test's result");
         };
+        if crate::emit::bvh_miss() {
+            // Every node is missed: a box node returns no child, anything
+            // else a triangle miss. Nothing is read from the node.
+            let guard = self.guard(b, i)?;
+            let v = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+            let pointer = self.i32_of(v)?;
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let site = (b, i);
         let nodes = self
             .x

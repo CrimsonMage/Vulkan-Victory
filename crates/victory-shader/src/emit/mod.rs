@@ -188,6 +188,22 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// `VICTORY_BVH_MISS=1`: the ray-tracing node test
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) misses every
+/// node: a box node returns no child, a triangle node a miss, and no node
+/// memory is read. Every traversal of the title's then ends after its root
+/// node (nothing is pushed on its stack, so its parent-pointer restart is
+/// never taken), whatever bytes lie where the structures would be: rays
+/// for indirect light and reflections take the title's own miss path
+/// (sky), shadow rays are unoccluded. For as long as nothing builds the
+/// structures (the builder is off), instead of walking up to 65,535 steps
+/// a wave through garbage. Off by default; part of the translation (the
+/// shader cache keys on every `VICTORY_*` switch read here).
+pub fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_MISS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest

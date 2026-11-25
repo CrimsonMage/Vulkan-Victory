@@ -14,7 +14,9 @@
 //! with the surfaces' colors.
 //!
 //! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
-//! keeps the title's own output (black in shadow).
+//! keeps the title's own output (black in shadow). With
+//! `VICTORY_BVH_MISS=1` (every ray misses, see `victory_shader::emit::bvh_miss`)
+//! the default is `off`: the title's probes then hold its own sky light.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -44,6 +46,13 @@ pub(crate) fn level() -> Option<f32> {
     let level = *LEVEL.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
         if set.trim() == "off" {
+            return -1.0;
+        }
+        // With every ray missing (`VICTORY_BVH_MISS=1`) the title's probes
+        // get its own sky light: its resolve is left alone unless a level
+        // is set.
+        if set.trim().is_empty() && victory_shader::emit::bvh_miss() {
+            tracing::info!("ambient light off: rays miss (VICTORY_BVH_MISS=1), the title's own resolve is kept");
             return -1.0;
         }
         set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
