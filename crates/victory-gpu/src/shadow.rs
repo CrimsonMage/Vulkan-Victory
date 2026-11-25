@@ -229,7 +229,7 @@ impl Shadow {
             list.defer_gpu_write(address as usize, len as usize);
             return;
         }
-        if self.gather.is_some() {
+        if self.gather.is_some() && crate::gather::copy_out() {
             // Copied back into its pages after the list.
             list.defer_window_write(self, address as usize, len as usize);
             return;

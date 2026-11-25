@@ -13,9 +13,18 @@
 //!   reads, title copies on the CPU: [`written`]), or written by shaders
 //!   through another view of the same pages (an in-place buffer, another
 //!   window), noted at the submission that runs them ([`around`]);
-//! - **out**, after a list whose shaders write the window: the ranges they
-//!   write, copied into the pages, so that the title and every other view
-//!   of them see it.
+//! - **out**, after a list whose shaders write the window, only with
+//!   `VICTORY_GATHER_COPYOUT=1` ([`copy_out`]; off by default): the ranges
+//!   they write, copied into the pages, so that the title and every other
+//!   view of them see it. Off, what shaders write into a window stays in
+//!   it, as it stayed in the buffers of their own before.
+//!
+//!   Why off: a declared range is a whole view, not the bytes written, so
+//!   the copy out wrote the window's bytes over everything in it, also
+//!   bytes the title's CPU had changed since (it does not announce its own
+//!   writes): the Series S run of 91e6851 crashed in the title's code at
+//!   loading (a read through a pointer that had become 0), where the build
+//!   before it ran into the world.
 //!
 //! The copies go to the one host queue in order around the list, between
 //! barriers that order everything before them: queue order is the order.
@@ -127,6 +136,18 @@ fn index() -> MutexGuard<'static, Index> {
 
 /// Windows alive and their bytes; windows made since the start.
 static LIVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `VICTORY_GATHER_COPYOUT`: `1` copies what shaders wrote into windows
+/// back into their pages after the list; unset or `0`, never (see the
+/// module comment).
+pub(crate) fn copy_out() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_GATHER_COPYOUT").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "windows over scattered pages: what shaders write into them is copied back into the title's pages (VICTORY_GATHER_COPYOUT)");
+        on
+    })
+}
 
 /// Whether any window over scattered pages is alive.
 pub(crate) fn any() -> bool {
@@ -361,7 +382,11 @@ fn plan_out(shadow: &Arc<Shadow>, address: u64, len: u64, ops: &mut Vec<Op>, mar
         let i = ((at - start) / K64) as usize;
         let page = start + i as u64 * K64;
         let stop = (page + K64).min(hi);
-        if let Some(&Src::At(home, offset)) = pages.src.get(i) {
+        // Never a page the window has no copy of (zeros, not looked up), nor
+        // one whose copy is behind what the title has there.
+        if let Some(&Src::At(home, offset)) = pages.src.get(i)
+            && !pages.behind[i]
+        {
             let (to, n) = (offset + (at - page), stop - at);
             push(ops, Op::Out(shadow.buffer.clone(), home, to, at - start, n));
             marks.push((home, to, n));

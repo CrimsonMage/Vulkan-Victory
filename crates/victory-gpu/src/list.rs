@@ -829,9 +829,9 @@ fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> b
     if !crate::unified::on() || len == 0 {
         return false;
     }
-    // In place, or a window over scattered pages (copied back into them
-    // after the list, `crate::gather`).
-    let Some(d) = crate::shadow::find(to, len).filter(|d| d.in_place() || d.gather().is_some()) else {
+    // In place, or a window over scattered pages if what is written into
+    // it is copied back into them after the list (`crate::gather`).
+    let Some(d) = crate::shadow::find(to, len).filter(|d| d.in_place() || (d.gather().is_some() && crate::gather::copy_out())) else {
         return false;
     };
     let Some(s) = crate::shadow::find(from, len) else {

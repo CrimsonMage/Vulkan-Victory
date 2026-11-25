@@ -496,9 +496,15 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   copies on the CPU: `unified::written`), or that shaders wrote through
   another view (an in-place buffer, another window: noted when the list
   that writes is submitted, so the next list that names the window copies
-  them). After a list whose shaders write a window, a list of ours copies
-  the written ranges back into the section heaps, so the title and every
-  alias see them. Copies sit between global barriers on the one host
+  them). Copy out (`VICTORY_GATHER_COPYOUT=1`, off by default): after a
+  list whose shaders write a window, a list of ours copies the written
+  ranges back into the section heaps, so the title and every alias see
+  them; off, shader writes into a window stay in it (as in the buffers of
+  their own before). Off because a declared range is a whole view, not
+  the bytes written: the copy out overwrote what the title's CPU had
+  changed since (Series S run of 91e6851: a crash in the title's code at
+  loading). It never copies pages that read as zeros or whose copy is
+  behind. Copies sit between global barriers on the one host
   queue: queue order is the order. Pages no unit holds that the title has
   not mapped, or shows by read-only stand-ins, read as zeros. Nothing is
   filled on the CPU and the CPU never reads the window. Whether a window

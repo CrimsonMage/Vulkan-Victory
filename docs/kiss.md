@@ -188,7 +188,10 @@ driver errors and no new crash, and the captures look no worse.
   that GPU copies gather from the opened section heaps before the list
   that names them, for the pages the title remapped or announced written
   (or shaders wrote through another view) since; what shaders write into
-  them is copied back into the sections after the list. No CPU fill at
+  them is copied back into the sections after the list only with
+  `VICTORY_GATHER_COPYOUT=1` (off by default: the copy out of whole
+  declared ranges overwrote the title's CPU writes, and the Series S run
+  crashed at loading). No CPU fill at
   submission. Whether a window opens in place whole is asked once until
   a remap (it was asked at every ask).
 - 2026-11-25: whole-file mapping of archives failed (levels.rpf is 76 GB);
