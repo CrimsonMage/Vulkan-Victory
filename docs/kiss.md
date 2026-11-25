@@ -69,6 +69,8 @@ driver errors and no new crash, and the captures look no worse.
 | 6 | Merge 1–3, gate run | coordinator | waiting |
 | 7 | Unified memory replaces mirroring (stages 1–3, default on; `VICTORY_UNIFIED=0` = old) | subagent | merged (323d262): heaps open, 0 refused, 714 buffers in place; blocked by the world-start VRAM spike; deletion (stage 4) after |
 | 9 | Find the world-start card-memory spike (+1.1–1.7 GB in a second) | subagent | running |
+| 11 | Cut memory-mapping churn: stock wineserver walks every view on each map/unmap (88% of a core, ~26k views) | subagent | running |
+| 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
@@ -105,5 +107,10 @@ driver errors and no new crash, and the captures look no worse.
   FSR4 lines were only the title's last debug output, printed under the
   crash report. Fetch buffers now skip the ceiling; the report heads the
   title's lines and says the run ends there.
+- 2026-11-25: Series S output is black in every run (960x540 captures);
+  being traced. Reserving card memory for render targets up front starved
+  the menus (menu video froze/flashed); replaced by letting idle copies go.
+- 2026-11-25: intro video flashes with unified texture detection; bisect
+  run with VICTORY_UNIFIED=0 under way.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
