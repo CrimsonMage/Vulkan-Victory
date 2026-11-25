@@ -4306,7 +4306,7 @@ impl Host {
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Upload, size, asked) {
             return Some(pooled);
         }
-        if !crate::memcap::shared_room(self, size, 1 << 30) {
+        if size >= SMALL_ALWAYS && !crate::memcap::shared_room(self, size, 1 << 30) {
             return None;
         }
         let heap = D3D12_HEAP_PROPERTIES {
@@ -4787,7 +4787,10 @@ impl Host {
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Shared, size, size) {
             return Some(pooled);
         }
-        if !crate::memcap::shared_room(self, size, 0) {
+        // The ceiling is for the big windows; small buffers (read-backs of
+        // what shaders wrote, staging) are always made: refusing one is a
+        // fatal "no memory to fetch" (run g4, 2026-11-25).
+        if size >= SMALL_ALWAYS && !crate::memcap::shared_room(self, size, 0) {
             return None;
         }
         let heap = D3D12_HEAP_PROPERTIES {
@@ -5133,3 +5136,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
+
+/// Buffers under this size are never refused by `crate::memcap`'s ceiling.
+const SMALL_ALWAYS: u64 = 4 << 20;
