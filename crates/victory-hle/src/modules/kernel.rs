@@ -149,7 +149,9 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        return title_override(module, name)
+            .or_else(|| host_override(module, name))
+            .unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
@@ -169,6 +171,17 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             std::ptr::null_mut()
         }
     }
+}
+
+/// Our replacement of a title DLL's export `name`, as at import binding
+/// (`crate::registry::title_override`).
+fn title_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+    if (name as usize) < 0x1_0000 {
+        return None;
+    }
+    let path = runtime::image_path(module as usize)?;
+    let file = path.file_name()?.to_string_lossy();
+    crate::registry::title_override(&file, &narrow(name)).map(|address| address as *mut c_void)
 }
 
 /// What a host module's `name` (or ordinal) is bound to at import binding

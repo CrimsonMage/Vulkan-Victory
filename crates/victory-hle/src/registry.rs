@@ -62,6 +62,18 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         .map(|e| e.address)
 }
 
+static TITLE_OVERRIDES: LazyLock<Vec<(&'static str, HleExport)>> =
+    LazyLock::new(modules::title_overrides);
+
+/// Our replacement of export `name` of title DLL `dll`, if we replace it
+/// ([`modules::title_overrides`]); the DLL's other exports stay its own.
+pub(crate) fn title_override(dll: &str, name: &str) -> Option<usize> {
+    TITLE_OVERRIDES
+        .iter()
+        .find(|(d, e)| d.eq_ignore_ascii_case(dll) && e.name == name)
+        .map(|(_, e)| e.address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

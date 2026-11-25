@@ -2506,6 +2506,12 @@ static HEAP_FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// Whether `this` is one of our resources (heaps and other objects are not).
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    object::has_table(this, &RESOURCE_FUNCTIONS)
+}
+
 /// IUnknown 3, object 4, device child 1, resource 10 (7 as on PC, then 3
 /// console ones).
 static RESOURCE_FUNCTIONS: Table<32> = {

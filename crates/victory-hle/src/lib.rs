@@ -45,8 +45,12 @@ impl HleResolver {
 
 impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
-        // Ordinal imports look up `#n`.
-        if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
+        // Ordinal imports look up `#n`. A title DLL's export we replace
+        // comes before the DLL's own (`WithTitleDlls` asks us first).
+        let name = symbol.to_string();
+        if let Some(address) =
+            registry::lookup(dll, &name).or_else(|| registry::title_override(dll, &name))
+        {
             return Resolution::Found {
                 address,
                 provenance: Provenance::Hle,
