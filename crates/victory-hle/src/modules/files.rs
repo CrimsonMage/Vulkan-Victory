@@ -532,9 +532,17 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The bytes are there (a synchronous read): host textures over them
+    // detile again (unified memory).
+    if ok != 0 && overlapped.is_null() && !read.is_null() {
+        // SAFETY: the kernel wrote the count it read.
+        let n = unsafe { *read } as usize;
+        victory_gpu::title_memory_written(buffer as usize, n, false);
+    }
+    ok
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -562,6 +570,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            victory_gpu::title_memory_written(buffer as usize + done, n, false);
             done += n;
         }
         if n < want {

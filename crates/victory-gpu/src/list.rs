@@ -778,7 +778,50 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Unified memory: a title copy into a buffer placed over title memory
+/// runs on the card, in the list where the title put it, as on the
+/// console. The source is whatever host buffer holds its bytes: in place,
+/// or a copy brought up to date before the list runs (the title's big GPU
+/// heap, whose copy is in the card's memory). False if the destination is
+/// not in place, or both are one host buffer: the copy is then made on the
+/// CPU at submission.
+#[cfg(windows)]
+fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if !crate::unified::on() || len == 0 {
+        return false;
+    }
+    let Some(d) = crate::shadow::find(to, len).filter(|d| d.in_place()) else {
+        return false;
+    };
+    let Some(s) = crate::shadow::find(from, len) else {
+        return false;
+    };
+    if windows::core::Interface::as_raw(&d.buffer) == windows::core::Interface::as_raw(&s.buffer) {
+        return false;
+    }
+    s.refresh(list, from, len);
+    d.gpu_writes(list, to, len);
+    // Ordered with the shader writes before and after it.
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        },
+    };
+    // SAFETY: an open list; two live buffers, the ranges inside them.
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_ref(&barrier));
+        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
+        list.list.ResourceBarrier(std::slice::from_ref(&barrier));
+    }
+    crate::unified::count(crate::unified::Stat::GpuCopy);
+    true
+}
+
+/// Buffer to buffer: on the card when both are in place (unified memory),
+/// else both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -791,6 +834,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !copy_on_card(list, to as u64, from as u64, len)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -875,7 +919,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
-        ) {
+        ) && !copy_on_card(list, to as u64, from as u64, a.min(b))
+        {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }

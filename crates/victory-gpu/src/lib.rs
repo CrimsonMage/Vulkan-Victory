@@ -61,6 +61,8 @@ mod tiles;
 #[cfg(windows)]
 mod unified;
 mod unified_map;
+#[cfg(windows)]
+mod unified_probe;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
@@ -69,6 +71,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use unified::{on as unified_on, title_region, title_section, title_section_gone};
 #[cfg(windows)]
 pub use views::title_memory_view;
 #[cfg(windows)]

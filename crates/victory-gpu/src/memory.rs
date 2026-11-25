@@ -62,6 +62,13 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+/// Bytes from the 16-byte line a copy's raw view starts on to the copy's
+/// first byte: 0 for a copy, the in-place buffer's offset below 16 bytes
+/// otherwise (the directory's offsets count from the view's start).
+fn skew(shadow: &Shadow) -> u64 {
+    shadow.offset(shadow.span().0) % 16
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
@@ -168,7 +175,7 @@ impl Memory {
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile((at - first + skew(&shadow)) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -184,7 +191,7 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        let offset = shadow.offset_in(start).unwrap_or(0) + skew(&shadow);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
@@ -285,8 +292,11 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        let (first, len) = shadow.span();
+        // From the 16 bytes at or below the copy's first byte in its buffer
+        // (an in-place buffer starts on the 64 KiB line below it).
+        let at = shadow.offset(first);
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, at - at % 16, len + at % 16);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone

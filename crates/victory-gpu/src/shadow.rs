@@ -72,6 +72,18 @@ pub(crate) struct Shadow {
     /// from `Host::shared_buffer`: when the copy goes it is given to the
     /// buffer pool (`crate::memcap`) to be used again.
     pooled: bool,
+    /// With unified memory (`crate::unified`): not a copy at all. `buffer`
+    /// is placed over the title's own memory, so shaders read what the
+    /// title wrote and write where the title reads; nothing is refreshed,
+    /// snapshotted or copied back, and no write watch is asked.
+    in_place: bool,
+    /// Bytes from `buffer`'s first byte to `start` (an in-place buffer
+    /// starts on the 64 KiB line below the title memory); 0 for a copy.
+    bias: u64,
+    /// In place over a view of a section: what the title maps there may
+    /// change ([`in_place_remapped`]), and then `stale` is set and the
+    /// next ask places a new buffer.
+    stale: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1392,6 +1404,10 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.in_place {
+            IN_PLACE[0].fetch_sub(1, Ordering::Relaxed);
+            IN_PLACE[1].fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.pooled {
             let shared = self.card.as_ref().map_or_else(|| self.buffer.clone(), |card| card.staging.clone());
             crate::memcap::give(crate::memcap::Kind::Shared, shared);
@@ -1581,7 +1597,7 @@ impl Shadow {
     /// Whether the memory behind the copy turned out not to be write-watched:
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
-        self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+        !self.in_place && self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
     /// The copy's own number (see the field).
@@ -1591,12 +1607,26 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        self.bias + address - self.start
+    }
+
+    /// Whether the buffer is placed over the title's memory itself
+    /// (unified memory): nothing to copy back.
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.in_place {
+            // Nothing to bring up to date: only kept alive while the list
+            // may run (a remapped view drops it from the tables).
+            if list.first_use(Arc::as_ptr(self) as usize | 1) {
+                list.keep(&self.buffer);
+            }
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -1626,6 +1656,9 @@ impl Shadow {
             card: None,
             window: false,
             pooled: false,
+            in_place: false,
+            bias: 0,
+            stale: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1647,6 +1680,15 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
+        if self.in_place {
+            // The shaders write the title's memory itself: declared all the
+            // same, so that what is prepared on the CPU while the
+            // submission runs waits where it writes (`host.rs`
+            // `late_blocked`); at submission it is noted
+            // ([`Shadow::writing`]) and announced once the submission has
+            // finished (`crate::unified::settle`).
+            self.refresh(list, address, len);
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -1659,6 +1701,11 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.in_place {
+            // Nothing kept to compare: the title's bytes are the GPU's.
+            crate::unified::gpu_wrote(address, len);
+            return;
+        }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // The copy-back is on its own thread: counted for this submission
@@ -1904,6 +1951,9 @@ impl Shadow {
     /// them (each once), and a range is done with when the last submission
     /// that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
+        if self.in_place {
+            return;
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
         pending.retain(|r| !free.contains(r));
@@ -2340,6 +2390,59 @@ impl Shadow {
     }
 }
 
+/// In-place buffers alive, and their bytes of title memory.
+static IN_PLACE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// See [`IN_PLACE`].
+pub(crate) fn in_place_live() -> (u64, u64) {
+    (IN_PLACE[0].load(Ordering::Relaxed), IN_PLACE[1].load(Ordering::Relaxed))
+}
+
+/// In-place buffers over views of sections, by (start, id): end and the
+/// buffer; and the longest one's bytes.
+#[allow(clippy::type_complexity)]
+static VIEWED: Mutex<(BTreeMap<(u64, u64), (u64, std::sync::Weak<Shadow>)>, u64)> = Mutex::new((BTreeMap::new(), 0));
+
+/// A buffer placed over title memory `[start, start + len)`, if
+/// `crate::unified` can open it; `None` leaves the caller to copy.
+fn in_place(start: u64, len: u64, window: bool) -> Option<Arc<Shadow>> {
+    let placed = crate::unified::place(start, len)?;
+    let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+    shadow.in_place = true;
+    shadow.bias = placed.bias;
+    shadow.window = window;
+    IN_PLACE[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE[1].fetch_add(len, Ordering::Relaxed);
+    let shadow = Arc::new(shadow);
+    if placed.view {
+        let mut viewed = VIEWED.lock().unwrap_or_else(|e| e.into_inner());
+        viewed.1 = viewed.1.max(len);
+        viewed.0.insert((start, shadow.id), (start + len, Arc::downgrade(&shadow)));
+    }
+    Some(shadow)
+}
+
+/// The runtime mapped title memory `[at, at + len)` anew: in-place buffers
+/// over views there show the old pages, so the next ask places new ones
+/// (lists and slots that hold the old ones keep them alive until done).
+pub(crate) fn in_place_remapped(at: usize, len: usize) {
+    let (at, end) = (at as u64, (at + len) as u64);
+    let mut guard = VIEWED.lock().unwrap_or_else(|e| e.into_inner());
+    let (viewed, longest) = &mut *guard;
+    if viewed.is_empty() {
+        return;
+    }
+    let from = at.saturating_sub(*longest);
+    let hit: Vec<(u64, u64)> = viewed.range((from, 0)..(end, 0)).filter(|(_, (e, _))| *e > at).map(|(k, _)| *k).collect();
+    for key in hit {
+        if let Some((_, weak)) = viewed.remove(&key)
+            && let Some(shadow) = weak.upgrade()
+        {
+            shadow.stale.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -2388,6 +2491,16 @@ fn lookup(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.as_ref().is_some_and(|s| s.stale.load(Ordering::Relaxed)) {
+        entry.shadow = None;
+    }
+    if entry.shadow.is_none()
+        && crate::unified::on()
+        && entry.end - key.0 < crate::unified::BIG
+        && let Some(shadow) = in_place(key.0, entry.end - key.0, false)
+    {
+        entry.shadow = Some(shadow);
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -2472,9 +2585,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool) -> Option<Arc<Shadow>> {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    if map.get(&(start, len)).is_some_and(|s| s.stale.load(Ordering::Relaxed)) {
+        map.remove(&(start, len));
+    }
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    if let Some(shadow) = in_place(start, len, true) {
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     // SAFETY: a live buffer.
