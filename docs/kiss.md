@@ -72,7 +72,7 @@ driver errors and no new crash, and the captures look no worse.
 | Rust lines | 128,292 | 106,472 |
 | `VICTORY_*` switches | 224 | 43 |
 | `diagnostics`-only blocks | 283 | 71 |
-| World frame time (Proton, 8 GB card) | 0.5–5 s | 390–470 ms (2.1–2.5 fps), Series S, world lit, card 6.8 GB of 8 |
+| World frame time (Proton, 8 GB card) | 0.5–5 s | ~530–580 ms (1.7 fps) in a 4,500-draw scene; per-draw CPU halved (0.28 → 0.15 ms); console instruction traps 21,000/s → 0; card 4.0 GB of ours; RSS 21.6 GB (to fix) |
 
 ## Workstreams
 
@@ -148,5 +148,9 @@ driver errors and no new crash, and the captures look no worse.
   the GPU; back render targets with shared pages keyed by title address.
   Not worth taking: its card-memory mirror of title memory (doubles memory;
   wouldn't fit 8 GB), its per-frame write-watch for textures.
+- 2026-11-25: run p7 (all fixes merged, stable): render-target page sharing
+  would save only ~52 MB, so it is dropped. Found: the 174 MB heap is split
+  at a 256 MiB piece edge and stays a card copy (134 ms fetch-back); idle
+  eviction churns (18,790 copies re-made); RSS grew to 21.6 GB.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
