@@ -444,16 +444,25 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   sections of at most 512 MiB (8192 pages), each with a canary page after
   the title's, and announces each (`title_section`, `title_section_gone`
   when its handle closes). Opening a 512 MiB section pins only that much.
-- **Opening** (`unified.rs` `place`, at the first GPU use of an address in
-  a unit). A region: its reserved pages are committed, every page is
-  written once in place with an atomic add of 0 (so pages a write watch
-  keeps read-only can be pinned), then `OpenExistingHeapFromAddress1`
-  over the region and its canary page. A section:
-  `OpenExistingHeapFromFileMapping`. Then the canary: the CPU writes a
-  16-byte pattern on the canary page, the GPU reads it back through the
-  heap (the probe's own queue), and they must match. A mismatch is
-  vkd3d-proton's silent fallback; the unit is refused, logged, and its
-  buffers keep copies.
+- **Opening** (`unified.rs` `place`, `piece`), piece by piece: at the
+  first GPU use of an address, the 256 MiB slice around it (absolute
+  addresses for a region, section offsets for a section), stretched only to
+  hold that use and cut to the pieces already open beside it. In a region
+  only committed read-write pages are opened (the run of them that holds the
+  use); no page is committed for the import, and an ask over pages that are
+  not committed keeps its copy. The pages are written once in place with an
+  atomic add of 0 (so pages a write watch keeps read-only can be pinned),
+  then `OpenExistingHeapFromAddress1` over the piece. A section piece: a
+  view of the piece alone is mapped, opened with
+  `OpenExistingHeapFromAddress1` and unmapped again (what vkd3d-proton's
+  `OpenExistingHeapFromFileMapping` does with the whole section). The check:
+  the GPU reads a word the CPU sees as not zero (in the ask, then at 64
+  places) and must find the same; if all are zero a pattern is put in a zero
+  word for the GPU to read and taken out again at once. A mismatch is
+  vkd3d-proton's silent fallback; the piece is refused, logged, and its
+  buffers keep copies. Until 2026-11-25 a whole region (its reserved pages
+  committed) or a whole 512 MiB section was opened at once: 6.7 GB pinned
+  in the Series S world (2.4 GB of regions, 4.3 GB of sections).
 - **Buffers in place** (`shadow.rs`). A title buffer under 16 MiB, or a
   4 MiB window of title memory outside buffers, whose memory lies in one
   opened region or one run of one section, becomes a buffer placed over
@@ -580,3 +589,40 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
    title was not seen freeing them; xmem has no free hook yet).
 7. Native Windows is not covered: opening is Proton-only; on Windows the
    copies stay.
+
+## 13. Memory follows the title
+
+Content is streamed in once and stays until the title unloads it; what
+victory holds for title memory follows it.
+
+- **Pieces, not units** (section 12, Opening): only what the GPU reads in
+  place is pinned. Line every 10 s: `unified opening: title memory open now
+  … MB in … pieces (regions …, sections …) of … MB in the units touched; the
+  regions touched had … MB committed and … MB only reserved …; asks kept as
+  copies: over a piece's edge …, over pages not committed …; pieces put off
+  …; let go because the title freed the memory … MB`.
+- **Levels on demand** (`tiles.rs`) is the only path on a card with tiled
+  resources tier 2, with texture quality applied to the reserved copy. Line:
+  `levels on demand (on): … textures made level by level, their levels … MB,
+  tiles given … MB (kept off the card … MB), pool … MB in … heaps …; host
+  copies with memory for all levels holding levels the title does not: …`.
+  The gate line's "textures the title fills" now includes the pool's heaps.
+- **Release at the API point** (`release.rs`): `VirtualFree` (hooked for the
+  title, `xmem::memory`), `XMemFreeDefault`, `XMemMapPhysicalPages` with no
+  pages and page-mapping copies to nothing call
+  `victory_gpu::title_memory_released`: host copies of textures the title
+  fills whose memory starts there go with their staging (at once if no list
+  and no slot holds them, else when none does; running submissions keep
+  them until they land), and opened pieces there go (a heap lives until its
+  last placed buffer). Released resources free their host copy at once, as
+  before. The idle sweep is the net under the budget. Line: `memory release
+  since the start: because the title freed or unmapped memory … MB …,
+  because the title released resources … MB …; by idle eviction … MB …;
+  made again after either …; host copies alive …`. "Made again" growing
+  every interval means churn.
+- **Render targets** are measured, not changed: `render target memory: …
+  host copies of textures the card writes take … MB of the card; their
+  title memory … MB, … MB with overlaps counted once; … lie over title
+  memory another one covers; sharing card pages by title address would
+  save about … MB`. The large targets of the 13:53 log (15 of 16 MB or
+  more) do not overlap.

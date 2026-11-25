@@ -21,10 +21,12 @@
 //! probe once at the first sweep (`unified_probe.rs`); 3, also the probe's
 //! tile-mapping test.
 //!
-//! Every heap is checked once when it is opened: vkd3d-proton gives memory
-//! of its own, and says nothing, when an import fails. `xmem` leaves a
-//! page of its own after each region and each section (the canary page),
-//! where the CPU writes a pattern the GPU must read back through the heap.
+//! Title memory is opened piece by piece at its first GPU use (`SLICE`),
+//! never committing a page for it, and let go when the title frees it
+//! (`crate::release`). Every piece is checked once when it is opened:
+//! vkd3d-proton gives memory of its own, and says nothing, when an import
+//! fails; the GPU must read through the heap what the CPU sees there
+//! (`check`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -663,6 +665,9 @@ pub(crate) fn in_unit(at: usize, len: usize) -> bool {
 /// seconds.
 pub(crate) fn tick() {
     crate::unified_probe::tick();
+    crate::tiles::tick();
+    crate::resource::targets_tick();
+    crate::release::tick();
     if !on() {
         return;
     }

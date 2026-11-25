@@ -50,6 +50,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         lifecycle::module(),
         net::module(),
         xmem::module(),
+        xmem::memory::module(),
         xsystem::module(),
     ]
 }

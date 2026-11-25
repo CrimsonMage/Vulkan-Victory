@@ -4584,8 +4584,10 @@ impl Meter {
             // mapped for the card.
             let [budget, card, _, shared] = host().and_then(Host::video_memory).unwrap_or_default();
             // What of it is ours, by kind (texture quality: `crate::quality`).
-            let filled = crate::resource::KINDS[1].load(Ordering::Relaxed);
-            let others = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed).saturating_sub(filled);
+            let whole = crate::resource::KINDS[1].load(Ordering::Relaxed);
+            let others = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed).saturating_sub(whole);
+            // With the heaps of the copies made level by level (`crate::tiles`).
+            let filled = whole + crate::tiles::pool_bytes();
             let (staged, spare) = crate::texture::staging_bytes();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame, {draws:.0} draws/frame; card memory {} MB in use of a budget of {} MB; \

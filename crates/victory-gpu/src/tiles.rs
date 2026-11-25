@@ -44,10 +44,16 @@
 //!   the next upload. Its tiles go back when the host copy does.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
-//! one layer, more than one level, of [`floor`] bytes or more, whose memory
+//! one layer, more than one level, of [`FLOOR`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. Texture quality
+//! (`crate::quality`) applies too: such a host copy is made without the
+//! console's largest levels the quality leaves out, and its level numbers
+//! are the host copy's (console level less the levels left out).
+//!
+//! The only path on a card with tiled resources tier 2 or more (vkd3d-proton
+//! reports it where Vulkan has sparse residency for 2D images and aliased
+//! sparse memory, and turns `UpdateTileMappings` into sparse binds).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -71,16 +77,11 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
-/// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// Whether textures are made this way: on a card that reads zeros from,
+/// and drops writes to, levels without memory (tiled resources tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
-            return false;
-        }
         let Some(host) = host() else {
             return false;
         };
@@ -98,26 +99,62 @@ pub(crate) fn wanted() -> bool {
         tracing::info!(
             tier,
             on,
-            floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            floor_kb = FLOOR >> 10,
+            "host copies of title textures take the card's memory level by level (levels on demand)"
         );
         on
     })
 }
 
-fn parse_floor(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+/// The bytes from which a texture is made this way. (The accounting of
+/// run 189: the levels not held are 1.9 MB a copy on some 1,600 copies; a
+/// 512x512 texture has six tiles at most, and most of the calls for
+/// nothing.)
+pub(crate) const FLOOR: u64 = 1 << 20;
+
+/// Every ten seconds, from the sweep: the levels line. What levels on
+/// demand keeps off the card is the bytes all levels of its textures would
+/// take less the tiles given; the pool's heaps are what the card holds for
+/// them. Host copies made with memory for all their levels (too small,
+/// whole when made, another shape) that hold levels the title does not:
+/// what is left to cut.
+pub(crate) fn tick() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let heaps = POOL.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().count();
+    let (unheld, unheld_bytes) = crate::texture::unheld();
+    tracing::info!(
+        "levels on demand ({}): {} textures made level by level, their levels {} MB, tiles given {} MB (kept off the card {} MB), \
+         pool {} MB in {} heaps ({} given back); {} made since the start, {} levels given in {} tile calls ({} us each); uploads \
+         that left a held level waiting for room {}, recorded again {}; host copies with memory for all levels holding levels \
+         the title does not: {} ({} MB)",
+        if wanted() { "on" } else { "off: the card has no tiled resources tier 2" },
+        s[0],
+        s[1] >> 20,
+        s[2] >> 20,
+        s[1].saturating_sub(s[2]) >> 20,
+        s[3] >> 20,
+        heaps,
+        s[8],
+        s[4],
+        s[5],
+        s[6],
+        s[7] / s[6].max(1),
+        s[9],
+        s[10],
+        unheld,
+        unheld_bytes >> 20,
+    );
 }
 
-/// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
-/// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
-/// tiles at most, and most of the calls for nothing.)
-pub(crate) fn floor() -> u64 {
-    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+/// The bytes of the pool's heaps: the card's memory levels on demand holds.
+pub(crate) fn pool_bytes() -> u64 {
+    STATS[3].load(Ordering::Relaxed)
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -624,7 +661,6 @@ impl Tiled {
     }
 
     /// The bytes of the tiles it has now.
-    #[cfg(test)]
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
@@ -1440,15 +1476,6 @@ void look() {
             s[3] >> 20,
             s[8]
         );
-    }
-
-    #[test]
-    fn floor_saturates_instead_of_wrapping() {
-        assert_eq!(parse_floor(None), 1 << 20);
-        assert_eq!(parse_floor(Some("0")), 64 << 10);
-        assert_eq!(parse_floor(Some("2048")), 2048 << 10);
-        assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
-        assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
     }
 
     #[test]

@@ -33,8 +33,6 @@ The relay (`VICTORY_RELAY`) was ON by default (stage 2), and with it
 | `VICTORY_GUARD_HOLES` | on | watch.rs |
 | `VICTORY_VIEW_GUARD` | on | watch.rs |
 | `VICTORY_PAGE_WRITES` | `guards` (bit 1) | watch.rs |
-| `VICTORY_LEVELS_ON_DEMAND` | off | tiles.rs |
-| `VICTORY_LEVELS_MIN_KB` | built-in floor | tiles.rs |
 | `VICTORY_TILES_TEST_CARD` | off | tiles.rs (test) |
 | `VICTORY_DISPLAY_MODE` | unset | dxgi.rs |
 | `VICTORY_SHADER_CACHE_KEY` | content | shader_cache.rs |
@@ -47,6 +45,8 @@ by victory-shader.)
 
 | Switch | Default | What it did | Decision |
 |---|---|---|---|
+| `VICTORY_LEVELS_ON_DEMAND` | off | host copies of textures the title fills take card memory level by level (reserved textures, `UpdateTileMappings`) | the only path on a card with tiled resources tier 2; combined with texture quality |
+| `VICTORY_LEVELS_MIN_KB` | 1024 | size floor for the above | constant 1 MiB |
 | `VICTORY_RELAY` | on, stage 2 | flights landed by a thread of their own; exact waits | relay is the only path |
 | `VICTORY_LATE_WAIT` | 3 (with relay) | submissions not waited for; present as a flight | stage 3 is the only path |
 | `VICTORY_LATE_WAIT_LISTS` | 256 | lists in the air before waiting | constant 256 |
