@@ -73,7 +73,9 @@ driver errors and no new crash, and the captures look no worse.
 | 13 | Series S: compose the title's two display planes (compose.rs) | subagent | merged: menus, loading and credits show |
 | 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f): Series S world renders lit (run s7, frame 1890) |
 | 15 | Frame-time breakdown (`frame time:` line every 5 s) and removal of four needless full card drains | subagent | merged (28ccc38), built, not yet run |
-| 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | first run going; idea study stopped at the usage limit |
+| 17 | Console CPU instructions: ~21,000 SIGILL traps/s (CLZERO, MONITORX/MWAITX, INSERTQ) emulated per trap; patch each site once | subagent | running |
+| 18 | Per-draw recording cost (~0.28 ms CPU per draw: shadow::find under a contended mutex, bind, descriptor mirroring, SipHash) | subagent | running |
+| 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
@@ -116,5 +118,9 @@ driver errors and no new crash, and the captures look no worse.
   the menus (menu video froze/flashed); replaced by letting idle copies go.
 - 2026-11-25: intro video flashes with unified texture detection; bisect
   run with VICTORY_UNIFIED=0 under way.
+- 2026-11-25: world frame breakdown (Series S, 430 ms): GPU busy ~99 ms;
+  title threads recording into our lists ~620 ms summed; submissions
+  ~100 ms; card waits ~49 ms; landing 72 ms (54 ms fetching shader writes
+  back). The process takes ~11,000 signals/s, mostly SIGILL.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
