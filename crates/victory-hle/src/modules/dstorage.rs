@@ -4,13 +4,13 @@
 //! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
-//! Every file the title opens here (its `.rpf` and `.ttpf` archives) is
-//! mapped read-only once and stays mapped for the run; Wine backs the view
-//! with the Linux page cache. A request's source is a slice of that
-//! mapping, or of title memory: an uncompressed request is one copy into
-//! its destination, a compressed one inflates zlib data and/or unpacks
-//! BCPack data straight from the slice into the destination (an address,
-//! or physical pages). Nothing is read into a buffer first.
+//! A file the title opens here (its `.rpf` and `.ttpf` archives) is one
+//! handle the workers share; each request reads exactly its source range
+//! with one positioned read, when it runs, and nothing of the file is
+//! mapped or kept. An uncompressed request is read straight into its
+//! destination (an address, or physical pages); a compressed one is read
+//! into the worker's reusable buffer, then zlib data is inflated and/or
+//! BCPack data unpacked from there into the destination.
 //!
 //! Submitted requests of every queue go, in submission order, through one
 //! channel to one pool of workers (one per core), which run them in
@@ -26,6 +26,8 @@
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_void};
+use std::os::windows::fs::FileExt;
+use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -33,16 +35,7 @@ use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
 use victory_formats::bcpack::{self, Tables};
-use windows_sys::Win32::Foundation::{CloseHandle, E_NOINTERFACE, HANDLE};
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-};
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
-    MapViewOfFile, MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_READONLY,
-    PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::Foundation::E_NOINTERFACE;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -59,6 +52,9 @@ const FACTORY: Guid = Guid::new(
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+/// `HRESULT_FROM_WIN32` of `ERROR_INVALID_USER_BUFFER` and
+/// `ERROR_NOACCESS`: the host refused a read into this destination.
+const REFUSED: [HRESULT; 2] = [0x8007_06F8_u32 as i32, 0x8007_03E6_u32 as i32];
 
 type Out = *mut *mut c_void;
 
@@ -132,8 +128,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 type Factory = *const Object;
 
-/// Opens `path` for reading and maps it (see `map_archive`); the file
-/// object holds the mapping's bytes.
+/// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
@@ -157,100 +152,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let mapped = map_archive(handle);
-    // SAFETY: a handle we just opened and nobody else owns; a view of the
-    // file keeps it open.
-    unsafe { CloseHandle(handle) };
-    let data = match mapped {
-        Ok(data) => data,
-        Err(error) => {
-            tracing::warn!(path = name, %error, "dstorage: mapping a file failed");
-            return from_win32(&error);
-        }
-    };
-    tracing::info!(
-        path = name,
-        iid = iid_text(iid),
-        bytes = data.len(),
-        at = format_args!("{:p}", data.as_ptr()),
-        "dstorage: file opened"
-    );
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { data });
+    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    // SAFETY: a handle we just opened and nobody else owns.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     put(out, file)
-}
-
-/// A file the title opened, as one identity: volume, file index, size and
-/// last write (a file made anew where an old one was is another).
-type Identity = (u32, u32, u32, u64, u64);
-
-/// The file's bytes: a read-only view of the whole file, made the first
-/// time the file is opened and kept for the run, so every request reads a
-/// slice of it and a file opened again maps nothing new. The view sits
-/// above every address a title may be given (46 bits at most, as
-/// `xmem::address_range`), so it takes none of the title's room.
-fn map_archive(file: HANDLE) -> std::io::Result<&'static [u8]> {
-    static ARCHIVES: Mutex<Vec<(Identity, &'static [u8])>> = Mutex::new(Vec::new());
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: an open handle and a structure of the size asked for.
-    if unsafe { GetFileInformationByHandle(file, &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
-    let written = &info.ftLastWriteTime;
-    let id = (
-        info.dwVolumeSerialNumber,
-        info.nFileIndexHigh,
-        info.nFileIndexLow,
-        size,
-        (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime),
-    );
-    let mut archives = lock(&ARCHIVES);
-    if let Some(&(_, data)) = archives.iter().find(|(known, _)| *known == id) {
-        return Ok(data);
-    }
-    let size = usize::try_from(size).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-    // An empty file has no view (a section cannot be empty).
-    let data: &'static [u8] = if size == 0 {
-        &[]
-    } else {
-        // SAFETY: an open handle; a read-only section of the whole file.
-        let section = unsafe {
-            CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
-        };
-        if section.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-            LowestStartingAddress: (1usize << 46) as *mut c_void,
-            HighestEndingAddress: std::ptr::null_mut(),
-            Alignment: 0,
-        };
-        let mut parameter = MEM_EXTENDED_PARAMETER::default();
-        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
-        // SAFETY: our section, viewed whole; the parameter points at
-        // `requirements`, which outlives the call.
-        let mut view = unsafe {
-            MapViewOfFile3(section, GetCurrentProcess(), std::ptr::null(), 0, size, 0, PAGE_READONLY, &mut parameter, 1)
-        }
-        .Value;
-        if view.is_null() {
-            // SAFETY: as above, anywhere.
-            view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, size) }.Value;
-        }
-        let error = std::io::Error::last_os_error();
-        // SAFETY: our section handle; a view keeps the section.
-        unsafe { CloseHandle(section) };
-        if view.is_null() {
-            return Err(error);
-        }
-        // SAFETY: a read-only view of `size` bytes that is never unmapped.
-        // The files are the title's packages, which nothing writes while
-        // it runs.
-        unsafe { std::slice::from_raw_parts(view.cast::<u8>(), size) }
-    };
-    archives.push((id, data));
-    Ok(data)
 }
 
 /// `(capacity, name, iid, out)`.
@@ -355,9 +261,10 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 // Files.
 
-/// An opened file: its mapped bytes, which outlive it.
+/// An opened file: one handle, which every worker reads at its own
+/// offsets.
 struct File {
-    data: &'static [u8],
+    file: std::fs::File,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -691,13 +598,18 @@ fn workers() -> &'static Sender<Job> {
 /// What the workers did since the last streaming line.
 struct Stats {
     requests: AtomicU64,
-    /// Source bytes taken from mapped files.
+    /// Bytes read from files, and of those read straight into
+    /// destinations.
     read: AtomicU64,
+    direct: AtomicU64,
     /// Destination bytes of compressed requests.
     decompressed: AtomicU64,
-    /// Summed over workers, page faults on the mapping included.
+    /// Summed over workers.
+    read_ns: AtomicU64,
     decompress_ns: AtomicU64,
     copy_ns: AtomicU64,
+    /// Reads into a destination the host refused, read again beside.
+    bounced: AtomicU64,
     /// Submitted, not yet finished; the most since the last line.
     depth: AtomicUsize,
     peak: AtomicUsize,
@@ -706,9 +618,12 @@ struct Stats {
 static STATS: Stats = Stats {
     requests: AtomicU64::new(0),
     read: AtomicU64::new(0),
+    direct: AtomicU64::new(0),
     decompressed: AtomicU64::new(0),
+    read_ns: AtomicU64::new(0),
     decompress_ns: AtomicU64::new(0),
     copy_ns: AtomicU64::new(0),
+    bounced: AtomicU64::new(0),
     depth: AtomicUsize::new(0),
     peak: AtomicUsize::new(0),
 };
@@ -725,19 +640,22 @@ fn report() {
         let requests = take(&STATS.requests);
         let depth = STATS.depth.load(Ordering::Relaxed);
         let peak = STATS.peak.swap(depth, Ordering::Relaxed);
-        let (read, decompressed) = (take(&STATS.read), take(&STATS.decompressed));
-        let (decompress_ns, copy_ns) = (take(&STATS.decompress_ns), take(&STATS.copy_ns));
         if requests == 0 && peak == 0 {
             continue;
         }
-        let mb = |n: u64| n as f64 / f64::from(1 << 20);
+        let mb = |n: &AtomicU64| take(n) as f64 / f64::from(1 << 20);
+        let ms = |n: &AtomicU64| take(n) / 1_000_000;
         tracing::info!(
-            "dstorage streaming (10 s): {requests} requests, {:.1} MB read, {:.1} MB decompressed, \
-             {} ms decompressing, {} ms copying, queue depth {depth} (peak {peak})",
-            mb(read),
-            mb(decompressed),
-            decompress_ns / 1_000_000,
-            copy_ns / 1_000_000,
+            "dstorage streaming (10 s): {requests} requests, {:.1} MB read ({:.1} MB straight into \
+             destinations), {:.1} MB decompressed, {} ms reading, {} ms decompressing, {} ms copying, \
+             {} reads refused and read beside, queue depth {depth} (peak {peak})",
+            mb(&STATS.read),
+            mb(&STATS.direct),
+            mb(&STATS.decompressed),
+            ms(&STATS.read_ns),
+            ms(&STATS.decompress_ns),
+            ms(&STATS.copy_ns),
+            take(&STATS.bounced),
         );
     }
 }
@@ -848,46 +766,78 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
     let bc = ((options & BCPACK) >> 1) as u8;
+    let memory = (options & MEMORY_SOURCE != 0).then(|| {
+        // SAFETY: the title's source holds `source_size` bytes until
+        // completion.
+        unsafe { std::slice::from_raw_parts(request.source.cast::<u8>(), request.source_size as usize) }
+    });
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
-        let source = source(request).map_err(|hr| fail(hr, "reading the source"))?;
-        // One copy from user mode: a guarded block of the destination
-        // faults into the GPU side's guard like the title's own writes (a
-        // kernel read into it failed instead, see `into_destination`).
-        let start = Instant::now();
-        into_destination(request, source.len(), |out| {
-            out.copy_from_slice(source);
-            Ok(out.len())
+        let size = request.source_size as usize;
+        let copy = |from: &[u8], out: &mut [u8]| {
+            let start = Instant::now();
+            out.copy_from_slice(from);
+            STATS.copy_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
+            Ok(size)
+        };
+        return into_destination(request, size, |out| match memory {
+            Some(source) => copy(source, out),
+            // Straight into the destination. A kernel read into a block the
+            // GPU side guarded again meanwhile (the guard over all the views
+            // of a page protects other views from other threads) is refused
+            // instead of faulting into the guard; that one is read beside
+            // and copied in from user mode, where it faults like the title's
+            // own writes.
+            None => match read_at(request, out) {
+                Err(hr) if REFUSED.contains(&hr) => {
+                    STATS.bounced.fetch_add(1, Ordering::Relaxed);
+                    scratch(&SOURCE, size, |bytes| {
+                        read_at(request, bytes)?;
+                        copy(bytes, out)
+                    })
+                }
+                read => read.map(|()| {
+                    STATS.direct.fetch_add(size as u64, Ordering::Relaxed);
+                    size
+                }),
+            },
         })
-        .map_err(|hr| fail(hr, "copying"))?;
-        STATS.copy_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
-        return Ok(());
+        .map_err(|hr| fail(hr, "reading into the destination"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = source(request).map_err(|hr| fail(hr, "reading the source"))?;
     let size = request.destination_size as usize;
-    let start = Instant::now();
-    let unpack = |stream: &[u8]| {
-        into_destination(request, size, |out| match tables {
-            Some(tables) => bcpack::decode(bc, stream, out, tables)
-                .map(|()| out.len())
-                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-            None => inflate(stream, out).map_err(|hr| fail(hr, "zlib")),
-        })
+    let decode = |source: &[u8]| -> Result<(), HRESULT> {
+        let start = Instant::now();
+        let unpack = |stream: &[u8]| {
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, stream, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(stream, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        };
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            scratch(&BETWEEN, request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                unpack(&packed[..n])
+            })?;
+        } else {
+            unpack(source)?;
+        }
+        STATS.decompress_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
+        STATS.decompressed.fetch_add(size as u64, Ordering::Relaxed);
+        Ok(())
     };
-    // The console's order: zlib first, then BCPack.
-    if bc != 0 && options & ZLIB != 0 {
-        scratch(&BETWEEN, request.intermediate_size as usize, |packed| {
-            let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
-            unpack(&packed[..n])
-        })?;
-    } else {
-        unpack(source)?;
+    match memory {
+        Some(source) => decode(source)?,
+        None => scratch(&SOURCE, request.source_size as usize, |bytes| {
+            read_at(request, bytes).map_err(|hr| fail(hr, "reading the source"))?;
+            decode(bytes)
+        })?,
     }
-    STATS.decompress_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
-    STATS.decompressed.fetch_add(size as u64, Ordering::Relaxed);
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -898,6 +848,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 }
 
 thread_local! {
+    /// A worker's compressed source, read from the file.
+    static SOURCE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// A worker's BCPack stream between zlib and BCPack.
     static BETWEEN: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// A worker's destination bytes for physical pages that are not one
@@ -1008,42 +960,26 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A request's source bytes, borrowed: a slice of the file's mapping
-/// (asked ahead from the kernel), or the title's memory.
-fn source(request: &Request) -> Result<&[u8], HRESULT> {
-    let size = request.source_size as usize;
-    if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
-        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
-    }
-    if size == 0 {
-        return Ok(&[]);
-    }
+/// Fills `out` from the request's file at the request's offset: one
+/// positioned read (more only if the host returns less).
+fn read_at(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     // SAFETY: a file object we created; the title keeps it open.
-    let data = unsafe { &*request.source.cast::<Instance<File>>() }.state.data;
-    let bytes = usize::try_from(request.offset)
-        .ok()
-        .and_then(|start| data.get(start..start.checked_add(size)?))
-        .ok_or(END_OF_FILE)?;
-    prefetch(bytes);
-    STATS.read.fetch_add(size as u64, Ordering::Relaxed);
-    Ok(bytes)
-}
-
-/// Has the kernel read a source's pages in one go (on Wine `madvise`
-/// `WILLNEED` on the page cache) rather than a fault at a time while it is
-/// inflated or copied. Under 64 KiB the faults do as well (the kernel maps
-/// pages around each).
-fn prefetch(bytes: &[u8]) {
-    if bytes.len() < 64 << 10 {
-        return;
-    }
-    let range = WIN32_MEMORY_RANGE_ENTRY {
-        VirtualAddress: bytes.as_ptr().cast_mut().cast(),
-        NumberOfBytes: bytes.len(),
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
+    let start = Instant::now();
+    let mut done = 0;
+    let result = loop {
+        if done == out.len() {
+            break Ok(());
+        }
+        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+            Ok(0) => break Err(END_OF_FILE),
+            Ok(n) => done += n,
+            Err(error) => break Err(from_win32(&error)),
+        }
     };
-    // SAFETY: a range of our own view; a hint, whose result does not matter.
-    unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) };
+    STATS.read_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
+    STATS.read.fetch_add(done as u64, Ordering::Relaxed);
+    result
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1058,11 +994,9 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. `fill` writes from user mode (a kernel read into
-        // a block guarded again meanwhile failed with
-        // ERROR_INVALID_USER_BUFFER, and the title stops at the failed
-        // request), so such a block faults into the guard instead of
-        // failing the write.
+        // there changes. A kernel read into a block guarded again meanwhile
+        // is refused (`execute` reads that one beside); `fill`'s own writes
+        // fault into the guard.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
@@ -1492,19 +1426,6 @@ mod tests {
         jobs.pop().unwrap().finish(Ok(()));
         waiter.join().unwrap();
         assert!(got.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn a_file_opened_twice_is_mapped_once() {
-        let (dir, first) = file_with(&pattern(4096));
-        let second = open(&dir.path().join("data.bin"));
-        let data = |file: *mut c_void| {
-            // SAFETY: file objects we created.
-            unsafe { &*file.cast::<Instance<File>>() }.state.data
-        };
-        assert_ne!(first, second);
-        assert_eq!(data(first).as_ptr(), data(second).as_ptr());
-        assert_eq!(data(first), pattern(4096));
     }
 
     #[test]
