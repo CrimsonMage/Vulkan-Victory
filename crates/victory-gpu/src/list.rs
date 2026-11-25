@@ -143,12 +143,29 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    with_state_as(this, crate::frametime::Call::State, f);
+}
+
+/// [`with_state`], timed as a call of `kind` (`crate::frametime`).
+#[cfg(windows)]
+fn with_state_as(
+    this: This,
+    kind: crate::frametime::Call,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    let t = crate::fast::ticks();
+    let _timed = crate::frametime::Timed::new(kind);
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
-    crate::frametime::recorded(crate::fast::ticks().wrapping_sub(t));
+}
+
+/// Times the rest of a recording call of `kind` (`crate::frametime`).
+macro_rules! timed {
+    ($kind:ident) => {
+        #[cfg(windows)]
+        let _timed = crate::frametime::Timed::new(crate::frametime::Call::$kind);
+    };
 }
 
 /// Records work of our own into title list `this` where the title's
@@ -164,7 +181,7 @@ pub(crate) fn record_own(this: This, f: impl FnOnce(&crate::host::HostList) -> b
         return false;
     }
     let mut recorded = false;
-    with_state(this, |list, state| {
+    with_state_as(this, crate::frametime::Call::Own, |list, state| {
         recorded = f(list);
         if recorded {
             state.bindings_taken();
@@ -647,7 +664,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    with_state_as(this, crate::frametime::Call::Reset, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
@@ -737,6 +754,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    timed!(Barrier);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -854,6 +872,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    timed!(Copy);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -887,6 +906,7 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    timed!(Copy);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -1002,6 +1022,7 @@ fn left_out(what: &str, resource: This, index: u32) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    timed!(Copy);
     copy_resource(this, dst, src);
 }
 
@@ -1027,6 +1048,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    timed!(Copy);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1268,6 +1290,7 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    timed!(Copy);
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1279,6 +1302,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    timed!(Copy);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1361,6 +1385,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    timed!(Clear);
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1411,6 +1436,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    timed!(Clear);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1453,6 +1479,7 @@ extern "system" fn clear_dsv(
 /// ([`copy_on_card`]); else at submission (if mapped), as a step of ours
 /// that waits until everything in the air has landed.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    timed!(Copy);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1511,6 +1538,7 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    timed!(Copy);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1603,7 +1631,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_state, with_state_as};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1739,13 +1767,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_as(this, crate::frametime::Call::Draw, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state_as(this, crate::frametime::Call::Dispatch, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1755,7 +1783,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state_as(this, crate::frametime::Call::Mesh, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1773,7 +1801,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state_as(this, crate::frametime::Call::Mesh, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1784,7 +1812,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_as(this, crate::frametime::Call::Draw, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1862,7 +1890,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_as(this, crate::frametime::Call::Indirect, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     }
@@ -2006,9 +2034,11 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     let _ = (this, wait);
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    timed!(Value);
     wait_for(this, address, comparison, reference, false);
 }
 extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
+    timed!(Value);
     wait_for(this, address, comparison, reference, true);
 }
 
@@ -2018,6 +2048,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    timed!(Barrier);
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(windows)]
     if count > 0
@@ -2037,10 +2068,12 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    timed!(Value);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    timed!(Value);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

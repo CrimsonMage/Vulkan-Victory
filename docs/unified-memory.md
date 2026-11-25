@@ -552,8 +552,11 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   compare with a run at `VICTORY_UNIFIED=0` in the same place.
 - Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms (compare
   of card copies C), idle I; S submissions/frame (U untimed); title threads
-  recording into our lists R ms (summed); in submissions P ms (… of them;
-  textures brought up to date T ms), waiting for the card W ms [why ms/n,
+  recording into our lists R ms (summed; by call ms/n: state, draw, mesh,
+  dispatch, indirect, reset, own | besides: barrier, copy, clear, value);
+  in submissions P ms (… of them; by part: enter, descriptors, upkeep,
+  watch, steps, copies, execute; textures brought up to date T ms),
+  waiting for the card W ms [why ms/n,
   …]; flights landed in L ms (fetching shader writes back F ms, M MB);
   title fence events set n/frame, D ms after the ask on average; buffers
   named by lists: in place (read over the bus) X MB, card copies Y MB; top
@@ -568,7 +571,17 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   ring full), `lists` (256 lists in the air), `fence` (the title blocks
   without an event), `own` (the card running a waited submission). The
   pipelines are sampled every 30th frame with a timestamp at each pipeline
-  change of the title's lists.
+  change of the title's lists. R is the sum of the kinds before the bar
+  (the calls that pass through a list's draw state), each with its ms and
+  calls per frame; barriers, copies, clears and memory-value waits and
+  writes are timed beside it, not in R. The parts of a submission:
+  `enter` (the submission lock and the flights in the air, waits
+  included), `descriptors` (records the title copied into heaps as bytes),
+  `upkeep` (the idle sweep, slots waiting for a texture, finished shader
+  writes announced), `watch` (the write-watch asking), `steps` (the lists'
+  CPU steps: refreshes, fills, copies, textures), `copies` (snapshots and
+  sends to card copies), `execute` (`ExecuteCommandLists` of a submission
+  sent ahead; a waited one counts as the `own` wait).
 
 ### Risks of this build
 
