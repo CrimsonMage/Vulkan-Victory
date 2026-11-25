@@ -103,10 +103,17 @@ pub fn filler_written() {
     OTHER[4].fetch_add(1, Relaxed);
 }
 
-/// A title thread met a page in the middle of a change and waited for it.
-pub fn waited() {
+/// A title thread met a page at `at` that was not mapped yet (in the
+/// middle of a change, or mapped a moment later) and waited `ms` for it.
+pub fn waited(at: usize, ms: u64) {
     OTHER[5].fetch_add(1, Relaxed);
+    WAIT_LONGEST.fetch_max(ms, Relaxed);
+    WAIT_AT.store(at as u64, Relaxed);
 }
+
+/// The longest such wait since the last line, and the last address.
+static WAIT_LONGEST: AtomicU64 = AtomicU64::new(0);
+static WAIT_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Called with each line (`xmem` checks its filler pages there).
 static HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
@@ -156,7 +163,7 @@ pub fn tick() {
     tracing::info!(
         "views: in {:.0} s mapped {} showing {} pages ({} of pages shown elsewhere too), unmapped {}, already as asked {}, \
          filler stand-ins {}; placeholder splits {}, merges {}, maps refused {}; title writes into stand-ins {}, \
-         title threads that waited for a change {}; views alive {} ({} of one page), stand-in pages {}",
+         title threads that waited for a page {} (longest {} ms, last at {:#x}); views alive {} ({} of one page), stand-in pages {}",
         (now - last) as f64 / 1000.0,
         per_site(0),
         d[SITES..2 * SITES].iter().sum::<u64>(),
@@ -169,6 +176,8 @@ pub fn tick() {
         d[o + 2],
         d[o + 4],
         d[o + 5],
+        WAIT_LONGEST.swap(0, Relaxed),
+        WAIT_AT.load(Relaxed),
         ALIVE.load(Relaxed),
         SINGLE.load(Relaxed),
         FILLED.load(Relaxed),

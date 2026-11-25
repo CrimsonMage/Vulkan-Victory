@@ -169,6 +169,10 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if constrained && !at.is_null() {
+        RESERVED.write().unwrap_or_else(|e| e.into_inner()).insert(at as usize, size);
+        install_fault_handler();
+    }
     if unified && !at.is_null() {
         let canary = (at as usize + title_bytes) as *const c_void;
         // SAFETY: the last page of the reservation just made, ours.
@@ -1351,7 +1355,9 @@ fn install_fault_handler() {
 ///   mapped again (the runtime cannot change a view in one step, and an
 ///   unmap of part of a view takes all of it away): it waits for the change
 ///   to end and carries on, as on the console, which changes its page
-///   table at once;
+///   table at once. In memory xmem reserved for the title, a page not
+///   there is waited for up to a second whatever the lock says (the
+///   bookkeeping decides, not a flag), and found there, the thread goes on;
 /// - the title wrote into a stand-in for a filler page: the page is made
 ///   writable and the write counted (it does not reach the filler page's
 ///   other places).
@@ -1389,20 +1395,55 @@ unsafe extern "system" fn on_fault(info: *mut windows_sys::Win32::System::Diagno
     if holder {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: a query into our structure.
-    if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || info.State != MEM_COMMIT {
-        return EXCEPTION_CONTINUE_SEARCH;
+    // Is the page there now? In memory xmem reserved for the title (its
+    // reservations for physical pages, its regions), a page not there may
+    // be one a change is about to show, whichever thread makes it: wait for
+    // it a while. Elsewhere, once.
+    let fine = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our structure.
+        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        let protect = info.Protect & 0xff;
+        n != 0
+            && info.State == MEM_COMMIT
+            && info.Protect & PAGE_GUARD == 0
+            && protect != PAGE_NOACCESS
+            && (kind == READ || protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE)
+    };
+    // Also any reserved page of title memory (below 1 TiB): a wait there
+    // only delays a fault that is the title's own by a second.
+    let reserved_title_page = at < 1 << 40 && {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our structure.
+        (unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) }) != 0
+            && info.State == MEM_RESERVE
+    };
+    let patience = if reserved_title_page || reserved_by_xmem(at) { 1000 } else { 0 };
+    let start = std::time::Instant::now();
+    loop {
+        if fine(at) {
+            victory_gpu::mapstat::waited(at, start.elapsed().as_millis() as u64);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if start.elapsed().as_millis() >= patience {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // A change that began meanwhile ends first.
+        if !victory_gpu::remapping_over(1000) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     }
-    let protect = info.Protect & 0xff;
-    let fine = info.Protect & PAGE_GUARD == 0
-        && protect != PAGE_NOACCESS
-        && (kind == READ || protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE);
-    if !fine {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    victory_gpu::mapstat::waited();
-    EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// What xmem reserved for the title, by address: `XMemVirtualAlloc`
+/// regions and reservations for physical pages, and their bytes. Kept for
+/// the fault handler, which must not wait for the page table.
+static RESERVED: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// Whether `at` lies in memory xmem reserved for the title.
+fn reserved_by_xmem(at: usize) -> bool {
+    RESERVED.read().is_ok_and(|r| r.range(..=at).next_back().is_some_and(|(&base, &len)| at < base + len))
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1585,6 +1626,9 @@ pub mod memory {
         let span = freed(address as usize, size, kind);
         // SAFETY: the title's own arguments.
         let ok = unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) };
+        if ok != 0 && size == 0 && kind & MEM_RELEASE != 0 {
+            super::RESERVED.write().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
+        }
         if ok != 0
             && let Some((at, len)) = span
         {
