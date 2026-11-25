@@ -64,10 +64,12 @@ driver errors and no new crash, and the captures look no worse.
 | 1 | Prune `victory-gpu` switches and statistics | subagent | merged (6f7b937): −18,465 lines, 163 → 21 switches; one gate line every 5 s; memory-mirroring switches left for #7; gate g4 running |
 | 2 | Prune `victory-shader` switches | subagent | merged (d645fb8): switches 25 → 1, −2,526 lines; all 25,985 containers translate byte-identically; gate g2 running |
 | 3 | Prune HLE, loader, formats, app | subagent | merged (08c435a): switches 38 → 7, −1,886 lines; one console-instruction emulator; gate g1 passed |
-| 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | done: `docs/unified-memory.md`; probe merged, gate run pending |
+| 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | done: `docs/unified-memory.md`; probe run |
 | 5 | HLSL + DXC shader backend (`VICTORY_SHADER_BACKEND=hlsl`) | subagent | running |
 | 6 | Merge 1–3, gate run | coordinator | waiting |
-| 7 | Unified memory replaces mirroring; delete `shadow`/`watch`/`tiles`/`inplace` | — | after 4 and 6 |
+| 7 | Unified memory replaces mirroring (stages 1–3, default on; `VICTORY_UNIFIED=0` = old) | subagent | merged (323d262): heaps open, 0 refused, 714 buffers in place; blocked by the world-start VRAM spike; deletion (stage 4) after |
+| 9 | Find the world-start card-memory spike (+1.1–1.7 GB in a second) | subagent | running |
+| 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
 ## Decisions log
@@ -92,5 +94,16 @@ driver errors and no new crash, and the captures look no worse.
   FSR4 pipeline setup (twice); Series X stays the profile. Series X reaches
   the world start but card memory peaks at 7.2 GB there (victory 5.3 GB of
   it, render targets 1.95 GB uncapped).
+- 2026-11-25: target is 60 fps in the world eventually (user).
+- 2026-11-25: world start pushes the 8 GB card to ~7.7 GB in under 2 s in
+  every configuration (Series X; 1080p display mode; rays off; unified on);
+  the user chose to keep the 7.2 GB watchdog and find the cause first.
+- 2026-11-25: the Series S end was not silent and not FSR4: victory's own
+  "host GPU failure: no memory to fetch what shaders wrote" ended both runs
+  (as it ended three Series X runs) when the world-start spike filled the
+  4,075 MB shared-memory ceiling and a 16 MB fetch buffer was refused. The
+  FSR4 lines were only the title's last debug output, printed under the
+  crash report. Fetch buffers now skip the ceiling; the report heads the
+  title's lines and says the run ends there.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).

@@ -2631,7 +2631,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.fetch_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -2828,7 +2828,7 @@ impl Host {
         }
         if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            work.fetched = self.fetch_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((fetched, data, _)) = &work.fetched else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -4805,6 +4805,22 @@ impl Host {
     /// failed creation.
     #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_under(size, true)
+    }
+
+    /// A [`Self::shared_buffer`] the ceiling never refuses: for the buffers
+    /// that fetch what shaders wrote to the card's memory. Without one the
+    /// run ends ("no memory to fetch"), which is worse than going a few
+    /// buffers over the ceiling. Both Series S runs and three Series X runs
+    /// of 2026-11-25 ended so at the world start: their fetch buffers (whole
+    /// 16 MB steps, so never "small") were refused at the 4,075 MB ceiling.
+    #[track_caller]
+    pub(crate) fn fetch_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_under(size, false)
+    }
+
+    #[track_caller]
+    fn shared_buffer_under(&self, size: u64, ceiling: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let caller = std::panic::Location::caller();
         let size = size.max(1);
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Shared, size, size) {
@@ -4813,7 +4829,7 @@ impl Host {
         // The ceiling is for the big windows; small buffers (read-backs of
         // what shaders wrote, staging) are always made: refusing one is a
         // fatal "no memory to fetch" (run g4, 2026-11-25).
-        if size >= SMALL_ALWAYS && !crate::memcap::shared_room(self, size, 0) {
+        if ceiling && size >= SMALL_ALWAYS && !crate::memcap::shared_room(self, size, 0) {
             return None;
         }
         let heap = D3D12_HEAP_PROPERTIES {
