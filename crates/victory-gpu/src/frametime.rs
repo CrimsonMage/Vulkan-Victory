@@ -40,8 +40,6 @@ pub(crate) enum Wait {
     Results,
     /// 256 host lists in the air.
     Lists,
-    /// A queue's wait for a memory value flights may write.
-    Value,
     /// The title blocks on a fence without an event.
     Fence,
     /// A submission that is waited for: the card running it (and the fetch
@@ -49,10 +47,10 @@ pub(crate) enum Wait {
     Own,
 }
 
-const WAITS_NAMED: [&str; 11] = ["lock", "settle", "reads", "step", "merge", "copy-in", "results", "lists", "value", "fence", "own"];
+const WAITS_NAMED: [&str; 10] = ["lock", "settle", "reads", "step", "merge", "copy-in", "results", "lists", "fence", "own"];
 
 /// Per [`Wait`]: nanoseconds and how many.
-static WAITS: [[AtomicU64; 2]; 11] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 11];
+static WAITS: [[AtomicU64; 2]; 10] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 10];
 
 /// Plain sums ([`Sum`]).
 static SUMS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];

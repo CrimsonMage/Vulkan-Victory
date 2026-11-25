@@ -1408,11 +1408,12 @@ impl Drop for Deferred {
 //    shaders may write and the title wrote since ([`stale_under_flights`]),
 //    where the title's changed bytes cannot be merged in beside the
 //    flight's writes (`Shadow::merge_under_writes`);
-// 4. a queue stands at a wait for a memory value that no flight's
-//    bottom-of-pipe write is known to satisfy, at an address a flight may
-//    write ([`late_met`]);
-// 5. the title blocks on a fence without an event;
-// 6. the flights hold [`late_most`] host lists (until there are fewer).
+// 4. the title blocks on a fence without an event;
+// 5. the flights hold [`late_most`] host lists (until there are fewer).
+//
+// A queue that stands at a wait for a memory value no flight's
+// bottom-of-pipe write is known to satisfy keeps holding what follows
+// and looks again whenever flights have landed ([`late_met`]).
 //
 // The present's copy is a flight of its own (`Host::execute_own`), and the
 // swap chain presents behind it. What the title is told (bottom-of-pipe
@@ -1885,43 +1886,30 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// whether it is met once the flights in the air have run. A flight's
 /// bottom-of-pipe write of a value that meets it says yes without a wait
 /// for the card: the part behind the wait goes to the card behind that
-/// flight, which is the order the wait asks for. If the flights may write
-/// the value in a way not known here (shaders, a timestamp, another
-/// width), they are settled and memory is asked again.
+/// flight, which is the order the wait asks for. Otherwise no: the queue
+/// keeps holding the part, and looks again each time flights have landed
+/// ([`late_helper`]), also when they may write the value in a way not
+/// known here (shaders, a timestamp, another width). (Those were settled
+/// here, a full drain of the card on the thread that submitted or
+/// presented, while the submission lock was held.)
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
-    {
-        let line = line();
-        if line.line.is_empty() && line.in_hand.is_empty() {
-            return false;
-        }
-        let mut unsure = touches(&line.written, address, address + bytes);
-        // (With the relay: first the writes of flights being landed.)
-        let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-            Late::Write(at, what, n) => Some((at, what, n)),
-            _ => None,
-        }));
-        for (at, what, n) in writes {
-            if *at >= address + bytes || address >= *at + *n {
-                continue;
-            }
-            match what {
-                crate::queue::Written::Value(v) if *at == address && *n >= bytes => {
-                    if wait.holds_for(*v) {
-                        return true;
-                    }
-                }
-                _ => unsure = true,
-            }
-        }
-        if !unsure {
-            return false;
+    let line = line();
+    // (With the relay: first the writes of flights being landed.)
+    let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
+        Late::Write(at, what, n) => Some((at, what, n)),
+        _ => None,
+    }));
+    for (at, what, n) in writes {
+        if let crate::queue::Written::Value(v) = what
+            && *at == address
+            && *n >= bytes
+            && wait.holds_for(*v)
+        {
+            return true;
         }
     }
-    let t = std::time::Instant::now();
-    settle_now();
-    crate::frametime::waited(crate::frametime::Wait::Value, t);
-    wait.met()
+    false
 }
 
 /// Waits until the thread that lands flights has landed everything in the
