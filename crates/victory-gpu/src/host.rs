@@ -2502,7 +2502,11 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[first.take(), Some(list.cast()?)]);
+                    let sync: ID3D12CommandList = list.cast()?;
+                    match first.take() {
+                        Some(stamp) => self.queue.ExecuteCommandLists(&[Some(stamp), Some(sync)]),
+                        None => self.queue.ExecuteCommandLists(&[Some(sync)]),
+                    }
                     Ok(())
                 })()
             };
@@ -2549,8 +2553,8 @@ impl Host {
                 at += pieces;
             }
         }
-        let first = start.unwrap_or(work.taken);
-        work.out.push_back((first, if start.is_some() { at } else { first }));
+        let from = start.unwrap_or(work.taken);
+        work.out.push_back((from, if start.is_some() { at } else { from }));
         if start.is_some() {
             work.taken = at;
         }

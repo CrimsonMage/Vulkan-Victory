@@ -288,11 +288,17 @@ fn read(back: &ID3D12Resource, first: u32, count: u32) -> Vec<u64> {
 fn collect(g: &mut Gpu) {
     let finished = crate::host::submissions_finished();
     let mut spans = Vec::new();
+    // One mapping for all of them.
+    let all = if g.used.iter().any(|&slot| g.slots[slot].owner <= finished) {
+        read(&g.back, 0, 3 * g.slots.len() as u32)
+    } else {
+        Vec::new()
+    };
     let mut i = 0;
     while i < g.used.len() {
         let slot = g.used[i];
         if g.slots[slot].owner <= finished {
-            let t = read(&g.back, 3 * slot as u32, 3);
+            let t = &all[3 * slot..3 * slot + 3];
             spans.push((t[0], t[1], t[2]));
             g.used.swap_remove(i);
             g.free.push(slot);
