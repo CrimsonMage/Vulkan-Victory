@@ -55,7 +55,7 @@ driver errors and no new crash, and the captures look no worse.
 | Rust lines | 128,292 | 106,472 |
 | `VICTORY_*` switches | 224 | 43 |
 | `diagnostics`-only blocks | 283 | 71 |
-| World frame time (Proton, 8 GB card) | 0.5–5 s | ~585 ms (Series S, wineserver fixed; CPU and GPU both idle part of each frame) |
+| World frame time (Proton, 8 GB card) | 0.5–5 s | 390–470 ms (2.1–2.5 fps), Series S, world lit, card 6.8 GB of 8 |
 
 ## Workstreams
 
@@ -71,7 +71,7 @@ driver errors and no new crash, and the captures look no worse.
 | 9 | Find the world-start card-memory spike (+1.1–1.7 GB in a second) | subagent | running |
 | 11 | Cut memory-mapping churn: stock wineserver walks every view on each map/unmap | subagent | merged (e4e2dd2): wineserver 88% → 5–7% of a core in the world; ~17 map calls/s instead of ~200; filler zero page shown by stand-ins |
 | 13 | Series S: compose the title's two display planes (compose.rs) | subagent | merged: menus, loading and credits show |
-| 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f), run s7 testing |
+| 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f): Series S world renders lit (run s7, frame 1890) |
 | 15 | Frame-time breakdown (GPU busy, CPU waits, top pipelines) and removal of needless waits | subagent | running |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
