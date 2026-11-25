@@ -975,6 +975,8 @@ pub fn title_memory_reading() -> Reading {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // A big buffer's heap over the views there shows the old pages.
+    crate::unified::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

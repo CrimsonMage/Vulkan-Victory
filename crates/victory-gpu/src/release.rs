@@ -111,18 +111,48 @@ pub(crate) fn watch_process_memory() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = std::thread::Builder::new().name("victory-procmem".into()).spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let Some(pid) = unix_pid() else {
+                tracing::info!("process memory: this process is not found under /proc (not Wine?); no process memory line");
+                return;
+            };
+            let path = format!(r"Z:\proc\{pid}\smaps");
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                match std::fs::read_to_string(r"Z:\proc\self\smaps") {
-                    Ok(text) => tracing::info!("{}", process_memory(&text)),
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => tracing::info!(pid, "{}", process_memory(&text)),
                     Err(e) => {
-                        tracing::info!(error = %e, "process memory: /proc/self/smaps cannot be read; no process memory line");
+                        tracing::info!(pid, error = %e, "process memory: smaps cannot be read; no process memory line");
                         return;
                     }
                 }
+                std::thread::sleep(std::time::Duration::from_secs(30));
             }
         });
     });
+}
+
+/// This process's Linux pid: the process under `/proc` (Wine's `Z:`) that
+/// maps our own executable over the address of our own code. (`/proc/self`
+/// read from the Windows side named another, small process in run p8: 34
+/// MB in 30 mappings against a VmRSS of 21 GB.)
+fn unix_pid() -> Option<u32> {
+    let marker = unix_pid as *const () as usize as u64;
+    let exe = std::env::current_exe().ok()?.file_name()?.to_string_lossy().to_ascii_lowercase();
+    for entry in std::fs::read_dir(r"Z:\proc").ok()?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(maps) = std::fs::read_to_string(format!(r"Z:\proc\{pid}\maps")) else { continue };
+        let ours = maps.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            let range = words.next().and_then(|r| r.split_once('-')).and_then(|(a, b)| {
+                Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(b, 16).ok()?))
+            });
+            range.is_some_and(|(a, b)| a <= marker && marker < b) && line.to_ascii_lowercase().contains(&exe)
+        });
+        if ours {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 /// A mapping of `/proc/self/smaps` being read: start, bytes, path, resident

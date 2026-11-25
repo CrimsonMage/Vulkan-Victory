@@ -459,9 +459,16 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
 - **Big buffers outside the units** (`unified.rs` `loose`): a title buffer
   of 16 MiB or more in memory no unit holds (a committed resource's memory
   from the title's allocator: the 174 MB GPU heap at 0xb9c0000 in run p7)
-  is opened as a heap of its own over its 64 KiB pages, checked by a word
-  the GPU must read as the CPU sees it, and let go when that memory is
-  freed.
+  is opened as a heap of its own over its 64 KiB pages (its 4 KiB pages if
+  the next 64 KiB is not committed), checked by a word the GPU must read as
+  the CPU sees it, and let go when that memory is freed. Any committed
+  protection that reads and writes counts, whatever the caching modifiers;
+  view pages victory's guards keep read-only are opened first; memory over
+  views is let go when the title maps anything else there. A refusal logs
+  the first pages that refused (state, protection, type) and is asked again
+  2 s later. Run p8 refused 0xb9c0000 (174 MB), 0xc15940000 (50 MB) and
+  0xc3ddd0000 (24 MB) on a check that wanted plain private read-write
+  pages.
 - **Buffers in place** (`shadow.rs`). A title buffer of any size, or a
   4 MiB window of title memory outside buffers, whose memory lies in one
   opened region, one run of one section or one opened big buffer, becomes
@@ -644,7 +651,9 @@ victory holds for title memory follows it.
   memory another one covers; sharing card pages by title address would
   save about … MB`. The large targets of the 13:53 log (15 of 16 MB or
   more) do not overlap.
-- **Process memory** (`release.rs`, every 30 s, Linux view through `Z:`):
+- **Process memory** (`release.rs`, every 30 s, Linux view through `Z:`,
+  of the process under `/proc` that maps victory's executable over its own
+  code; `/proc/self` named another process in run p8):
   `process memory (Linux): resident … MB in … mappings; title addresses:
   anonymous …, shared …; host addresses: anonymous …, shared …; NVIDIA
   driver mappings …; files …; of ours in the PC's memory: …; largest …`.

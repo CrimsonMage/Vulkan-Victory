@@ -81,7 +81,7 @@ struct Units {
     /// Big buffers outside the units, opened by themselves ([`loose`]), by
     /// first address; and the first addresses that did not open.
     loose: BTreeMap<usize, Loose>,
-    loose_refused: std::collections::HashSet<u64>,
+    loose_refused: HashMap<u64, u64>,
     /// The probe's queue, for the canaries.
     rig: Option<Rig>,
 }
@@ -194,7 +194,7 @@ pub(crate) fn released(at: usize, len: usize) {
             OPENING[3].fetch_add(l.len, Ordering::Relaxed);
         }
     }
-    u.loose_refused.retain(|&lo| lo < at as u64 || lo >= end as u64);
+    u.loose_refused.retain(|&lo, _| lo < at as u64 || lo >= end as u64);
 }
 
 /// A buffer placed over title memory.
@@ -220,14 +220,14 @@ pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
     let run = crate::views::section_run(start as usize, len as usize);
     let mut u = units();
     let u = &mut *u;
-    let (heap, size, offset) = match run {
+    let (heap, size, offset, view) = match run {
         Some((section, offset)) => {
             let unit = u.sections.get_mut(&section)?;
             if offset.checked_add(len)? > unit.len {
                 return None;
             }
             let (heap, size) = open(device, &mut u.rig, unit, Home::Section(section))?;
-            (heap, size, offset)
+            (heap, size, offset, true)
         }
         None => match u.regions.range_mut(..=start as usize).next_back() {
             Some((&base, unit)) if start < base as u64 + unit.len => {
@@ -235,7 +235,7 @@ pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
                     return None;
                 }
                 let (heap, size) = open(device, &mut u.rig, unit, Home::Region(base))?;
-                (heap, size, start - base as u64)
+                (heap, size, start - base as u64, false)
             }
             _ => loose(device, u, start, end)?,
         },
@@ -249,7 +249,7 @@ pub(crate) fn place(start: u64, len: u64) -> Option<Placed> {
     STATS[4].fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
-    Some(Placed { buffer, gpu, bias, view: run.is_some() })
+    Some(Placed { buffer, gpu, bias, view })
 }
 
 #[derive(Clone, Copy)]
@@ -302,89 +302,188 @@ const LOOSE_MIN: u64 = 16 << 20;
 struct Loose {
     len: u64,
     heap: ID3D12Heap,
+    /// Over views of sections (the title's pages, mapped by `xmem`): let go
+    /// when the title maps anything else there ([`remapped`]).
+    view: bool,
 }
 
 /// The heap of a big buffer outside the units that holds `[start, end)`:
-/// the heap, its bytes, and the offset of `start` in it; opened now for a
-/// buffer of [`LOOSE_MIN`] bytes or more over committed read-write pages.
-fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(ID3D12Heap, u64, u64)> {
+/// the heap, its bytes, the offset of `start` in it, and whether it lies
+/// over views; opened now for a buffer of [`LOOSE_MIN`] bytes or more over
+/// committed read-write pages ([`usable`]). Over the 64 KiB pages that hold
+/// the buffer, else over its 4 KiB pages (the next 64 KiB may not be
+/// committed). A view page victory's guards keep read-only is opened first
+/// (memory read in place needs no write tracking). Refused memory is asked
+/// again two seconds later (its tail may be committed by then).
+fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(ID3D12Heap, u64, u64, bool)> {
     if let Some((&at, l)) = u.loose.range(..=start as usize).next_back()
         && end <= at as u64 + l.len
     {
-        return Some((l.heap.clone(), l.len, start - at as u64));
+        return Some((l.heap.clone(), l.len, start - at as u64, l.view));
     }
     if end - start < LOOSE_MIN {
         return None;
     }
-    let (lo, hi) = (start & !(K64 - 1), end.next_multiple_of(K64));
-    if u.loose_refused.contains(&lo) {
+    let now = crate::host::now_ms();
+    if u.loose_refused.get(&start).is_some_and(|&until| now < until) {
         return None;
     }
+    let wide = (start & !(K64 - 1), end.next_multiple_of(K64));
+    let narrow = (start & !0xfff, end.next_multiple_of(0x1000));
     // Not over another one, nor over a region (a page is opened once).
+    let (lo, hi) = narrow;
     if u.loose.range(..hi as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > lo)
         || u.regions.range(..hi as usize).next_back().is_some_and(|(&at, r)| at as u64 + r.len + K64 > lo)
     {
         return None;
     }
+    let usable_wide = usable(wide.0 as usize, (wide.1 - wide.0) as usize)
+        .ok()
+        .filter(|_| {
+            !u.loose.range(..wide.1 as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > wide.0)
+                && !u.regions.range(..wide.1 as usize).next_back().is_some_and(|(&at, r)| at as u64 + r.len + K64 > wide.0)
+        });
+    let found = match usable_wide {
+        Some(view) => Ok((wide, view)),
+        None => match usable(lo as usize, (hi - lo) as usize) {
+            Ok(view) => Ok((narrow, view)),
+            Err(Refusal::ReadOnly(_)) => {
+                // Guarded by victory (a view a copy watches): opened, then
+                // asked again.
+                crate::watch::writing(lo as usize, (hi - lo) as usize);
+                usable(lo as usize, (hi - lo) as usize).map(|view| (narrow, view))
+            }
+            Err(why) => Err(why),
+        },
+    };
     let started = std::time::Instant::now();
-    // SAFETY: the pages are checked committed and read-write first.
-    let opened = unsafe {
-        if !committed_rw(lo as usize, (hi - lo) as usize) {
-            Err("pages not all committed and read-write".to_owned())
-        } else {
+    let opened = found.map_err(|why| why.to_string()).and_then(|((lo, hi), view)| {
+        // SAFETY: the pages are committed and readable and writable.
+        unsafe {
             touch(lo as *mut u8, (hi - lo) as usize);
             device
                 .cast::<ID3D12Device13>()
                 .and_then(|d| d.OpenExistingHeapFromAddress1::<ID3D12Heap>(lo as *const _, (hi - lo) as usize))
                 .map_err(|e| format!("OpenExistingHeapFromAddress1: {e}"))
                 .and_then(|heap| match check(device, &mut u.rig, &heap, lo as *const u8, hi - lo, start - lo) {
-                    Ok(true) => Ok(heap),
-                    Ok(false) => Err("nothing in it to check it by".to_owned()),
+                    Ok(true) => Ok((heap, lo, hi, view)),
+                    Ok(false) => Err("nothing in it to check it by yet".to_owned()),
                     Err(why) => Err(why),
                 })
         }
-    };
+    });
     let ms = started.elapsed().as_secs_f64() * 1000.0;
     match opened {
-        Ok(heap) => {
+        Ok((heap, lo, hi, view)) => {
             let len = hi - lo;
+            u.loose_refused.remove(&start);
             STATS[0].fetch_add(1, Ordering::Relaxed);
             STATS[1].fetch_add(len, Ordering::Relaxed);
             OPENING[4].fetch_add(len, Ordering::Relaxed);
             crate::memcap::count(crate::memcap::Use::Opened, len);
-            tracing::info!(what = "buffer", at = format_args!("{lo:#x}"), mb = len >> 20, ms = format_args!("{ms:.0}"), "unified: title memory opened as a heap");
-            u.loose.insert(lo as usize, Loose { len, heap: heap.clone() });
-            Some((heap, len, start - lo))
+            tracing::info!(what = "buffer", at = format_args!("{lo:#x}"), mb = len >> 20, view, ms = format_args!("{ms:.0}"), "unified: title memory opened as a heap");
+            u.loose.insert(lo as usize, Loose { len, heap: heap.clone(), view });
+            Some((heap, len, start - lo, view))
         }
         Err(why) => {
-            STATS[2].fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(what = "buffer", at = format_args!("{lo:#x}"), mb = (hi - lo) >> 20, why, "unified: title memory NOT opened; its buffers keep copies");
-            u.loose_refused.insert(lo);
+            let n = STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 32 || n.is_power_of_two() {
+                tracing::warn!(what = "buffer", at = format_args!("{start:#x}"), mb = (end - start) >> 20, why, n, "unified: title memory NOT opened; its buffers keep copies (asked again in 2 s)");
+            }
+            u.loose_refused.insert(start, now + 2_000);
             None
         }
     }
 }
 
-/// Whether every page of `[at, at + len)` is committed read-write private
-/// memory: not a view of a section, whose pages the title may map anew (a
-/// heap opened over a view would keep the old pages).
-fn committed_rw(at: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+/// Why memory cannot be opened ([`usable`]): the first page that says so.
+enum Refusal {
+    /// Committed, but read-only (victory's guards make view pages so).
+    ReadOnly(String),
+    Other(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::ReadOnly(s) | Refusal::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Whether every page of `[at, at + len)` is committed and both readable and
+/// writable, whatever the caching modifiers (write-combined, uncached: the
+/// title's graphics memory may ask for them); `Ok(true)` if some of it is a
+/// view of a section. Else the first pages that are not, with their state,
+/// protection and type.
+fn usable(at: usize, len: usize) -> Result<bool, Refusal> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    const READ_WRITE: [u32; 2] = [0x04, 0x40]; // PAGE_READWRITE, PAGE_EXECUTE_READWRITE
+    const READ_ONLY: [u32; 2] = [0x02, 0x20]; // PAGE_READONLY, PAGE_EXECUTE_READ
+    const GUARD: u32 = 0x100;
     let end = at + len;
     let mut p = at;
+    let mut view = false;
     while p < end {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: a query into our structure.
-        if unsafe { VirtualQuery(p as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
-            || info.State != MEM_COMMIT
-            || info.Protect != PAGE_READWRITE
-            || info.Type != MEM_PRIVATE
-        {
-            return false;
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return Err(Refusal::Other(format!("no answer for {p:#x}")));
         }
-        p = (info.BaseAddress as usize + info.RegionSize).max(p + 4096);
+        let stop = (info.BaseAddress as usize + info.RegionSize).max(p + 4096);
+        let base = info.Protect & 0xff;
+        let say = || {
+            format!(
+                "pages {p:#x}..{:#x} ({} KiB into the buffer's pages): state {:#x}, protection {:#x}, type {:#x}",
+                stop.min(end),
+                (p - at) >> 10,
+                info.State,
+                info.Protect,
+                info.Type
+            )
+        };
+        if info.State != MEM_COMMIT || info.Protect & GUARD != 0 {
+            return Err(Refusal::Other(say()));
+        }
+        if READ_ONLY.contains(&base) {
+            return Err(Refusal::ReadOnly(say()));
+        }
+        if !READ_WRITE.contains(&base) {
+            return Err(Refusal::Other(say()));
+        }
+        view |= info.Type == MEM_MAPPED;
+        p = stop;
     }
-    true
+    Ok(view)
+}
+
+/// The title maps something else at `[at, at + len)` (`crate::watch`): a
+/// big buffer's heap over views there shows the old pages, so it goes (its
+/// in-place buffers are made stale by `crate::shadow`, and the next ask
+/// opens the memory anew).
+pub(crate) fn remapped(at: usize, len: usize) {
+    if !on() || len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut u = units();
+    if u.loose.is_empty() {
+        return;
+    }
+    let gone: Vec<usize> = u
+        .loose
+        .range(..end)
+        .rev()
+        .take_while(|(lo, l)| **lo + l.len as usize > at)
+        .filter(|(_, l)| l.view)
+        .map(|(lo, _)| *lo)
+        .collect();
+    for lo in gone {
+        if let Some(l) = u.loose.remove(&lo) {
+            STATS[1].fetch_sub(l.len, Ordering::Relaxed);
+            OPENING[4].fetch_sub(l.len, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Writes every page of `[at, at + len)` once in place (an atomic add of 0,
@@ -540,7 +639,8 @@ unsafe fn ready_region(base: usize, total: usize) -> Result<(), String> {
         }
         let stop = (info.BaseAddress as usize + info.RegionSize).min(end);
         match info.State {
-            MEM_COMMIT if info.Protect == PAGE_READWRITE => {}
+            // Read-write, whatever the caching modifiers.
+            MEM_COMMIT if matches!(info.Protect & 0x1ff, 0x04 | 0x40) => {}
             // SAFETY: reserved pages of the region.
             MEM_RESERVE if !unsafe { VirtualAlloc(at as *const _, stop - at, MEM_COMMIT, PAGE_READWRITE) }.is_null() => {
                 OPENING[2].fetch_add((stop - at) as u64, Ordering::Relaxed);
