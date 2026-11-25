@@ -76,6 +76,20 @@ pub(crate) struct Staging {
     /// quality, `crate::quality`): host level `mip` is console level
     /// `mip + dropped`, and those levels are neither read nor detiled.
     dropped: u32,
+    /// For a host copy with memory for all its levels: the bytes of its
+    /// levels the title did not hold at the last detiling (counted in
+    /// [`UNHELD`] while it lives): what levels on demand would not give it.
+    unheld: std::sync::atomic::AtomicU64,
+}
+
+/// Staged host copies with memory for all their levels that hold levels the
+/// title does not ([`Staging::unheld`]), and those levels' bytes.
+static UNHELD: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the levels line (`crate::tiles::tick`): [`UNHELD`].
+pub(crate) fn unheld() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (UNHELD[0].load(Relaxed), UNHELD[1].load(Relaxed))
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -416,6 +430,11 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        let unheld = *self.unheld.get_mut();
+        if unheld > 0 {
+            UNHELD[0].fetch_sub(1, Relaxed);
+            UNHELD[1].fetch_sub(unheld, Relaxed);
+        }
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
@@ -434,6 +453,12 @@ impl Drop for Staging {
 
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`LET_GO`], for the release line (`crate::release`).
+pub(crate) fn let_go() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed))
+}
 
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
@@ -890,6 +915,36 @@ impl Staging {
         held
     }
 
+    /// A host copy with memory for all its levels: notes the bytes of its
+    /// levels the title does not hold now ([`Staging::unheld`]).
+    fn count_unheld(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let held = self.held_levels(self.judgement()) >> self.dropped;
+        let bytes: u64 = self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .enumerate()
+            .filter(|&(i, _)| {
+                let mip = i as u32 % self.mips;
+                mip < 32 && held & (1 << mip) == 0
+            })
+            .map(|(_, (f, &rows))| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth))
+            .sum();
+        let old = self.unheld.swap(bytes, Relaxed);
+        match (old > 0, bytes > 0) {
+            (false, true) => {
+                UNHELD[0].fetch_add(1, Relaxed);
+            }
+            (true, false) => {
+                UNHELD[0].fetch_sub(1, Relaxed);
+            }
+            _ => {}
+        }
+        UNHELD[1].fetch_add(bytes, Relaxed);
+        UNHELD[1].fetch_sub(old, Relaxed);
+    }
+
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
@@ -1073,15 +1128,17 @@ impl Staging {
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
+        // (In console levels; the host copy's are `dropped` fewer.)
         let held = if self.on_demand {
             use std::sync::atomic::Ordering::Relaxed;
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
+            let held = self.held_levels(judged) >> self.dropped;
             self.detiled.store(held, Relaxed);
             held
         } else {
+            self.count_unheld();
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
@@ -1122,11 +1179,10 @@ impl Staging {
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
-pub(crate) fn unstage(resource: This) {
+/// Returns the staging buffer's bytes (0: it had none).
+pub(crate) fn unstage(resource: This) -> u64 {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut().and_then(|map| map.remove(&(resource as usize))).map_or(0, |s| s.bytes)
 }
 
 /// Where a staged title texture's memory is: address and bytes.
@@ -1367,6 +1423,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
         dropped,
+        unheld: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

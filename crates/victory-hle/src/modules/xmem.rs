@@ -332,7 +332,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            memory::free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -897,6 +897,10 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, site: Site) ->
     let shown = show(&mut physical, base, n * PAGE, &runs, site);
     drop((changing, physical));
     victory_gpu::mapstat::tick();
+    // Unmapped: what victory holds for that memory goes.
+    if pages.is_null() && shown {
+        victory_gpu::title_memory_released(base, n * PAGE);
+    }
     if shown && known { address } else { std::ptr::null_mut() }
 }
 
@@ -981,6 +985,10 @@ pub fn map_alias(to: u64, from: u64, len: u64, repeat: bool) -> bool {
     let shown = show(&mut physical, to, len, &runs, Site::Alias);
     drop((changing, physical));
     victory_gpu::mapstat::tick();
+    // Unmapped: what victory holds for that memory goes.
+    if from == 0 && shown {
+        victory_gpu::title_memory_released(to, len);
+    }
     shown && found
 }
 
@@ -1550,6 +1558,82 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
         ],
+    }
+}
+
+/// The title's `VirtualFree` (it imports it from
+/// `api-ms-win-core-memory-l1-1-0.dll` and frees its `XMemVirtualAlloc`
+/// regions with it): the host's, then what victory holds for that memory
+/// goes (`victory_gpu::title_memory_released`).
+pub mod memory {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::core::BOOL;
+
+    use crate::{HleModule, hle_export};
+
+    const MEM_DECOMMIT: u32 = 0x4000;
+    const MEM_RELEASE: u32 = 0x8000;
+    /// `MEM_COALESCE_PLACEHOLDERS`, `MEM_PRESERVE_PLACEHOLDER`: placeholder
+    /// work, not a free.
+    const PLACEHOLDER: u32 = 0x1 | 0x2;
+
+    #[allow(non_snake_case)]
+    pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        let span = freed(address as usize, size, kind);
+        // SAFETY: the title's own arguments.
+        let ok = unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) };
+        if ok != 0
+            && let Some((at, len)) = span
+        {
+            // SAFETY: plain calls; the title sees the error the host left.
+            let error = unsafe { GetLastError() };
+            victory_gpu::title_memory_released(at, len);
+            unsafe { SetLastError(error) };
+        }
+        ok
+    }
+
+    /// Victory's frees of title memory (`XMemFreeDefault`) go the same way.
+    pub(crate) fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        VirtualFree(address, size, kind)
+    }
+
+    /// The memory a `VirtualFree` of the title's frees or decommits: below
+    /// 1 TiB (title memory), and for a size of 0 the whole allocation that
+    /// starts at `at`, asked before it goes.
+    fn freed(at: usize, size: usize, kind: u32) -> Option<(usize, usize)> {
+        if at == 0 || at as u64 >= 1 << 40 || kind & (MEM_DECOMMIT | MEM_RELEASE) == 0 || kind & PLACEHOLDER != 0 {
+            return None;
+        }
+        if size != 0 {
+            return Some((at, size.next_multiple_of(4096)));
+        }
+        let mut end = at;
+        loop {
+            // SAFETY: plain data, filled by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a query into our structure.
+            if unsafe { VirtualQuery(end as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+                || info.AllocationBase as usize != at
+                || info.State == MEM_FREE
+                || info.RegionSize == 0
+            {
+                break;
+            }
+            end = info.BaseAddress as usize + info.RegionSize;
+        }
+        (end > at).then(|| (at, end - at))
+    }
+
+    pub(crate) fn module() -> HleModule {
+        HleModule {
+            name: "memory",
+            dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+            exports: vec![hle_export!(VirtualFree)],
+        }
     }
 }
 

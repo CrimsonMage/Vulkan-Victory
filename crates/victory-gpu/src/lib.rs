@@ -53,6 +53,8 @@ mod primitive;
 pub mod query;
 #[cfg(windows)]
 mod quality;
+#[cfg(windows)]
+mod release;
 pub mod queue;
 pub mod resource;
 pub mod root;
@@ -83,6 +85,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use release::title_memory_released;
 #[cfg(windows)]
 pub use unified::{on as unified_on, title_region, title_section, title_section_gone};
 #[cfg(windows)]
