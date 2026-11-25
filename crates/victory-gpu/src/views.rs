@@ -49,7 +49,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     if v.views.is_empty() {
         return;
     }
-    let end = at.saturating_add(len);
+    // A length of 0 (a free of a whole allocation) names the view at `at`
+    // alone; an empty range would also make the range below panic.
+    let end = at.saturating_add(len.max(1));
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
