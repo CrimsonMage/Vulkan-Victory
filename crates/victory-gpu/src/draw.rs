@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use crate::indirect::Cause;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -69,7 +70,7 @@ thread_local! {
     /// While a whole binding is made (`State::bind`): the title memory its
     /// shaders are declared to write, and whether they may write memory
     /// not known by address (by address, buffers picked by index).
-    static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64, Cause)>> = const { std::cell::RefCell::new(Vec::new()) };
     static UNTRACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
@@ -183,7 +184,7 @@ pub(crate) struct State {
     /// (`BIND_WRITES`, `UNTRACKED`): a binding taken from it writes the
     /// same, which ends the list's window of bounded indirect records over
     /// it (`crate::indirect`).
-    writes: [Vec<(u64, u64)>; 2],
+    writes: [Vec<(u64, u64, Cause)>; 2],
     untracked: [bool; 2],
     /// The compute root signature and the root arguments the host list was
     /// last given for the title (what [`State::bind`] and
@@ -206,9 +207,9 @@ enum Replay {
 }
 
 /// Shaders bound now write `[address, address + len)` of title memory.
-fn note_write(list: &HostList, address: u64, len: u64) {
-    BIND_WRITES.with_borrow_mut(|w| w.push((address, len)));
-    list.wrote(address, len);
+fn note_write(list: &HostList, address: u64, len: u64, cause: Cause) {
+    BIND_WRITES.with_borrow_mut(|w| w.push((address, len, cause)));
+    list.wrote(address, len, cause);
 }
 
 impl Drop for State {
@@ -860,8 +861,8 @@ impl State {
         let kind = usize::from(compute);
         if self.bound_already(list, p, compute) || (compute && self.constants_only(list, p)) {
             // It writes what the binding it is taken from writes.
-            for &(address, len) in &self.writes[kind] {
-                list.wrote(address, len);
+            for &(address, len, cause) in &self.writes[kind] {
+                list.wrote(address, len, cause);
             }
             if self.untracked[kind] {
                 list.wrote_somewhere();
@@ -1328,7 +1329,7 @@ impl State {
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
-                note_write(list, a, len);
+                note_write(list, a, len, Cause::RootUav);
             }
         };
         let heap = match self.heaps[0] {
@@ -2030,6 +2031,22 @@ impl State {
     /// list; these say which memory it would have read and written (the
     /// ray-tracing structure builder passes its buffers this way).
 
+    /// A draw or dispatch of the bound pipeline was dropped: if its shaders
+    /// may write memory (or what they do is not known: no host pipeline),
+    /// indirect records from now on in the list are bounded
+    /// (`crate::indirect`). The ray-tracing structure builder's stages,
+    /// dropped all together while it is off, write no records.
+    pub(crate) fn dropped_here(&self, list: &HostList) {
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return;
+        }
+        let writes = crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|s| s.translated().stores));
+        if writes {
+            list.producer_dropped();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // The ray-tracing structure builder's stages run all or none.
@@ -2043,6 +2060,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.producer_dropped();
             return;
         };
         if !p.compute {
@@ -2051,6 +2069,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.dropped_here(list);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2355,6 +2374,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.dropped_here(list);
         }
     }
 
@@ -2696,6 +2716,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.dropped_here(list);
         }
     }
 
@@ -2792,6 +2813,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.dropped_here(list);
         }
     }
 }
@@ -2801,8 +2823,9 @@ impl State {
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
-    /// where they were written; in a buffer shaders may write (`writable`:
-    /// the title made it for unordered access) they are bounded first, a
+    /// where they were written; after a dropped draw or dispatch of the
+    /// list, in a buffer shaders may write (`writable`: the title made it
+    /// for unordered access), they are bounded first, a
     /// window of records at a time (`crate::indirect`; the console's
     /// records are the host's: draw, indexed draw, dispatch and mesh
     /// dispatch, three group counts). The title's barrier between its pass
@@ -2885,7 +2908,8 @@ impl State {
         // (`crate::indirect`): a pass of ours, if one is recorded, sets a
         // compute root signature and pipeline of its own, and the title's
         // are set back after it.
-        let (bounded, from) = if writable || crate::indirect::copied(arguments, len) {
+        let bound = (writable || crate::indirect::copied(arguments, len)) && list.indirect().dropped();
+        let (bounded, from) = if bound {
             let window = (kind, stride, max);
             let at = (args.gpu(arguments), arguments);
             let Some((bounded, from, pass)) = crate::indirect::bounded(list, window, at, args.left(arguments)) else {
@@ -2896,6 +2920,7 @@ impl State {
             }
             (bounded, from)
         } else {
+            crate::indirect::unbounded();
             (args.buffer.clone(), offset)
         };
         let ran = match kind {
@@ -3039,7 +3064,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() {
                 shadow.gpu_writes(list, address, len);
-                note_write(list, address, len);
+                note_write(list, address, len, Cause::TableUav);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

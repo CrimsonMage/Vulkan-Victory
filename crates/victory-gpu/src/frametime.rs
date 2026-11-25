@@ -709,6 +709,10 @@ pub(crate) fn frame() {
         let (ticks, n) = (take(&PART_SUMS[k][0]), take(&PART_SUMS[k][1]));
         dispatch.push_str(&format!(" {name} {:.1}/{:.0}", per(crate::fast::ticks_to_ns(ticks)), n as f64 / frames));
     }
+    #[cfg(windows)]
+    let indirect = crate::indirect::frame_text(frames);
+    #[cfg(not(windows))]
+    let indirect = String::new();
     let (mut card, mut pipes) = (String::from("no GPU timestamps"), String::new());
     if let Some(g) = gpu().as_mut() {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / g.frequency as f64 / frames;
@@ -735,7 +739,7 @@ pub(crate) fn frame() {
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
          in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, not in place (filled at submission) {:.0} MB, windows over scattered pages \
-         (copies on the card) {:.0} MB; window gathers {:.1} ({:.1} MB), scatters {:.1} ({:.1} MB); {dispatch}; {pipes}",
+         (copies on the card) {:.0} MB; window gathers {:.1} ({:.1} MB), scatters {:.1} ({:.1} MB); {dispatch}; {indirect}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,

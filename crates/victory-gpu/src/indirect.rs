@@ -13,9 +13,17 @@
 //! - mesh dispatches likewise, with the second and third counts cut to at
 //!   most 1 (the console's mesh programs are one-dimensional).
 //!
-//! Only records in buffers shaders may write are bounded (the title made
-//! the buffer for unordered access, or a copy on the card wrote it): what
-//! the CPU writes the title meant as it is.
+//! Garbage records come from a pass of the title victory dropped (no host
+//! pipeline, not translated, not bound): only executions recorded after
+//! such a drop in the same list are bounded ([`HostList::producer_dropped`];
+//! run p16 bounded every execution and the world's 2,600 a frame cost
+//! 0.18 ms each, against 0.03 unbounded). Of those, only records in buffers
+//! shaders may write (the title made the buffer for unordered access, or a
+//! copy on the card wrote it): what the CPU writes the title meant as it
+//! is.
+//!
+//! shortcut: a producer dropped in another list than the execution's (an
+//! earlier one of the same submission) leaves its records unbounded.
 //!
 //! The records are copied, bounded, into a buffer of the list's own by a
 //! compute pass of ours, not one execution at a time but a **window** of
@@ -45,6 +53,9 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
+
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 
 use crate::host::{HostList, host, transition};
 
@@ -169,6 +180,48 @@ pub(crate) fn copied(address: u64, len: u64) -> bool {
     pages(address, len).any(|(word, bit)| COPIED[word].load(Relaxed) & bit != 0)
 }
 
+/// What ends a window of bounded records, for the frame line.
+#[derive(Clone, Copy)]
+pub(crate) enum Cause {
+    /// A shader's root unordered access view (to its buffer's end).
+    RootUav = 0,
+    /// An unordered access view in a shader's table.
+    TableUav = 1,
+    /// A shader that writes memory not known by address (title memory by
+    /// address, buffers picked from the heap by index).
+    Untracked = 2,
+    /// A title copy run on the card.
+    Copy = 3,
+}
+
+/// Since the last frame line: bounding passes, executions bounded and not,
+/// and windows ended by each [`Cause`].
+static PASSES: AtomicU64 = AtomicU64::new(0);
+static BOUNDED: AtomicU64 = AtomicU64::new(0);
+static UNBOUNDED: AtomicU64 = AtomicU64::new(0);
+static ENDED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// An indirect execution ran from its records as they are.
+pub(crate) fn unbounded() {
+    UNBOUNDED.fetch_add(1, Relaxed);
+}
+
+/// The frame line's part, per frame over `frames` frames.
+pub(crate) fn frame_text(frames: f64) -> String {
+    let take = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / frames;
+    let ended = ENDED.each_ref().map(take);
+    format!(
+        "indirect bounding per frame: passes {:.1}, executions bounded {:.0} unbounded {:.0}, windows ended by root UAV {:.1} table UAV {:.1} by address or heap {:.1} card copy {:.1}",
+        take(&PASSES),
+        take(&BOUNDED),
+        take(&UNBOUNDED),
+        ended[0],
+        ended[1],
+        ended[2],
+        ended[3]
+    )
+}
+
 /// A list's copy buffer and the window bounded into it.
 #[derive(Default)]
 pub(crate) struct Window {
@@ -177,6 +230,9 @@ pub(crate) struct Window {
     /// A pass in this recording left the buffer readable as indirect
     /// arguments (else it is common).
     readable: bool,
+    /// A draw or dispatch that may write memory was dropped in this
+    /// recording: executions from then on are bounded.
+    dropped: bool,
     /// What is bounded in it: kind, stride, records, the GPU address of
     /// the title records' first, and their title memory (from, to).
     bounded: Option<(u32, u32, u32, u64, (u64, u64))>,
@@ -184,23 +240,37 @@ pub(crate) struct Window {
 
 impl Window {
     /// Something recorded from now on writes `[address, address + len)`.
-    pub(crate) fn wrote(&mut self, address: u64, len: u64) {
+    pub(crate) fn wrote(&mut self, address: u64, len: u64, cause: Cause) {
         if let Some((.., (from, to))) = self.bounded
             && address < to
             && address.saturating_add(len) > from
         {
             self.bounded = None;
+            ENDED[cause as usize].fetch_add(1, Relaxed);
         }
     }
 
     /// Something recorded from now on may write anywhere.
     pub(crate) fn wrote_somewhere(&mut self) {
-        self.bounded = None;
+        if self.bounded.take().is_some() {
+            ENDED[Cause::Untracked as usize].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// A draw or dispatch that may write memory was dropped.
+    pub(crate) fn producer_dropped(&mut self) {
+        self.dropped = true;
+    }
+
+    /// Whether one was, in this recording.
+    pub(crate) fn dropped(&self) -> bool {
+        self.dropped
     }
 
     /// The list is reset: its buffer was left common when it closed.
     pub(crate) fn reset(&mut self) {
         self.readable = false;
+        self.dropped = false;
         self.bounded = None;
     }
 
@@ -242,6 +312,7 @@ pub(crate) fn bounded(
         && (src - first) % u64::from(stride) == 0
         && (src - first) / u64::from(stride) + u64::from(max) <= u64::from(records)
     {
+        BOUNDED.fetch_add(1, Relaxed);
         return Some((copy.clone(), src - first, false));
     }
     let records = (u64::from(max).max(u64::from(WINDOW)))
@@ -298,6 +369,8 @@ pub(crate) fn bounded(
         )]);
     }
     window.readable = true;
+    PASSES.fetch_add(1, Relaxed);
+    BOUNDED.fetch_add(1, Relaxed);
     window.bounded = Some((kind, stride, records as u32, src, (title, title + bytes)));
     Some((copy, 0, true))
 }

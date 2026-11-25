@@ -842,7 +842,7 @@ fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> b
     }
     s.refresh(list, from, len);
     d.gpu_writes(list, to, len);
-    list.wrote(to, len);
+    list.wrote(to, len, crate::indirect::Cause::Copy);
     crate::indirect::copied_onto(to, len);
     // Ordered with the writes before and the uses after it.
     list.writes_barrier();
@@ -1884,6 +1884,9 @@ extern "system" fn execute_indirect(
         with_state_as(this, crate::frametime::Call::Indirect, |list, s| {
             let writable = crate::resource::shader_writable(arguments);
             ran = s.execute_indirect(list, (kind, stride, max), (address, writable), counter);
+            if !ran && kind == DISPATCH {
+                s.dropped_here(list);
+            }
         });
     }
     if ran {
