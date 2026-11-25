@@ -42,6 +42,10 @@ the twin; it implements only what is truly console-only.
   once (DirectStorage, file reads) and does not churn it. So do work once,
   at the moment the title announces new data, and never re-check, re-hash,
   re-copy or re-translate it per frame.
+- **Memory follows what is loaded**: when the title frees, unmaps or
+  destroys something, victory releases its copies, views and heaps for it
+  right then (after in-flight work lands). Idle eviction under budget
+  pressure is only a safety net.
 
 ## Rules
 
