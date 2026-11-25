@@ -17,7 +17,7 @@ the twin; it implements only what is truly console-only.
 
 | Xbox side (what the title uses) | PC side (what victory turns it into) | Module | Status |
 |---|---|---|---|
-| Unified memory: the CPU writes, the GPU reads the same pages | One CPU-visible D3D12 heap (ReBAR video memory, spilling to system memory); resources placed in it at the title's offsets; sync at fences, submits and DirectStorage completion | `victory-gpu` (new `unified.rs`), `victory-hle/xmem.rs` | **designing**: replaces write-watch, guards, snapshots and copies (`shadow`, `watch`, `tiles`, `inplace`, `copystat`) |
+| Unified memory: the CPU writes, the GPU reads the same pages | One CPU-visible D3D12 heap (ReBAR video memory, spilling to system memory); resources placed in it at the title's offsets; sync at fences, submits and DirectStorage completion | `victory-gpu` (new `unified.rs`), `victory-hle/xmem.rs` | **probe built**: title memory stays in system RAM and is *opened* as D3D12 heaps (`OpenExistingHeapFromAddress1`/`FromFileMapping`); a ReBAR GPU-upload heap can't hold textures or sit at title addresses on this stack. Replaces write-watch, guards, snapshots and copies (~17k lines) |
 | D3D12.X device and command lists (`d3d12_xs`) | D3D12, call for call where a PC call exists | `victory-gpu` (`device`, `list`, `draw`) | works; pruning experiments |
 | Console GPU code (RDNA2 machine code, no HLSL or DXIL shipped) | Decoder → IR → **HLSL text → DXC** (`dxcompiler.dll` beside the exe) | `victory-shader` (new `hlsl/`) | **prototyping**; today a hand-written DXIL encoder |
 | Console tiled texture layouts | Detile once when the data arrives (resource creation, DirectStorage completion, title copies) | `victory-gpu/texture.rs` | works; to move to explicit points |
@@ -64,7 +64,7 @@ driver errors and no new crash, and the captures look no worse.
 | 1 | Prune `victory-gpu` switches and statistics | subagent | running |
 | 2 | Prune `victory-shader` switches; equivalence sample of 1,000 shaders | subagent | running |
 | 3 | Prune HLE, loader, formats, app | subagent | running |
-| 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | running |
+| 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | done: `docs/unified-memory.md`; probe merged, gate run pending |
 | 5 | HLSL + DXC shader backend (`VICTORY_SHADER_BACKEND=hlsl`) | subagent | running |
 | 6 | Merge 1–3, gate run | coordinator | waiting |
 | 7 | Unified memory replaces mirroring; delete `shadow`/`watch`/`tiles`/`inplace` | — | after 4 and 6 |
