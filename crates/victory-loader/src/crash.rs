@@ -52,8 +52,17 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
+    // The title's lines come before the failure in time; headed, so they
+    // do not read as its cause (the Series S runs of 2026-11-25 ended on
+    // FSR4 lines that were only the title's last words).
+    let said = title_output();
+    let said = if said.is_empty() {
+        said
+    } else {
+        format!("  (the title's last debug output before this, for context:)\n{said}")
+    };
     let text = format!("{text}
-{}", title_output());
+{said}");
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -122,6 +131,11 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+/// `__fastfail` (`int 0x29`), its code in the first parameter. Windows ends
+/// the process without any handler; Wine dispatches it as this exception,
+/// so a vectored handler sees it.
+const FAST_FAIL: i32 = 0xC000_0409_u32 as i32;
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -133,7 +147,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if code == FAST_FAIL {
+        // No filter runs after a fast fail: reported to the file now.
+        // SAFETY: as above.
+        unsafe { report("fast fail (__fastfail: the process ends)", info, true) };
+    } else if FATAL.contains(&code) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
@@ -227,6 +246,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
+    } else if code == FAST_FAIL && record.NumberParameters >= 1 {
+        format!(" (fast-fail code {})", p[0])
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
         format!(" (code {})", unsafe { instruction_bytes(at) })

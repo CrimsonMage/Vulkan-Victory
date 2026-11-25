@@ -98,5 +98,12 @@ driver errors and no new crash, and the captures look no worse.
 - 2026-11-25: world start pushes the 8 GB card to ~7.7 GB in under 2 s in
   every configuration (Series X; 1080p display mode; rays off; unified on);
   the user chose to keep the 7.2 GB watchdog and find the cause first.
+- 2026-11-25: the Series S end was not silent and not FSR4: victory's own
+  "host GPU failure: no memory to fetch what shaders wrote" ended both runs
+  (as it ended three Series X runs) when the world-start spike filled the
+  4,075 MB shared-memory ceiling and a 16 MB fetch buffer was refused. The
+  FSR4 lines were only the title's last debug output, printed under the
+  crash report. Fetch buffers now skip the ceiling; the report heads the
+  title's lines and says the run ends there.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
