@@ -19,6 +19,8 @@
 mod capture;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 pub mod descriptor;
 pub mod device;
