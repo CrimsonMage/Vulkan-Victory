@@ -66,6 +66,16 @@ pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
+/// Whether `this` is an object made with `table` (one of our objects of
+/// that kind): for pointers the title hands over outside a method call,
+/// such as the list and textures in a FidelityFX upscale description.
+#[cfg(windows)]
+pub(crate) fn has_table<const N: usize>(this: This, table: &'static Table<N>) -> bool {
+    // SAFETY: a non-null pointer the title passes as one of our objects;
+    // only its first word is read.
+    !this.is_null() && unsafe { (*this).functions } == table.0.as_ptr()
+}
+
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1

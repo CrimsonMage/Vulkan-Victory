@@ -149,6 +149,28 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Records work of our own into title list `this` where the title's
+/// recording stands now: `f` gets the host list and says whether it
+/// recorded (it then set descriptor heaps, a root signature and a
+/// pipeline of its own, and the next draw or dispatch sets the title's
+/// again). False, recording nothing, if `this` is not one of our lists.
+#[cfg(windows)]
+pub(crate) fn record_own(this: This, f: impl FnOnce(&crate::host::HostList) -> bool) -> bool {
+    if !object::has_table(this, &LIST_FUNCTIONS)
+        && !object::has_table(this, &NEWER_LIST_FUNCTIONS)
+    {
+        return false;
+    }
+    let mut recorded = false;
+    with_state(this, |list, state| {
+        recorded = f(list);
+        if recorded {
+            state.bindings_taken();
+        }
+    });
+    recorded
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

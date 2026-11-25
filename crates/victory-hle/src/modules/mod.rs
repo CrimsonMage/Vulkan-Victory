@@ -10,6 +10,7 @@ pub mod d3d12x;
 pub mod display;
 pub mod dsp;
 pub mod dstorage;
+pub mod ffx;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -51,4 +52,10 @@ pub(crate) fn all() -> Vec<HleModule> {
         xmem::module(),
         xsystem::module(),
     ]
+}
+
+/// Single exports of title DLLs we replace, the DLL itself staying the
+/// title's (mapped and bound like its other DLLs): (DLL, export).
+pub(crate) fn title_overrides() -> Vec<(&'static str, crate::HleExport)> {
+    ffx::overrides()
 }

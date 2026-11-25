@@ -476,6 +476,15 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A pass of ours set its own descriptor heaps, root signature and
+    /// pipeline on the host list: the next draw or dispatch sets the
+    /// title's again.
+    pub(crate) fn bindings_taken(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -1676,9 +1685,7 @@ impl State {
         // pass sets its own heap, root signature and pipeline, so the next
         // draw or dispatch sets the title's again.
         if self.ambient(list, p) {
-            self.host_pipeline = 0;
-            self.host_roots = [0; 2];
-            self.host_heaps = [0; 2];
+            self.bindings_taken();
         }
     }
 
