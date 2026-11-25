@@ -751,8 +751,19 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // Buffers have host copies, not resources the barrier can name:
+        // a barrier on one, or an unordered access barrier on everything,
+        // orders every write before it with every use after it (indirect
+        // executions read the title's records in place; on the console the
+        // argument fetch reads through the cache shaders write).
+        let orders_writes = barriers.iter().any(|b| match (b.kind, b.first.is_null()) {
+            (1, _) => false,
+            (2, true) => true,
+            (_, null) => !null && crate::resource::buffer_bytes(b.first).is_some(),
+        });
         let host: Vec<Barrier> = barriers
             .iter()
+            .filter(|b| !(orders_writes && b.kind == 2 && b.first.is_null()))
             .filter_map(|b| host_barrier(list, b))
             .collect();
         if !host.is_empty() {
@@ -769,12 +780,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one orders every write before it with every use
-        // after it (indirect executions read the title's records in place).
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        if orders_writes {
             list.writes_barrier();
         }
     }
@@ -820,7 +826,6 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 /// CPU at submission.
 #[cfg(windows)]
 fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
-    use windows::Win32::Graphics::Direct3D12::*;
     if !crate::unified::on() || len == 0 {
         return false;
     }

@@ -156,6 +156,9 @@ pub(crate) struct State {
     /// Of the dynamic slots taken a chunk at a time ([`State::take_slots`]):
     /// the title heap, the next slot not handed out, the chunk's end.
     chunk: (usize, u32, u32),
+    /// The tables a stage's binding made afresh ([`State::tables`]), kept
+    /// to be filled again by the next.
+    made: Vec<(u8, u32)>,
 }
 
 impl Drop for State {
@@ -640,15 +643,24 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
-            match root {
-                Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
-                _ => {}
-            }
+        // Gathered in memory the thread keeps (the builder dispatches
+        // hundreds of times a frame).
+        thread_local! {
+            static NAMED: std::cell::RefCell<(Vec<u64>, Vec<u32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        NAMED.with_borrow_mut(|(addresses, constants)| {
+            addresses.clear();
+            constants.clear();
+            for root in self.roots_ref(compute) {
+                match root {
+                    Root::View(address) => addresses.push(*address),
+                    Root::Constants(values) => constants.extend_from_slice(values),
+                    _ => {}
+                }
+            }
+            crate::memory::ready(list, heap, addresses, constants, writes)
+        })
     }
 
     /// The bound heap holding `handle`.
@@ -812,10 +824,14 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            // In the list's own vector: no allocation per draw.
+            let mut made = std::mem::take(&mut self.made);
+            made.clear();
+            self.tables(list, &t.used, &t.host.root_indexed_views, compute, &mut made);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                self.made = made;
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -863,6 +879,7 @@ impl State {
                     }
                 }
             }
+            self.made = made;
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -2054,7 +2071,8 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+        made: &mut Vec<(u8, u32)>,
+    ) {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // The root slots of the tables made afresh, as bits (no allocation
         // per draw; a root signature has at most 64 parameters).
@@ -2141,7 +2159,6 @@ impl State {
                 host.mirror(first + k, table + u64::from(k) * 32, true);
             }
         }
-        let mut made = Vec::new();
         for slot in (0..128u8).filter(|&slot| fresh & bit(slot) != 0) {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -2287,7 +2304,6 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
     }
 
     /// What a draw's shaders read, one line per used resource (diagnostics
@@ -2574,14 +2590,33 @@ impl State {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
+/// once. Each recording thread keeps the few it met: no lock per
+/// execution.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+    type Made = Vec<((u32, u32), ID3D12CommandSignature)>;
+    thread_local! {
+        static SEEN: std::cell::RefCell<Made> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+    let find = |made: &Made| made.iter().find(|(k, _)| *k == (kind, stride)).map(|(_, s)| s.clone());
+    if let Some(s) = SEEN.with_borrow(find) {
+        return Some(s);
+    }
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let s = match find(&made) {
+        Some(s) => s,
+        None => {
+            let s = make_signature(kind, stride)?;
+            made.push(((kind, stride), s.clone()));
+            s
+        }
+    };
+    SEEN.with_borrow_mut(|seen| seen.push(((kind, stride), s.clone())));
+    Some(s)
+}
+
+/// A new host command signature for [`host_signature`].
+fn make_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
@@ -2605,9 +2640,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

@@ -3755,8 +3755,12 @@ impl HostList {
     /// argument fetch of an indirect execution, which reads the title's
     /// records where its passes wrote them.
     pub(crate) fn writes_barrier(&self) {
-        let list7 = self.list7.get_or_init(|| self.list.cast().ok());
+        let list7 = self
+            .list7
+            .get_or_init(|| enhanced_barriers().then(|| self.list.cast().ok()).flatten());
         let Some(list7) = list7 else {
+            // shortcut: without enhanced barriers, a barrier that names no
+            // resource (drivers that lack them order everything with it).
             // SAFETY: an open list; a barrier that names no resource.
             unsafe { self.list.ResourceBarrier(&[uav_barrier()]) };
             return;
@@ -5027,8 +5031,31 @@ impl Host {
     }
 }
 
+/// Whether the device takes enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`),
+/// asked once.
+fn enhanced_barriers() -> bool {
+    static ENHANCED: OnceLock<bool> = OnceLock::new();
+    *ENHANCED.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: the structure the feature asks for, and its size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let enhanced = asked.is_ok() && options.EnhancedBarriersSupported.as_bool();
+        if !enhanced {
+            tracing::warn!("no enhanced barriers: indirect arguments written by shaders are ordered by unordered access barriers alone");
+        }
+        enhanced
+    })
+}
+
 /// An unordered access barrier on every resource.
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

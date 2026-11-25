@@ -316,7 +316,7 @@ void work() {
         /// A compute pass of ours of one group, and the pipeline back.
         Compute,
         /// The same between two waits for every earlier shader write, as
-        /// the clamp records them.
+        /// the indirect-argument clamp (removed) recorded them.
         ComputeWithWaits,
     }
 
@@ -754,14 +754,14 @@ void work() {
                             Between::Compute | Between::ComputeWithWaits => {
                                 let waits = between == Between::ComputeWithWaits;
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[crate::host::uav_barrier()]);
                                 }
                                 l.SetComputeRootSignature(&self.work_root);
                                 l.SetPipelineState(&self.work);
                                 l.SetComputeRootUnorderedAccessView(0, self.words.GetGPUVirtualAddress());
                                 l.Dispatch(1, 1, 1);
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[crate::host::uav_barrier()]);
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }
