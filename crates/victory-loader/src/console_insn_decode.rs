@@ -41,24 +41,23 @@ fn field_len(len: u8) -> u32 {
     }
 }
 
+/// The bits of an SSE4a field: `len` bits from bit `idx`, cut at bit 63.
+pub fn field_mask(len: u8, idx: u8) -> u64 {
+    let (len, idx) = (field_len(len), (idx & 63) as u32);
+    let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+    ones << idx
+}
+
 /// EXTRQ on a low quadword: `len` bits from bit `idx`, zero-extended (a field past bit 63 is
 /// undefined on the console; here it is what a shift gives).
 pub fn extrq(v: u64, len: u8, idx: u8) -> u64 {
-    let (len, idx) = (field_len(len), (idx & 63) as u32);
-    let field = v.checked_shr(idx).unwrap_or(0);
-    if len >= 64 {
-        field
-    } else {
-        field & ((1u64 << len) - 1)
-    }
+    (v & field_mask(len, idx)) >> (idx & 63)
 }
 
 /// INSERTQ on a low quadword: the low `len` bits of `src` put at bit `idx` of `dst`.
 pub fn insertq(dst: u64, src: u64, len: u8, idx: u8) -> u64 {
-    let (len, idx) = (field_len(len), (idx & 63) as u32);
-    let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
-    let mask = ones.checked_shl(idx).unwrap_or(0);
-    (dst & !mask) | ((src & ones).checked_shl(idx).unwrap_or(0) & mask)
+    let mask = field_mask(len, idx);
+    (dst & !mask) | ((src << (idx & 63)) & mask)
 }
 
 /// The length of a ModRM-encoded operand (ModRM, SIB and displacement) at `b[0]`, None when the

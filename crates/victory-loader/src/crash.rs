@@ -119,6 +119,7 @@ pub fn report_crashes() {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
+    crate::console_insn::start_counting();
 }
 
 /// What the vectored handler reports as it happens.
@@ -506,25 +507,47 @@ mod tests {
         unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") at) };
         assert!(line.0[..64].iter().all(|&b| b == 0));
         assert!(line.0[64..].iter().all(|&b| b == 0xff));
-        // insertq xmm0, xmm1, len 16, at 16; then extrq xmm0, len 8, at 20.
-        let out: u64;
-        // SAFETY: touches only the named registers.
-        unsafe {
-            std::arch::asm!(
-                "movq xmm0, {a}", "movq xmm1, {b}",
-                ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10",
-                "movq {a}, xmm0",
-                ".byte 0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14",
-                "movq {b}, xmm0",
-                a = inout(reg) 0x1111_2222_3333_4444u64 => _, b = inout(reg) 0xabcdu64 => out,
-                out("xmm0") _, out("xmm1") _)
-        };
-        assert_eq!(out, 0xbc); // 0x1111_2222_abcd_4444 >> 20, 8 bits
-        // SAFETY: monitorx/mwaitx are wait hints that write no memory.
-        unsafe {
-            std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
-                in("rax") at, in("ecx") 0, in("edx") 0)
-        };
+        // The title's loop, `clzero; add rax, 0x40; cmp rax, rdx; jb`, over lines 1 to 3 of
+        // 5, twice: emulated whole at the first trap, then run as its stub.
+        for _ in 0..2 {
+            #[repr(align(64))]
+            struct Lines([u8; 320]);
+            let mut lines = Lines([0xff; 320]);
+            let (from, to) = (lines.0.as_mut_ptr().wrapping_add(64), lines.0.as_mut_ptr().wrapping_add(256));
+            let end: usize;
+            // SAFETY: the loop writes only lines 1 to 3 of ours.
+            unsafe {
+                std::arch::asm!(".byte 0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4",
+                    inout("rax") from => end, in("rdx") to)
+            };
+            assert_eq!(end, to as usize);
+            assert!(lines.0[..64].iter().all(|&b| b == 0xff));
+            assert!(lines.0[64..256].iter().all(|&b| b == 0));
+            assert!(lines.0[256..].iter().all(|&b| b == 0xff));
+        }
+        // Twice: emulated at the first trap, then run as the plain code they were rewritten as.
+        for _ in 0..2 {
+            // insertq xmm0, xmm1, len 16, at 16; then extrq xmm0, len 8, at 20.
+            let (out, mid): (u64, u64);
+            // SAFETY: touches only the named registers.
+            unsafe {
+                std::arch::asm!(
+                    "movq xmm0, {a}", "movq xmm1, {b}",
+                    ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10",
+                    "movq {a}, xmm0",
+                    ".byte 0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14",
+                    "movq {b}, xmm0",
+                    a = inout(reg) 0x1111_2222_3333_4444u64 => mid, b = inout(reg) 0xabcdu64 => out,
+                    out("xmm0") _, out("xmm1") _)
+            };
+            assert_eq!(mid, 0x1111_2222_abcd_4444);
+            assert_eq!(out, 0xbc); // 0x1111_2222_abcd_4444 >> 20, 8 bits
+            // SAFETY: monitorx/mwaitx are wait hints that write no memory.
+            unsafe {
+                std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
+                    in("rax") at, in("ecx") 0, in("edx") 0)
+            };
+        }
     }
 
     #[test]

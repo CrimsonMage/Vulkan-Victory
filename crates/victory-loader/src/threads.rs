@@ -43,6 +43,17 @@ pub(crate) fn mapped(image: &LoadedImage) {
     });
 }
 
+/// `at` as the address it has in its title image's file (at the preferred base, as a
+/// disassembler shows it), if a title image holds it. None too while another thread holds
+/// the list (an exception handler may call it on a thread that does).
+pub(crate) fn title_address(at: usize) -> Option<u64> {
+    let images = IMAGES.try_lock().ok()?;
+    images.iter().find_map(|m| {
+        let (base, info) = (m.image.base(), m.image.info());
+        (base <= at && at < base + info.size_of_image as usize).then(|| info.image_base + (at - base) as u64)
+    })
+}
+
 /// Its `DLL_PROCESS_ATTACH` is done. The list keeps attach order, which is
 /// the Windows loader's initialisation order.
 pub(crate) fn attached(base: usize) {
