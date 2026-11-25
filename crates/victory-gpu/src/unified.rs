@@ -320,8 +320,10 @@ fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(
     if u.loose_refused.contains(&lo) {
         return None;
     }
-    // Not over another one.
-    if u.loose.range(..hi as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > lo) {
+    // Not over another one, nor over a region (a page is opened once).
+    if u.loose.range(..hi as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > lo)
+        || u.regions.range(..hi as usize).next_back().is_some_and(|(&at, r)| at as u64 + r.len + K64 > lo)
+    {
         return None;
     }
     let started = std::time::Instant::now();
@@ -363,9 +365,11 @@ fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(
     }
 }
 
-/// Whether every page of `[at, at + len)` is committed read-write.
+/// Whether every page of `[at, at + len)` is committed read-write private
+/// memory: not a view of a section, whose pages the title may map anew (a
+/// heap opened over a view would keep the old pages).
 fn committed_rw(at: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
     let end = at + len;
     let mut p = at;
     while p < end {
@@ -374,6 +378,7 @@ fn committed_rw(at: usize, len: usize) -> bool {
         if unsafe { VirtualQuery(p as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
             || info.State != MEM_COMMIT
             || info.Protect != PAGE_READWRITE
+            || info.Type != MEM_PRIVATE
         {
             return false;
         }
