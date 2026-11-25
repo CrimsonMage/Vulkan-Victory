@@ -26,9 +26,6 @@ use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
-#[cfg(all(windows, feature = "diagnostics"))]
-pub mod capture;
-
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
@@ -422,8 +419,6 @@ impl Xma {
             words = ?(0..10).map(|w| format!("{:08x}", context.get(w))).collect::<Vec<_>>(),
             "XMA voice enabled"
         );
-        #[cfg(feature = "diagnostics")]
-        dump_input(index, context);
         *slot = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
@@ -646,30 +641,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     context.set_field(2, 0, 26, next as u32);
     true
-}
-
-/// `VICTORY_XMA_DUMP=<dir>`: saves the context words (`<n>-<index>.ctx`)
-/// and input buffer 0 (`.xma`) of the first 32 voices enabled, to test
-/// the decoder on a title's streams outside the title.
-#[cfg(feature = "diagnostics")]
-fn dump_input(index: u32, context: Context) {
-    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let Some(dir) = std::env::var_os("VICTORY_XMA_DUMP") else {
-        return;
-    };
-    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= 32 {
-        return;
-    }
-    let dir = std::path::PathBuf::from(dir);
-    let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
-    let input = heap_bytes(
-        context.get(5) & !0x7ff,
-        context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
-    );
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill

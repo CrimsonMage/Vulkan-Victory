@@ -230,17 +230,6 @@ pub extern "system" fn QueryApiImpl(
     else {
         return NOT_SUPPORTED;
     };
-    #[cfg(feature = "diagnostics")]
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        // Each runtime call site once: which title code uses which area, when.
-        static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let from = super::kernel::callers();
-        let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
-        if !calls.contains(&from) {
-            tracing::debug!(%provider, %iid, %from, "runtime call");
-            calls.push(from);
-        }
-    }
     let found = AREAS
         .iter()
         .flat_map(|area| area.iter())

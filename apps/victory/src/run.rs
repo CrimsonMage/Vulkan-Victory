@@ -109,8 +109,6 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
-    #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -129,60 +127,6 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
-}
-
-/// The debugging aids (README): scheduled stack dumps, watched values and
-/// memory saved on a crash.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
-    victory_loader::dump_stacks_on_schedule();
-    victory_hle::modules::audio::capture::start();
-    watch(image.base(), image.info().size_of_image as usize);
-    // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
-    // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
-    let size = image.info().size_of_image as usize;
-    let ranges = std::env::var("VICTORY_CRASH_SAVE").unwrap_or_default();
-    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
-    victory_loader::save_on_crash(
-        ranges
-            .split(',')
-            .filter_map(|r| r.split_once(':'))
-            .filter_map(|(rva, len)| Some((hex(rva)?, hex(len)?)))
-            .filter(|&(rva, len)| rva.checked_add(len).is_some_and(|end| end <= size))
-            .map(|(rva, len)| {
-                let file = cfg.cache_dir.join(format!("crash-{rva:x}.bin"));
-                (image.base() + rva, len, file)
-            })
-            .collect(),
-    );
-}
-
-/// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
-/// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
-#[cfg(all(windows, feature = "diagnostics"))]
-fn watch(base: usize, size: usize) {
-    let Ok(list) = std::env::var("VICTORY_WATCH") else {
-        return;
-    };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
-    std::thread::spawn(move || {
-        let mut seen = vec![None; rvas.len()];
-        loop {
-            for (&rva, seen) in rvas.iter().zip(&mut seen) {
-                // SAFETY: four bytes inside the mapped image, checked above.
-                let value = unsafe { ((base + rva) as *const u32).read_volatile() };
-                if *seen != Some(value) {
-                    eprintln!("VIctory: title+{rva:#x} = {value:#x}");
-                    *seen = Some(value);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    });
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.

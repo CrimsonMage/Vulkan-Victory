@@ -31,9 +31,5 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 tempfile.workspace = true
 
-[features]
-# Debugging switches (scheduled stack dumps and the like).
-diagnostics = []
-
 [lints]
 workspace = true

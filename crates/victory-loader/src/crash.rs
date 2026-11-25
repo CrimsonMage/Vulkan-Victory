@@ -28,19 +28,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
-pub(crate) const MAX_FRAMES: usize = 40;
-
-/// Memory saved to files when a crash is reported: (address, length, file).
-#[cfg(feature = "diagnostics")]
-static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
-    std::sync::OnceLock::new();
-
-/// Debugging aid: on a reported crash, also write each `[address, address
-/// + len)` (readable title memory, e.g. an engine table) to its file.
-#[cfg(feature = "diagnostics")]
-pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
-    let _ = SAVE.set(ranges);
-}
+const MAX_FRAMES: usize = 40;
 
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -515,16 +503,6 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         text.push_str(&said);
         append_to_log(&text);
     }
-    #[cfg(feature = "diagnostics")]
-    for (address, len, file) in SAVE.get().into_iter().flatten() {
-        // SAFETY: the caller of `save_on_crash` named readable memory.
-        let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
-        let saved = std::fs::write(file, bytes);
-        eprintln!(
-            "  saved {address:#x}+{len:#x} to {} ({saved:?})",
-            file.display()
-        );
-    }
 }
 
 /// Return addresses of the faulting thread's frames, from the faulting
@@ -547,7 +525,7 @@ pub(crate) struct Aligned16(pub(crate) CONTEXT);
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
-pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).

@@ -386,12 +386,6 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// The return addresses above the caller, as `module+rva`, for logs.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn callers() -> String {
-    host::callers()
-}
-
 #[cfg(windows)]
 mod host {
     use std::ffi::c_void;
