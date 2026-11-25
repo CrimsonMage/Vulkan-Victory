@@ -196,5 +196,14 @@ driver errors and no new crash, and the captures look no worse.
   a remap (it was asked at every ask).
 - 2026-11-25: whole-file mapping of archives failed (levels.rpf is 76 GB);
   streaming now does one positioned read of exactly each request's range.
+- 2026-11-25: Leonida study (GPL-3.0, code reusable with notice; no world
+  frame shown there). Taken: route pool memory through the 64 KiB
+  raw-address directory onto section heaps (remap = directory write, in
+  queue order), the directory in device-local memory, globallycoherent
+  builder UAVs, deferred texture backing in shared 64 MiB blocks. Later:
+  descriptors as memory (V#/T# read by shaders), offline pipeline prewarm
+  from the title's PSO cache. Not taken: bypassing vkd3d, its windows.
+- 2026-11-25: window copy-out corrupted title memory (title crash at frame
+  ~900); copy-out off by default (VICTORY_GATHER_COPYOUT).
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
