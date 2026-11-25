@@ -581,8 +581,6 @@ pub(crate) struct HostList {
     /// Counts what makes a draw's or dispatch's preparation differ from
     /// the same one's before ([`HostList::epoch`]).
     epoch: std::sync::atomic::AtomicU64,
-    /// Barriers that order writes ([`HostList::writes_barrier`]) recorded.
-    barriers: std::sync::atomic::AtomicU64,
     /// Bounded indirect records (`crate::indirect`).
     indirect: Mutex<crate::indirect::Window>,
 }
@@ -1931,7 +1929,6 @@ impl Host {
                 list6: OnceLock::new(),
                 list7: OnceLock::new(),
                 epoch: std::sync::atomic::AtomicU64::new(0),
-                barriers: std::sync::atomic::AtomicU64::new(0),
                 indirect: Mutex::default(),
             })
         }
@@ -2478,9 +2475,16 @@ impl HostList {
         self.epoch.load(Ordering::Relaxed)
     }
 
-    /// Barriers that order writes recorded so far ([`HostList::writes_barrier`]).
-    pub(crate) fn barriers(&self) -> u64 {
-        self.barriers.load(Ordering::Relaxed)
+    /// Something recorded from now on writes `[address, address + len)` of
+    /// title memory: a bounded window of indirect records over it is done
+    /// (`crate::indirect`).
+    pub(crate) fn wrote(&self, address: u64, len: u64) {
+        self.indirect().wrote(address, len);
+    }
+
+    /// Something recorded from now on may write title memory anywhere.
+    pub(crate) fn wrote_somewhere(&self) {
+        self.indirect().wrote_somewhere();
     }
 
     /// The list's bounded indirect records (`crate::indirect`).
@@ -2799,7 +2803,6 @@ impl HostList {
     /// argument fetch of an indirect execution, which reads the title's
     /// records where its passes wrote them.
     pub(crate) fn writes_barrier(&self) {
-        self.barriers.fetch_add(1, Ordering::Relaxed);
         let list7 = self
             .list7
             .get_or_init(|| enhanced_barriers().then(|| self.list.cast().ok()).flatten());

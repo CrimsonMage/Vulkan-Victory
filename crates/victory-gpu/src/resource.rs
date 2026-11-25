@@ -2174,6 +2174,13 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Whether the title made buffer `this` for unordered access: shaders may
+/// write it (`crate::indirect` bounds indirect records only in such).
+pub(crate) fn shader_writable(this: This) -> bool {
+    const UNORDERED: u32 = 4;
+    !this.is_null() && resource(this).desc.flags & UNORDERED != 0
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {

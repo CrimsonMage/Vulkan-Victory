@@ -66,6 +66,11 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a whole binding is made (`State::bind`): the title memory its
+    /// shaders are declared to write, and whether they may write memory
+    /// not known by address (by address, buffers picked by index).
+    static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static UNTRACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -174,6 +179,36 @@ pub(crate) struct State {
     /// one pipeline that differ in their constants were bound whole for
     /// each.
     consts: [Option<(usize, u64)>; 2],
+    /// Per kind, what the last whole binding's shaders write
+    /// (`BIND_WRITES`, `UNTRACKED`): a binding taken from it writes the
+    /// same, which ends the list's window of bounded indirect records over
+    /// it (`crate::indirect`).
+    writes: [Vec<(u64, u64)>; 2],
+    untracked: [bool; 2],
+    /// The compute root signature and the root arguments the host list was
+    /// last given for the title (what [`State::bind`] and
+    /// [`State::constants_only`] set), complete if `replay_ok`: set back
+    /// after a pass of ours ([`State::restore_compute`]).
+    replay_root: Option<ID3D12RootSignature>,
+    replay: Vec<Replay>,
+    replay_words: Vec<u32>,
+    replay_ok: bool,
+}
+
+/// A compute root argument the host list was given ([`State::replay`]).
+#[derive(Clone, Copy)]
+enum Replay {
+    /// Root constants: parameter, first word in `replay_words`, words.
+    Words(u32, usize, u32),
+    Cbv(u32, u64),
+    Srv(u32, u64),
+    Table(u32, u64),
+}
+
+/// Shaders bound now write `[address, address + len)` of title memory.
+fn note_write(list: &HostList, address: u64, len: u64) {
+    BIND_WRITES.with_borrow_mut(|w| w.push((address, len)));
+    list.wrote(address, len);
 }
 
 impl Drop for State {
@@ -819,19 +854,29 @@ impl State {
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         let began = crate::fast::ticks();
-        if self.bound_already(list, p, compute) {
+        let kind = usize::from(compute);
+        if self.bound_already(list, p, compute) || (compute && self.constants_only(list, p)) {
+            // It writes what the binding it is taken from writes.
+            for &(address, len) in &self.writes[kind] {
+                list.wrote(address, len);
+            }
+            if self.untracked[kind] {
+                list.wrote_somewhere();
+            }
             if compute {
                 part(Part::Skipped, began);
             }
             return true;
         }
-        if compute && self.constants_only(list, p) {
-            part(Part::Skipped, began);
-            return true;
-        }
-        let kind = usize::from(compute);
         self.bound[kind] = None;
         self.consts[kind] = None;
+        BIND_WRITES.with_borrow_mut(Vec::clear);
+        UNTRACKED.set(false);
+        if compute {
+            self.replay.clear();
+            self.replay_words.clear();
+            self.replay_ok = false;
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -891,6 +936,16 @@ impl State {
                 part(Part::Tables, at);
             }
             STORES.set(true);
+            // Writes not known by address: through title memory by address,
+            // or to buffers it picks from the heap by index.
+            if t.stores
+                && t.host.root_srvs.iter().any(|&s| {
+                    s == victory_shader::emit::SLOT_MEMORY || s == victory_shader::emit::SLOT_STRIDES
+                })
+            {
+                UNTRACKED.set(true);
+                list.wrote_somewhere();
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 self.made = made;
@@ -939,13 +994,17 @@ impl State {
                         match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                            Some(gpu) => {
+                                // SAFETY: as above.
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, gpu);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                                    }
                                 }
-                            },
+                                self.noted(compute, Replay::Srv(param, gpu));
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -993,6 +1052,7 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
+                    self.noted(compute, if srv { Replay::Srv(param, gpu) } else { Replay::Cbv(param, gpu) });
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1034,7 +1094,15 @@ impl State {
         let by_address = p.stages.iter().any(|s| {
             s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)
         });
+        BIND_WRITES.with_borrow(|w| self.writes[kind].clone_from(w));
+        self.untracked[kind] = UNTRACKED.get();
         if !by_address {
+            if compute {
+                self.replay_ok = true;
+                if self.replay_root.as_ref().is_none_or(|r| r.as_raw() != p.root.as_raw()) {
+                    self.replay_root = Some(p.root.clone());
+                }
+            }
             self.bound[kind] = Some((p.pso.as_raw() as usize, list.epoch(), TESTED_DEPTH.get().1));
             if compute && p.stages.len() == 1 && p.stages[0].translated().host.root_indexed_views.is_empty() {
                 self.consts[kind] = Some((p.pso.as_raw() as usize, list.epoch()));
@@ -1050,7 +1118,7 @@ impl State {
     /// reads): the title's root arguments, the offsets of the tables
     /// `made` afresh, and the host's own words.
     fn user_data(
-        &self,
+        &mut self,
         list: &HostList,
         stage: &crate::pipeline::host::Stage,
         made: &[(u8, u32)],
@@ -1088,6 +1156,72 @@ impl State {
                     l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                 } else {
                     l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                }
+            }
+            if compute {
+                self.noted_words(param, values);
+            }
+        }
+    }
+
+    /// The host list was given compute root argument `r` for the title.
+    fn noted(&mut self, compute: bool, r: Replay) {
+        if compute {
+            self.replay.push(r);
+        }
+    }
+
+    /// The host list was given compute root constants `values` at `param`
+    /// for the title (again, if only the constants changed).
+    fn noted_words(&mut self, param: u32, values: &[u32]) {
+        let n = values.len() as u32;
+        let found = self.replay.iter().find_map(|r| match *r {
+            Replay::Words(p, at, words) if p == param && words == n => Some(at),
+            _ => None,
+        });
+        match found {
+            Some(at) => self.replay_words[at..at + values.len()].copy_from_slice(values),
+            None => {
+                self.replay.push(Replay::Words(param, self.replay_words.len(), n));
+                self.replay_words.extend_from_slice(values);
+            }
+        }
+    }
+
+    /// After a pass of ours in the list (`crate::indirect`), which set a
+    /// compute root signature and pipeline of its own: the title's compute
+    /// root signature and arguments set back as they were, so that the
+    /// next dispatch binds nothing anew (its pipeline is set again by it).
+    /// Without a complete record of them the next dispatch binds whole.
+    pub(crate) fn restore_compute(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        let Some(root) = self
+            .replay_root
+            .as_ref()
+            .filter(|r| self.replay_ok && r.as_raw() as usize == self.host_roots[1])
+        else {
+            self.host_roots[1] = 0;
+            return;
+        };
+        let l = &list.list;
+        // SAFETY: an open list; the root signature is the one the list was
+        // last given (the list keeps it), the arguments are what it was
+        // given with it.
+        unsafe {
+            l.SetComputeRootSignature(root);
+            for r in &self.replay {
+                match *r {
+                    Replay::Words(param, at, n) => l.SetComputeRoot32BitConstants(
+                        param,
+                        n,
+                        self.replay_words[at..].as_ptr().cast(),
+                        0,
+                    ),
+                    Replay::Cbv(param, gpu) => l.SetComputeRootConstantBufferView(param, gpu),
+                    Replay::Srv(param, gpu) => l.SetComputeRootShaderResourceView(param, gpu),
+                    Replay::Table(param, gpu) => {
+                        l.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu })
+                    }
                 }
             }
         }
@@ -1191,6 +1325,7 @@ impl State {
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
+                note_write(list, a, len);
             }
         };
         let heap = match self.heaps[0] {
@@ -1237,6 +1372,7 @@ impl State {
         unsafe {
             if compute {
                 list.list.SetComputeRootDescriptorTable(param, handle);
+                self.replay.push(Replay::Table(param, handle.ptr));
             } else {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
@@ -1319,6 +1455,7 @@ impl State {
         unsafe {
             if compute {
                 list.list.SetComputeRootDescriptorTable(param, handle);
+                self.replay.push(Replay::Table(param, handle.ptr));
             } else {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
@@ -2635,17 +2772,18 @@ impl State {
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
-    /// where the title's passes wrote them, bounded first a window of
-    /// records at a time (`crate::indirect`; the console's records are the
-    /// host's: draw, indexed draw, dispatch and mesh dispatch, three group
-    /// counts). The title's barrier between its pass and the execution
-    /// orders the two (`HostList::writes_barrier`). False if it cannot run
-    /// on the host.
+    /// where they were written; in a buffer shaders may write (`writable`:
+    /// the title made it for unordered access) they are bounded first, a
+    /// window of records at a time (`crate::indirect`; the console's
+    /// records are the host's: draw, indexed draw, dispatch and mesh
+    /// dispatch, three group counts). The title's barrier between its pass
+    /// and the execution orders the two (`HostList::writes_barrier`). False
+    /// if it cannot run on the host.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
-        arguments: u64,
+        (arguments, writable): (u64, bool),
         count: Option<u64>,
     ) -> bool {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
@@ -2714,18 +2852,23 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first (`crate::indirect`): a pass of ours, if one is
-        // recorded, sets a compute root signature and pipeline of its own.
-        let window = (kind, stride, max);
-        let Some((bounded, from, pass)) =
-            crate::indirect::bounded(list, window, args.gpu(arguments), args.left(arguments))
-        else {
-            return false;
+        // Records shaders may have written are bounded first
+        // (`crate::indirect`): a pass of ours, if one is recorded, sets a
+        // compute root signature and pipeline of its own, and the title's
+        // are set back after it.
+        let (bounded, from) = if writable || crate::indirect::copied(arguments, len) {
+            let window = (kind, stride, max);
+            let at = (args.gpu(arguments), arguments);
+            let Some((bounded, from, pass)) = crate::indirect::bounded(list, window, at, args.left(arguments)) else {
+                return false;
+            };
+            if pass {
+                self.restore_compute(list);
+            }
+            (bounded, from)
+        } else {
+            (args.buffer.clone(), offset)
         };
-        if pass {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
-        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -2867,6 +3010,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() {
                 shadow.gpu_writes(list, address, len);
+                note_write(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

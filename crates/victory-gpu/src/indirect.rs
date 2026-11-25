@@ -13,15 +13,27 @@
 //! - mesh dispatches likewise, with the second and third counts cut to at
 //!   most 1 (the console's mesh programs are one-dimensional).
 //!
+//! Only records in buffers shaders may write are bounded (the title made
+//! the buffer for unordered access, or a copy on the card wrote it): what
+//! the CPU writes the title meant as it is.
+//!
 //! The records are copied, bounded, into a buffer of the list's own by a
 //! compute pass of ours, not one execution at a time but a **window** of
 //! up to [`WINDOW`] records from the first execution's on: the title runs
 //! its draws one record at a time, each its own execution, at successive
 //! records. Later executions within the window read the bounded copy, with
-//! nothing recorded for them, until the title's next barrier on buffers
-//! ([`HostList::writes_barrier`]), after which its passes may have written
-//! the records again. The window's records past the ones the title runs
-//! are bounded too and never read.
+//! nothing recorded for them, until something recorded since may write the
+//! window's records: a shader or a copy declared to write memory over them
+//! ([`HostList::wrote`]), or a shader whose writes are not known by address
+//! (title memory by address, buffers picked from the heap by index). A
+//! barrier alone ends no window (the windows of run p15 were one execution
+//! long, a barrier between every two). The window's records past the ones
+//! the title runs are bounded too and never read.
+//!
+//! The pass sets a compute root signature and pipeline of its own; the
+//! title's compute root signature and arguments are set back right after
+//! it (`crate::draw::State::restore_compute`), so the next dispatch binds
+//! nothing anew.
 //!
 //! The copy buffer is moved from common (or indirect arguments) to
 //! unordered access before a pass and to indirect arguments after it, and
@@ -128,6 +140,35 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
+/// Title memory a copy on the card wrote since the start, by 64 KiB page
+/// (hashed onto 65,536 bits; a page that shares a bit is bounded too):
+/// records copied there by the GPU from a buffer shaders write are bounded
+/// although the title's buffer is not one shaders write.
+static COPIED: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn pages(address: u64, len: u64) -> impl Iterator<Item = (usize, u64)> {
+    (address >> 16..=(address + len.max(1) - 1) >> 16).map(|page| {
+        let bit = (page.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize;
+        (bit / 64, 1u64 << (bit % 64))
+    })
+}
+
+/// A copy on the card writes `[address, address + len)`.
+pub(crate) fn copied_onto(address: u64, len: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (word, bit) in pages(address, len) {
+        if COPIED[word].load(Relaxed) & bit == 0 {
+            COPIED[word].fetch_or(bit, Relaxed);
+        }
+    }
+}
+
+/// Whether a copy on the card may have written `[address, address + len)`.
+pub(crate) fn copied(address: u64, len: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    pages(address, len).any(|(word, bit)| COPIED[word].load(Relaxed) & bit != 0)
+}
+
 /// A list's copy buffer and the window bounded into it.
 #[derive(Default)]
 pub(crate) struct Window {
@@ -137,11 +178,26 @@ pub(crate) struct Window {
     /// arguments (else it is common).
     readable: bool,
     /// What is bounded in it: kind, stride, records, the GPU address of
-    /// the title records' first, and the list's barrier count then.
-    bounded: Option<(u32, u32, u32, u64, u64)>,
+    /// the title records' first, and their title memory (from, to).
+    bounded: Option<(u32, u32, u32, u64, (u64, u64))>,
 }
 
 impl Window {
+    /// Something recorded from now on writes `[address, address + len)`.
+    pub(crate) fn wrote(&mut self, address: u64, len: u64) {
+        if let Some((.., (from, to))) = self.bounded
+            && address < to
+            && address.saturating_add(len) > from
+        {
+            self.bounded = None;
+        }
+    }
+
+    /// Something recorded from now on may write anywhere.
+    pub(crate) fn wrote_somewhere(&mut self) {
+        self.bounded = None;
+    }
+
     /// The list is reset: its buffer was left common when it closed.
     pub(crate) fn reset(&mut self) {
         self.readable = false;
@@ -168,21 +224,20 @@ impl Window {
 
 /// The bounded copy of `max` records of `kind` (PC numbering) `stride`
 /// bytes apart at GPU address `src` (4-byte aligned, `left` bytes of its
-/// host buffer from there on): the buffer and the offset to execute from,
+/// host buffer from there on; title address `title`): the buffer and the offset to execute from,
 /// and whether a pass of ours was recorded (it set its own compute root
 /// signature and pipeline: the caller binds the title's again). `None` if
 /// it cannot be bounded: the execution is dropped.
 pub(crate) fn bounded(
     list: &HostList,
     (kind, stride, max): (u32, u32, u32),
-    src: u64,
+    (src, title): (u64, u64),
     left: u64,
 ) -> Option<(ID3D12Resource, u64, bool)> {
     let max = max.max(1);
-    let barriers = list.barriers();
     let mut window = list.indirect();
-    if let (Some((k, st, records, first, at)), Some((copy, _))) = (window.bounded, &window.copy)
-        && (k, st, at) == (kind, stride, barriers)
+    if let (Some((k, st, records, first, _)), Some((copy, _))) = (window.bounded, &window.copy)
+        && (k, st) == (kind, stride)
         && src >= first
         && (src - first) % u64::from(stride) == 0
         && (src - first) / u64::from(stride) + u64::from(max) <= u64::from(records)
@@ -243,6 +298,6 @@ pub(crate) fn bounded(
         )]);
     }
     window.readable = true;
-    window.bounded = Some((kind, stride, records as u32, src, barriers));
+    window.bounded = Some((kind, stride, records as u32, src, (title, title + bytes)));
     Some((copy, 0, true))
 }
