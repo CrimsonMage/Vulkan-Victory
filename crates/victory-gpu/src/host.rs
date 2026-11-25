@@ -578,6 +578,9 @@ pub(crate) struct HostList {
     /// The list as `ID3D12GraphicsCommandList7`, for the global barrier
     /// that orders writes before every later use ([`HostList::writes_barrier`]).
     list7: OnceLock<Option<ID3D12GraphicsCommandList7>>,
+    /// Counts what makes a draw's or dispatch's preparation differ from
+    /// the same one's before ([`HostList::epoch`]).
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2283,6 +2286,7 @@ impl Host {
                 stamps: Mutex::default(),
                 list6: OnceLock::new(),
                 list7: OnceLock::new(),
+                epoch: std::sync::atomic::AtomicU64::new(0),
             })
         }
     }
@@ -3438,16 +3442,35 @@ impl HostList {
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        let moved = match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
+                self.changed();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some((texture, before))
             }
+        };
+        if moved.is_some() {
+            self.changed();
         }
+        moved
+    }
+
+    /// A count that changes whenever something recorded in the list could
+    /// make the same draw or dispatch prepare differently than it did
+    /// before: a texture moved to another state, a depth texture's twin
+    /// used, title memory written at submission (refreshes are made
+    /// again after it). `crate::draw::State::bind` binds nothing anew while
+    /// it stays.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    fn changed(&self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -3468,6 +3491,7 @@ impl HostList {
             }
         };
         drop(states);
+        self.changed();
         if let Some(before) = before {
             let barrier = transition(
                 &copy.texture,
@@ -3507,6 +3531,7 @@ impl HostList {
         let Some(depth) = crate::resource::host_copy(resource) else {
             return false;
         };
+        self.changed();
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
@@ -3836,6 +3861,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.declared.clear();
+        self.changed();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3970,6 +3996,7 @@ impl HostList {
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
         deferred.declared.clear();
+        self.changed();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

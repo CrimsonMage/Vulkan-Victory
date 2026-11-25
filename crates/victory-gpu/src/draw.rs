@@ -159,6 +159,12 @@ pub(crate) struct State {
     /// The tables a stage's binding made afresh ([`State::tables`]), kept
     /// to be filled again by the next.
     made: Vec<(u8, u32)>,
+    /// Graphics, compute: what the last whole [`State::bind`] of the kind
+    /// bound, if the title has set nothing of the kind since (its heaps,
+    /// root arguments, for draws its targets): the host pipeline, the
+    /// list's [`HostList::epoch`] when it was done, and whether a view the
+    /// draw read was of the depth target it only tests.
+    bound: [Option<(usize, u64, bool)>; 2],
 }
 
 impl Drop for State {
@@ -178,6 +184,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        self.bound = [None; 2];
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -361,6 +368,7 @@ impl State {
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
+        self.bound = [None; 2];
         self.heaps = [0; 2];
         for &h in heaps {
             if !h.is_null() {
@@ -371,6 +379,7 @@ impl State {
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
+        self.bound[usize::from(compute)] = None;
         if compute {
             &mut self.compute
         } else {
@@ -429,6 +438,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.bound[0] = None;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -774,6 +784,11 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if self.bound_already(list, p, compute) {
+            return true;
+        }
+        let kind = usize::from(compute);
+        self.bound[kind] = None;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -990,6 +1005,53 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        // A shader that reads title memory by address is made ready every
+        // time: copies other lists numbered since are its too.
+        let by_address = p.stages.iter().any(|s| {
+            s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)
+        });
+        if !by_address {
+            self.bound[kind] = Some((p.pso.as_raw() as usize, list.epoch(), TESTED_DEPTH.get().1));
+        }
+        true
+    }
+
+    /// Whether the host list still has all that binding `p` for a draw or
+    /// dispatch would give it, as the last whole [`State::bind`] of the
+    /// kind gave it: nothing the title set since, the same host pipeline,
+    /// root signature and heaps, and nothing recorded since that prepares
+    /// differently ([`HostList::epoch`]: textures moved, title memory
+    /// written at submission). The root arguments stay on the host list
+    /// (another kind's pipeline in between is set back here), every buffer
+    /// range is refreshed and every texture is in its state already. A
+    /// title's run of one-record indirect draws with the same bindings
+    /// was prepared whole for each record (~25 microseconds a record).
+    /// shortcut: a descriptor the title rewrites between two such draws
+    /// or dispatches, in a slot they share, keeps the view of the first;
+    /// on the console both read the slot when they run.
+    fn bound_already(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let kind = usize::from(compute);
+        let pso = p.pso.as_raw() as usize;
+        let Some((was, epoch, read)) = self.bound[kind] else {
+            return false;
+        };
+        if was != pso
+            || epoch != list.epoch()
+            || self.host_roots[kind] != p.root.as_raw() as usize
+            || self.host_heaps != self.heaps
+        {
+            return false;
+        }
+        if self.host_pipeline != pso {
+            // SAFETY: an open list and a live pipeline (the list keeps it
+            // from its first setting).
+            unsafe { list.list.SetPipelineState(&p.pso) };
+            self.host_pipeline = pso;
+        }
+        if !compute {
+            let tested = if self.depth_state == DEPTH_READ { self.depth } else { 0 };
+            TESTED_DEPTH.set((tested, read));
+        }
         true
     }
 
@@ -2481,6 +2543,9 @@ impl State {
     /// They were clamped by a compute pass of ours before every execution
     /// until the world frame spent ~0.1 ms of recording on each of its
     /// ~4,500 executions and the card drained twice around every one.
+    /// shortcut: a mesh record's second and third group counts are run as
+    /// written (the clamp cut them to at most 1); the title's mesh programs
+    /// are one-dimensional, and its direct mesh dispatches pass 1 for both.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
