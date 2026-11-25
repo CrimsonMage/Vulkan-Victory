@@ -505,7 +505,7 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host root signature refused");
                 return None;
             }
         };
@@ -536,7 +536,8 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    super::save_refused(shaders);
+                    tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -589,7 +590,8 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    super::save_refused(shaders);
+                    tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -695,7 +697,8 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                super::save_refused(shaders);
+                tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host pipeline refused");
                 host.log_messages();
                 return None;
             }

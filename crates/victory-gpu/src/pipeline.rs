@@ -60,6 +60,11 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// The program's name, if its container tells (`CS_SkyMain`,
+    /// `CS_TransmissionVolumetrics_Tiled`; see
+    /// [`program_name`]); empty otherwise. Logged beside the hash so a log
+    /// says which pass a failure is without the title's shader archive.
+    pub(crate) name: String,
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
@@ -75,6 +80,58 @@ pub(crate) struct Shader {
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
+    }
+}
+
+/// The program's name its container carries, as the engine's shader
+/// archive names the record (`<entry>_<8 hex>_Wrapped`; the archive's
+/// record adds `<family>:` before it, the container does not): the
+/// printable run that ends at `_Wrapped`, without the 8-digit suffix and
+/// `_Wrapped`. Empty if the container has no such string.
+pub(crate) fn program_name(container: &[u8]) -> String {
+    const END: &[u8] = b"_Wrapped";
+    let Some(at) = container.windows(END.len()).position(|w| w == END) else {
+        return String::new();
+    };
+    let begin = container[..at]
+        .iter()
+        .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_' || *b == b':'))
+        .map_or(0, |p| p + 1);
+    let name = String::from_utf8_lossy(&container[begin..at]).into_owned();
+    // `_9e6def81`: the variant's hash, the same for a whole family.
+    match name.rsplit_once('_') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => head.to_owned(),
+        _ => name,
+    }
+}
+
+/// The names of `shaders`, for logs (`?` for a nameless one).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn names(shaders: &[Arc<Shader>]) -> String {
+    shaders
+        .iter()
+        .map(|s| if s.name.is_empty() { "?" } else { s.name.as_str() })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `VICTORY_REFUSED_SAVE=<dir>`: the shaders of a pipeline the host
+/// refused, as the title gave them (`<hash>.<stage>.cdxil`) and as
+/// translated (`.dxil`), with their names in `<hash>.<stage>.txt`, to run
+/// through dxil-spirv offline (vkd3d-proton answers an invalid argument
+/// for a conversion it fails and says why only in its own log).
+#[cfg(windows)]
+pub(crate) fn save_refused(shaders: &[Arc<Shader>]) {
+    let Some(dir) = std::env::var_os("VICTORY_REFUSED_SAVE") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    for s in shaders {
+        let stem = format!("{}.{}", s.hash, s.stage);
+        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &s.container);
+        if let Some(t) = s.translated() {
+            let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+        }
+        let _ = std::fs::write(dir.join(format!("{stem}.txt")), format!("{}\n{}\n", s.name, names(shaders)));
     }
 }
 
@@ -117,6 +174,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                name: program_name(bytes),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -175,6 +233,7 @@ impl Shader {
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
+                        name = %self.name,
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
@@ -473,7 +532,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, name = %shader.name, "first bind");
     }
 }
 
@@ -941,5 +1000,18 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::program_name;
+
+    #[test]
+    fn names_come_from_the_wrapped_entry() {
+        let c = b"DXBC\x00\x01junk\x1eCS_Visibility_7226f52c_Wrapped\x00more";
+        assert_eq!(program_name(c), "CS_Visibility");
+        assert_eq!(program_name(b"\x00PS_FogColor_Wrapped\x00"), "PS_FogColor");
+        assert_eq!(program_name(b"DXBC no name here"), "");
     }
 }
