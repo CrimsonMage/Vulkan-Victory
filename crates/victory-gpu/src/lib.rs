@@ -68,6 +68,9 @@ mod memcap;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+#[cfg(windows)]
+mod unified;
+mod unified_map;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
