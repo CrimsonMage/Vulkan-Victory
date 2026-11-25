@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -229,11 +229,6 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
-    /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
-    /// branch lies between the entry and the block, or the program has a
-    /// loop a lane can be cut out of): the barrier there keeps its fences
-    /// and does not wait for the group ([`super::group_sync`]).
-    fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
@@ -290,21 +285,12 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
+    /// Loop headers' iteration counters (see [`Lower::count_iteration`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    /// The block a loop stopped by the iteration limit leaves the program from.
     abort: Option<usize>,
 }
-
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -816,11 +802,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):
-/// a wait for the group with a shared-memory fence; the fence alone with
-/// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
-fn meeting_mode() -> u32 {
-    if super::group_sync() == 0 { 8 } else { 1 | 8 }
-}
+/// a wait for the group with a shared-memory fence.
+const MEETING_MODE: u32 = 1 | 8;
 
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
@@ -986,27 +969,6 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     LOCAL_WAVES.set(was);
     r
-}
-
-/// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
-/// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
-/// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
-/// the last place of a result that is not exact is then one lower than the console's).
-/// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
-fn f16_nearest_on() -> bool {
-    #[cfg(test)]
-    if let Some(on) = TEST_F16_NEAREST.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test's choice for [`f16_nearest_on`], for its thread only.
-    pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -1358,40 +1320,6 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        // The title's barriers a thread of the group may never reach, which
-        // leaves the others waiting on the host: those in blocks some lanes
-        // do not run, and all of them in a program with a loop closed by a
-        // plain jump (a lane still in it at the iteration limit leaves the
-        // program there, `abort_block`).
-        let fence_only: HashSet<usize> = if insts().any(|i| i.name() == "s_barrier") {
-            let order = crate::ir::reverse_postorder(&p.blocks);
-            let mut place = vec![usize::MAX; p.blocks.len()];
-            for (n, &b) in order.iter().enumerate() {
-                place[b] = n;
-            }
-            let back = |from: usize, to: usize| {
-                let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
-                at(from) != usize::MAX && at(to) <= at(from)
-            };
-            let cut_short = x
-                .st
-                .exits
-                .iter()
-                .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(x.st);
-            (0..p.blocks.len())
-                .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
-                .filter(|&b| {
-                    cut_short
-                        || all
-                            .as_ref()
-                            .is_none_or(|all| !all.get(b).copied().unwrap_or(false))
-                })
-                .collect()
-        } else {
-            HashSet::new()
-        };
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -1514,7 +1442,6 @@ impl<'a> Lower<'a> {
             wave_base: None,
             flat: None,
             no_barrier,
-            fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -2156,7 +2083,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`count_iteration`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -2763,7 +2690,6 @@ impl<'a> Lower<'a> {
         let page = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
-        self.s.m.tag(page, Tag::Clamp);
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
@@ -3660,7 +3586,7 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
-        let mode = self.s.m.i32(meeting_mode());
+        let mode = self.s.m.i32(MEETING_MODE);
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
@@ -3906,9 +3832,7 @@ impl<'a> Lower<'a> {
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
                 };
-                let v = self.s.m.select(self.cur, g, x, old);
-                self.s.m.tag(v, Tag::Guard);
-                v
+                self.s.m.select(self.cur, g, x, old)
             }
             _ => x,
         };
@@ -4768,7 +4692,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
+            let mode = self.s.m.i32(MEETING_MODE);
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
@@ -4779,18 +4703,7 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
-                let mode = self.s.m.i32(mode);
+                let mode = self.s.m.i32(if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 });
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4832,7 +4745,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
-        let mode = self.s.m.i32(meeting_mode());
+        let mode = self.s.m.i32(MEETING_MODE);
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
@@ -6399,7 +6312,6 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
-        self.s.m.tag(slot, Tag::Clamp);
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -7557,7 +7469,7 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    if guard.is_none() {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has
@@ -8053,13 +7965,10 @@ impl<'a> Lower<'a> {
             }
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
-            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            // shortcut: the host's conversion ([`Self::f16_nearest`] would cost a dozen
+            // instructions per result). The wave sum of 16-bit floats
+            // ([`Self::half_sum`]) is exact.
+            let h = l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -11020,30 +10929,34 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
+    /// the iteration limit by `p` (below: go on; at or above: stop).
+    ///
+    /// The limit is per entry into the loop. The console runs a loop as long
+    /// as its data says; data the host has not mirrored yet (a null view
+    /// reads zeros) can make that four billion iterations, which hangs the
+    /// host GPU until the driver resets it. A lane that reaches the limit
+    /// leaves the program as killed (a pixel discards).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        self.s.m.tag(phi, Tag::Counter);
-        self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
+        // A loop that never meets its exit (a count read from a buffer the
+        // host has not got yet, say) runs to the limit in every lane. A
+        // million iterations a pixel hung the GPU for seconds a draw until
+        // Windows reset it (PS_Textured_Eight, 2026-11-24, run 12).
         // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
+        // past 256 or a compute loop past 4,096 is cut short, genuine or not.
+        // (They were 1,024, 4,096 and 65,536: the opening cutscene then lost
+        // the card 14-25 frames in, in a minimap or shadow mesh draw; with
+        // every loop cut at 64 it ran 90 frames. Raise them again once
+        // shaders stop reading data that is not there yet.)
+        let limit = if self.s.pixel {
+            1 << 7
+        } else if self.s.mesh.is_some() || self.s.threads.is_none() {
+            1 << 8
+        } else {
+            1 << 12
         };
         let limit = self.s.m.i32(limit);
         self.counters
@@ -11052,11 +10965,10 @@ impl<'a> Lower<'a> {
             .1
             .push((next, c));
         let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    /// The block a lane stopped by the iteration limit leaves through.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
             return a;
