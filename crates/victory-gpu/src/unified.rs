@@ -293,10 +293,15 @@ fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Hom
 
 /// Title buffers of this size and up that lie in no `xmem` unit (memory a
 /// committed resource got from the title's allocator, like its 174 MB GPU
-/// heap at 0xb9c0000, run p7) are opened as a heap of their own, over the
-/// 64 KiB pages that hold them: else they stay a copy in the card's memory,
-/// compared and fetched back after every submission that writes them.
-const LOOSE_MIN: u64 = 16 << 20;
+/// heap at 0xb9c0000, run p7, and the 1.3-12 MB buffers over views at
+/// 0xc34530000-0xc482e0000 of run p10) are opened as a heap of their own,
+/// over the pages that hold them: else they stay a copy in the PC's memory,
+/// snapshotted, compared and merged back after every submission that
+/// writes them. (At 16 MiB, run p10 kept 18 such buffers, 209 MB named a
+/// frame, as card copies: their fetch-back and merge waits were ~200 ms of
+/// every frame.) Smaller buffers would each be a heap and a check of their
+/// own; they keep copies.
+const LOOSE_MIN: u64 = 1 << 20;
 
 /// A heap opened over the pages of one big buffer outside the units.
 struct Loose {

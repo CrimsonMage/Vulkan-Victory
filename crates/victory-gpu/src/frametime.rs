@@ -1,9 +1,8 @@
 //! What a frame's milliseconds are made of: one line every five seconds,
 //! `frame time: ...`, beside the gate line.
 //!
-//! - **The card**: three timestamps around each submission of ours (before
-//!   its lists, after them, after the compare of copies in the card's
-//!   memory). Everything runs on one queue, so the stamps of consecutive
+//! - **The card**: two timestamps around each submission of ours (before
+//!   its lists, after them). Everything runs on one queue, so the stamps of consecutive
 //!   submissions follow each other: busy is the sum of their spans, idle
 //!   what lies between one's end and the next one's start.
 //! - **The CPU**: time inside `Host::submit`, every wait for the card by
@@ -36,21 +35,18 @@ pub(crate) enum Wait {
     Merge,
     /// A title copy on the CPU into title memory flights may read.
     CopyIn,
-    /// The compare's result area of card copies was half taken.
-    Results,
     /// 256 host lists in the air.
     Lists,
     /// The title blocks on a fence without an event.
     Fence,
-    /// A submission that is waited for: the card running it (and the fetch
-    /// of what its shaders wrote to card copies).
+    /// A submission that is waited for: the card running it.
     Own,
 }
 
-const WAITS_NAMED: [&str; 10] = ["lock", "settle", "reads", "step", "merge", "copy-in", "results", "lists", "fence", "own"];
+const WAITS_NAMED: [&str; 9] = ["lock", "settle", "reads", "step", "merge", "copy-in", "lists", "fence", "own"];
 
 /// Per [`Wait`]: nanoseconds and how many.
-static WAITS: [[AtomicU64; 2]; 10] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 10];
+static WAITS: [[AtomicU64; 2]; 9] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 9];
 
 /// Plain sums ([`Sum`]).
 static SUMS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
@@ -62,8 +58,8 @@ pub(crate) enum Sum {
     Submits,
     /// Nanoseconds the relay thread spent landing flights.
     LandNs,
-    /// Of it (or of a waited submission), fetching what shaders wrote to
-    /// copies in the card's memory: nanoseconds and bytes.
+    /// Of it, comparing what shaders wrote to copies in the PC's memory
+    /// and merging it into title memory: nanoseconds and bytes merged.
     FetchNs,
     FetchBytes,
     /// The title's fence events: set, and microseconds from the ask to the set.
@@ -72,8 +68,9 @@ pub(crate) enum Sum {
     /// Bytes of in-place buffers (title memory the card reads over the bus)
     /// named by lists, once per list.
     InPlaceBytes,
-    /// Bytes of copies in the card's memory named by lists, once per list.
-    CardBytes,
+    /// Bytes of copies (title memory that is not read in place) named by
+    /// lists, once per list.
+    CopyBytes,
     /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
     TextureNs,
 }
@@ -98,7 +95,7 @@ pub(crate) enum Phase {
     Watch,
     /// The lists' steps on the CPU: refreshes, fills, copies, textures.
     Steps,
-    /// Snapshots of ranges shaders may write, and the sends to card copies.
+    /// Snapshots of ranges shaders may write.
     Copies,
     /// `ExecuteCommandLists` and the signal.
     Execute,
@@ -247,7 +244,7 @@ const SAMPLE_EVERY: u64 = 30;
 
 struct Slot {
     allocator: ID3D12CommandAllocator,
-    lists: [ID3D12GraphicsCommandList; 3],
+    lists: [ID3D12GraphicsCommandList; 2],
     /// The submission it times.
     owner: u64,
 }
@@ -260,9 +257,8 @@ struct Gpu {
     used: Vec<usize>,
     /// The last stamp collected (the end of the latest submission timed).
     last_end: u64,
-    /// Ticks since the last line: busy, of it the compare, idle.
+    /// Ticks since the last line: busy, idle.
     busy: u64,
-    check: u64,
     idle: u64,
     timed: u64,
     untimed: u64,
@@ -304,14 +300,13 @@ fn make() -> Option<Gpu> {
     let frequency = unsafe { host.queue().GetTimestampFrequency() }.ok().filter(|&f| f > 0);
     let made = (|| {
         Some(Gpu {
-            heap: heap(3 * SLOTS as u32)?,
-            back: host.read_back_buffer(24 * SLOTS as u64)?,
+            heap: heap(2 * SLOTS as u32)?,
+            back: host.read_back_buffer(16 * SLOTS as u64)?,
             slots: Vec::new(),
             free: Vec::new(),
             used: Vec::new(),
             last_end: 0,
             busy: 0,
-            check: 0,
             idle: 0,
             timed: 0,
             untimed: 0,
@@ -351,40 +346,39 @@ fn slot(g: &mut Gpu) -> Option<usize> {
                 l.Close()?;
                 Ok(l)
             };
-            Ok(Slot { lists: [list()?, list()?, list()?], allocator, owner: 0 })
+            Ok(Slot { lists: [list()?, list()?], allocator, owner: 0 })
         })()
     };
     g.slots.push(made.ok()?);
     Some(g.slots.len() - 1)
 }
 
-/// The three stamp lists for submission `number`: before its lists (with the
-/// sends to card copies), after them, after the compare. `None` if it is not
-/// timed.
-pub(crate) fn begin(number: u64) -> Option<[ID3D12CommandList; 3]> {
+/// The two stamp lists for submission `number`: before its lists, after
+/// them. `None` if it is not timed.
+pub(crate) fn begin(number: u64) -> Option<[ID3D12CommandList; 2]> {
     let mut g = gpu();
     let g = g.as_mut()?;
     let Some(i) = slot(g) else {
         g.untimed += 1;
         return None;
     };
-    let base = 3 * i as u32;
+    let base = 2 * i as u32;
     let (heap, back) = (g.heap.clone(), g.back.clone());
     let s = &mut g.slots[i];
     // SAFETY: the slot's last submission finished (it was collected); its
     // own allocator and lists, recorded one after the other.
     let recorded = unsafe {
-        (|| -> windows::core::Result<[ID3D12CommandList; 3]> {
+        (|| -> windows::core::Result<[ID3D12CommandList; 2]> {
             s.allocator.Reset()?;
             for (k, list) in s.lists.iter().enumerate() {
                 list.Reset(&s.allocator, None)?;
                 list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, base + k as u32);
-                if k == 2 {
-                    list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, base, 3, &back, 8 * u64::from(base));
+                if k == 1 {
+                    list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, base, 2, &back, 8 * u64::from(base));
                 }
                 list.Close()?;
             }
-            Ok([s.lists[0].cast()?, s.lists[1].cast()?, s.lists[2].cast()?])
+            Ok([s.lists[0].cast()?, s.lists[1].cast()?])
         })()
     };
     match recorded {
@@ -425,7 +419,7 @@ fn collect(g: &mut Gpu) {
     let mut spans = Vec::new();
     // One mapping for all of them.
     let all = if g.used.iter().any(|&slot| g.slots[slot].owner <= finished) {
-        read(&g.back, 0, 3 * g.slots.len() as u32)
+        read(&g.back, 0, 2 * g.slots.len() as u32)
     } else {
         Vec::new()
     };
@@ -433,8 +427,7 @@ fn collect(g: &mut Gpu) {
     while i < g.used.len() {
         let slot = g.used[i];
         if g.slots[slot].owner <= finished {
-            let t = &all[3 * slot..3 * slot + 3];
-            spans.push((t[0], t[1], t[2]));
+            spans.push((all[2 * slot], all[2 * slot + 1]));
             g.used.swap_remove(i);
             g.free.push(slot);
         } else {
@@ -442,18 +435,17 @@ fn collect(g: &mut Gpu) {
         }
     }
     spans.sort_unstable();
-    for (a, b, c) in spans {
-        if a == 0 || c < a || b < a || c < b {
+    for (a, c) in spans {
+        if a == 0 || c < a {
             continue;
         }
         // Counted once where spans overlap (a stamp taken before the work
         // ahead of it has finished).
-        let (a, b) = (a.max(g.last_end), b.max(g.last_end));
+        let a = a.max(g.last_end);
         if g.last_end != 0 && a > g.last_end {
             g.idle += a - g.last_end;
         }
         g.busy += c.saturating_sub(a);
-        g.check += c.saturating_sub(b);
         g.last_end = g.last_end.max(c);
     }
     let mut k = 0;
@@ -683,14 +675,13 @@ pub(crate) fn frame() {
     if let Some(g) = gpu().as_mut() {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / g.frequency as f64 / frames;
         card = format!(
-            "GPU busy {:.1} ms (compare of card copies {:.1}), idle {:.1}; {:.1} submissions/frame ({} untimed)",
+            "GPU busy {:.1} ms, idle {:.1}; {:.1} submissions/frame ({} untimed)",
             ms(g.busy),
-            ms(g.check),
             ms(g.idle),
             g.timed as f64 / frames,
             g.untimed
         );
-        (g.busy, g.check, g.idle, g.timed, g.untimed) = (0, 0, 0, 0, 0);
+        (g.busy, g.idle, g.timed, g.untimed) = (0, 0, 0, 0);
         let sampled = std::mem::take(&mut g.sampled).max(1) as f64;
         let mut top: Vec<(String, u64)> = g.pipelines.drain().collect();
         let all: u64 = top.iter().map(|t| t.1).sum();
@@ -704,8 +695,8 @@ pub(crate) fn frame() {
     let fence_set = sums[Sum::FenceSet as usize];
     tracing::info!(
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
-         in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
-         on average; buffers named by lists: in place (read over the bus) {:.0} MB, card copies {:.0} MB; {pipes}",
+         in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (merging shader writes into title memory {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
+         on average; buffers named by lists: in place (read over the bus) {:.0} MB, copies {:.0} MB; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
@@ -717,6 +708,6 @@ pub(crate) fn frame() {
         fence_set as f64 / frames,
         if fence_set > 0 { sums[Sum::FenceUs as usize] as f64 / 1000.0 / fence_set as f64 } else { 0.0 },
         sums[Sum::InPlaceBytes as usize] as f64 / frames / 1e6,
-        sums[Sum::CardBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::CopyBytes as usize] as f64 / frames / 1e6,
     );
 }

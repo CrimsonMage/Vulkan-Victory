@@ -1592,13 +1592,9 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match video {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept(budget) < budget / 100 * ROOM_PERCENT
-        }
+        // What is kept for the render targets a world makes in its first
+        // frame ([`targets_room_kept`]) counts as used.
+        Some([budget, used, ..]) => used + targets_room_kept(budget) < budget / 100 * ROOM_PERCENT,
         None => filled < WITHOUT_BUDGET,
     }
 }
