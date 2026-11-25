@@ -10,24 +10,16 @@ mod decode;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
 
-/// Whether what Windows said about memory is remembered per thread (the regions it found
-/// writable, the code bytes it found readable) and not asked again at every emulated
-/// instruction. A query walks the pages of the region it answers for: asked from outside, it
-/// took 2-9 ms in the title's heaps of 0.6-2.2 GB and 89 ms in its 6.2 GB page pool (run 30),
-/// and the title zeroes blocks of them with `clzero` loops all through a frame: six of its
-/// threads spent 25-78 % of their time inside that query (runs 29 and 30), about 27 s of
-/// processor time in Windows per 9 s frame. On by default; `VICTORY_CLZERO_ASK=1` asks every
-/// time, as before.
-fn remembers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
-}
-
+/// What Windows said about memory is remembered per thread (the regions it found writable,
+/// the code bytes it found readable) and not asked again at every emulated instruction. A
+/// query walks the pages of the region it answers for: it took 2-9 ms in the title's heaps of
+/// 0.6-2.2 GB and 89 ms in its 6.2 GB page pool (run 30), and the title zeroes blocks of them
+/// with `clzero` loops all through a frame.
+///
 /// Answers a remembered region gives before Windows is asked about it again: one freed or
 /// protected meanwhile is forgotten then.
 const ANSWERS: u32 = 4096;
@@ -40,19 +32,12 @@ thread_local! {
     static CODE: Cell<[(usize, usize); 8]> = const { Cell::new([(0, 0); 8]) };
 }
 
-/// Instructions emulated, the times Windows was asked about memory for them, and the bytes
-/// `clzero` loops zeroed, since the start.
-static EMULATED: AtomicU64 = AtomicU64::new(0);
-static ASKED: AtomicU64 = AtomicU64::new(0);
-static ZEROED: AtomicU64 = AtomicU64::new(0);
-
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    ASKED.fetch_add(1, Relaxed);
     found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
@@ -68,32 +53,26 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
-    let remember = remembers();
-    if remember {
-        let (regions, answers) = WRITABLE.with(Cell::get);
-        if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
-            let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
-            WRITABLE.with(|w| w.set(next));
-            return Some(to.min(end));
-        }
+    let (regions, answers) = WRITABLE.with(Cell::get);
+    if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
+        let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
+        WRITABLE.with(|w| w.set(next));
+        return Some(to.min(end));
     }
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    ASKED.fetch_add(1, Relaxed);
     if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
         return None;
     }
     let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
-    if remember {
-        WRITABLE.with(|w| {
-            let (mut regions, answers) = w.get();
-            regions.rotate_right(1);
-            regions[0] = (from, to);
-            w.set((regions, answers));
-        });
-    }
+    WRITABLE.with(|w| {
+        let (mut regions, answers) = w.get();
+        regions.rotate_right(1);
+        regions[0] = (from, to);
+        w.set((regions, answers));
+    });
     Some(to.min(end))
 }
 
@@ -106,7 +85,7 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their bytes are asked about once.
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
+    let known = CODE.with(Cell::get);
     let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
         Some(&(_, n)) => n,
         None => {
@@ -114,12 +93,10 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 return 0;
             }
             let n = (1..=16).rev().find(|&n| readable(rip, n)).unwrap_or(0);
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
-            }
+            let mut known = known;
+            known.rotate_right(1);
+            known[0] = (rip, n);
+            CODE.with(|c| c.set(known));
             n
         }
     };
@@ -182,7 +159,6 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 if at == start {
                     return 0;
                 }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
                 if at < end {
                     // What follows is not writable: the loop goes on there (the same
                     // instruction again), where the real one faults too.
@@ -235,15 +211,145 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
     }
     ctx.Rip += len as u64;
-    // How often this runs at all (each one is an exception: a trip into Windows and back).
-    let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
-    if emulated >= 1 << 16 && emulated.is_power_of_two() {
-        tracing::info!(
-            emulated,
-            asked = ASKED.load(Relaxed),
-            zeroed_mb = ZEROED.load(Relaxed) >> 20,
-            "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
-        );
-    }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Diagnostics::Debug::M128A;
+
+    fn reg(low: u64, high: u64) -> M128A {
+        M128A {
+            Low: low,
+            High: high as i64,
+        }
+    }
+
+    /// Gives `code` to the emulation as if it faulted at its first byte,
+    /// with `rax` and `xmm` as the saved registers. The emulation does not
+    /// execute `code`, so this works on any CPU. Returns the number of bytes
+    /// that the emulation skipped, or `None` if it did not emulate the
+    /// instruction. `xmm` gets the saved registers after.
+    fn run(code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
+        // `int3` after the instruction, so that a decoder that reads too
+        // far sees no valid bytes.
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..code.len()].copy_from_slice(code);
+        let start = bytes.as_ptr() as u64;
+        // SAFETY: a zeroed context is valid; the emulation reads only
+        // `bytes` and writes only `context` (and memory at `rax` for
+        // clzero, which the caller owns).
+        unsafe {
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = start;
+            context.Rax = rax;
+            context.Anonymous.FltSave.XmmRegisters = *xmm;
+            let emulated = emulate(&mut context) == CONTINUE_EXECUTION;
+            *xmm = context.Anonymous.FltSave.XmmRegisters;
+            emulated.then(|| context.Rip - start)
+        }
+    }
+
+    fn low(xmm: &[M128A; 16], i: usize) -> u64 {
+        xmm[i].Low
+    }
+
+    #[test]
+    fn emulated_clzero_zeroes_its_line() {
+        #[repr(align(64))]
+        struct Line([u8; 128]);
+        let mut line = Line([0xff; 128]);
+        let at = line.0.as_mut_ptr().wrapping_add(5) as u64; // inside the first line
+        let mut xmm = [reg(0, 0); 16];
+        assert_eq!(run(&[0x0f, 0x01, 0xfc], at, &mut xmm), Some(3));
+        assert!(line.0[..64].iter().all(|&b| b == 0));
+        assert!(line.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn emulated_monitorx_and_mwaitx_are_skipped() {
+        let mut xmm = [reg(1, 2); 16];
+        assert_eq!(run(&[0x0f, 0x01, 0xfa], 0, &mut xmm), Some(3));
+        assert_eq!(run(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        assert!(xmm.iter().all(|r| r.Low == 1 && r.High == 2));
+    }
+
+    #[test]
+    fn emulated_insertq_and_extrq_with_immediates() {
+        let mut xmm = [reg(0, 0); 16];
+        xmm[0] = reg(0x1111_2222_3333_4444, 0x5555);
+        xmm[1] = reg(0xabcd, 0x6666);
+        // insertq xmm0, xmm1, length 16, index 16
+        let insertq = [0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+        assert_eq!(run(&insertq, 0, &mut xmm), Some(6));
+        assert_eq!(low(&xmm, 0), 0x1111_2222_abcd_4444);
+        assert_eq!((low(&xmm, 1), xmm[1].High), (0xabcd, 0x6666));
+        // extrq xmm0, length 8, index 20
+        let extrq = [0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14];
+        assert_eq!(run(&extrq, 0, &mut xmm), Some(6));
+        assert_eq!(low(&xmm, 0), 0xbc);
+    }
+
+    #[test]
+    fn emulated_insertq_and_extrq_with_fields_in_a_register() {
+        let mut xmm = [reg(0, 0); 16];
+        // insertq xmm0, xmm1: length and index in xmm1's high half.
+        xmm[0] = reg(0x1111_2222_3333_4444, 0);
+        xmm[1] = reg(0xabcd, 0x10_10);
+        assert_eq!(run(&[0xf2, 0x0f, 0x79, 0xc1], 0, &mut xmm), Some(4));
+        assert_eq!(low(&xmm, 0), 0x1111_2222_abcd_4444);
+        // extrq xmm0, xmm1: length and index in xmm1's low half.
+        xmm[1] = reg(0x14_08, 0);
+        assert_eq!(run(&[0x66, 0x0f, 0x79, 0xc1], 0, &mut xmm), Some(4));
+        assert_eq!(low(&xmm, 0), 0xbc);
+    }
+
+    #[test]
+    fn emulated_sse4a_reaches_xmm8_to_xmm15() {
+        let mut xmm = [reg(0, 0); 16];
+        xmm[8] = reg(0x1111_2222_3333_4444, 0);
+        xmm[9] = reg(0xabcd, 0);
+        // insertq xmm8, xmm9, length 16, index 16 (REX.R and REX.B)
+        let insertq = [0xf2, 0x45, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+        assert_eq!(run(&insertq, 0, &mut xmm), Some(7));
+        assert_eq!(low(&xmm, 8), 0x1111_2222_abcd_4444);
+        assert_eq!((low(&xmm, 0), low(&xmm, 1)), (0, 0));
+        // extrq xmm9, length 8, index 4 (REX.B)
+        let extrq = [0x66, 0x41, 0x0f, 0x78, 0xc1, 0x08, 0x04];
+        assert_eq!(run(&extrq, 0, &mut xmm), Some(7));
+        assert_eq!(low(&xmm, 9), 0xbc);
+        assert_eq!(low(&xmm, 1), 0);
+    }
+
+    #[test]
+    fn emulated_sse4a_length_0_is_64_bits() {
+        let mut xmm = [reg(0, 0); 16];
+        xmm[0] = reg(0x1122_3344_5566_7788, 0);
+        // extrq xmm0, length 0 (64), index 0. A non-zero index with
+        // length 64 goes past bit 63, and AMD leaves that result undefined.
+        assert_eq!(
+            run(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], 0, &mut xmm),
+            Some(6)
+        );
+        assert_eq!(low(&xmm, 0), 0x1122_3344_5566_7788);
+        // insertq xmm0, xmm1, length 0 (64), index 0
+        xmm[1] = reg(0xdead_beef_cafe_f00d, 0);
+        assert_eq!(
+            run(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x00], 0, &mut xmm),
+            Some(6)
+        );
+        assert_eq!(low(&xmm, 0), 0xdead_beef_cafe_f00d);
+    }
+
+    #[test]
+    fn other_instructions_are_not_emulated() {
+        let mut xmm = [reg(0, 0); 16];
+        assert_eq!(run(&[0x0f, 0x0b], 0, &mut xmm), None); // ud2
+        // extrq with a memory operand, which does not exist
+        assert_eq!(run(&[0x66, 0x0f, 0x79, 0x00], 0, &mut xmm), None);
+        // extrq with immediates needs ModRM.reg 0
+        let bad_extrq = [0x66, 0x0f, 0x78, 0xc8, 0x08, 0x14];
+        assert_eq!(run(&bad_extrq, 0, &mut xmm), None);
+    }
 }

@@ -696,8 +696,6 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
- "windows",
- "windows-core",
  "windows-sys",
  "zlib-rs",
 ]

@@ -181,7 +181,6 @@ pub fn title() -> Title {
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
-#[cfg(windows)]
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
@@ -193,15 +192,11 @@ pub fn use_console_timers() {
     // "efficiency mode": lower clock, the slow cores of a hybrid processor)
     // when its window is not the one in front, as while its owner works in
     // another window or streams. The console has eight cores alike and no
-    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
-    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
-        0
-    } else {
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-    };
+    // such mode.
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+            | PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.

@@ -38,7 +38,7 @@ pub const IID_2026: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("persistent local storage", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
+use windows_sys::Win32::Foundation::E_FAIL;
 
 type This = *const Object;
 
@@ -52,10 +52,7 @@ fn folder() -> Option<String> {
     if storage.as_os_str().is_empty() {
         return None;
     }
-    #[cfg(windows)]
-    return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(windows))]
-    None
+    super::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
 extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
@@ -103,7 +100,6 @@ fn used_bytes(dir: &Path) -> u64 {
 
 /// What the host disk under `dir` has free (unlimited if unknown).
 pub(crate) fn disk_free(dir: &Path) -> u64 {
-    #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();

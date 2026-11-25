@@ -19,14 +19,12 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
-    #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
 }
 
 /// A host GPU failure ends the run like a crash: reported to the crash log,
 /// then the process ends as the console ends a title.
-#[cfg(windows)]
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
@@ -38,28 +36,15 @@ fn host_gpu_failed(what: &str) -> ! {
 
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        victory_gpu::shader_cache::warm(container)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = container;
-        Err("no shader cache on this host".into())
-    }
+    victory_gpu::shader_cache::warm(container)
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
-    #[cfg(windows)]
-    {
-        victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
-        victory_gpu::shader_cache::use_shader_cache(dir);
-    }
-    #[cfg(not(windows))]
-    let _ = dir;
+    victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+    victory_gpu::shader_cache::use_shader_cache(dir);
 }
 
 pub(crate) fn module() -> HleModule {

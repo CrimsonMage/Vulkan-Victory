@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -38,8 +38,7 @@ const FACTORY: Guid = Guid::new(
     0x4884,
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+use windows_sys::Win32::Foundation::E_NOINTERFACE;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
@@ -131,22 +130,16 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
-    // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
-    };
+    let name = super::xgameruntime::wide_text(path).unwrap_or_default();
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -203,9 +196,7 @@ extern "system" fn create_queue(
         iid = iid_text(iid),
         "dstorage: queue"
     );
-    let Some(scheduler) = scheduler() else {
-        return E_OUTOFMEMORY;
-    };
+    let scheduler = scheduler();
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
@@ -221,9 +212,7 @@ extern "system" fn create_queue(
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
-    }
+    scheduler().lock().staging = u64::from(size);
     S_OK
 }
 
@@ -351,13 +340,6 @@ struct Lanes {
     clock: [u64; 3],
     now: u64,
     lane_now: [u64; 3],
-    /// Since the last debug summary: requests, bytes written, time spent
-    /// running them.
-    done: (u64, u64, std::time::Duration),
-    refused: u64,
-    /// BCPack bytes written and time spent on them.
-    bcpack: (u64, std::time::Duration),
-    since: Option<std::time::Instant>,
 }
 
 /// A queue's requests in the scheduler.
@@ -393,34 +375,25 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
-/// The scheduler, with its workers started on first use; `None` if not
-/// even one worker could start.
-fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
+/// The scheduler, with its workers started on first use.
+fn scheduler() -> &'static Scheduler {
+    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
-        .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
+    let scheduler = SCHEDULER.get_or_init(|| Scheduler {
+        lanes: Mutex::new(Lanes {
+            lanes: HashMap::new(),
+            next_id: 0,
+            next_seq: 0,
+            staged: 0,
+            staging: STAGING,
+            starved: false,
+            clock: [0; 3],
+            now: 0,
+            lane_now: [0; 3],
+        }),
+        work: Condvar::new(),
+        finished: Condvar::new(),
+    });
     STARTED.call_once(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let started = (0..workers)
@@ -433,7 +406,7 @@ fn scheduler() -> Option<&'static Scheduler> {
             .count();
         tracing::info!(workers = started, "dstorage: workers");
     });
-    Some(scheduler)
+    scheduler
 }
 
 impl Scheduler {
@@ -442,64 +415,8 @@ impl Scheduler {
     }
 }
 
-/// The walls trace (`VICTORY_WALLS_TRACE`): 0 or unset: off; 1: a line for
-/// every read request that fails, with its file; 2: for every request (the
-/// list of a launch's reads, by file and offset, is what a launch with the
-/// first room's walls and one without are compared by).
-fn walls_trace() -> u8 {
-    static ON: OnceLock<u8> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
-    })
-}
-
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-
-/// The walls trace's line for a request that is done.
-fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
-    let level = walls_trace();
-    if level == 0 || (level == 1 && result.is_ok()) {
-        return;
-    }
-    let file = if request.options & MEMORY_SOURCE != 0 {
-        "memory".to_string()
-    } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
-    };
-    let hr = match result {
-        Ok(()) => 0,
-        Err(hr) => *hr as u32,
-    };
-    tracing::info!(
-        file,
-        offset = request.offset,
-        source_size = request.source_size,
-        destination_size = request.destination_size,
-        to_pages = request.options & PAGE_DESTINATION != 0,
-        options = format_args!("{:#x}", request.options),
-        ms = started.elapsed().as_millis() as u64,
-        ok = result.is_ok(),
-        hr = format_args!("{hr:#010x}"),
-        "walls trace: a read request is done"
-    );
-}
-
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
-    // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
-    // title's threads (`victory_gpu::framelog::keep_on_slow_cores`; off by
-    // default until it is measured).
-    #[cfg(windows)]
-    {
-        static SLOW: OnceLock<bool> = OnceLock::new();
-        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
-            victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
-        }
-    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -509,10 +426,14 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
-        walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
-        lanes.count(&job, started);
+        {
+            use victory_gpu::framelog::{T, add};
+            add(T::DiskReads, 1);
+            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskUs, started.elapsed().as_micros() as u64);
+        }
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
@@ -521,46 +442,6 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
-        let (requests, bytes, busy) = &mut self.done;
-        *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
-        *busy += started.elapsed();
-        #[cfg(windows)]
-        {
-            use victory_gpu::framelog::{T, add};
-            add(T::DiskReads, 1);
-            add(T::DiskBytes, u64::from(job.request.destination_size));
-            add(T::DiskUs, started.elapsed().as_micros() as u64);
-        }
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
-            self.bcpack.1 += started.elapsed();
-        }
-        let since = *self.since.get_or_insert(started);
-        let elapsed = since.elapsed();
-        if elapsed.as_secs() >= 5 {
-            let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
-            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
-                requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
-                staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
-                waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
-            );
-            self.done = Default::default();
-            self.bcpack = Default::default();
-            self.since = None;
-        }
-    }
-
     /// Starts the next read of the class with the least virtual time, from
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
@@ -576,7 +457,6 @@ impl Lanes {
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
-            self.refused += 1;
             return None;
         }
         lane.reads.pop_front();
@@ -694,9 +574,7 @@ fn staging_bytes(request: &Request) -> u64 {
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
 fn close_lane(id: u64) {
-    let Some(scheduler) = scheduler() else {
-        return;
-    };
+    let scheduler = scheduler();
     let mut lanes = scheduler.lock();
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
@@ -802,9 +680,7 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
-    let Some(scheduler) = scheduler() else {
-        return;
-    };
+    let scheduler = scheduler();
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
@@ -832,9 +708,7 @@ fn queue(this: QueueRef, command: Command) {
 extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
-    let Some(scheduler) = scheduler() else {
-        return;
-    };
+    let scheduler = scheduler();
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
@@ -1027,9 +901,6 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     Ok(Cow::Owned(bytes))
 }
 
-/// Nanoseconds workers spent reading files, for the debug summary.
-static READING: AtomicU64 = AtomicU64::new(0);
-
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -1041,9 +912,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
-    let started = std::time::Instant::now();
     let mut done = 0;
-    let result = loop {
+    loop {
         if done == out.len() {
             break Ok(());
         }
@@ -1052,9 +922,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
         }
-    };
-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    result
+    }
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1080,8 +948,7 @@ fn into_destination(
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
-        // read was under way took what was there before. Counted; acted on
-        // only with `VICTORY_PAGE_WRITES=all`.
+        // read was under way took what was there before.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
         return filled;
     }
@@ -1111,48 +978,22 @@ fn into_destination(
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
-    });
-    // Since the start: writes that succeeded on a later try, and writes
-    // given up.
-    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    // the request fails (12 tries, about 0.9 s in all). Runs 175-178 lost
+    // 12 to 446 reads a launch here, all in one second of the loading; the
+    // one build that tried again (run 165) lost none of 13.
+    const RETRIES: u32 = 12;
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0u32;
-    while !written && tries < retries {
+    while !written && tries < RETRIES {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
     if written {
-        if tries > 0 {
-            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(
-                offset,
-                len,
-                tries,
-                on_a_retry,
-                given_up = RETRIED[1].load(Ordering::Relaxed),
-                "dstorage: a destination's physical pages written after a retry"
-            );
-        }
         // As above, after the write that succeeded.
         super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1161,6 +1002,8 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            known = super::xmem::pages_known(pages, offset, len),
+            tries,
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
@@ -1458,10 +1301,6 @@ mod tests {
             clock: [0; 3],
             now: 0,
             lane_now: [0; 3],
-            done: Default::default(),
-            refused: 0,
-            bcpack: Default::default(),
-            since: None,
         }
     }
 

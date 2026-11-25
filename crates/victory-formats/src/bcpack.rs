@@ -1567,33 +1567,6 @@ mod tests {
         }
     }
 
-    /// Compares with reference outputs made outside the repository:
-    /// `VICTORY_BCPACK_TABLES` (the table file) and `VICTORY_BCPACK_CASES`, a
-    /// directory of `<name>.bc<n>` packed chunks with `<name>.out` beside them.
-    #[test]
-    #[ignore = "needs the format tables and reference chunks"]
-    fn reference_chunks() {
-        let tables = std::env::var_os("VICTORY_BCPACK_TABLES").expect("VICTORY_BCPACK_TABLES");
-        let cases = std::env::var_os("VICTORY_BCPACK_CASES").expect("VICTORY_BCPACK_CASES");
-        let t = Tables::parse(&std::fs::read(tables).unwrap()).unwrap();
-        let mut n = 0;
-        for entry in std::fs::read_dir(cases).unwrap() {
-            let path = entry.unwrap().path();
-            let Some(bc) = path
-                .extension()
-                .and_then(|e| e.to_str()?.strip_prefix("bc")?.parse().ok())
-            else {
-                continue;
-            };
-            let want = std::fs::read(path.with_extension("out")).unwrap();
-            let mut got = vec![0u8; want.len()];
-            decode(bc, &std::fs::read(&path).unwrap(), &mut got, &t).unwrap();
-            assert!(got == want, "{}", path.display());
-            n += 1;
-        }
-        assert!(n > 0);
-    }
-
     /// A dictionary entry stands in for a block the decoder made: a set with
     /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
     #[test]

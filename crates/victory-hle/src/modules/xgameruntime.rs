@@ -165,11 +165,38 @@ pub fn text(s: *const c_char) -> Option<String> {
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
+/// The title's NUL-terminated UTF-16 string, if any.
+pub fn wide_text(s: *const u16) -> Option<String> {
+    // SAFETY: the title passes a NUL-terminated string or null.
+    (!s.is_null()).then(|| unsafe {
+        let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(s, len))
+    })
+}
+
 /// A new registration token for callbacks we never call (events nobody
 /// raises offline).
 pub fn token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Registers a callback for an event nothing raises offline (a user,
+/// licence, network hint or install progress that never changes): it is
+/// never called. `(this, queue, context, callback, out token)`.
+pub extern "system" fn register_never_called(
+    _: *const Object,
+    _queue: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    out: *mut u64,
+) -> HRESULT {
+    put(out, token())
+}
+
+/// Ends a [`register_never_called`] registration: `(this, token, wait)`.
+pub extern "system" fn unregister_never_called(_: *const Object, _token: u64, _wait: bool) -> bool {
+    true
 }
 
 /// Calls method `slot` (byte offset) of `object` as title code would.
@@ -230,17 +257,6 @@ pub extern "system" fn QueryApiImpl(
     else {
         return NOT_SUPPORTED;
     };
-    #[cfg(feature = "diagnostics")]
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        // Each runtime call site once: which title code uses which area, when.
-        static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let from = super::kernel::callers();
-        let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
-        if !calls.contains(&from) {
-            tracing::debug!(%provider, %iid, %from, "runtime call");
-            calls.push(from);
-        }
-    }
     let found = AREAS
         .iter()
         .flat_map(|area| area.iter())
@@ -334,7 +350,6 @@ mod tests {
         assert_eq!(out, untouched);
         assert_eq!(FreeLibrary(runtime), 1);
 
-        #[cfg(windows)]
         {
             let kernel32 = load(c"kernel32.dll");
             assert!(!kernel32.is_null(), "host DLLs still load from the host");

@@ -38,11 +38,7 @@ fn narrow(text: *const u8) -> String {
 
 /// See [`narrow`].
 fn wide(text: *const u16) -> String {
-    // SAFETY: the title passes a NUL-terminated string.
-    unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-    }
+    super::xgameruntime::wide_text(text).unwrap_or_default()
 }
 
 /// A title image's path is its original file, not our cache copy;
@@ -386,13 +382,6 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// The return addresses above the caller, as `module+rva`, for logs.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn callers() -> String {
-    host::callers()
-}
-
-#[cfg(windows)]
 mod host {
     use std::ffi::c_void;
 
@@ -527,70 +516,6 @@ mod host {
     }
 }
 
-#[cfg(not(windows))]
-mod host {
-    use std::ffi::c_void;
-
-    pub(super) fn get_module_handle_w(_: *const u16) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn get_module_handle_a(_: *const u8) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn get_module_file_name_w(_: *mut c_void, _: *mut u16, _: u32) -> u32 {
-        0
-    }
-
-    pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
-        0
-    }
-
-    pub(super) fn set_last_error(_: u32) {}
-
-    pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn get_proc_address(_: *mut c_void, _: *const u8) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn free_library(_: *mut c_void) -> i32 {
-        0
-    }
-
-    pub(super) fn disable_thread_library_calls(_: *mut c_void) -> i32 {
-        0
-    }
-
-    pub(super) fn exit(code: i32) -> ! {
-        std::process::exit(code)
-    }
-
-    pub(super) fn abort() -> ! {
-        std::process::abort()
-    }
-
-    pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
-        std::process::exit(code as i32)
-    }
-
-    pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
-
-    pub(super) fn report_unhandled(_: *const c_void) {}
-
-    pub(super) fn note_title_output(_: &str) {}
-
-    pub(super) fn callers() -> String {
-        String::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -619,7 +544,6 @@ mod tests {
         text.encode_utf16().chain(Some(0)).collect()
     }
 
-    #[cfg(windows)]
     #[test]
     fn host_lookups_by_name_get_our_overrides() {
         let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());

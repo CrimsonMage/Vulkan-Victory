@@ -89,13 +89,7 @@ fn narrow(text: *const c_char) -> Option<String> {
     })
 }
 
-fn wide(text: *const u16) -> Option<String> {
-    // SAFETY: the title passes a NUL-terminated string or null.
-    (!text.is_null()).then(|| unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-    })
-}
+use super::xgameruntime::wide_text as wide;
 
 /// An IPv4 or IPv6 `sockaddr` of `len` bytes.
 fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {

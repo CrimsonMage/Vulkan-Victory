@@ -26,7 +26,7 @@ pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+use windows_sys::Win32::Foundation::E_NOINTERFACE;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -510,24 +510,8 @@ impl State {
     }
 }
 
-#[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
-}
-
-#[cfg(not(windows))]
-fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
-    }
-    Box::new(Nothing)
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -1068,7 +1052,6 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
-#[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
 

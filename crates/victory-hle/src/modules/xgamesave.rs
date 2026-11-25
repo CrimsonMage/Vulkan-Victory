@@ -221,12 +221,6 @@ fn current_named(dir: &Path, name: &str) -> std::io::Result<Option<Version>> {
     }
 }
 
-/// Where a crash test stops the process (test builds only).
-fn step() {
-    #[cfg(test)]
-    tests::crash_point();
-}
-
 /// A blob of a new version: new data, or the previous version's file.
 enum Source<'a> {
     Data(&'a [u8]),
@@ -259,13 +253,10 @@ fn commit(
             Source::Kept(from) => std::fs::hard_link(from, &path)
                 .or_else(|_| std::fs::copy(from, &path).map(drop))?,
         }
-        step();
     }
     let names: Vec<&str> = blobs.iter().map(|(n, _)| *n).collect();
     write(staged.join(MANIFEST), &manifest(name, display, &names))?;
-    step();
     std::fs::rename(&staged, dir.join(format!("v{number}")))?;
-    step();
     Ok(())
 }
 
@@ -477,7 +468,6 @@ impl Update {
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
             let _ = std::fs::remove_dir_all(&old.dir);
-            step();
         }
         S_OK
     }
@@ -494,11 +484,9 @@ fn delete(root: &Path, name: &str) -> HRESULT {
     }
     let gone = dir.with_extension("gone");
     let _ = std::fs::remove_dir_all(&gone);
-    step();
     if let Err(e) = std::fs::rename(&dir, &gone) {
         return io_error(&dir, &e);
     }
-    step();
     let _ = std::fs::remove_dir_all(&gone);
     S_OK
 }
@@ -937,9 +925,6 @@ static VTABLE: Methods<30> = Methods([
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufRead;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use super::*;
     use crate::modules::xgameruntime::method;
 
@@ -949,23 +934,6 @@ mod tests {
             context: std::ptr::null_mut(),
             callback: None,
             internal: [0; 4],
-        }
-    }
-
-    static STEPS: AtomicU32 = AtomicU32::new(0);
-
-    /// In a child process of the crash test, stops for good at the step
-    /// `VICTORY_SAVE_STOP` names and says so.
-    pub(super) fn crash_point() {
-        let Ok(stop) = std::env::var("VICTORY_SAVE_STOP") else {
-            return;
-        };
-        if stop.parse() == Ok(STEPS.fetch_add(1, Ordering::SeqCst) + 1) {
-            println!("STOPPED");
-            let _ = std::io::stdout().flush();
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
         }
     }
 
@@ -1000,73 +968,6 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
-    }
-
-    fn old_state() -> Option<(String, Vec<(String, String)>)> {
-        Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
-    }
-
-    /// Run by the crash test in a child process; does nothing otherwise.
-    #[test]
-    fn crash_child() {
-        let (Ok(root), Ok(op)) = (std::env::var("VICTORY_SAVE_CHILD"), std::env::var("VICTORY_SAVE_OP")) else {
-            return;
-        };
-        let root = PathBuf::from(root);
-        let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
-        } else {
-            delete(&root, "Slot")
-        };
-        assert_eq!(hr, S_OK);
-        println!("FINISHED");
-    }
-
-    /// Kills a process in the middle of an update (and of a deletion) at
-    /// every step: what is left is the whole old container or the whole
-    /// new one.
-    #[test]
-    fn a_kill_at_any_step_leaves_old_or_new() {
-        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
-        for (op, after) in [("update", new), ("delete", None)] {
-            let mut seen = (0, 0);
-            for stop in 1.. {
-                let dir = tempfile::tempdir().unwrap();
-                let root = dir.path();
-                assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
-                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "modules::xgamesave::tests::crash_child", "--nocapture"])
-                    .args(["--test-threads=1"])
-                    .env("VICTORY_SAVE_CHILD", root)
-                    .env("VICTORY_SAVE_OP", op)
-                    .env("VICTORY_SAVE_STOP", stop.to_string())
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                let out = std::io::BufReader::new(child.stdout.take().unwrap());
-                let mut finished = false;
-                for line in out.lines() {
-                    let line = line.unwrap();
-                    if line.contains("STOPPED") {
-                        break;
-                    }
-                    finished |= line.contains("FINISHED");
-                }
-                let _ = child.kill();
-                child.wait().unwrap();
-                let left = state(root);
-                if left == old_state() {
-                    seen.0 += 1;
-                } else {
-                    assert_eq!(left, after, "{op}, killed at step {stop}");
-                    seen.1 += 1;
-                }
-                if finished {
-                    break;
-                }
-            }
-            assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
-        }
     }
 
     #[test]

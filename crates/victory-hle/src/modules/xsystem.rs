@@ -133,7 +133,6 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
 /// takes a missing value for a PC.
-#[cfg(windows)]
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -169,15 +168,7 @@ mod device_type {
     }
 
     fn is(text: *const u16, expected: &str) -> bool {
-        if text.is_null() {
-            return false;
-        }
-        // SAFETY: the title passes a NUL-terminated string.
-        let text = unsafe {
-            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-        };
-        text.eq_ignore_ascii_case(expected)
+        crate::modules::xgameruntime::wide_text(text).is_some_and(|t| t.eq_ignore_ascii_case(expected))
     }
 
     /// Opens our key for its path; the key has no subkeys. `None`: not
@@ -362,7 +353,6 @@ mod device_type {
         }
     }
 }
-#[cfg(windows)]
 pub(crate) use device_type::module;
 
 #[cfg(test)]

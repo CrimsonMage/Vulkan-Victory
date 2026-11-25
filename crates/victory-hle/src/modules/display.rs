@@ -75,7 +75,6 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
 
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.
-#[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
@@ -107,7 +106,6 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     put(out, request)
 }
 
-#[cfg(windows)]
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
@@ -120,7 +118,6 @@ extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     }
 }
 
-#[cfg(windows)]
 fn last_error() -> HRESULT {
     // SAFETY: no preconditions.
     let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -144,7 +141,6 @@ static HDR_VTABLE: Methods<5> = Methods([
     try_enable_hdr as *const (), // 0x20
 ]);
 
-#[cfg(windows)]
 static SHELL_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
@@ -152,13 +148,6 @@ static SHELL_VTABLE: Methods<6> = Methods([
     launch_uri as *const (),       // 0x18
     acquire_deferral as *const (), // 0x20
     close_deferral as *const (),   // 0x28
-]);
-#[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    launch_uri as *const (),
 ]);
 
 static CAPTURE_VTABLE: Methods<6> = Methods([
@@ -170,7 +159,7 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
