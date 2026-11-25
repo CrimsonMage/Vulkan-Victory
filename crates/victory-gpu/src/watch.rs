@@ -143,36 +143,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
 }
 
-/// Since the last frame line: the kernel askings that took a millisecond
-/// or more, their microseconds, and the longest asking's. An asking walks
-/// page tables, some ten microseconds for most ranges; in run 75 the 2,644
-/// askings of a frame took 219 ms in the lines where the pass over the
-/// heap's views ran long, 25-50 ms in the others. These numbers say
-/// whether a few askings wait for something or all of them are slow.
-#[cfg(feature = "diagnostics")]
-static SLOW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
-#[cfg(feature = "diagnostics")]
-fn slow(us: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if us >= 1000 {
-        SLOW[0].fetch_add(1, Relaxed);
-        SLOW[1].fetch_add(us, Relaxed);
-    }
-    SLOW[2].fetch_max(us, Relaxed);
-}
-
 /// Since the last frame line: ranges of view memory the guards hold that a
 /// submission's askings ahead ([`ask_ahead`], [`ask_once`]) left out. Each
 /// was a kernel asking that failed, or several, before.
 #[cfg(feature = "diagnostics")]
 pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// [`SLOW`], taken.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn slow_asks() -> [u64; 3] {
-    [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
-}
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
@@ -279,34 +254,6 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
-/// We wrote the 64 KiB page numbered `page` of title memory through a
-/// view of our own (`crate::inplace::write_own`): no guard was opened and
-/// no kernel write-watch bit set, so the journal is told here. The page,
-/// and the same physical page at its other title addresses (`others`,
-/// page numbers), count as written at a new asking, which every host copy
-/// that holds them takes at its next refresh. Returns the asking that had
-/// last found `page` written (0: never) and the new one, for the copy
-/// that wrote to note itself current.
-pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    j.asked += 1;
-    let now = j.asked;
-    // As in [`wrote`]: an asking that stands for a submission, or for a
-    // flush, moves with it, or a copy taking the page at the standing
-    // asking would find it written "later" at every refresh.
-    if j.kept || !j.ahead.is_empty() {
-        j.ahead_asked = now;
-    }
-    let before = j.written.insert(page, now).unwrap_or(0);
-    for &other in others {
-        if other != page {
-            j.written.insert(other, now);
-        }
-    }
-    (before, now)
-}
-
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -334,8 +281,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -350,33 +295,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     if failed {
         return false;
     }
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
-    }
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
     true
-}
-
-/// What [`writes`] would say of `[start, end)` from the journal alone, if
-/// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
-/// pages written since tracking began and the asking that last found each
-/// written, with the number of the asking that stands (as [`writes`] gives
-/// it). `None` if the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -403,8 +327,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
@@ -421,36 +343,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut granularity,
             )
         } != 0;
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        if known_view {
-            crate::copystat::C::WatchKnownView
-        } else {
-            crate::copystat::C::WatchFailed
-        },
-        failed as u64,
-    );
     let guarded = if failed {
         count = 0;
         if !guarded {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
-        let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
     } else {
         Vec::new()
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
-    }
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
@@ -697,11 +599,11 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+    for (base, bytes) in crate::views::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
+            let shown = crate::views::pages_of(block * BLOCK);
             // One view (nothing else to guard), or the page the title shows
             // wherever it has nothing (thousands of views): each view of
             // that one is guarded by itself.
@@ -824,7 +726,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
+        for alias in crate::views::pages_of(block * BLOCK) {
             if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -941,7 +843,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
-/// of `section` (`crate::inplace::title_memory_view`): the view is
+/// of `section` (`crate::views::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
 /// again — and are, the pages noted written, which also has the next check
 /// guard the new view (`protect`).
@@ -949,7 +851,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !view_guard() {
         return;
     }
-    let ranges = crate::inplace::views_of_section(section, offset, len);
+    let ranges = crate::views::views_of_section(section, offset, len);
     if ranges.is_empty() {
         return;
     }
@@ -979,25 +881,14 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
-
-impl Drop for Remapping {
-    fn drop(&mut self) {
-        // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
-    }
-}
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    let asked = std::time::Instant::now();
-    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
-    crate::framelog::add(crate::framelog::T::Remaps, 1);
-    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1030,9 +921,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // written.
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
-    crate::inplace::views_gone(at, len);
-    // And nothing stays in place over it.
-    crate::inplace::title_memory_freeing(at, len);
+    crate::views::views_gone(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -1079,9 +968,6 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -1467,8 +1353,8 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
-            crate::inplace::title_memory_view(one, bytes, section as usize, 0);
-            crate::inplace::title_memory_view(two, bytes, section as usize, 0);
+            crate::views::title_memory_view(one, bytes, section as usize, 0);
+            crate::views::title_memory_view(two, bytes, section as usize, 0);
             (section as usize, one, two)
         }
     }
@@ -1521,7 +1407,7 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
         title_memory_remapped(other, SIZE);
-        crate::inplace::title_memory_view(other, SIZE, section, 0);
+        crate::views::title_memory_view(other, SIZE, section, 0);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
@@ -1580,7 +1466,7 @@ mod tests {
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
-            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+            crate::views::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         assert!(writable(two), "another view of it is left alone");

@@ -260,25 +260,6 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// With the frame line: what [`sync_heaps`] did per frame over `frames`.
-/// Nothing while no heap page changed.
-#[cfg(windows)]
-pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if pages == 0 {
-        return;
-    }
-    tracing::info!(
-        "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
-        pages as f64 / frames,
-        looked as f64 / frames,
-        mirrored as f64 / frames,
-        host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
-    );
-}
-
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
 /// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
 /// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
@@ -708,43 +689,6 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
-}
-
-/// For the memory line: the distinct views kept ([`Views`]), those of them
-/// free for reuse, and the bytes the table and its index hold for them (an
-/// estimate: an entry of the table, and one of the index with its share of
-/// a tree node; the shapes likewise); then the entries that are constant
-/// buffer views and views of placed memory (those that did not fit a
-/// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
-/// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
-    use std::sync::atomic::Ordering::Relaxed;
-    let views = views_read();
-    let each = size_of::<(View, u32)>() as u64;
-    let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
-    [
-        views.list.len() as u64,
-        views.free.len() as u64,
-        views.list.capacity() as u64 * each
-            + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
-        constants,
-        placed,
-        views.shapes.len() as u64,
-        NAMED_WHOLE[0].load(Relaxed),
-        NAMED_WHOLE[1].load(Relaxed),
-    ]
 }
 
 impl View {

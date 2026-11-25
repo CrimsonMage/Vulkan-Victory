@@ -250,12 +250,6 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
                     return false;
                 };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
                 tracing::info!(
                     view = ?placed,
                     texture = ?source,
@@ -404,7 +398,6 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let us = started.elapsed().as_micros() as u64;
     REFRESH_WAITS[slot].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
     if slot == 2 {
-        crate::framelog::add(crate::framelog::T::RefreshStillUs, us);
     }
     out
 }
@@ -477,28 +470,8 @@ impl Drop for Staging {
     }
 }
 
-/// For the memory line: staging buffers alive, their bytes, and how many
-/// of them their texture still has (the others wait for a list's reset).
-#[cfg(feature = "diagnostics")]
-pub(crate) fn memory() -> [u64; 3] {
-    use std::sync::atomic::Ordering::Relaxed;
-    let kept = STAGING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map_or(0, |map| map.len() as u64);
-    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
-}
-
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// For the memory line: staging buffers let go as idle, and their bytes.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn let_go() -> [u64; 2] {
-    use std::sync::atomic::Ordering::Relaxed;
-    [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
-}
 
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
@@ -694,14 +667,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
         return;
     }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::TexUploads, 1);
-    crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -712,27 +680,23 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + footprint.Offset, len),
-            );
+            list.note_op(|| {
+                format!(
+                    "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.Format.0,
+                    d.MipLevels,
+                    staging.footprints.len(),
+                    staging.size,
+                    footprint.Offset,
+                    f.Width,
+                    f.Height,
+                    f.Depth,
+                    f.RowPitch
+                )
+            });
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -972,25 +936,11 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+        self.refresh_now();
     }
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
-        let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
-        let us = whole.elapsed().as_micros() as u64;
-        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-        crate::framelog::add(crate::framelog::T::RefreshUs, us);
-        read
-    }
-
-    fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1006,8 +956,6 @@ impl Staging {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
             });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
         // View memory has no write-watch, and a texture there was hashed
@@ -1062,8 +1010,6 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
@@ -1079,7 +1025,6 @@ impl Staging {
             });
             #[cfg(feature = "diagnostics")]
             if changed {
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             let _ = changed;
             return size;
@@ -1087,15 +1032,11 @@ impl Staging {
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
         }
@@ -1103,15 +1044,11 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
         }
         last.hash = Some(hash);
         self.detile(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
@@ -1472,12 +1409,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);

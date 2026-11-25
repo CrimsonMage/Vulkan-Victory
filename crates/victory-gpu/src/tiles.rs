@@ -620,11 +620,6 @@ impl Tiled {
         if self.levels >= 32 { u32::MAX } else { (1 << self.levels) - 1 }
     }
 
-    /// The bytes of the tiles it has now.
-    pub(crate) fn given_bytes(&self) -> u64 {
-        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
-    }
 }
 
 impl Drop for Tiled {
@@ -680,39 +675,6 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         }
         _ => {}
     }
-}
-
-/// For the log, with the texture queue's line: what this saves, and what
-/// the mapping calls cost since the line before.
-pub(crate) fn status() {
-    static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    if s[4] == 0 {
-        return;
-    }
-    let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
-    let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
-    tracing::info!(
-        "textures with levels on demand: {} alive ({} made so far), {} MB of the card given to {} levels in all, \
-         {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
-         the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
-         UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
-        s[0],
-        s[4],
-        s[2] >> 20,
-        s[5],
-        s[1].saturating_sub(s[2]) >> 20,
-        s[1] >> 20,
-        s[3] >> 20,
-        s[8],
-        calls,
-        micros,
-        s[6],
-        s[7],
-        s[9],
-        s[10],
-    );
 }
 
 /// On the card, without the title: what levels on demand relies on, with

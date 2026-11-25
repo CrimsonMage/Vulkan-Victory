@@ -771,25 +771,6 @@ fn view_stride(view: &View) -> Option<u32> {
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
-/// For device-removed reports: where host GPU address `va` lies against
-/// the host descriptor heaps.
-pub(crate) fn near_heaps(va: u64) -> String {
-    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
-        };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
-    }
-    text
-}
-
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -939,7 +920,6 @@ impl HostHeap {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1054,10 +1034,6 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -1086,16 +1062,8 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
             return None;
         };
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
@@ -1126,20 +1094,6 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
-    }
-
-    /// Every title slot of the queue that is due at `frame`, and whether
-    /// it was uploaded before (in part, or whole and waiting for another
-    /// look): for the card accounting line
-    /// (`crate::resource::card_accounting`).
-    pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
-            .collect()
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)

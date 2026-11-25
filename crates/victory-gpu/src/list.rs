@@ -144,15 +144,9 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
-    #[cfg(feature = "diagnostics")]
-    crate::profile::seen(crate::profile::Seen::Record);
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -635,11 +629,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // A wait recorded and never submitted goes with the recording.
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&(list, _)| list != this as usize);
+
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -761,8 +751,6 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -997,8 +985,6 @@ extern "system" fn copy_texture_region(
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
         let _upload; // keeps the source alive while this call records it
-        #[cfg(feature = "diagnostics")]
-        let mut read = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
@@ -1014,11 +1000,6 @@ extern "system" fn copy_texture_region(
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
-            }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -1075,10 +1056,7 @@ extern "system" fn copy_texture_region(
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
-            match read {
-                Some(range) => list.note_read(text, range),
-                None => list.note_op(text),
-            }
+            list.note_op(text);
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
@@ -1760,18 +1738,10 @@ extern "system" fn execute_indirect(
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
-    } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
     }
     if ran {
         return;
     }
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -1787,11 +1757,6 @@ extern "system" fn execute_indirect(
     }
 }
 
-/// Indirect executions dropped since the last call.
-pub(crate) fn take_indirect() -> u64 {
-    INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1838,15 +1803,7 @@ impl ValueWait {
     /// that thread in run 49 found it in this question).
     /// `VICTORY_WAIT_ASK=1` asks first, as before.
     pub(crate) fn met(&self) -> bool {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        let started = std::time::Instant::now();
         let met = self.holds();
-        #[cfg(all(windows, feature = "diagnostics"))]
-        {
-            use crate::copystat::{C, add};
-            add(C::WaitChecks, 1);
-            add(C::WaitCheckNs, started.elapsed().as_nanos() as u64);
-        }
         met
     }
 
@@ -1896,49 +1853,6 @@ impl ValueWait {
     }
 }
 
-/// The waits lists recorded since their last reset, by list.
-static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
-
-/// The waits of the submitted `lists` that are not met yet (taken from
-/// them): what the console's GPU would stop at. The title orders work
-/// between its queues this way (the title: the compute queue's
-/// lighting passes wait for a value the graphics queue's depth pass writes
-/// at the bottom of the pipe; run at once, they read a cleared depth
-/// buffer and nothing was lit).
-/// shortcut: a wait holds its whole list (and submission) back, not only
-/// the commands after it.
-pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut unmet = Vec::new();
-    waits.retain(|&(list, wait)| {
-        if !lists.iter().any(|&l| l as usize == list) {
-            return true;
-        }
-        if !wait.met() {
-            unmet.push(wait);
-        }
-        false
-    });
-    unmet
-}
-
-/// The waits each of the submitted `lists` recorded (taken from them),
-/// met or not, at the list's first place in the submission.
-#[cfg(windows)]
-pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut by = vec![Vec::new(); lists.len()];
-    waits.retain(|&(list, wait)| {
-        match lists.iter().position(|&l| l as usize == list) {
-            Some(i) => {
-                by[i].push(wait);
-                false
-            }
-            None => true,
-        }
-    });
-    by
-}
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
     let wait = ValueWait {
@@ -1967,16 +1881,14 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             )
         });
     }
-    // The list is cut here, and the wait stands before what follows.
+    // The list is cut here, and the wait stands before what follows. The
+    // title orders work between its queues this way (the compute queue's
+    // lighting passes wait for a value the graphics queue's depth pass
+    // writes at the bottom of the pipe).
     #[cfg(windows)]
-    if crate::queue::cuts() {
-        cut(this, wait);
-        return;
-    }
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((this as usize, wait));
+    cut(this, wait);
+    #[cfg(not(windows))]
+    let _ = (this, wait);
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     wait_for(this, address, comparison, reference, false);
@@ -1992,13 +1904,6 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
-    }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
@@ -2035,58 +1940,17 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
 }
 
 /// The title wrote a value at the bottom of the pipe (not a timestamp, not
-/// a query result): listed (diagnostics), and with `VICTORY_CUT_WRITES=1`
-/// the host list is cut right behind it, so that the value is stored when
-/// the card has run the list up to there, as on the console, and not when
-/// the whole list has run. Lists of other queues wait for these values
-/// (the title: the compute list that builds the depth pyramid
-/// waits for one, and the meshlet culling of the same frame reads that
-/// pyramid). Off by default: every such write then ends a host list, and
-/// each part is a submission of its own.
+/// a query result): listed for the frame capture.
 fn value_written(this: This, address: u64, value: u64) {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if address != 0
+        && let Some(host) = host_list(this)
     {
-        if address == 0 || this.is_null() {
-            return;
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = value;
-        #[cfg(feature = "diagnostics")]
-        if let Some(host) = host_list(this) {
-            crate::capture::op(std::ptr::from_ref(host) as usize, || {
-                format!("WRITE VALUE at {address:#x} value {value:#x}")
-            });
-        }
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WRITES").is_some_and(|v| v == "1"))
-            || !crate::queue::cuts()
-        {
-            return;
-        }
-        // SAFETY: the title passes one of our lists; a list is recorded by
-        // one thread at a time and is not submitted while it records.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(current) = list.host.as_ref() else {
-            return;
-        };
-        let Some(fresh) = fresh_list() else {
-            return;
-        };
-        current.close();
-        if let Some(done) = list.host.replace(fresh) {
-            // The part so far keeps its waits; nothing stands before the
-            // next one but this part itself.
-            let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
-        }
-        if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
-        }
+        crate::capture::op(std::ptr::from_ref(host) as usize, || {
+            format!("WRITE VALUE at {address:#x} value {value:#x}")
+        });
     }
-    #[cfg(not(windows))]
+    #[cfg(not(all(windows, feature = "diagnostics")))]
     let _ = (this, address, value);
 }
 

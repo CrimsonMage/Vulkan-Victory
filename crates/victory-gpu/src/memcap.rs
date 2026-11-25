@@ -349,43 +349,6 @@ pub(crate) fn drain() -> u64 {
     bytes
 }
 
-/// The line for the memory log: the ceilings, what the system says, and
-/// what the pool did since the start.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn line(host: &crate::host::Host) {
-    let raw = host.video_memory_raw().unwrap_or_default();
-    let (kept, kept_bytes) = {
-        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.entries.len(), pool.bytes)
-    };
-    let s: Vec<u64> = STATS.iter().map(|a| a.load(Relaxed)).collect();
-    tracing::info!(
-        "memory ceilings: the card {} MB in use, the system's budget {} MB, the layer's line {} MB (ceiling {} MB, {} MB kept free; \
-         {} looks lowered; {} host copies of textures the title fills not made at the line); the PC's memory mapped for the card {} MB in use of a ceiling of {} MB, {} buffers refused {} MB, the pool \
-         emptied for it {} times; buffer pool: {} kept {} MB, {} taken from it {} MB, {} made anew {} MB, {} given back, {} let go",
-        raw[1] / MB,
-        raw[0] / MB,
-        clamp_budget(raw[0]) / MB,
-        card_cap().map_or(0, |c| c / MB),
-        card_reserve() / MB,
-        CLAMPED.load(Relaxed),
-        crate::resource::CARD_FULL_REFUSED.load(Relaxed),
-        raw[3] / MB,
-        shared_cap().map_or(0, |c| c / MB),
-        REFUSED[0].load(Relaxed),
-        REFUSED[1].load(Relaxed) / MB,
-        REFUSED[2].load(Relaxed),
-        kept,
-        kept_bytes / MB,
-        s[0],
-        s[1] / MB,
-        s[2],
-        s[3] / MB,
-        s[4],
-        s[5],
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

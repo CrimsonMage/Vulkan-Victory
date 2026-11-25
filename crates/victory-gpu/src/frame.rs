@@ -150,18 +150,6 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
-    #[cfg(windows)]
-    {
-        let us = wait.min(limit).as_micros() as u64;
-        crate::framelog::add(crate::framelog::T::PaceUs, us);
-        crate::framelog::here(crate::framelog::H::PaceUs, us);
-    }
-    #[cfg(all(windows, feature = "diagnostics"))]
-    {
-        use crate::copystat::{C, add};
-        add(C::PaceWaits, 1);
-        add(C::PaceUs, wait.min(limit).as_micros() as u64);
-    }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.

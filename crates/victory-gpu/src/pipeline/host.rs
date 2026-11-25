@@ -536,14 +536,12 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    super::save_refused(shaders);
                     tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -590,14 +588,12 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    super::save_refused(shaders);
                     tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -697,14 +693,12 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                super::save_refused(shaders);
                 tracing::warn!(error = %e, ?shaders, names = %super::names(shaders), "host pipeline refused");
                 host.log_messages();
                 return None;
             }
         };
         tracing::info!(?shaders, "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
