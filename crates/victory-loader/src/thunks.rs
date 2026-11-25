@@ -43,15 +43,7 @@ pub struct ImportSite {
     pub calls: AtomicU64,
 }
 
-static UNIMPLEMENTED_CALLS: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of calls that reached an unimplemented-import stub.
-pub fn unimplemented_call_count() -> u64 {
-    UNIMPLEMENTED_CALLS.load(Ordering::Relaxed)
-}
-
 extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
-    UNIMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     let previous = site.calls.fetch_add(1, Ordering::Relaxed);
     match site.policy {
         UnimplementedPolicy::ReturnZero => {
