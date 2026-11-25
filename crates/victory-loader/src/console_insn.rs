@@ -15,19 +15,12 @@ use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
 
-/// Whether what Windows said about memory is remembered per thread (the regions it found
-/// writable, the code bytes it found readable) and not asked again at every emulated
-/// instruction. A query walks the pages of the region it answers for: asked from outside, it
-/// took 2-9 ms in the title's heaps of 0.6-2.2 GB and 89 ms in its 6.2 GB page pool (run 30),
-/// and the title zeroes blocks of them with `clzero` loops all through a frame: six of its
-/// threads spent 25-78 % of their time inside that query (runs 29 and 30), about 27 s of
-/// processor time in Windows per 9 s frame. On by default; `VICTORY_CLZERO_ASK=1` asks every
-/// time, as before.
-fn remembers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
-}
-
+/// What Windows said about memory is remembered per thread (the regions it found writable,
+/// the code bytes it found readable) and not asked again at every emulated instruction. A
+/// query walks the pages of the region it answers for: it took 2-9 ms in the title's heaps of
+/// 0.6-2.2 GB and 89 ms in its 6.2 GB page pool (run 30), and the title zeroes blocks of them
+/// with `clzero` loops all through a frame.
+///
 /// Answers a remembered region gives before Windows is asked about it again: one freed or
 /// protected meanwhile is forgotten then.
 const ANSWERS: u32 = 4096;
@@ -68,14 +61,11 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
-    let remember = remembers();
-    if remember {
-        let (regions, answers) = WRITABLE.with(Cell::get);
-        if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
-            let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
-            WRITABLE.with(|w| w.set(next));
-            return Some(to.min(end));
-        }
+    let (regions, answers) = WRITABLE.with(Cell::get);
+    if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
+        let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
+        WRITABLE.with(|w| w.set(next));
+        return Some(to.min(end));
     }
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -86,14 +76,12 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
         return None;
     }
     let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
-    if remember {
-        WRITABLE.with(|w| {
-            let (mut regions, answers) = w.get();
-            regions.rotate_right(1);
-            regions[0] = (from, to);
-            w.set((regions, answers));
-        });
-    }
+    WRITABLE.with(|w| {
+        let (mut regions, answers) = w.get();
+        regions.rotate_right(1);
+        regions[0] = (from, to);
+        w.set((regions, answers));
+    });
     Some(to.min(end))
 }
 
@@ -106,7 +94,7 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their bytes are asked about once.
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
+    let known = CODE.with(Cell::get);
     let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
         Some(&(_, n)) => n,
         None => {
@@ -114,12 +102,10 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 return 0;
             }
             let n = (1..=16).rev().find(|&n| readable(rip, n)).unwrap_or(0);
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
-            }
+            let mut known = known;
+            known.rotate_right(1);
+            known[0] = (rip, n);
+            CODE.with(|c| c.set(known));
             n
         }
     };
