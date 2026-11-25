@@ -78,5 +78,15 @@ driver errors and no new crash, and the captures look no worse.
   NVIDIA driver corrupted itself and hung the kernel twice at ~7.7 of 8 GB).
 - 2026-11-25: reverted reading DirectStorage page lists at enqueue (loading
   failed 4,922 times with it; 0 without).
+- 2026-11-25: unified-memory probe on the RTX 5060 Ti under Proton: title
+  memory opened as D3D12 heaps works, and the GPU sees every alias and
+  writes back through every alias. Textures cannot be placed in it. The card
+  reads it at 12.6 GB/s (PCIe), against 199 GB/s from its own memory.
+  GPU-upload (ReBAR) heaps hold buffers and textures at 193 GB/s but are
+  mapped above 1 TiB, so they can't be title memory. Direction: what the CPU
+  writes often (constants, dynamic vertices) is read in place from RAM; big
+  read-mostly data (geometry, textures) is uploaded to the card once, when
+  the title says it arrived (DirectStorage completion, title copies), the
+  way a PC game uses upload and default heaps.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
