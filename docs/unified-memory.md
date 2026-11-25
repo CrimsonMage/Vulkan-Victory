@@ -1,0 +1,399 @@
+# Unified memory
+
+The console has one memory. The title writes buffers and textures with the
+CPU and the GPU reads the same bytes; the GPU writes and the CPU reads them
+after a fence. VIctory today keeps title memory apart from host GPU memory
+and has to find out what changed: write-watch queries, read-only guards on
+every alias of a physical page, snapshots and compares of what shaders may
+have written, tile sweeps, pools and statistics (`shadow.rs`, `watch.rs`,
+`tiles.rs`, `inplace.rs`, `copystat.rs`, most of `host.rs`). In the run of
+2026-11-25 07:38 (Series X profile) a frame checked 8.2 GB for writes,
+refreshed 11.8 GB of copies, compared 0.38 GB on the CPU and copied back
+64 MB: 1.4 frames a second, 126 ms preparing and 104 ms copying back per
+frame.
+
+This document replaces all of that with one rule:
+
+> **Every byte of title memory has one home, and the GPU reads and writes it
+> there.** Title buffers have no host copy. Title textures have a host copy
+> only because the layouts differ, and it is refreshed at points the title
+> names itself (DirectStorage completion, page mapping, its own GPU writes),
+> never by watching memory.
+
+The home is **system memory opened as host heaps**, not a GPU-upload heap.
+Section 1 says why; the rest is the design, the deletion list and a staged
+plan with a test per stage. The probe that checks the facts on the PC is in
+`crates/victory-gpu/src/unified.rs` (`VICTORY_UNIFIED=1`).
+
+## 1. What the host allows
+
+Facts from the sources and the driver, before any design.
+
+**GPU-upload heaps (ReBAR) exist here, for buffers only.** vkd3d-proton
+master supports `D3D12_HEAP_TYPE_GPU_UPLOAD` when the device has one
+device-local heap (`vkd3d_memory_info_decide_hvv_usage`, `resource.c`),
+which this card has; the heap is `DEVICE_LOCAL | HOST_VISIBLE |
+HOST_COHERENT` memory (`memory.c` `vkd3d_select_memory_flags`; a custom heap
+with write-combine in L1 is normalised to the same type). On this driver
+(620.73) that memory type, number 4, is not usable for optimally tiled
+images (`vulkaninfo`: "IMAGE_TILING_OPTIMAL: None"). **No texture the GPU
+samples efficiently can live in a GPU-upload heap on this card.**
+
+**A heap the host maps lies where the host puts it, once.** D3D12 has no call
+that maps a heap at a chosen address or twice. Under Proton the mapping is
+the driver's `mmap` on the Unix side: winevulkan uses
+`VK_EXT_map_memory_placed` only for WoW64 processes (`win32u/vulkan.c`,
+`zero_bits`), so a 64-bit process gets an address near `0x7f..`, far above
+1 TiB, where the copystat memory map already finds every host allocation.
+Title memory must lie below 1 TiB (40-bit texture descriptors, the
+ray-tracing builder; `xmem` `address_range`, decision 0001), and a physical
+page must show at several addresses (pool view, tiled heap). A GPU-upload
+heap can do neither. The probe logs the address it gets.
+
+**The other direction works: a heap opened on memory the title already
+has.** vkd3d-proton implements `OpenExistingHeapFromAddress1` and
+`OpenExistingHeapFromFileMapping` with `VK_EXT_external_memory_host`
+(`device.c`). The heap is a custom heap in the PC's memory (write-back, L0),
+shared and cross-adapter, `ALLOW_ONLY_BUFFERS`. For a section it maps a
+view, imports it and unmaps it again; the driver pins the pages. Wine makes
+anonymous sections with `memfd_create` (`server/mapping.c`), so the pinned
+pages are the pages every view of the section shows: **the GPU sees the same
+bytes as every alias, with no copy and no detection.** The driver supports
+the import (`minImportedHostPointerAlignment` 4 KiB, `maxBufferSize`
+1 TiB, no allocation size limit).
+
+Three catches, all handled below:
+
+- **Silent fallback.** If the import fails, vkd3d-proton allocates memory of
+  its own and returns success (`vkd3d_import_host_memory`). That heap is
+  not the title's memory. Every opened heap is checked once with a canary.
+- **Pinning.** Opened memory is resident from the moment it is opened, used
+  or not.
+- **Bandwidth.** The card reaches the PC's memory over the bus. This card's
+  link is PCIe Gen4 x8 (`nvidia-smi`: GPU max gen 5, host max gen 4, width 8),
+  about 13 GB/s in practice. The card's own memory is about 30 times faster.
+  The probe measures both.
+
+**Capacity.** The card has 8 GB. vkd3d's budget with the desktop running is
+6.78 GiB. Title memory in the Series X run: 5.7 GB of heaps
+(`XMemVirtualAlloc`), a 6.2 GB physical-page pool, and 4.1 GB of views that
+are aliases of pool pages, not more memory. The Series S profile tells the
+title it has 7.8 GB (`XMemGetWorkingSetStatistics`, latest log). Title
+memory does not fit on the card beside the render targets (3.3 GB in the
+07:38 run) and the detiled textures, whichever way it is mapped. The PC has
+31 GB.
+
+So title memory stays in the PC's memory, which is how it has to be anyway,
+and becomes the GPU's memory by being opened, not copied. The card's memory
+holds what only the host GPU touches: render targets and detiled textures.
+
+## 2. Memory classes
+
+| Class | What | Where | CPU | GPU |
+|---|---|---|---|---|
+| **A. Title memory** | `XMemVirtualAlloc` regions, physical-page sections, D3D12.X heaps, committed resources (from the title's allocator, so inside its heaps) | PC memory, at the title's addresses below 1 TiB, opened as heaps (L0, write-back, coherent) | title, DirectStorage, VIctory reads | reads and writes in place through one buffer spanning each heap |
+| **B. Host textures** | detiled copies of title textures; render targets, depth and UAV textures the host owns (as today) | card memory (`DEFAULT`) | never | yes |
+| **C. Upload ring** | bytes VIctory writes and never reads: detiled texels on their way into class B, its own constants | GPU-upload heap (ReBAR), buffers only, a fixed 128–256 MB | write-combined writes only | copy source |
+| **D. VIctory's own** | indirect scratch, descriptor heaps, read-backs, query heaps | as today | as today | as today |
+
+Rule for CPU reads (question 3): **the title's CPU reads only class A**,
+which is write-back and coherent, so read-backs, resolved query results,
+buffers shaders wrote (culling output, exposure, counters) and DirectStorage
+destinations read at full CPU speed after the title's fence. Class C is
+write-combined: CPU reads from it are uncached, and the probe prints how
+slow. Nothing the title can read lives there. VIctory's own read-backs stay
+in `READBACK` heaps.
+
+## 3. Heap layout and address translation
+
+Each class A unit becomes one host heap and one spanning buffer:
+
+| Title memory | Made by | Opened as |
+|---|---|---|
+| `XMemVirtualAlloc` region (address-constrained, no base) | `VirtualAlloc2` as today, **without** `MEM_WRITE_WATCH` | `OpenExistingHeapFromAddress1(base, committed extent)` at the first GPU use of an address in it |
+| `XMemAllocatePhysicalPages` | a section, **always `SEC_COMMIT`** (it already is under Wine) | `OpenExistingHeapFromFileMapping(section)` at the first GPU use of any of its pages. If the 6.2 GB pool does not open whole (probe `VICTORY_UNIFIED_PROBE_BIG_MB=6400`), xmem backs one request with sections of at most 1 GiB (`Slice` already records a section per page) |
+| D3D12.X `CreateHeap` | today VIctory's own allocator, at an address above 1 TiB (`resource.rs` `Memory::new`) | an `xmem`-style constrained `VirtualAlloc2`, then opened like a region |
+
+The spanning buffer is placed at offset 0 of the heap over all of it, with
+`ALLOW_UNORDERED_ACCESS | ALLOW_CROSS_ADAPTER`, in the common state. Every
+use of a title GPU address names it plus an offset: buffer views, root
+views, vertex and index views, indirect arguments and counts, copy sources
+and destinations, query resolves, and the raw-address directory of
+`memory.rs` (the BVH walkers). Its entries become heap slots instead of
+copy numbers, and change only when heaps open or pages are remapped.
+D3D12.X buffer resources get no host resource at all. Their GPU address is
+the title address, translated. If a driver limit ever shows, one placed
+buffer per title buffer at the matching heap offset is the fallback. D3D12.X
+textures cannot be placed in the heap: the layout differs (section 6), and
+neither L0 imported heaps nor GPU-upload heaps hold optimal textures here.
+
+Translation is `unified_map::Map`: by title address, a span's length, heap
+and heap offset; `resolve(at, len)` answers a home, `Scattered` or
+`Unknown`. It holds hundreds of entries, not millions, and replaces
+`shadow::find`/`find_any`/`exact`/`extent`, the seam that
+`descriptor/host.rs` and `draw.rs` call at about ten sites each today.
+
+Every heap is checked when it is opened: the CPU writes 16 bytes at a
+committed address of it, the GPU copies them out, and they must match.
+A mismatch is the silent fallback. The heap is dropped, the unit is counted
+as refused and logged, and its addresses resolve `Unknown`. Until stage 4,
+`Unknown` means the old copy path. After stage 4 it is an error line.
+
+## 4. Aliases (question 1)
+
+**On the CPU, nothing changes.** `xmem` keeps placeholders and
+`MapViewOfFile3` views of sections. That is already the console's page
+table, and a view can be mapped, unmapped and remapped under an opened heap,
+because the heap is the section, not a view (native result in
+`inplace.rs`'s notes, and the vkd3d implementation unmaps its own view
+right after import).
+
+**On the GPU, a contiguous run is a span.** `XMemMapPhysicalPages`,
+`...Scatter` and `map_alias` (the queue's `CopyPageMappingsBatchX`) call
+`Map::insert(address, len, section heap, page offset)` per run of
+consecutive pages and `Map::remove` for unmaps. Two addresses showing one
+page resolve to the same heap offset, the same bytes. There is nothing to
+keep in step.
+
+**Scattered pages.** After `CopyPageMappingsBatchX` the tiled heap is page
+by page from anywhere in the pool. A range over it resolves `Scattered`.
+
+- *Textures* there are detiled by the CPU through the title's own addresses
+  (section 6), where the scattering is the kernel's business. Most of the
+  tiled heap is textures.
+- *Buffers and raw windows* there need a GPU page table. D3D12 has one: a
+  **reserved buffer over the tiled heap's reservation, whose 64 KiB tiles
+  are mapped (`UpdateTileMappings`) into the section heaps** at the moments
+  xmem maps pages, on the host queue in submission order. This is the
+  console's GPU page table in D3D12 terms. It depends on the driver taking
+  tile mappings into an opened heap. `inplace.rs` records that the software
+  adapter refuses them and removes the device. `VICTORY_UNIFIED=2` asks this
+  driver.
+- Without tiles, a scattered buffer range keeps today's copy (the shadow
+  path, restricted to scattered view memory) and is counted. The in-place
+  census (`VICTORY_INPLACE_PROBE`) already sorts title buffers into "one run
+  of a section" and "scattered pages". If scattered buffers turn out to be
+  rare, the fallback is a few hundred lines kept, not a design.
+
+## 5. Synchronisation
+
+The title already orders everything. Its CPU writes come before the
+`ExecuteCommandLists` that reads them, and its CPU reads come after a fence
+wait on work that wrote. Coherent memory needs nothing more:
+
+| Point | Today | Unified |
+|---|---|---|
+| `ExecuteCommandLists` | bring changed pages of every copy up to date; snapshot ranges shaders may write | detile the stale textures the lists sample (section 6), then submit. No buffer work |
+| after a submission | compare snapshots, write differences back, settle flights | nothing; mark textures over the submission's declared write ranges stale |
+| `Signal` / fence wait / `PresentX` | settle and copy back before the CPU may look | host fence only |
+| DirectStorage completion (`dstorage.rs` `into_destination`, already calls `title_memory_written` / `pages_written`) | guard bookkeeping | `Stale::written(range)`, and for page destinations at every address the pages show (`xmem::shown_at`) |
+| page mapping (`XMemMapPhysicalPages`, `map_alias`) | remap notifications, guards reset | `Map::insert/remove` + `Stale::written`; with tiles, `UpdateTileMappings` |
+| title cache flush or invalidate packets, barriers | partly a trigger for copies | a UAV or global barrier; no CPU work |
+| `VirtualFree` of an opened region, `XMemFreePhysicalPages` of a whole section | — | retire the heap after the GPU is idle on it (`host::retire`). Natively the heap must go before the free (error 87, `inplace::title_memory_freeing`). The title was not seen freeing its heaps |
+
+Host GPU caches: the memory is host-coherent. Vulkan makes host writes
+before `vkQueueSubmit` visible, and the title's fence waits map to host
+fence waits after the GPU's writes are made available. A write the title
+makes while the GPU reads the same bytes is the title's own race, as on the
+console.
+
+## 6. Textures (question 2)
+
+They keep a host copy. The console's tiled layouts are AMD swizzles; the
+card's are its own and not exposed; D3D12's standard swizzle is neither
+supported here nor the console's; and on this card a texture cannot be put
+in CPU-visible card memory at all. So title memory stays the truth and the
+host texture is derived from it:
+
+- **Made stale** by: creation (never detiled); DirectStorage completion over
+  its memory; a page mapping over its memory; a title GPU write over its
+  memory that is not to the texture object itself (copies into raw memory,
+  UAV writes over raw memory: their ranges are known at record time),
+  marked when the submission completes. Writes to the texture object itself
+  go to the host texture directly, as today.
+- **Refreshed** before the first submission that samples it while stale:
+  the CPU detiles from the title's address (cached PC memory, coherent with
+  the GPU's writes after the fence) straight into the upload ring (class C,
+  write-combined streaming writes), and the GPU copies ring → host texture
+  card to card. A later step can detile on the GPU from the spanning buffer.
+- **The one case without an event: textures the title's CPU fills itself**
+  (movie frames, glyph atlases, CPU-made textures), which no DirectStorage
+  request or GPU command wrote. Those keep today's content fingerprint at
+  sampling (`texture.rs` `fingerprint`). A texture is in that class while
+  nothing announced has ever written it. This is the only residual check, a
+  hash of the few textures in it (21 MB a frame in the 07:38 run). No write
+  watching and no guards.
+- **Eviction is free.** Title memory is the truth, so a host texture let go
+  for room (the existing `let_go_idle` / `room`) is detiled again on its
+  next use. There is never anything to copy back.
+
+`VICTORY_UNIFIED_CHECK=1` (stage 3) fingerprints every sampled texture and
+logs those that changed with no event. It should report only the CPU-filled
+class. Anything else is a writer that has to be found.
+
+## 7. Capacity and spill (question 4)
+
+- **Class A never goes to the card** in stages 1–4. It is pinned PC memory:
+  about 12 GB on the Series X profile (heaps plus pool; views add nothing),
+  about 8 GB on Series S. The 07:38 run's process had 18.4 GB in memory
+  (its memory line), mostly copies, and they go. Opening lazily, at the first GPU use
+  of each unit, pins only units the GPU ever touches. The Series S profile
+  is the right default for an 8 GB card.
+- **Card memory, in order of claim:** render targets, depth and UAV
+  textures (must be there, the GPU writes them every frame); the upload
+  ring, fixed at 128–256 MB; VIctory's own buffers; then detiled title
+  textures, least recently sampled let go first when
+  `QueryVideoMemoryInfo` leaves less than 512 MB. If that is not enough,
+  vkd3d places new `DEFAULT` allocations in PC memory: memory type 0 takes
+  optimal images. That is the driver's spill, slow but correct.
+- **No promotion of title buffers to the card** unless stage 2 shows the
+  bus is the limit. Stage 5 says how, and it is optional.
+
+The bus budget is the one number to watch. At 13 GB/s, a 30 fps frame can
+read about 430 MB of buffers from PC memory before the bus alone costs the
+frame. `nvidia-smi dmon -s t` prints the bus traffic per second during
+play.
+
+## 8. What goes, what stays (question 5)
+
+Line counts from `integrate` at 37164d6. "Goes" for whole files is exact;
+for shared files it is an estimate by section.
+
+| File | Lines | Goes | Why |
+|---|---:|---:|---|
+| `victory-gpu/src/shadow.rs` | 4121 | 4121 | host copies of buffers and windows, flights, snapshots, compares, card copies |
+| `victory-gpu/src/watch.rs` | 1653 | 1653 | write watch, guards on every alias, the fault handler |
+| `victory-gpu/src/inplace.rs` | 1379 | 1379 | superseded: `unified.rs` opens the memory; its probe and census are replaced |
+| `victory-gpu/src/tiles.rs` | 1587 | 1587 | levels on demand (off by default); eviction is free once title memory is the truth. Bring it back only if texture room is still the limit |
+| `victory-gpu/src/plaincopy.rs` | 318 | 318 | copies in place of reads of title memory |
+| `victory-gpu/src/copystat.rs` | 1358 | ~1100 | statistics of copies; the memory map and timing lines stay |
+| `victory-gpu/src/memory.rs` | 319 | ~200 | the directory names heaps, not copies; faults go |
+| `victory-gpu/src/host.rs` | 8824 | ~4500 | card work, in-flight fetch, relay, late wait and flights (1406–3695); card and relay methods (3838–5075); deferred refresh batch (6399–7075); `copy_mapped`/`read_*`/`write_mapped` (7075–7275); copy tests (8513–8824) |
+| `victory-gpu/src/draw.rs` | 3489 | ~500 | root-view readiness, heap-buffer passes, refresh before draws |
+| `victory-gpu/src/descriptor/host.rs` | 3644 | ~600 | choosing a copy for a buffer view (`buffer_copy`, `own_bytes*`, raw windows, exact copies) |
+| `victory-gpu/src/texture.rs` | 1618 | ~450 | change detection by watch and query (`readable`, `committed_by_query`, `mapped_bytes`, waits); detiling and staging stay |
+| `victory-gpu/src/resource.rs` | 4047 | ~300 | shadow registration and the buffer-copy accounting |
+| `victory-gpu/src/list.rs`, `queue.rs`, `indirect.rs` | 6313 | ~300 | reads of title memory through copies |
+| `victory-hle/src/modules/xmem.rs` | 1455 | ~120 | `MEM_WRITE_WATCH`, `shown`-for-guards, remapping hooks; ~60 lines added (sections committed, map and heap notifications) |
+| `victory-hle/src/modules/dstorage.rs` | 1797 | ~20 | `kernel_will_write` and guard comments |
+| **Total** | | **~17,100** | 32 `VICTORY_*` switches live in the five deleted files alone |
+
+Added: `unified.rs` runtime (opening, canary, ring, stale-texture driving)
+about 600 lines; `unified_map.rs` 230 (with tests); the probe, 970 lines,
+can go once its answers are in this document. **Stays:** `xmem`'s placeholders
+and sections (the CPU page table), detiling (`victory-formats`), host
+textures, twins and render targets, descriptors, pipelines, shader
+translation, `memcap.rs`, the frame and present path.
+
+## 9. Staged migration
+
+One switch, `VICTORY_UNIFIED`, with levels; each level includes the ones
+below. The coordinator runs each test in-game. Default 0 changes nothing.
+
+**Stage 0: probe (done, `VICTORY_UNIFIED=1`).** What to look for in the log
+(`grep "unified probe"`):
+
+- `aliases: ... the GPU reads what the CPU wrote through both true ... by a
+  copy true, by a shader true` is the design's foundation. If it says `THE
+  HEAP IS NOT THE MEMORY`, the import fell back and this design does not
+  work as is.
+- `private memory ... the GPU reads what the CPU wrote: true`.
+- `GPU-upload heap ... the CPU sees it at 0x...: ABOVE 1 TiB` is expected
+  under Proton and confirms section 1. `texture heap in GPU-upload: REFUSED`
+  or `false` is expected on this card.
+- `the card reads 256 MB at: X GB/s from a heap opened on a section, Y from
+  a GPU-upload heap, Z from its own memory` gives the bus cost of section 7.
+- the `VERDICT` line sums it up.
+
+Then, separately: `VICTORY_UNIFIED=2` (tiles into an opened heap; may
+remove the device, so run it alone and read the last "tiles:" line), and
+`VICTORY_UNIFIED=1 VICTORY_UNIFIED_PROBE_BIG_MB=6400` (one pool-sized
+section: open time, pinned memory, whether a 6.25 GB buffer places). Watch
+free RAM.
+
+**Stage 1: open and map, change nothing (`VICTORY_UNIFIED=3`).** xmem
+notifies regions, sections and views (3 call sites already exist:
+`title_memory_section`, `title_memory_view`, `title_memory_remapped`, plus
+one for regions). `unified.rs` opens heaps lazily, canaries them and fills
+the `Map`. `shadow::find` callers also ask the map, without using the
+answer. Log every 10 s: heaps open and MB, refused and canary failures,
+lookups resolved, scattered and unknown. **Test:** 5 minutes from boot into
+the world. Pass: no canary failure, ≥ 99% of buffer lookups resolve or are
+scattered, RAM within budget, frame rate unchanged.
+
+**Stage 2: buffers in place (`VICTORY_UNIFIED=4`).** For a resolved range,
+`shadow::find` returns an in-place shadow over the spanning buffer (the
+`place: Some(..)` path that `inplace.rs` already feeds, so no refresh, no
+snapshot and no copy-back are taken for it); scattered ranges keep copies.
+**Test:** the 07:38 scene (`autorun.sh`, same keys). Pass: copystat "N
+refreshes ... MB" and "shader writes looked for" near 0; "copying back" 0 ms;
+captures match the previous run's frames; fps up. Record `nvidia-smi dmon
+-s t` and the GPU ms in the fps line: that is the bus cost.
+
+**Stage 3: textures by events (`VICTORY_UNIFIED=5`).** xmem stops
+requesting `MEM_WRITE_WATCH`; guards and watch queries are off; `Stale` is fed
+by DirectStorage, page mappings and declared GPU writes; CPU-filled textures
+keep the fingerprint. **Test:** load into the world, walk, open the menu,
+play a movie. Pass: textures stream in (no black or old textures), UI
+text and movies update, `VICTORY_UNIFIED_CHECK=1` reports no texture changed
+without an event outside the CPU-filled class, texture ms per frame down.
+
+**Stage 4: delete.** Unified becomes the only path and the switch goes;
+section 8's list is removed; `Unknown` ranges become an error line.
+**Test:** stage 2 and 3 tests again on the clean build; build time and
+binary size down; no new error lines over 15 minutes.
+
+**Stage 5 (optional): what the measurements ask for.** If the probe said
+tiles work and stage 1 counted scattered buffers, map the tiled heap with a
+reserved buffer (section 4) and drop the last copies. If stage 2 shows the
+bus is the limit (bus traffic near 13 GB/s, GPU ms high), promote
+DirectStorage-filled buffers that nothing else writes into card memory at
+DirectStorage completion, demoting on any announced write or on the first
+CPU write (one read-only protection per promoted range, set once, no
+re-arming). **Test:** bus traffic and GPU ms before and after.
+
+## 10. Risks
+
+1. **Silent import fallback** (vkd3d-proton). Mitigated by the canary per
+   heap; a failure is loud and leaves the old path for that unit until
+   stage 4.
+2. **Pinned memory.** 8–12 GB resident. Mitigated by lazy opening, the
+   Series S profile, smaller sections. A 16 GB PC would struggle.
+3. **Bus bandwidth.** Buffer reads cross PCIe Gen4 x8. The design removes
+   CPU work measured in hundreds of ms a frame and adds GPU-side bus time.
+   Measure it (probe, stage 2); stage 5 is the answer if needed.
+4. **D3D12 view rules on console offsets.** Table CBVs want 256-byte
+   alignment, structured views an offset that is a multiple of the stride.
+   Copies today start at the buffer's own offset, so the rules are no worse
+   than now. Root views under vkd3d are raw addresses with no such rule.
+5. **One buffer in many states.** The spanning buffer is read, written,
+   copied and used as indirect arguments in one list. Buffers have no
+   layout under enhanced barriers and vkd3d ignores buffer states; keep it
+   in common with UAV/global barriers, as copies are used today.
+6. **Native Windows.** `OpenExistingHeapFromFileMapping` refuses
+   `SEC_RESERVE`, so the pool must be committed (the commit limit, error
+   1450, is why it is reserved today), and an opened address range cannot be
+   freed or protected (error 87). Proton first; on Windows, smaller sections
+   and a pagefile note.
+7. **CPU-filled textures misclassified.** A texture written by both
+   DirectStorage and later the CPU would be missed. The check mode finds it;
+   the fix is to keep it in the fingerprint class.
+8. **Freed and reused memory.** A heap must be retired before its pages
+   are reused, or the GPU reads the old pinned pages. The title was not seen
+   freeing GPU memory. Hook its frees when it does.
+
+## 11. Recommendation
+
+Build the system-memory home (classes A–D), not "title memory is a
+GPU-upload heap". On this stack the second cannot hold textures, cannot be
+placed below 1 TiB, cannot alias, and would not fit. The first is what
+vkd3d-proton already implements, keeps every title address and alias as it
+is, and removes the whole detection machinery with it. GPU-upload memory
+has one job: the write-only upload ring that carries detiled texels into
+card memory.
+
+Order: run the probe (`VICTORY_UNIFIED=1`, then `=2` alone, then the big
+section). If the alias answers are true, stages 1 and 2 are about 600 lines
+on top of the existing in-place plumbing and give the decisive measurement:
+copy cost gone, bus cost in its place. Stage 3 removes write watching,
+stage 4 deletes about 17,000 lines.
