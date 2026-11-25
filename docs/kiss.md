@@ -222,5 +222,12 @@ driver errors and no new crash, and the captures look no worse.
   CPU-only shared pools never GPU heaps. Series S is the cheapest profile
   (pool 3,977 MiB, heaps 8.4 GB). Frame interval comes from data (30 fps on
   S; table supports 60/120). Only three command-line switches exist.
+- 2026-11-25: indirect bounding: unbounded and "bound only after a drop in
+  the same list" both hang the GPU at frame ~1,440 (Xid 109); bounding every
+  shader-writable argument buffer never did, but costs ~0.18 ms per call.
+  f3bf739 reverted; making the bound cheap instead. The watchdog now also
+  stops the game on any NVIDIA Xid.
+- 2026-11-25: the title's ray-tracing builder stays off: 3 of its 53 programs
+  don't translate (wave64 first-lane reads); being fixed.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
