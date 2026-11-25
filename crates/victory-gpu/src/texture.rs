@@ -614,6 +614,11 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    // Every later draw of the list that samples it: done, before the lock
+    // all recording threads share.
+    if list.used_already(resource as usize) {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
