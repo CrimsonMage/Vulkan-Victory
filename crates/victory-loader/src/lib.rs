@@ -45,7 +45,7 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
-pub use thunks::UnimplementedPolicy;
+pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
