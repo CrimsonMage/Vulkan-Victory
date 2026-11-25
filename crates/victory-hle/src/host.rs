@@ -92,7 +92,6 @@ pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     imp::resolve(dll, &name)
 }
 
-#[cfg(windows)]
 mod imp {
     use std::collections::HashMap;
     use std::ffi::CString;
@@ -137,12 +136,5 @@ mod imp {
             )
         } as usize;
         (handle != 0).then(|| *cache.entry(key).or_insert(handle))
-    }
-}
-
-#[cfg(not(windows))]
-mod imp {
-    pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
-        None
     }
 }

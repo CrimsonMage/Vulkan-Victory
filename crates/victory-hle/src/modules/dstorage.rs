@@ -432,7 +432,6 @@ fn work(scheduler: &'static Scheduler) {
         let result = execute(&job.request);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
-        #[cfg(windows)]
         {
             use victory_gpu::framelog::{T, add};
             add(T::DiskReads, 1);

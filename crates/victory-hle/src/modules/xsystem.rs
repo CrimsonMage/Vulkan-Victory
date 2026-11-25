@@ -133,7 +133,6 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
 /// takes a missing value for a PC.
-#[cfg(windows)]
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -362,7 +361,6 @@ mod device_type {
         }
     }
 }
-#[cfg(windows)]
 pub(crate) use device_type::module;
 
 #[cfg(test)]

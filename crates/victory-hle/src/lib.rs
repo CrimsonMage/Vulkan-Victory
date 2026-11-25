@@ -93,7 +93,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn shared_api_sets_pass_through_to_host() {
         let r = HleResolver::default();
@@ -108,7 +107,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn overrides_win_over_host() {
         let r = HleResolver::default();

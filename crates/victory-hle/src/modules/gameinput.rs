@@ -510,24 +510,8 @@ impl State {
     }
 }
 
-#[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
-}
-
-#[cfg(not(windows))]
-fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
-    }
-    Box::new(Nothing)
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -1068,7 +1052,6 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
-#[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
 

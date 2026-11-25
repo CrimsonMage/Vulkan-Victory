@@ -181,7 +181,6 @@ pub fn title() -> Title {
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
-#[cfg(windows)]
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{

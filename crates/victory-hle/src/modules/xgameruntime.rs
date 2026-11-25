@@ -323,7 +323,6 @@ mod tests {
         assert_eq!(out, untouched);
         assert_eq!(FreeLibrary(runtime), 1);
 
-        #[cfg(windows)]
         {
             let kernel32 = load(c"kernel32.dll");
             assert!(!kernel32.is_null(), "host DLLs still load from the host");
