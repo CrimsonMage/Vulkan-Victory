@@ -10824,8 +10824,7 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        over
+        self.s.m.cmp(c, p, next, limit)
     }
 
     /// The block a lane stopped by the iteration limit leaves through.
