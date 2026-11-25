@@ -368,7 +368,7 @@ impl State {
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
-        self.bound = [None; 2];
+        let was = self.heaps;
         self.heaps = [0; 2];
         for &h in heaps {
             if !h.is_null() {
@@ -376,8 +376,14 @@ impl State {
                 self.heaps[usize::from(samplers)] = h as usize;
             }
         }
+        if self.heaps != was {
+            self.bound = [None; 2];
+        }
     }
 
+    /// The root arguments of a kind, to change: the next binding of the
+    /// kind binds anew ([`State::bound`]). Setting what is set already
+    /// changes nothing.
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
         self.bound[usize::from(compute)] = None;
         if compute {
@@ -388,21 +394,30 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
-        set(self.roots(compute), slot, Root::Table(handle));
+        if !matches!(self.roots_ref(compute).get(slot as usize), Some(&Root::Table(h)) if h == handle) {
+            set(self.roots(compute), slot, Root::Table(handle));
+        }
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+        if !matches!(self.roots_ref(compute).get(slot as usize), Some(&Root::View(a)) if a == address) {
+            set(self.roots(compute), slot, Root::View(address));
+        }
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
-        let roots = self.roots(compute);
         let s = slot as usize;
+        let end = offset as usize + values.len();
+        if let Some(Root::Constants(c)) = self.roots_ref(compute).get(s)
+            && c.get(offset as usize..end) == Some(values)
+        {
+            return;
+        }
+        let roots = self.roots(compute);
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
             set(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
-            let end = offset as usize + values.len();
             if c.len() < end {
                 c.resize(end, 0);
             }
@@ -2545,7 +2560,7 @@ impl State {
     /// ~4,500 executions and the card drained twice around every one.
     /// shortcut: a mesh record's second and third group counts are run as
     /// written (the clamp cut them to at most 1); the title's mesh programs
-    /// are one-dimensional, and its direct mesh dispatches pass 1 for both.
+    /// are one-dimensional, and its direct mesh dispatches run with 1 for both.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
