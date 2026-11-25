@@ -268,16 +268,11 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
-/// Whether the title's root SRVs are bound as one-view tables of the
-/// buffer's host copy, whose reads past its end return zeros, rather than
-/// as root descriptors, which have no size: a mesh shader's vertex fetch
-/// has no record limit, and a read past the copy reaches whatever the host
-/// placed after it (memory it has freed: the device is removed, upstream
-/// PR #493). `VICTORY_ROOT_SRV_DIRECT=1` goes back to root descriptors.
-pub(crate) fn bounded_root_srvs() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
-}
+// The title's root SRVs and UAVs are bound as one-view tables of the
+// buffer's host copy, whose reads past its end return zeros, rather than as
+// root descriptors, which have no size: a mesh shader's vertex fetch has no
+// record limit, and a read past the copy reaches whatever the host placed
+// after it (memory it has freed: the device is removed, upstream PR #493).
 
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
@@ -437,7 +432,7 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.

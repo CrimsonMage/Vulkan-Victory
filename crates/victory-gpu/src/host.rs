@@ -1417,21 +1417,13 @@ mod relay_tests {
     }
 }
 
-/// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
-/// relay it stopped the submitting thread twice a frame for 92-103 ms in
-/// all while the card stood idle 64-113 ms a frame, runs 158, 159 and 162;
-/// 32 settled the flights three times a
-/// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
-/// asked and none refused; watch "tables asked, N refused"): their dynamic
-/// descriptor slots, upload
-/// memory and scratch chunks are held until then, and a frame's lists held
-/// all at once ran the slots out before (run 45).
+/// The most host lists in the air before a submission waits for fewer
+/// (128 stopped the submitting thread twice a frame while the card stood
+/// idle): their dynamic descriptor slots, upload memory and scratch chunks
+/// are held until they land, and a frame's lists held all at once ran the
+/// slots out before.
 fn late_most() -> usize {
-    static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    256
 }
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
@@ -2034,26 +2026,7 @@ fn relay_hand_back(back: &[Declared]) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
-
-    /// Copies join only when both ends continue and the whole does not
-    /// overlap itself.
-    #[test]
-    fn copies_join_only_end_to_end_and_apart() {
-        // (destination, source, bytes)
-        assert!(continues((1000, 5000, 16), (1016, 5016, 32)));
-        assert!(continues((5000, 1000, 16), (5016, 1016, 32)));
-        // A gap, or only one side continues.
-        assert!(!continues((1000, 5000, 16), (1020, 5016, 32)));
-        assert!(!continues((1000, 5000, 16), (1016, 5020, 32)));
-        assert!(!continues((1000, 5000, 16), (1000, 5000, 16)));
-        // Together they would overlap: the second reads what the first wrote.
-        assert!(!continues((1000, 1016, 16), (1016, 1032, 16)));
-        assert!(!continues((1016, 1000, 16), (1032, 1016, 16)));
-        // They touch without overlapping.
-        assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
-        assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
-    }
+    use super::{join_ranges, touches};
 
     /// Ranges are found by what they hold, not by where they start, and a
     /// range that only touches another's end does not touch it.
@@ -2084,46 +2057,6 @@ mod late_tests {
     }
 }
 
-/// Whether a title buffer copy that continues the one recorded before it
-/// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
-/// default).
-///
-/// Each copy is done at submission through the kernel, which reports a
-/// page that is not there instead of faulting (`copy_mapped`), tells the
-/// write watch and the guards, and ends the refreshes gathered so far: a
-/// call into the kernel for some 480 bytes, 14,042 times a frame in run 86
-/// (6.8 MB; "moves 19 ms" with the refreshes' own reads). How many of them
-/// continue the one before is counted either way and said on its own line
-/// with the frame rate; the switch is worth that many kernel calls.
-///
-/// Joined, the same bytes move: [`continues`] joins only copies whose
-/// ranges, taken together, do not overlap, and nothing is recorded between
-/// two steps that follow each other. What differs: a page that is not
-/// mapped now fails the joined copy as a whole (it then goes page by page,
-/// zeros for what cannot be read, as a single copy does), where before
-/// only the copy that held it did.
-fn join_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
-}
-
-/// Since the last frame-rate line: title buffer copies recorded, and those
-/// that continue the one before ([`join_copies`]).
-static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// Whether the copy `next` (destination, source, bytes) goes on exactly
-/// where `last` ended, source and destination both, and the two as one do
-/// not overlap (source over destination): then one copy of both moves the
-/// bytes the two would move in turn.
-fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
-    let ((d, s, n), (dst, src, len)) = (last, next);
-    let Some(all) = n.checked_add(len) else {
-        return false;
-    };
-    d.checked_add(n) == Some(dst)
-        && s.checked_add(n) == Some(src)
-        && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
-}
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
@@ -3716,19 +3649,6 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
-        COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
-        // A copy that goes on where the one recorded just before it ended,
-        // source and destination both: with `join_copies` the two are one
-        // step.
-        if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
-            && continues((*d, *s, *n), (dst as usize, src as usize, len))
-        {
-            COPIES_JOINED[1].fetch_add(1, Ordering::Relaxed);
-            if join_copies() {
-                *n += len;
-                return;
-            }
-        }
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -3829,13 +3749,6 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
-    }
-
-    /// The bytes of scratch chunks the list holds now (after a reset:
-    /// none while lists share their chunks).
-    pub(crate) fn scratch_kept(&self) -> u64 {
-        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch.chunks.iter().map(|c| c.1).sum()
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -4387,7 +4300,7 @@ impl Host {
     /// than shared buffers get: uploads are what the rest waits on).
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let asked = size;
-        let size = if crate::memcap::on() { crate::memcap::class(crate::memcap::Kind::Upload, size) } else { size };
+        let size = crate::memcap::class(crate::memcap::Kind::Upload, size);
         if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Upload, size, asked) {
             return Some(pooled);
         }

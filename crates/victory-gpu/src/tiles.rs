@@ -620,6 +620,12 @@ impl Tiled {
         if self.levels >= 32 { u32::MAX } else { (1 << self.levels) - 1 }
     }
 
+    /// The bytes of the tiles it has now.
+    #[cfg(test)]
+    pub(crate) fn given_bytes(&self) -> u64 {
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+    }
 }
 
 impl Drop for Tiled {

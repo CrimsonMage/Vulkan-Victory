@@ -87,8 +87,6 @@ static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
 /// The most bytes kept spare, and the largest buffer that is pooled.
 const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
-/// Staging buffers taken from the spare ones, and made, since the start.
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A mapped upload buffer of `total` bytes for a texture's staging, all
 /// zeros, and its pool size (0: not pooled).
@@ -101,11 +99,9 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// to 500 uploads in a frame (run 222), and those are the frames that
 /// dip. Buffers of up to 8 MiB are now kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
-/// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+    if size > SPARE_MOST.1 {
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -117,13 +113,11 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         taken
     };
     if let Some(Spare(buffer, data)) = spare {
-        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
         // else holds.
         unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
         return Some((buffer, data as *mut u8, size));
     }
-    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
@@ -343,65 +337,6 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
-///
-/// A texture whose memory is all mapped is read in place, under a lock
-/// the runtime takes alone while it changes a mapping
-/// (`crate::watch::title_memory_reading`), so that no page goes away under
-/// the read. While the world streams in the runtime remaps all the time,
-/// and each of the frame's 150-360 refreshes waited for it: runs 99-101
-/// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
-/// 3,708 ms, and on every one of them the wait for this lock is the whole
-/// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
-/// ms, the texture's own lock 0).
-///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
-///
-/// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
-fn no_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
-}
-
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// Since the last frame-rate line, of texture refreshes on every thread, in
-/// microseconds: waiting for the texture's own lock (another thread is
-/// refreshing the same texture), asking the write watch and the guards,
-/// waiting for title memory to hold still (the lock the runtime takes
-/// alone while it remaps, `crate::watch::title_memory_reading`), and the
-/// refreshes in all.
-///
-/// While the world streams in, the frame line's "textures" is seconds a
-/// frame in some runs and tenths in others for the same megabytes (2,566
-/// ms for 110 MB in run 93, 314 ms for 132 MB in run 91; before these
-/// counters, runs 81, 83, 85 and 94 each had lines of 1.5-2.9 s), and the
-/// submitting thread is not running while it lasts (run 93: 240-310 ms of
-/// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
-/// These say for what.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
-fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
-    let started = std::time::Instant::now();
-    let out = f();
-    let us = started.elapsed().as_micros() as u64;
-    REFRESH_WAITS[slot].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-    if slot == 2 {
-    }
-    out
-}
-
 thread_local! {
     /// Room to read a texture's memory into: one buffer per submitting
     /// thread. Each texture kept its own, a second copy in memory of every
@@ -421,23 +356,10 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     })
 }
 
-/// Whether a texture all of whose memory is mapped is read through the
-/// kernel's copy instead of in place (`VICTORY_TEXTURE_COPY=1`; off by
-/// default). Round 3 of the memory work read every such texture that way
-/// to be safe from pages taken away under the read; it cost 0.6 ms per MB
-/// against 0.3 in place (90-105 ms a frame while the world streams in, runs
-/// 72 and 73, against 20-40), and both runs with it lost the graphics
-/// device, for a reason not found. The read in place is safe now for
-/// another reason (`crate::watch::title_memory_reading`); this switch is
-/// left to tell whether the copy was what lost the device.
-fn through_copy() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
-}
-
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
+#[cfg(test)]
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
@@ -943,9 +865,9 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -967,11 +889,7 @@ impl Staging {
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
-        // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
-        static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
-        {
+        if let Some((now, written)) = crate::watch::writes(start, start + size, true) {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -986,17 +904,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
-        };
+        let _mapped = crate::watch::title_memory_reading();
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1010,35 +918,19 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
-            let changed = with_read(size, |read| {
+            with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
-                    return false;
+                    return;
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
-                    return false;
+                    return;
                 }
                 self.detile(read);
-                true
             });
-            #[cfg(feature = "diagnostics")]
-            if changed {
-            }
-            let _ = changed;
             return size;
-        }
-        if through_copy() {
-            return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
-                if last.hash == Some(hash) {
-                    return size;
-                }
-                last.hash = Some(hash);
-                self.detile(tiled);
-                size
-            });
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
@@ -1050,35 +942,6 @@ impl Staging {
         last.hash = Some(hash);
         self.detile(tiled);
         size
-    }
-
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
-        }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1212,28 +1075,11 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
-    }
     if len == 0 {
         return true;
     }
     let (there, of) = readable(at as usize, len, true);
     there == of
-}
-
-/// Whether the two questions above and below are put to `VirtualQuery`, as
-/// they were (`VICTORY_COMMITTED_QUERY=1`). `VirtualQuery` answers with the
-/// length of the run of pages in the same state, which it finds by walking
-/// the page tables to the run's end: 8.8 ms for one question in the title's
-/// 1.1 GB block (round 6). The pass over the heap's views asks three or
-/// more of them for every texture slot that is due, 3,000 slots a frame
-/// when the card has no room (run 75): that pass then ran 208-264 ms, and
-/// while it ran the submitting thread's write-watch askings waited behind
-/// the walks (run 76: 8-22 askings a frame of 6-21 ms each, 46-172 ms).
-fn by_query() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
 }
 
 /// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
@@ -1283,31 +1129,20 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
-fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let mut p = at as usize;
-    let end = p + len;
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
-            return false;
-        }
-        p = info.BaseAddress as usize + info.RegionSize;
-    }
-    true
-}
-
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
+///
+/// By 64 KiB block, one page asked of each: the title's memory is mapped in
+/// blocks of that size (the console's page), and the answer is a measure of
+/// how much of a texture has arrived, not a promise that every byte can be
+/// read (the upload reads through the kernel). By page, a texture half there
+/// cost a failed kernel read for each of its missing pages, every frame it
+/// stayed due.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
@@ -1316,47 +1151,15 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
-    if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
-            // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+        if readable(lo, 1, true).0 == 1 {
+            there += (hi - lo) as u64;
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
-    }
-    let (mut p, mut there) = (start, 0u64);
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
-        if n == 0 || next <= p {
-            break;
-        }
-        if info.State == MEM_COMMIT {
-            there += (next - p) as u64;
-        }
-        p = next;
+        block = block.saturating_add(BLOCK);
     }
     there
 }

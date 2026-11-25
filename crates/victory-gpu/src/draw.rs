@@ -853,7 +853,7 @@ impl State {
                         }
                         continue;
                     }
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let tabled = srv;
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -935,11 +935,9 @@ impl State {
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
-    /// address not on 16 bytes), or as a root descriptor with
-    /// `VICTORY_ROOT_SRV_DIRECT=1` (the dispatch is dropped then if there
-    /// is nothing to bind). With `writes`, what the shader stored is copied
-    /// back into title memory when the list has run. False if the draw
-    /// must be dropped.
+    /// address not on 16 bytes). With `writes`, what the shader stored is
+    /// copied back into title memory when the list has run. False if the
+    /// draw must be dropped.
     /// shortcut: a root view has no size: the view, the refresh and the
     /// copy back cover all that is left of the title's buffer.
     fn root_uav(
@@ -968,26 +966,6 @@ impl State {
                 s.gpu_writes(list, a, len);
             }
         };
-        if !crate::pipeline::host::bounded_root_srvs() {
-            let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
-                once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
-            };
-            ready(a, &s);
-            // From the 16 bytes below: the shader adds the rest.
-            // SAFETY: a live buffer.
-            let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-            let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
-            return true;
-        }
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),

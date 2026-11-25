@@ -194,10 +194,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again (it keeps no
+/// upload memory: lists share their scratch chunks).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -212,41 +212,24 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<Vec<Idle>> = std::sync::Mutex::new(Vec::new());
 
-/// The most host lists kept idle, and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// The most host lists kept idle.
 #[cfg(windows)]
 // (512 since run 221: with submissions prepared by a thread of ours the
 // title has its lists back at once and resets them while the flights of
 // the frame before are still in the air, so more than 128 are out at a
 // time: 80 host lists were made and as many thrown away every frame,
 // 8 ms to make and more to free, on the thread that submits.)
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
-
-/// Whether host lists that have run are used again (on by default;
-/// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
-#[cfg(windows)]
-fn pools() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
-}
+const IDLE_MOST: usize = 512;
 
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).pop();
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -257,24 +240,19 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
-    if !pools() {
-        return;
-    }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).len() >= IDLE_MOST {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
-        let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        if idle.len() < IDLE_MOST {
+            idle.push(Idle(host));
         }
     }
 }
@@ -1093,10 +1071,6 @@ fn read_back(
     use windows::Win32::Graphics::Direct3D12::D3D12_BOX;
     use windows::core::Interface;
     const FOOTPRINT: u32 = 1;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK").is_none_or(|v| v != "0")) {
-        return Err("switched off");
-    }
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
     }
@@ -1801,21 +1775,9 @@ impl ValueWait {
     /// 1.0-2.2 s of every cutscene frame on the thread that submits (runs
     /// 36-49: "between its submissions ... kernel"; 47 of 110 looks at
     /// that thread in run 49 found it in this question).
-    /// `VICTORY_WAIT_ASK=1` asks first, as before.
     pub(crate) fn met(&self) -> bool {
-        let met = self.holds();
-        met
-    }
-
-    fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
-            return true;
-        }
-        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
-            && !crate::texture::committed(self.address as *const u8, bytes)
-        {
             return true;
         }
         // The low `bytes` bytes; the rest stays zero.

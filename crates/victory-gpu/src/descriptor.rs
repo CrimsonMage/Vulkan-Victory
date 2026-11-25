@@ -178,16 +178,8 @@ fn mirror(handle: u64) {
 /// slots a frame in the world of the title this fork works on, against a
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
-/// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
-        return;
-    }
-    let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -213,61 +205,16 @@ pub(crate) fn sync_heaps() {
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                        0..0
-                    } else {
-                        slots
-                    };
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
+                    // (`HostHeap::mirror_copied_page`).
+                    host.mirror_copied_page(slots, (start, step), from, &page_bytes);
                 }
                 page += crate::watch::PAGE;
             }
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
-        count.fetch_add(n, Relaxed);
-    }
-}
-
-/// Since the last frame line, of [`sync_heaps`]: changed pages of placed
-/// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
-#[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// Whether [`sync_heaps`] hands a changed page's records to the host heap
-/// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
-/// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
-/// by one, as before.
-#[cfg(windows)]
-fn page_at_once() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -522,17 +469,6 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
 
-/// Whether constant buffer views and views of placed memory are named whole
-/// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
-/// makes every view a table entry, as before.
-fn inline() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
-}
-
-/// Views named whole in their records since the start: constant buffer
-/// views, views of placed memory (for the memory line).
-static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -650,31 +586,27 @@ impl Views {
 }
 
 /// The two words that name `view` in a record: the view itself where its
-/// kind allows ([`Views`]), else its table entry.
+/// kind allows ([`Views`]: constant buffer views and views of placed
+/// memory are named whole in their records), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
-    use std::sync::atomic::Ordering::Relaxed;
-    if inline() {
-        match &view {
-            View::Constant(address, size) => {
-                if let Some(words) = constant_words(*address, *size) {
-                    NAMED_WHOLE[0].fetch_add(1, Relaxed);
-                    return words;
-                }
+    match &view {
+        View::Constant(address, size) => {
+            if let Some(words) = constant_words(*address, *size) {
+                return words;
             }
-            View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
-                    // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
-                        NAMED_WHOLE[1].fetch_add(1, Relaxed);
-                        return placed_words(shape, address);
-                    }
-                }
-            }
-            _ => {}
         }
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                // Nearly every placed view has a shape seen before.
+                let known = views_read().shape_index.get(&shape).copied();
+                let shape = known.or_else(|| views_write().shape(shape));
+                if let Some(shape) = shape {
+                    return placed_words(shape, address);
+                }
+            }
+        }
+        _ => {}
     }
     // A view written before keeps its entry and generation.
     if let Some(words) = views_read().entry_of(&view) {
@@ -1293,9 +1225,6 @@ mod tests {
     /// table; one shape stands for all the placed views alike.
     #[test]
     fn views_at_new_addresses_add_no_entries() {
-        if !inline() {
-            return;
-        }
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;

@@ -131,12 +131,9 @@ pub(crate) extern "system" fn wait(
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the
     // tick that passed: sleeping on to the next one cost 17 ms of every
-    // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
-    // time-out shorter than a tick) answer as before.
-    // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
-    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
-        && limit >= wait
+    // 730 ms frame). Polls (a time-out shorter than a tick) answer as
+    // before.
+    if limit >= wait
         && tick > last(kind).load(Ordering::Relaxed) + 1
     {
         tick -= 1;

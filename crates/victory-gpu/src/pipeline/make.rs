@@ -71,18 +71,11 @@ impl Pending {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
-}
+/// Waiting allowed per title frame, over all threads together: a thread
+/// that waits takes what is left of it and gives back what it did not use.
+/// (One per thread, each of the title's five recording threads waited the
+/// whole half second in every frame in which pipelines were being made.)
+const WAIT_BUDGET: Duration = Duration::from_millis(500);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -118,38 +111,19 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Whether the frame's budget is one for all threads together: a thread
-/// that waits takes what is left of it and gives back what it did not
-/// use. Counted only when a wait had ended, the budget was one per thread:
-/// each of the title's five recording threads began its first wait of a
-/// frame with nothing counted yet and waited the whole half second, 2.5 s
-/// of waiting in every frame in which pipelines were being made (runs
-/// 34-49: "2504 ms waiting for pipelines" in each such frame).
-/// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
-fn shared_budget() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
-}
-
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() {
-        return;
-    }
+    let budget = WAIT_BUDGET;
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
-    let shared = shared_budget();
     let left = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
         let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
+        spent.1 += left;
         left
     };
     if left.is_zero() {
@@ -171,11 +145,7 @@ fn wait(p: &Pending, frame: u64) {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
+            spent.1 = spent.1.saturating_sub(left - waited);
         }
     }
 }
