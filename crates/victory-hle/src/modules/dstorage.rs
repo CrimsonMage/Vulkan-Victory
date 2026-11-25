@@ -509,6 +509,7 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        release_page_list(&job.request, true);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -702,8 +703,14 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
-    lane.reads.clear();
+    for command in lane.unsubmitted.drain(..) {
+        if let Command::Read(request) = command {
+            release_page_list(&request, false);
+        }
+    }
+    for (_, request) in lane.reads.drain(..) {
+        release_page_list(&request, false);
+    }
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
@@ -780,7 +787,106 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(snapshot_page_list(request)));
+}
+
+/// Page lists copied at enqueue, by the address of our copy: the title's
+/// list (address) and the number of page numbers.
+static PAGE_LISTS: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
+
+/// Since the start: page lists copied at enqueue, and of them lists the
+/// title had changed by the time the request ran.
+static PAGE_LIST_COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `VICTORY_DSTORAGE_PAGES_AT_ENQUEUE=0`: page lists are read when the
+/// request runs, as before.
+fn pages_at_enqueue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_PAGES_AT_ENQUEUE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// A request to physical pages names them through an array in title
+/// memory, and the request runs on a worker later, seconds later on a busy
+/// frame: what was read then is what the array held then. The console's
+/// queue takes the request (and so its pages) when it is enqueued, and a
+/// title may build the next request's list in the same buffer. Read at the
+/// run, such a list sends the data into another request's pages (a model or
+/// texture overwritten, its own left as it was) or into pages that are
+/// gone ("a destination's physical pages could not be written").
+/// So the list is copied here, and the copy is what the request writes
+/// through; when it runs, the title's array is compared with the copy and
+/// a difference is counted and logged.
+fn snapshot_page_list(mut request: Request) -> Request {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() || !pages_at_enqueue() {
+        return request;
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let n = (offset + request.destination_size as usize).div_ceil(PAGE).max(1);
+    // SAFETY: the title passes a page number per 64 KiB of destination.
+    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), n) };
+    let copy: Box<[usize]> = pages.into();
+    let at = Box::into_raw(copy) as *mut usize as usize;
+    PAGE_LISTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(at, (request.destination as usize, n));
+    PAGE_LIST_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+    request.destination = at as *mut c_void;
+    request
+}
+
+/// After a request ran (`ran`) or was dropped: frees our copy of its page
+/// list (if it has one); after a run, compares it with what the title's
+/// array holds now.
+fn release_page_list(request: &Request, ran: bool) {
+    if request.options & PAGE_DESTINATION == 0 {
+        return;
+    }
+    let at = request.destination as usize;
+    let Some((theirs, n)) = PAGE_LISTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&at) else {
+        return;
+    };
+    // SAFETY: made by `snapshot_page_list` from a box of `n` numbers and
+    // taken out of the table, so freed once.
+    let copy = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(at as *mut usize, n)) };
+    if !ran {
+        return;
+    }
+    let mut now = vec![0usize; n];
+    // The title's array may be gone: read through the kernel.
+    let read = {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut done = 0;
+        // SAFETY: `now` holds `n` numbers; the kernel checks the source.
+        unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                theirs as *const c_void,
+                now.as_mut_ptr().cast(),
+                n * size_of::<usize>(),
+                &mut done,
+            ) != 0
+        }
+    };
+    if read && now[..] == copy[..] {
+        return;
+    }
+    let changed = PAGE_LIST_COUNTS[1].fetch_add(1, Ordering::Relaxed) + 1;
+    if changed <= 16 || changed.is_power_of_two() {
+        tracing::warn!(
+            changed,
+            copied = PAGE_LIST_COUNTS[0].load(Ordering::Relaxed),
+            readable = read,
+            pages = n,
+            at_enqueue = format_args!("{:x?}", &copy[..n.min(4)]),
+            at_run = format_args!("{:x?}", &now[..n.min(4)]),
+            known_at_enqueue = super::xmem::pages_known(&copy, 0, n * PAGE),
+            known_at_run = read && super::xmem::pages_known(&now, 0, n * PAGE),
+            "dstorage: the title changed a request's page list between enqueue and the run; the list as enqueued was used \
+             (VICTORY_DSTORAGE_PAGES_AT_ENQUEUE=0: the list at the run)"
+        );
+    }
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1148,6 +1254,7 @@ fn into_destination(
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             known = super::xmem::pages_known(pages, offset, len),
+            pages = %super::xmem::describe_pages(pages, offset, len),
             tries,
             given_up,
             on_a_retry = RETRIED[0].load(Ordering::Relaxed),

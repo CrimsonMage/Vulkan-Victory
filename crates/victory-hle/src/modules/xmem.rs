@@ -555,6 +555,33 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// For a failed DirectStorage write: of the pages under `[offset, offset +
+/// len)`, how many are known, how many were handed out once and freed since
+/// (`XMemFreePhysicalPages`), and how many no call ever handed out (a
+/// number the title truncated or read from memory that held something
+/// else), with the first unknown number.
+pub(crate) fn describe_pages(pages: &[usize], offset: usize, len: usize) -> String {
+    let end = offset.saturating_add(len);
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        return "the list ends early".into();
+    };
+    let physical = physical();
+    let (mut known, mut freed, mut never, mut first) = (0, 0, 0, None);
+    for &page in pages {
+        if physical.pages.contains_key(&page) {
+            known += 1;
+            continue;
+        }
+        first.get_or_insert(page);
+        if (0x10_0000..physical.next_page).contains(&page) && page.is_multiple_of(FRAMES) {
+            freed += 1;
+        } else {
+            never += 1;
+        }
+    }
+    format!("{known} known, {freed} freed since, {never} never handed out; first unknown {first:#x?}")
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
