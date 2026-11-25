@@ -431,11 +431,11 @@ fn create() -> windows::core::Result<Host> {
         // The ceilings of `crate::memcap` come from the adapter's own
         // memory, not from the budget the system reports (under vkd3d that
         // budget shrinks with what is free on the card).
-        if let Some(a) = &adapter
-            && let Ok(desc) = a.GetDesc1()
-        {
-            crate::memcap::set_dedicated(desc.DedicatedVideoMemory as u64);
+        let dedicated = adapter.as_ref().and_then(|a| a.GetDesc1().ok()).map(|d| d.DedicatedVideoMemory as u64);
+        if let Some(dedicated) = dedicated {
+            crate::memcap::set_dedicated(dedicated);
         }
+        crate::quality::set(dedicated.unwrap_or(0));
         Ok(Host {
             device,
             queue,
@@ -4441,12 +4441,25 @@ impl Meter {
             // Budget and use of the card's memory, use of the PC's memory
             // mapped for the card.
             let [budget, card, _, shared] = host().and_then(Host::video_memory).unwrap_or_default();
+            // What of it is ours, by kind (texture quality: `crate::quality`).
+            let filled = crate::resource::KINDS[1].load(Ordering::Relaxed);
+            let others = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed).saturating_sub(filled);
+            let (staged, spare) = crate::texture::staging_bytes();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame, {draws:.0} draws/frame; card memory {} MB in use of a budget of {} MB; \
-                 PC memory mapped for the card {} MB",
+                 PC memory mapped for the card {} MB; of ours: textures the title fills {} MB (texture quality {}), \
+                 targets and textures the card writes {} MB, buffer copies on the card {} MB; staging {} MB, spare {} MB, \
+                 buffers pooled {} MB",
                 card >> 20,
                 budget >> 20,
-                shared >> 20
+                shared >> 20,
+                filled >> 20,
+                crate::quality::name(),
+                others >> 20,
+                crate::shadow::card_bytes() >> 20,
+                staged >> 20,
+                spare >> 20,
+                crate::memcap::pooled() >> 20,
             );
         }
         if self.caption.is_none() {

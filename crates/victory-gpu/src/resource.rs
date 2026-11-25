@@ -1109,6 +1109,10 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// The console's largest levels the host copy leaves out (texture
+    /// quality, `crate::quality`): its level 0 is the console's level
+    /// `dropped`.
+    pub(crate) dropped: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1315,8 +1319,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        // Texture quality (`crate::quality`): a texture the title fills may
+        // be made with fewer of its largest levels.
+        let dropped = if texture.is_none() { dropped_levels(this, &r.desc) } else { 0 };
         let texture = match texture {
             Some(texture) => Some(texture),
+            None if dropped > 0 => host_texture(&smaller(&r.desc, dropped), r.host.state, clear),
             None => host_texture(&r.desc, r.host.state, clear),
         };
         let Some(texture) = texture else {
@@ -1341,6 +1349,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.filled = fills(&r.desc);
+        host.dropped = dropped;
         crate::memcap::note(
             if host.filled { crate::memcap::Use::Texture } else { crate::memcap::Use::Target },
             host.bytes,
@@ -1397,6 +1406,79 @@ pub(crate) fn host_made<'a>(
     let (host, _) = hosted(this, false)?;
     // SAFETY: as in `host_resource`.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// The largest levels texture quality leaves out of the host copy of title
+/// texture `this` (`crate::quality`): only of a texture the title fills
+/// from memory the upload can read (a console layout, no XOR mode), two-
+/// dimensional, of one sample, that no view in another format reads
+/// through the host's copy of a target ([`alias_of`]: that copy keeps the
+/// shape of the target's).
+#[cfg(windows)]
+fn dropped_levels(this: This, desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if crate::quality::levels() == 0
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.sample_count > 1
+        || desc.width < crate::quality::SMALLEST
+        || u64::from(desc.height) < crate::quality::SMALLEST
+    {
+        return 0;
+    }
+    let Some((_, block)) = element(desc.format) else {
+        return 0;
+    };
+    let readable = texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+    if !readable || alias_of(this).is_some() {
+        return 0;
+    }
+    crate::quality::dropped_for(desc.width, u64::from(desc.height), mip_count(desc), block)
+}
+
+/// `desc` without its `dropped` largest levels.
+#[cfg(windows)]
+fn smaller(desc: &ResourceDesc, dropped: u32) -> ResourceDesc {
+    let mut d = *desc;
+    d.width = (desc.width >> dropped).max(1);
+    d.height = (desc.height >> dropped).max(1);
+    d.mip_levels = (mip_count(desc) - dropped) as u16;
+    d
+}
+
+/// The console levels the host copy of title texture `this` leaves out
+/// (texture quality, `crate::quality`), if it is made; 0 otherwise. The
+/// copy is not made here.
+#[cfg(windows)]
+pub(crate) fn host_dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |(host, _)| host.dropped)
+}
+
+/// The host subresource of title texture `this` that holds its console
+/// subresource `index`; `None` for a level texture quality left out of
+/// the host copy (`crate::quality`).
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let dropped = host_dropped(this);
+    if dropped == 0 {
+        return Some(index);
+    }
+    crate::quality::host_subresource(index, mip_count(&resource(this).desc), dropped)
+}
+
+/// The subresources of title texture `this` as the console numbers them:
+/// levels times array slices (a volume's slices are in its levels).
+#[cfg(windows)]
+pub(crate) fn subresources(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let d = &resource(this).desc;
+    let layers = if d.dimension == TEXTURE_3D { 1 } else { u32::from(d.depth_or_array_size).max(1) };
+    mip_count(d) * layers
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1628,6 +1710,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            dropped: 0,
         }
     }
 
@@ -1645,6 +1728,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            dropped: 0,
         }
     }
 }

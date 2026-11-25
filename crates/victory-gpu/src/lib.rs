@@ -43,6 +43,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
+#[cfg(windows)]
+mod quality;
 pub mod queue;
 pub mod resource;
 pub mod root;

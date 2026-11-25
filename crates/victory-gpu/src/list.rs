@@ -914,6 +914,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            // Texture quality (`crate::quality`): host copies that leave out
+            // different levels are copied level by level, each console
+            // level both of them hold.
+            if crate::resource::host_dropped(dst) != crate::resource::host_dropped(src) {
+                copy_levels(list, (dst, to), (src, from));
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -926,6 +933,48 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// [`copy_resource`] between two title textures of one shape whose host
+/// copies leave out different levels (texture quality, `crate::quality`):
+/// every subresource both host copies hold, at the host subresources that
+/// hold it. Both are in the copy states.
+#[cfg(windows)]
+fn copy_levels(
+    list: &crate::host::HostList,
+    (dst, to): (This, &windows::Win32::Graphics::Direct3D12::ID3D12Resource),
+    (src, from): (This, &windows::Win32::Graphics::Direct3D12::ID3D12Resource),
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    for index in 0..crate::resource::subresources(dst) {
+        if let (Some(a), Some(b)) =
+            (crate::resource::host_subresource(dst, index), crate::resource::host_subresource(src, index))
+        {
+            // SAFETY: an open list; both locations name live textures.
+            unsafe { list.list.CopyTextureRegion(&location(to, a), 0, 0, 0, &location(from, b), None) };
+        }
+    }
+}
+
+/// Says once that a title copy named a level texture quality leaves out of
+/// a host copy (`crate::quality`): the copy is not made.
+#[cfg(windows)]
+fn left_out(what: &str, resource: This, index: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            what,
+            ?resource,
+            subresource = index,
+            "a copy of a level texture quality leaves out of the host copy is not made (the first one)"
+        )
+    });
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1003,6 +1052,24 @@ extern "system" fn copy_texture_region(
         };
         if unlike(dst.resource, src.resource) {
             return;
+        }
+        // Texture quality (`crate::quality`): a subresource index names the
+        // host level that holds the console level; a level the host copy
+        // leaves out is not copied.
+        const INDEX: u32 = 0;
+        let mut dst = dst;
+        let mut src = src;
+        for (location, what) in [(&mut dst, "destination"), (&mut src, "source")] {
+            if location.kind == INDEX {
+                let index = location.footprint.offset as u32;
+                match crate::resource::host_subresource(location.resource, index) {
+                    Some(host) => location.footprint.offset = u64::from(host),
+                    None => {
+                        left_out(what, location.resource, index);
+                        return;
+                    }
+                }
+            }
         }
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
@@ -1128,6 +1195,12 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    // Texture quality (`crate::quality`): the host level that holds it.
+    let mut src = src;
+    src.footprint.offset = u64::from(
+        crate::resource::host_subresource(src.resource, src.footprint.offset as u32)
+            .ok_or("a level texture quality leaves out of the host copy")?,
+    );
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1198,6 +1271,12 @@ extern "system" fn resolve(
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
+            return;
+        }
+        // Texture quality (`crate::quality`): a resolve into or out of a
+        // host copy that leaves out levels is not made.
+        if crate::resource::host_dropped(dst) > 0 || crate::resource::host_dropped(src) > 0 {
+            left_out("resolve", dst, dst_sub);
             return;
         }
         // Depth textures shaders also write: what they wrote, first.

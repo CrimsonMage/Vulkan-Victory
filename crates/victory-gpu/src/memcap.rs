@@ -371,10 +371,12 @@ pub(crate) fn class(kind: Kind, size: u64) -> u64 {
 }
 
 /// The most bytes the pool keeps. Nothing bigger than 64 MiB is kept.
-const POOL_MOST: u64 = 512 * MB;
+/// (512 MB, kept for 20 s, held PC memory mapped for the card through the
+/// menus that the ceiling then refused to the buffers a frame needs.)
+const POOL_MOST: u64 = 192 * MB;
 
 /// How long a pooled buffer is kept unused, in milliseconds.
-const POOL_IDLE_MS: u64 = 20_000;
+const POOL_IDLE_MS: u64 = 5_000;
 
 struct Entry {
     kind: Kind,
@@ -473,6 +475,20 @@ pub(crate) fn trim() {
         old
     };
     drop(out);
+}
+
+/// The bytes the pool keeps, for the memory line.
+pub(crate) fn pooled() -> u64 {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes
+}
+
+/// Whether the PC's memory mapped for the card is at seven tenths of
+/// [`shared_cap`] or more (title memory opened as heaps counts too): the
+/// caches of it are let go of sooner (`crate::texture::let_go_idle`).
+pub(crate) fn shared_tight(host: &crate::host::Host) -> bool {
+    shared_cap()
+        .zip(host.video_memory_raw())
+        .is_some_and(|(cap, [_, _, _, shared])| shared >= cap / 10 * 7)
 }
 
 /// Lets go of everything pooled; the bytes.
