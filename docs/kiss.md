@@ -52,16 +52,16 @@ driver errors and no new crash, and the captures look no worse.
 
 | | Start (2026-11-25) | Now |
 |---|---|---|
-| Rust lines | 128,292 | 128,292 |
-| `VICTORY_*` switches | 224 | 224 |
-| `diagnostics`-only blocks | 283 | 283 |
+| Rust lines | 128,292 | 106,472 |
+| `VICTORY_*` switches | 224 | 43 |
+| `diagnostics`-only blocks | 283 | 71 |
 | World frame time (Proton, 8 GB card) | 0.5–5 s | — |
 
 ## Workstreams
 
 | # | Work | Owner | State |
 |---|---|---|---|
-| 1 | Prune `victory-gpu` switches and statistics | subagent | running |
+| 1 | Prune `victory-gpu` switches and statistics | subagent | merged (6f7b937): −18,465 lines, 163 → 21 switches; one gate line every 5 s; memory-mirroring switches left for #7; gate g4 running |
 | 2 | Prune `victory-shader` switches | subagent | merged (d645fb8): switches 25 → 1, −2,526 lines; all 25,985 containers translate byte-identically; gate g2 running |
 | 3 | Prune HLE, loader, formats, app | subagent | merged (08c435a): switches 38 → 7, −1,886 lines; one console-instruction emulator; gate g1 passed |
 | 4 | Unified memory design and probe (`VICTORY_UNIFIED`) | subagent | done: `docs/unified-memory.md`; probe merged, gate run pending |
@@ -88,5 +88,9 @@ driver errors and no new crash, and the captures look no worse.
   read-mostly data (geometry, textures) is uploaded to the card once, when
   the title says it arrived (DirectStorage completion, title copies), the
   way a PC game uses upload and default heaps.
+- 2026-11-25: the Series S profile ends silently right after the title's
+  FSR4 pipeline setup (twice); Series X stays the profile. Series X reaches
+  the world start but card memory peaks at 7.2 GB there (victory 5.3 GB of
+  it, render targets 1.95 GB uncapped).
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
