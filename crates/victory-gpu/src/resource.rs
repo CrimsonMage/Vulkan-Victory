@@ -1471,7 +1471,7 @@ pub(crate) fn room() -> bool {
 #[cfg(windows)]
 pub(crate) fn targets_room_kept(budget: u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    let most = (3072u64 << 20).min(budget / 2);
+    let most = (3072u64 << 20).min(budget / 10 * 3);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
@@ -1485,13 +1485,15 @@ pub(crate) static CARD_FULL_REFUSED: std::sync::atomic::AtomicU64 = std::sync::a
 /// Whether the card's memory in use (as the system counted it at most a
 /// tenth of a second ago, plus what the layer made on the card since:
 /// `crate::memcap::card_used`) has reached the budget the layer goes by
-/// (`Host::video_memory`) less the room kept for render targets not made
-/// yet ([`targets_room_kept`]).
+/// (`Host::video_memory`). No room is held back for render targets made
+/// later: holding 2.3 GB back starved the menus (the menu video froze and
+/// flashed, run x1); idle copies are let go under pressure instead
+/// (`let_go_idle`), since they can always be made again from title memory.
 #[cfg(windows)]
 pub(crate) fn card_full_lately() -> bool {
     crate::host::host()
         .and_then(crate::memcap::card_used)
-        .is_some_and(|(used, budget)| budget > 0 && used + targets_room_kept(budget) >= budget)
+        .is_some_and(|(used, budget)| budget > 0 && used >= budget)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
