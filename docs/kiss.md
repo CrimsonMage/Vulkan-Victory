@@ -209,5 +209,18 @@ driver errors and no new crash, and the captures look no worse.
   steps 250 → 11 ms, in submissions 270 → 39 ms, not-in-place fills 4.2 GB
   → 55 MB; dispatch 555 → 132 ms; but bounded indirect windows cost
   468 ms (short windows), being made nearly free.
+- 2026-11-25: exe study (static): the streaming pool has three views of the
+  same pages: a CPU view (read-write), a GPU view the CPU can never touch
+  (PAGE_NOACCESS | GRAPHICS_NOACCESS) and a pool view mapped whole once.
+  Mapping changes are announced once per submission (title 0xF2C470): one
+  Scatter for the CPU view, one CopyPageMappingsBatchX of single 64 KiB
+  pages for the GPU view. So the GPU view needs no host mapping: a tile →
+  pool-page table (the directory) is the GPU view; the pool view is each
+  page's one home. Heap classes from the title's own protections: 0x22004
+  CPU-coherent (RAM in place), 0x2404 write-combined (streamed once → card
+  candidate), 0x42404 the one GPU-writes/CPU-reads page (fences/labels),
+  CPU-only shared pools never GPU heaps. Series S is the cheapest profile
+  (pool 3,977 MiB, heaps 8.4 GB). Frame interval comes from data (30 fps on
+  S; table supports 60/120). Only three command-line switches exist.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
