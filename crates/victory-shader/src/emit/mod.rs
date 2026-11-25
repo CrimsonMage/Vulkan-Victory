@@ -151,6 +151,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&crate::hlsl::fingerprint());
     out
 }
 
@@ -210,6 +211,10 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    // `VICTORY_SHADER_BACKEND=hlsl`: through HLSL and DXC where that works.
+    if let Some(shader) = crate::hlsl::try_translate(container) {
+        return Ok(shader);
+    }
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
