@@ -4,28 +4,45 @@
 //! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
-//! Submitted requests of every queue run on one pool of workers, as the
-//! console's hardware runs them: in parallel, started in queue order,
-//! queues served by weighted round robin over their priorities (about 10x
-//! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
-//! memory), inflates zlib data and/or unpacks BCPack data, and writes the
-//! destination (an address, or physical pages). Completion is what stays
-//! in order: a status entry is written once every request enqueued before
-//! it on its queue has finished, with the first failure (in queue order)
-//! since the previous status entry, or success.
+//! Every file the title opens here (its `.rpf` and `.ttpf` archives) is
+//! mapped read-only once and stays mapped for the run; Wine backs the view
+//! with the Linux page cache. A request's source is a slice of that
+//! mapping, or of title memory: an uncompressed request is one copy into
+//! its destination, a compressed one inflates zlib data and/or unpacks
+//! BCPack data straight from the slice into the destination (an address,
+//! or physical pages). Nothing is read into a buffer first.
+//!
+//! Submitted requests of every queue go, in submission order, through one
+//! channel to one pool of workers (one per core), which run them in
+//! parallel. Completion is what stays in order: a status entry is written
+//! once every request enqueued before it on its queue has finished, with
+//! the first failure (in queue order) since the previous status entry, or
+//! success. A status entry closes a segment of its queue's requests; the
+//! segment counts what it still waits for (its requests, the segment
+//! before it, its own submission) and the last of those writes the status
+//! and lets the next segment go on. No lock is taken per request.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::LocalKey;
+use std::time::{Duration, Instant};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::{CloseHandle, E_NOINTERFACE, HANDLE};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
+    MapViewOfFile, MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_READONLY,
+    PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -38,7 +55,6 @@ const FACTORY: Guid = Guid::new(
     0x4884,
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
-use windows_sys::Win32::Foundation::E_NOINTERFACE;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
@@ -108,11 +124,16 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
         .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 // The factory.
 
 type Factory = *const Object;
 
-/// Opens `path` for reading; the file object owns the handle.
+/// Opens `path` for reading and maps it (see `map_archive`); the file
+/// object holds the mapping's bytes.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
@@ -136,11 +157,100 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
-    // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let mapped = map_archive(handle);
+    // SAFETY: a handle we just opened and nobody else owns; a view of the
+    // file keeps it open.
+    unsafe { CloseHandle(handle) };
+    let data = match mapped {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::warn!(path = name, %error, "dstorage: mapping a file failed");
+            return from_win32(&error);
+        }
+    };
+    tracing::info!(
+        path = name,
+        iid = iid_text(iid),
+        bytes = data.len(),
+        at = format_args!("{:p}", data.as_ptr()),
+        "dstorage: file opened"
+    );
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { data });
     put(out, file)
+}
+
+/// A file the title opened, as one identity: volume, file index, size and
+/// last write (a file made anew where an old one was is another).
+type Identity = (u32, u32, u32, u64, u64);
+
+/// The file's bytes: a read-only view of the whole file, made the first
+/// time the file is opened and kept for the run, so every request reads a
+/// slice of it and a file opened again maps nothing new. The view sits
+/// above every address a title may be given (46 bits at most, as
+/// `xmem::address_range`), so it takes none of the title's room.
+fn map_archive(file: HANDLE) -> std::io::Result<&'static [u8]> {
+    static ARCHIVES: Mutex<Vec<(Identity, &'static [u8])>> = Mutex::new(Vec::new());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: an open handle and a structure of the size asked for.
+    if unsafe { GetFileInformationByHandle(file, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    let written = &info.ftLastWriteTime;
+    let id = (
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+        size,
+        (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime),
+    );
+    let mut archives = lock(&ARCHIVES);
+    if let Some(&(_, data)) = archives.iter().find(|(known, _)| *known == id) {
+        return Ok(data);
+    }
+    let size = usize::try_from(size).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+    // An empty file has no view (a section cannot be empty).
+    let data: &'static [u8] = if size == 0 {
+        &[]
+    } else {
+        // SAFETY: an open handle; a read-only section of the whole file.
+        let section = unsafe {
+            CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+        };
+        if section.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 46) as *mut c_void,
+            HighestEndingAddress: std::ptr::null_mut(),
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: our section, viewed whole; the parameter points at
+        // `requirements`, which outlives the call.
+        let mut view = unsafe {
+            MapViewOfFile3(section, GetCurrentProcess(), std::ptr::null(), 0, size, 0, PAGE_READONLY, &mut parameter, 1)
+        }
+        .Value;
+        if view.is_null() {
+            // SAFETY: as above, anywhere.
+            view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, size) }.Value;
+        }
+        let error = std::io::Error::last_os_error();
+        // SAFETY: our section handle; a view keeps the section.
+        unsafe { CloseHandle(section) };
+        if view.is_null() {
+            return Err(error);
+        }
+        // SAFETY: a read-only view of `size` bytes that is never unmapped.
+        // The files are the title's packages, which nothing writes while
+        // it runs.
+        unsafe { std::slice::from_raw_parts(view.cast::<u8>(), size) }
+    };
+    archives.push((id, data));
+    Ok(data)
 }
 
 /// `(capacity, name, iid, out)`.
@@ -176,6 +286,10 @@ struct QueueDesc {
     unknown: u64,
 }
 
+/// Every queue's requests run in submission order, whatever its priority.
+// shortcut: the title makes all its queues (17) at one priority (real
+// time), so order across queues is all a priority could change; serve
+// higher priorities first if a title mixes them.
 extern "system" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
@@ -196,23 +310,17 @@ extern "system" fn create_queue(
         iid = iid_text(iid),
         "dstorage: queue"
     );
-    let scheduler = scheduler();
-    let mut lanes = scheduler.lock();
-    let id = lanes.next_id;
-    lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
-    lanes.lanes.insert(id, lane);
-    drop(lanes);
+    let lane = Arc::new(Lane::new(desc.capacity));
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { lane }),
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. Nothing is staged
+/// here: sources are slices of the mapped files or of title memory.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    scheduler().lock().staging = u64::from(size);
     S_OK
 }
 
@@ -247,8 +355,9 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 // Files.
 
+/// An opened file: its mapped bytes, which outlive it.
 struct File {
-    file: std::fs::File,
+    data: &'static [u8],
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -296,294 +405,341 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane, which its requests on their way also hold.
 struct Queue {
-    id: u64,
+    lane: Arc<Lane>,
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        close_lane(self.id);
+        self.lane.close();
     }
 }
 
 type QueueRef = *const Instance<Queue>;
 
-/// Every queue's requests, run by a pool of workers.
-struct Scheduler {
-    lanes: Mutex<Lanes>,
-    /// Requests to start, or staging space freed.
-    work: Condvar,
-    /// A request finished (for full queues and `close`).
-    finished: Condvar,
+fn lane<'a>(this: QueueRef) -> &'a Arc<Lane> {
+    // SAFETY: a queue we created and the title still holds while it calls.
+    &unsafe { &*this }.state.lane
 }
 
-/// Priority weights per class (low, normal, high and real-time), as the
-/// console's: about 10x per level, counted against request sizes.
-const COST: [u64; 3] = [100, 10, 1];
-/// The console's default staging buffer.
-const STAGING: u64 = 32 << 20;
-
-struct Lanes {
-    lanes: HashMap<u64, Lane>,
-    next_id: u64,
-    /// Submission order over all queues.
-    next_seq: u64,
-    /// Bytes of staging held by running requests, and the limit.
-    staged: u64,
-    staging: u64,
-    /// A start waited for staging space since the last finish.
-    starved: bool,
-    /// Weighted round robin: each class's virtual time (bytes × cost), and
-    /// the time of the last start; within a class, the lane clock of the
-    /// last start.
-    clock: [u64; 3],
-    now: u64,
-    lane_now: [u64; 3],
-}
-
-/// A queue's requests in the scheduler.
+/// A queue's state. Only the title's threads take `open` (to enqueue,
+/// submit and close); workers touch atomics alone.
 struct Lane {
-    class: usize,
     capacity: usize,
-    /// Bytes started, for round robin among the lanes of a class.
-    clock: u64,
-    /// Enqueued, not yet submitted.
-    unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
-    statuses: VecDeque<(u64, Status)>,
-    running: BTreeSet<u64>,
-    failures: BTreeMap<u64, HRESULT>,
-    closed: bool,
+    open: Mutex<Open>,
+    /// Requests and status entries held: enqueued, submitted, running.
+    held: AtomicUsize,
+    /// Requests running now.
+    running: AtomicUsize,
+    closed: AtomicBool,
+}
+
+/// What the title has enqueued and not yet submitted, and the segment its
+/// next request joins.
+struct Open {
+    commands: Vec<Command>,
+    segment: Arc<Segment>,
+    /// Requests in `segment` so far: the next one's place.
+    index: u32,
+}
+
+enum Command {
+    Read(Job),
+    /// A status entry: the segment it closes, let go at submission.
+    Status(Arc<Segment>),
+}
+
+/// The requests between two status entries of a queue.
+struct Segment {
+    /// What it waits for: its requests not yet finished, plus one while
+    /// the segment before it has not completed, plus one until its status
+    /// entry is submitted.
+    pending: AtomicUsize,
+    /// The first failure in queue order: place << 32 | HRESULT.
+    failure: AtomicU64,
+    /// Set when the status entry closes it, with `next` (before its
+    /// submission can complete it).
+    status: OnceLock<Status>,
+    next: OnceLock<Arc<Segment>>,
+}
+
+/// A status entry to write, holding a reference on its array.
+struct Status {
+    array: Array,
+    index: u32,
+}
+
+// SAFETY: the array's reference count and entries are atomic, and it stays
+// alive while this holds its reference.
+unsafe impl Send for Status {}
+// SAFETY: as above.
+unsafe impl Sync for Status {}
+
+impl Drop for Status {
+    fn drop(&mut self) {
+        release(self.array);
+    }
+}
+
+impl Status {
+    fn entry(&self) -> &AtomicI32 {
+        // SAFETY: we hold a reference; the index was checked when enqueued.
+        &unsafe { &*self.array }.state.entries[self.index as usize]
+    }
+}
+
+/// A request on its way to a worker.
+struct Job {
+    request: Request,
+    lane: Arc<Lane>,
+    segment: Arc<Segment>,
+    /// Its place in the segment.
+    index: u32,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
-unsafe impl Send for Lane {}
-
-/// A read a worker runs.
-struct Job {
-    lane: u64,
-    seq: u64,
-    request: Request,
-    staging: u64,
-}
-
-// SAFETY: as for `Lane`.
+// valid until the title has seen them complete.
 unsafe impl Send for Job {}
 
-/// The scheduler, with its workers started on first use.
-fn scheduler() -> &'static Scheduler {
-    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER.get_or_init(|| Scheduler {
-        lanes: Mutex::new(Lanes {
-            lanes: HashMap::new(),
-            next_id: 0,
-            next_seq: 0,
-            staged: 0,
-            staging: STAGING,
-            starved: false,
-            clock: [0; 3],
-            now: 0,
-            lane_now: [0; 3],
-        }),
-        work: Condvar::new(),
-        finished: Condvar::new(),
-    });
-    STARTED.call_once(|| {
+impl Segment {
+    fn new(after_another: bool) -> Arc<Segment> {
+        Arc::new(Segment {
+            pending: AtomicUsize::new(1 + usize::from(after_another)),
+            failure: AtomicU64::new(u64::MAX),
+            status: OnceLock::new(),
+            next: OnceLock::new(),
+        })
+    }
+
+    /// One thing it waited for is done; at the last, its status is written
+    /// and the next segment no longer waits for it. The caller holds this
+    /// segment, and each segment holds the next.
+    fn release(&self, lane: &Lane) {
+        let mut segment = self;
+        while segment.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Complete, so closed: `status` and `next` are set.
+            let (Some(status), Some(next)) = (segment.status.get(), segment.next.get()) else {
+                return;
+            };
+            let failure = segment.failure.load(Ordering::Relaxed);
+            let result = if failure == u64::MAX { S_OK } else { failure as u32 as HRESULT };
+            status.entry().store(result, Ordering::Release);
+            lane.held.fetch_sub(1, Ordering::SeqCst);
+            segment = next;
+        }
+    }
+}
+
+impl Lane {
+    fn new(capacity: u16) -> Lane {
+        Lane {
+            capacity: usize::from(capacity),
+            open: Mutex::new(Open {
+                commands: Vec::new(),
+                segment: Segment::new(false),
+                index: 0,
+            }),
+            held: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes a slot for one more command, waiting while the queue is full
+    /// (one slot stays free, as the console's count of empty slots says);
+    /// none once it is closed. It waits as the title waits for its status
+    /// entries, a millisecond at a time.
+    fn slot(&self) -> Option<MutexGuard<'_, Open>> {
+        loop {
+            let open = lock(&self.open);
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            if self.held.load(Ordering::SeqCst) + 1 < self.capacity.max(2) {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                return Some(open);
+            }
+            drop(open);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A request joining the open segment.
+    fn read(self: &Arc<Self>, open: &mut Open, request: Request) -> Job {
+        open.segment.pending.fetch_add(1, Ordering::Relaxed);
+        let index = open.index;
+        open.index = open.index.wrapping_add(1);
+        Job {
+            request,
+            lane: Arc::clone(self),
+            segment: Arc::clone(&open.segment),
+            index,
+        }
+    }
+
+    /// Closes the open segment with a status entry and opens the next.
+    fn close_segment(open: &mut Open, status: Status) -> Arc<Segment> {
+        let next = Segment::new(true);
+        let closed = std::mem::replace(&mut open.segment, Arc::clone(&next));
+        // Both are unset: the segment was open.
+        let _ = closed.status.set(status);
+        let _ = closed.next.set(next);
+        open.index = 0;
+        closed
+    }
+
+    /// Adds a command; submits on its own once half the queue is
+    /// enqueued, as the console does.
+    fn push(&self, open: &mut Open, command: Command) {
+        open.commands.push(command);
+        if open.commands.len() >= (self.capacity / 2).max(1) {
+            self.submit(open);
+        }
+    }
+
+    /// Hands the enqueued requests to the workers, in order.
+    fn submit(&self, open: &mut Open) {
+        let workers = workers();
+        for command in open.commands.drain(..) {
+            match command {
+                Command::Read(job) => {
+                    let depth = STATS.depth.fetch_add(1, Ordering::Relaxed) + 1;
+                    STATS.peak.fetch_max(depth, Ordering::Relaxed);
+                    // The workers' end of the channel lives for the process.
+                    let _ = workers.send(job);
+                }
+                Command::Status(segment) => segment.release(self),
+            }
+        }
+    }
+
+    /// Ends the queue: what was not submitted is dropped, what was and has
+    /// not started never runs (a worker drops it), and this returns once
+    /// the requests already running have finished (they write title
+    /// memory). Their status entries are never written.
+    fn close(&self) {
+        {
+            let mut open = lock(&self.open);
+            self.closed.store(true, Ordering::SeqCst);
+            open.commands.clear(); // releases their arrays
+        }
+        while self.running.load(Ordering::SeqCst) != 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Job {
+    /// Runs the request unless its queue was closed.
+    fn run(self) {
+        let lane = &self.lane;
+        // Counted before `closed` is read, as `close` sets `closed` before
+        // it reads the count: either the close waits for this request, or
+        // this sees the close and drops the request.
+        lane.running.fetch_add(1, Ordering::SeqCst);
+        if !lane.closed.load(Ordering::SeqCst) {
+            let result = execute(&self.request);
+            STATS.requests.fetch_add(1, Ordering::Relaxed);
+            self.finish(result);
+        }
+        STATS.depth.fetch_sub(1, Ordering::Relaxed);
+        lane.running.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Counts the request done in its segment.
+    fn finish(&self, result: Result<(), HRESULT>) {
+        if let Err(hr) = result {
+            let failure = (u64::from(self.index) << 32) | u64::from(hr as u32);
+            self.segment.failure.fetch_min(failure, Ordering::Relaxed);
+        }
+        self.segment.release(&self.lane);
+        self.lane.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The workers' channel, with the workers started on first use: one per
+/// core. One worker at a time waits on the channel, the rest for it.
+fn workers() -> &'static Sender<Job> {
+    static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
+    JOBS.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+        let receiver: &'static Mutex<Receiver<Job>> = Box::leak(Box::new(Mutex::new(receiver)));
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        loop {
+                            let next = lock(receiver).recv();
+                            let Ok(job) = next else { return };
+                            job.run();
+                        }
+                    })
                     .is_ok()
             })
             .count();
+        let _ = std::thread::Builder::new()
+            .name("dstorage stats".into())
+            .spawn(report);
         tracing::info!(workers = started, "dstorage: workers");
-    });
-    scheduler
+        sender
+    })
 }
 
-impl Scheduler {
-    fn lock(&self) -> MutexGuard<'_, Lanes> {
-        self.lanes.lock().unwrap_or_else(|e| e.into_inner())
-    }
+/// What the workers did since the last streaming line.
+struct Stats {
+    requests: AtomicU64,
+    /// Source bytes taken from mapped files.
+    read: AtomicU64,
+    /// Destination bytes of compressed requests.
+    decompressed: AtomicU64,
+    /// Summed over workers, page faults on the mapping included.
+    decompress_ns: AtomicU64,
+    copy_ns: AtomicU64,
+    /// Submitted, not yet finished; the most since the last line.
+    depth: AtomicUsize,
+    peak: AtomicUsize,
 }
 
-/// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
-    let mut lanes = scheduler.lock();
+static STATS: Stats = Stats {
+    requests: AtomicU64::new(0),
+    read: AtomicU64::new(0),
+    decompressed: AtomicU64::new(0),
+    decompress_ns: AtomicU64::new(0),
+    copy_ns: AtomicU64::new(0),
+    depth: AtomicUsize::new(0),
+    peak: AtomicUsize::new(0),
+};
+
+fn nanos_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// One line every 10 s while requests come.
+fn report() {
     loop {
-        let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+        std::thread::sleep(Duration::from_secs(10));
+        let take = |n: &AtomicU64| n.swap(0, Ordering::Relaxed);
+        let requests = take(&STATS.requests);
+        let depth = STATS.depth.load(Ordering::Relaxed);
+        let peak = STATS.peak.swap(depth, Ordering::Relaxed);
+        let (read, decompressed) = (take(&STATS.read), take(&STATS.decompressed));
+        let (decompress_ns, copy_ns) = (take(&STATS.decompress_ns), take(&STATS.copy_ns));
+        if requests == 0 && peak == 0 {
             continue;
-        };
-        drop(lanes);
-        let result = execute(&job.request);
-        lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        if std::mem::take(&mut lanes.starved) {
-            scheduler.work.notify_all();
         }
-        scheduler.finished.notify_all();
+        let mb = |n: u64| n as f64 / f64::from(1 << 20);
+        tracing::info!(
+            "dstorage streaming (10 s): {requests} requests, {:.1} MB read, {:.1} MB decompressed, \
+             {} ms decompressing, {} ms copying, queue depth {depth} (peak {peak})",
+            mb(read),
+            mb(decompressed),
+            decompress_ns / 1_000_000,
+            copy_ns / 1_000_000,
+        );
     }
-}
-
-impl Lanes {
-    /// Starts the next read of the class with the least virtual time, from
-    /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
-    fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
-            self.starved = true;
-            return None;
-        }
-        lane.reads.pop_front();
-        lane.running.insert(seq);
-        self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
-        self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
-        lane.clock += size;
-        Some(Job {
-            lane: id,
-            seq,
-            request,
-            staging,
-        })
-    }
-
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
-        self.staged -= job.staging;
-        if let Some(lane) = self.lanes.get_mut(&job.lane) {
-            lane.running.remove(&job.seq);
-            if let Err(hr) = result {
-                lane.failures.insert(job.seq, hr);
-            }
-            lane.flush();
-        }
-    }
-
-    /// Moves a queue's enqueued commands to the workers.
-    fn submit(&mut self, id: u64) {
-        let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
-            return;
-        };
-        // A class that had nothing waiting starts from now, not from the
-        // credit it left behind.
-        if !self
-            .lanes
-            .values()
-            .any(|l| l.class == class && !l.reads.is_empty())
-        {
-            self.clock[class] = self.clock[class].max(self.now);
-        }
-        let Some(lane) = self.lanes.get_mut(&id) else {
-            return;
-        };
-        if lane.reads.is_empty() {
-            lane.clock = lane.clock.max(self.lane_now[class]);
-        }
-        for command in std::mem::take(&mut lane.unsubmitted) {
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
-            }
-        }
-        lane.flush();
-    }
-}
-
-impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
-        Lane {
-            class: priority.clamp(-1, 1).wrapping_add(1) as usize,
-            capacity: usize::from(capacity),
-            clock: 0,
-            unsubmitted: Vec::new(),
-            reads: VecDeque::new(),
-            statuses: VecDeque::new(),
-            running: BTreeSet::new(),
-            failures: BTreeMap::new(),
-            closed: false,
-        }
-    }
-
-    /// Requests and status entries held, submitted or not.
-    fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
-    }
-
-    /// Writes the status entries whose earlier reads have all finished.
-    fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
-                return;
-            }
-            let Some((_, status)) = self.statuses.pop_front() else {
-                return;
-            };
-            let later = self.failures.split_off(&seq);
-            let first = std::mem::replace(&mut self.failures, later)
-                .into_values()
-                .next();
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
-        }
-    }
-}
-
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
-fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
-    }
-}
-
-/// Ends a queue: what was not started is dropped, and this waits for the
-/// reads already running (they write title memory).
-fn close_lane(id: u64) {
-    let scheduler = scheduler();
-    let mut lanes = scheduler.lock();
-    let Some(lane) = lanes.lanes.get_mut(&id) else {
-        return;
-    };
-    lane.closed = true;
-    lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
-    while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
-        lanes = scheduler
-            .finished
-            .wait(lanes)
-            .unwrap_or_else(|e| e.into_inner());
-    }
-    lanes.lanes.remove(&id);
-    scheduler.finished.notify_all();
 }
 
 /// A read request as the title builds it, 0x48 bytes.
@@ -602,7 +758,8 @@ struct Request {
     source: *const c_void,
     offset: u64,
     source_size: u32,
-    /// Compressed size between two decompression stages; unused here.
+    /// Compressed size between two decompression stages: the BCPack stream
+    /// a zlib stream inflates to.
     intermediate_size: u32,
     /// Matched by cancellation; the title leaves it 0.
     tag: u64,
@@ -621,37 +778,17 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 
 const PAGE: usize = 64 * 1024;
 
-enum Command {
-    Read(Request),
-    Status(Status),
-}
-
-
-/// A status entry to write, holding a reference on its array.
-struct Status {
-    array: Array,
-    index: u32,
-}
-
-impl Drop for Status {
-    fn drop(&mut self) {
-        release(self.array);
-    }
-}
-
-impl Status {
-    fn entry(&self) -> &AtomicI32 {
-        // SAFETY: we hold a reference; the index was checked when enqueued.
-        &unsafe { &*self.array }.state.entries[self.index as usize]
-    }
-}
-
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    let lane = lane(this);
+    let Some(mut open) = lane.slot() else {
+        return; // closed: dropped
+    };
+    let job = lane.read(&mut open, request);
+    lane.push(&mut open, Command::Read(job));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -664,60 +801,30 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
         return;
     };
     entry.store(E_PENDING, Ordering::Release);
-    add_ref_instance(array);
-    queue(this, Command::Status(Status { array, index }));
-}
-
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
-fn queue(this: QueueRef, command: Command) {
-    // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
-    let scheduler = scheduler();
-    let mut lanes = scheduler.lock();
-    loop {
-        let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
-        };
-        // One slot stays free, as the console's count of empty slots says.
-        if lane.entries() + 1 < lane.capacity.max(2) {
-            break;
-        }
-        lanes = scheduler
-            .finished
-            .wait(lanes)
-            .unwrap_or_else(|e| e.into_inner());
-    }
-    let Some(lane) = lanes.lanes.get_mut(&id) else {
-        return;
+    let lane = lane(this);
+    let Some(mut open) = lane.slot() else {
+        return; // closed: never completes
     };
-    lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
-        scheduler.work.notify_all();
-    }
+    add_ref_instance(array);
+    let segment = Lane::close_segment(&mut open, Status { array, index });
+    lane.push(&mut open, Command::Status(segment));
 }
 
 extern "system" fn submit(this: QueueRef) {
-    // SAFETY: as above.
-    let id = unsafe { &*this }.state.id;
-    let scheduler = scheduler();
-    let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
-    tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id);
-    scheduler.work.notify_all();
+    let lane = lane(this);
+    let mut open = lock(&lane.open);
+    tracing::debug!(commands = open.commands.len(), "dstorage: submit");
+    lane.submit(&mut open);
 }
 
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
-    // SAFETY: as above.
-    close_lane(unsafe { &*this }.state.id);
+    lane(this).close();
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
+/// Inflates and/or unpacks, or copies, one request into its destination.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
@@ -741,49 +848,46 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
     let bc = ((options & BCPACK) >> 1) as u8;
-    let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
-        let size = request.source_size as usize;
-        // A file read into a title address is the kernel's write, and the
-        // kernel does not fault into the GPU side's guard: a block guarded
-        // again between `kernel_will_write` and the read (the guard over all
-        // the views of a page protects other views from other threads) made
-        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
-        // at the failed request (runs amd-C and amd-C2, seconds after the
-        // world's first frame). It is read beside and copied in: our copy
-        // faults into the guard like the title's own writes.
-        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
-            if !bounce {
-                return read_into(request, out).map(|()| size);
-            }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+        let source = source(request).map_err(|hr| fail(hr, "reading the source"))?;
+        // One copy from user mode: a guarded block of the destination
+        // faults into the GPU side's guard like the title's own writes (a
+        // kernel read into it failed instead, see `into_destination`).
+        let start = Instant::now();
+        into_destination(request, source.len(), |out| {
+            out.copy_from_slice(source);
+            Ok(out.len())
         })
-        .map_err(|hr| fail(hr, "copying"));
+        .map_err(|hr| fail(hr, "copying"))?;
+        STATS.copy_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
+        return Ok(());
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
+    let source = source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let size = request.destination_size as usize;
+    let start = Instant::now();
+    let unpack = |stream: &[u8]| {
+        into_destination(request, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, stream, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(stream, out).map_err(|hr| fail(hr, "zlib")),
+        })
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    // The console's order: zlib first, then BCPack.
+    if bc != 0 && options & ZLIB != 0 {
+        scratch(&BETWEEN, request.intermediate_size as usize, |packed| {
+            let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+            unpack(&packed[..n])
+        })?;
+    } else {
+        unpack(source)?;
+    }
+    STATS.decompress_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
+    STATS.decompressed.fetch_add(size as u64, Ordering::Relaxed);
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -791,6 +895,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+thread_local! {
+    /// A worker's BCPack stream between zlib and BCPack.
+    static BETWEEN: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// A worker's destination bytes for physical pages that are not one
+    /// window.
+    static SPREAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on `len` bytes of a worker's buffer, which is kept for the
+/// next request up to 8 MiB (larger ones give their memory back).
+fn scratch<R>(buffer: &'static LocalKey<RefCell<Vec<u8>>>, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const KEPT: usize = 8 << 20;
+    buffer.with_borrow_mut(|bytes| {
+        if bytes.len() < len {
+            bytes.resize(len, 0);
+        }
+        let result = f(&mut bytes[..len]);
+        if bytes.len() > KEPT {
+            *bytes = Vec::new();
+        }
+        result
+    })
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -880,42 +1008,42 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// A request's source bytes, borrowed: a slice of the file's mapping
+/// (asked ahead from the kernel), or the title's memory.
+fn source(request: &Request) -> Result<&[u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
-}
-
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
-    if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
-        return Ok(());
+    if size == 0 {
+        return Ok(&[]);
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
-    let mut done = 0;
-    loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
+    let data = unsafe { &*request.source.cast::<Instance<File>>() }.state.data;
+    let bytes = usize::try_from(request.offset)
+        .ok()
+        .and_then(|start| data.get(start..start.checked_add(size)?))
+        .ok_or(END_OF_FILE)?;
+    prefetch(bytes);
+    STATS.read.fetch_add(size as u64, Ordering::Relaxed);
+    Ok(bytes)
+}
+
+/// Has the kernel read a source's pages in one go (on Wine `madvise`
+/// `WILLNEED` on the page cache) rather than a fault at a time while it is
+/// inflated or copied. Under 64 KiB the faults do as well (the kernel maps
+/// pages around each).
+fn prefetch(bytes: &[u8]) {
+    if bytes.len() < 64 << 10 {
+        return;
     }
+    let range = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: bytes.as_ptr().cast_mut().cast(),
+        NumberOfBytes: bytes.len(),
+    };
+    // SAFETY: a range of our own view; a hint, whose result does not matter.
+    unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) };
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -930,9 +1058,11 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. `fill` writes from user mode (a file read is read
-        // beside first, see `execute`), so a block guarded again meanwhile
-        // faults into the guard instead of failing the write.
+        // there changes. `fill` writes from user mode (a kernel read into
+        // a block guarded again meanwhile failed with
+        // ERROR_INVALID_USER_BUFFER, and the title stops at the failed
+        // request), so such a block faults into the guard instead of
+        // failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
@@ -967,40 +1097,42 @@ fn into_destination(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a
-    // moment, comes right a little later: the write is tried again before
-    // the request fails (12 tries, about 0.9 s in all). Runs 175-178 lost
-    // 12 to 446 reads a launch here, all in one second of the loading; the
-    // one build that tried again (run 165) lost none of 13.
-    const RETRIES: u32 = 12;
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0u32;
-    while !written && tries < RETRIES {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if written {
-        // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
-        Ok(())
-    } else {
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+    scratch(&SPREAD, len, |data| {
+        let n = fill(data)?;
+        // A page the title has just made, or a view the host refuses for a
+        // moment, comes right a little later: the write is tried again
+        // before the request fails (12 tries, about 0.9 s in all). Runs
+        // 175-178 lost 12 to 446 reads a launch here, all in one second of
+        // the loading; the one build that tried again (run 165) lost none
+        // of 13.
+        const RETRIES: u32 = 12;
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0u32;
+        while !written && tries < RETRIES {
+            std::thread::sleep(Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
+        }
+        if written {
+            // As above, after the write that succeeded.
+            super::xmem::pages_written(pages, offset, n);
+            Ok(())
+        } else {
+            // Said aloud: the title never reads a request's result
+            // (it only polls for completion), so a destination left unwritten
+            // is a model or texture that silently holds whatever its pages
+            // held before.
+            tracing::warn!(
+                offset,
+                len,
+                pages = pages.len(),
+                known = super::xmem::pages_known(pages, offset, len),
+                tries,
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            );
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1282,101 +1414,97 @@ mod tests {
         assert_eq!(out, pattern(64)[8..24]);
     }
 
-    /// Lanes without workers: what `start` picks, and when statuses land.
-    fn lanes(staging: u64) -> Lanes {
-        Lanes {
-            lanes: HashMap::new(),
-            next_id: 0,
-            next_seq: 0,
-            staged: 0,
-            staging,
-            starved: false,
-            clock: [0; 3],
-            now: 0,
-            lane_now: [0; 3],
-        }
+    /// A queue without the workers: requests kept back and finished by
+    /// hand, status entries submitted as `submit` does.
+    fn held_read(lane: &Arc<Lane>) -> Job {
+        let r = request(0, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        lane.read(&mut lane.slot().unwrap(), r)
     }
 
-    fn read(lanes: &mut Lanes, id: u64, options: u64, size: u32) {
-        let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
-        (r.destination_size, r.source_size) = (size, size);
-        let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
-    }
-
-    #[test]
-    fn priorities_share_by_bytes_about_tenfold() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
-        for _ in 0..400 {
-            for id in 0..3 {
-                read(&mut l, id, 0, 4096);
-            }
-        }
-        (0..3).for_each(|id| l.submit(id));
-        let mut started = [0u32; 3];
-        for _ in 0..330 {
-            let job = l.start().unwrap();
-            started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
-        }
-        // Normal gets about a tenth of what high and real-time get together.
-        assert_eq!(started[1] + started[2], 300, "{started:?}");
-        assert_eq!(started[0], 30, "{started:?}");
-        assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
-    }
-
-    #[test]
-    fn staging_bounds_compressed_bytes_in_flight() {
-        let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
-        read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, 0, 1000); // raw: straight to its destination
-        l.submit(0);
-        let first = l.start().unwrap();
-        assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
-        let second = l.start().unwrap();
-        let raw = l.start().unwrap();
-        assert_eq!((second.staging, raw.staging), (60, 0));
-        // Alone, a request larger than the buffer still runs.
-        read(&mut l, 0, ZLIB, 500);
-        l.submit(0);
-        assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
-        assert!(l.start().is_some());
+    fn held_status(lane: &Arc<Lane>, array: Array, index: u32) -> Arc<Segment> {
+        // SAFETY: an array we created.
+        let entries = unsafe { &(*array).state.entries };
+        entries[index as usize].store(E_PENDING, Ordering::Release);
+        add_ref_instance(array);
+        Lane::close_segment(&mut lane.slot().unwrap(), Status { array, index })
     }
 
     #[test]
     fn a_status_waits_for_every_earlier_read() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        let lane = Arc::new(Lane::new(64));
         let array = status_array(2).cast::<Instance<StatusArray>>();
-        let status = |index| {
-            add_ref_instance(array);
-            Command::Status(Status { array, index })
-        };
-        read(&mut l, 0, 0, 16);
-        read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
-        read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
-        // SAFETY: an array we created.
-        for entry in unsafe { &(*array).state.entries }.iter() {
-            entry.store(E_PENDING, Ordering::Release);
-        }
-        l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
-        // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        let (first, second) = (held_read(&lane), held_read(&lane));
+        let status0 = held_status(&lane, array, 0);
+        let third = held_read(&lane);
+        let status1 = held_status(&lane, array, 1);
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
+        // Submitted: nothing has finished yet.
+        status0.release(&lane);
+        status1.release(&lane);
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        // The last read and the first finish; the second then fails.
+        third.finish(Ok(()));
+        first.finish(Ok(()));
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+        second.finish(Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+        assert_eq!(lane.held.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_first_failure_is_first_in_queue_order() {
+        let lane = Arc::new(Lane::new(64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        let (first, second, third) = (held_read(&lane), held_read(&lane), held_read(&lane));
+        held_status(&lane, array, 0).release(&lane);
+        third.finish(Err(E_NOTIMPL));
+        second.finish(Err(END_OF_FILE));
+        first.finish(Ok(()));
+        assert_eq!(result(array.cast(), 0), END_OF_FILE);
+    }
+
+    #[test]
+    fn a_status_is_written_only_once_submitted() {
+        let lane = Arc::new(Lane::new(64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        held_read(&lane).finish(Ok(()));
+        let status = held_status(&lane, array, 0);
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+        status.release(&lane);
+        assert_eq!(result(array.cast(), 0), S_OK);
+    }
+
+    #[test]
+    fn a_full_queue_waits_for_room() {
+        let lane = Arc::new(Lane::new(4));
+        // Three held: the fourth slot stays free.
+        let mut jobs: Vec<Job> = (0..3).map(|_| held_read(&lane)).collect();
+        let got = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (lane, got) = (Arc::clone(&lane), Arc::clone(&got));
+            std::thread::spawn(move || {
+                drop(lane.slot().unwrap());
+                got.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!got.load(Ordering::SeqCst), "the queue is full");
+        jobs.pop().unwrap().finish(Ok(()));
+        waiter.join().unwrap();
+        assert!(got.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_file_opened_twice_is_mapped_once() {
+        let (dir, first) = file_with(&pattern(4096));
+        let second = open(&dir.path().join("data.bin"));
+        let data = |file: *mut c_void| {
+            // SAFETY: file objects we created.
+            unsafe { &*file.cast::<Instance<File>>() }.state.data
+        };
+        assert_ne!(first, second);
+        assert_eq!(data(first).as_ptr(), data(second).as_ptr());
+        assert_eq!(data(first), pattern(4096));
     }
 
     #[test]
