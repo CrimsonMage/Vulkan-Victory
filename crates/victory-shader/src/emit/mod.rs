@@ -261,8 +261,6 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    // (what an earlier program's lowering on this thread left behind)
-    lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -329,12 +327,6 @@ pub fn emit(
                     }
                 }
             }
-            if idiom(p, st) == exact {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                if done(&local) {
-                    return local.map(|(shader, _)| shader);
-                }
-            }
         }
         if !exact_only {
             // Last: every mask and lane read per host wave.
@@ -350,21 +342,6 @@ pub fn emit(
             }
         }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
-    let original = match original {
-        Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs && what == lower::LANE_MASK =>
-        {
-            let again = widen(c, native, p);
-            match again {
-                Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
-            }
-        }
-        other => other,
-    };
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -380,56 +357,6 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
-}
-
-/// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
-/// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
-/// lowering names the blocks where the two host waves must meet and could not
-/// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
-fn widen(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
-    const NOT: ShaderError = ShaderError::Unsupported {
-        offset: 0,
-        what: "wave-wide branches in a thread group of several console waves",
-    };
-    match native.io {
-        // (a program whose waves are the host's meets no one: no barrier, any group)
-        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        _ => return Err(NOT),
-    }
-    let mut wide = std::collections::HashSet::new();
-    loop {
-        let st = structure::structure_wide(p, &wide)?;
-        let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-        lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
-        let needs = lower::take_needs();
-        // (or translated for 64-lane waves still: shared memory read and written where not
-        // every lane runs, whose blocks the lowering names too)
-        let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
-                if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
-        if !stuck {
-            return r;
-        }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| !wide.contains(b))
-            .collect();
-        if more.is_empty() {
-            return r;
-        }
-        wide.extend(more);
-    }
 }
 
 /// The translated program, and the wave size it requires of the host.

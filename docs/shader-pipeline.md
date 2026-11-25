@@ -46,9 +46,8 @@ Windows-only test tools (D3D12 device, `dxil.dll`).
   simulating the whole-wave section (`wave.rs`) and become DXIL wave ops.
   When that cannot be made exact, `emit/mod.rs` retries other forms of the
   program (early-outs left out, skips left out, each host wave as its own
-  wave, approximate per-half forms) and the lane-mask retry takes per-lane
-  branches wave-wide (`structure::structure_wide`). A program that still
-  needs 64 lanes declares `WaveSize(64)`. `set_host_max_wave` gives the
+  wave, approximate per-half forms; `threading.rs` last). A program that
+  still needs 64 lanes declares `WaveSize(64)`. `set_host_max_wave` gives the
   host's widest wave (32 on NVIDIA).
 - **Descriptors read as data.** Console code loads descriptors from heap
   memory with scalar loads and may read their dwords as numbers (a buffer

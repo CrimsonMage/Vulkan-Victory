@@ -336,8 +336,8 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
+/// not post-dominate it, which only some lanes run. Not the branches on scalar conditions.
+/// None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -379,8 +379,8 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
+        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            continue; // a uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it
         let mut seen = vec![false; n];
@@ -397,39 +397,10 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     Some(regions)
 }
 
-/// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
-/// host waves must meet, [`take_needs`]): the ones to take wave-wide
-/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
-/// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
-pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
-    let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
-        if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
-            st.wave_any.get(d).copied().flatten()?;
-            out.push(d);
-        }
-    }
-    Some(out)
-}
-
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {
     what.ends_with("where not every lane runs") || what == MASK_ELSEWHERE
-}
-
-/// The blocks where the last lowering on this thread wanted every lane and did not have it
-/// (its "... where not every lane runs" refusals), which it forgets.
-pub(super) fn take_needs() -> Vec<usize> {
-    NEEDS.take()
-}
-
-fn need(block: usize) {
-    NEEDS.with_borrow_mut(|n| {
-        if !n.contains(&block) {
-            n.push(block);
-        }
-    });
 }
 
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
@@ -926,8 +897,6 @@ pub fn set_host_max_wave(lanes: u32) {
 }
 
 thread_local! {
-    /// See [`take_needs`].
-    static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
@@ -1241,9 +1210,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || lane_constant_masks(x.st)
-                // (a branch the wave takes together asks the wave)
-                || !x.st.wide.is_empty();
+            }) || lane_constant_masks(x.st);
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1263,8 +1230,7 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
-                }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
+                }) || lane_constant_masks(x.st);
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
@@ -1288,15 +1254,6 @@ impl<'a> Lower<'a> {
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
-                        }
-                        if !lds_ok {
-                            // (the blocks whose LDS accesses not every lane runs: with the
-                            // branches around them taken wave-wide they get their barriers)
-                            for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
-                                    need(b);
-                                }
-                            }
                         }
                         if lds_ok {
                             wave = 32;
@@ -1815,7 +1772,6 @@ impl<'a> Lower<'a> {
             r
         } else if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
-                need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
             let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
@@ -1913,7 +1869,6 @@ impl<'a> Lower<'a> {
         let mut r_hi = self.s.m.extract(c, split, 1);
         if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
-                need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
             let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
@@ -1984,7 +1939,6 @@ impl<'a> Lower<'a> {
         };
         if !every {
             if halves {
-                need(self.cur_ir);
                 return Err(WHERE);
             }
             return Ok(self.half_sum_present(x));
@@ -2999,9 +2953,6 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
-            }
             return Err(MASK_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
@@ -3035,7 +2986,6 @@ impl<'a> Lower<'a> {
                         }
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
-                        need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
                     }
                     xy = self.exchange_halves(at, xy.0);
@@ -3650,12 +3600,6 @@ impl<'a> Lower<'a> {
         v
     }
 
-    /// The console's decision of the branch closing IR block `b`, which the wave takes
-    /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
-    /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
-    /// when every lane's does (`execz`, `vccz`, that SCC clear), [`Structured::wave_any`].
-    /// Each host wave asks its lanes and the halves exchange the answers, so both go the
-    /// same way and can meet again inside the branch.
     /// SCC of a mask operation as data ([`Structured::scc_some`]): whether some lane of the
     /// console wave has its bit of the result, asked where the operation stands. The lanes
     /// that are elsewhere have no bit (the result is ANDed with EXEC or is EXEC), so with
@@ -3681,7 +3625,6 @@ impl<'a> Lower<'a> {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
-            need(made.unwrap_or(0));
             return Err("a lane mask exchanged where not every lane runs");
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
@@ -3689,49 +3632,6 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
-    }
-
-    fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
-        const WHY: Why = "a wave-wide branch where not every lane runs";
-        let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
-            // The host's waves are the console's: the wave's own answer. The lanes that are
-            // elsewhere have no bit set, as on the console, so "some lane" needs no one but
-            // the lanes here, and "every lane's bit is clear" is true of the others anyway.
-            let c = self.cur;
-            let mine = self.boolean(when, c)?;
-            let i1t = self.s.t.i1;
-            self.s.flags |= flags::WAVE_OPS;
-            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
-            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
-        }
-        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
-            return Err(WHY);
-        }
-        if !self.all_lanes(b) {
-            need(b);
-            return Err(WHY);
-        }
-        let c = self.cur;
-        let mine = self.boolean(when, c)?;
-        // what the halves exchange is "some lane speaks against" either way (for `any`:
-        // some lane's `when` holds; else: some lane's does not), so a half with no lane says
-        // nothing
-        let set = if any {
-            mine
-        } else {
-            let t = self.s.m.bool(true);
-            self.s.m.bin(c, Bin::Xor, mine, t)
-        };
-        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
-        let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
-        self.s.flags |= flags::WAVE_OPS;
-        let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
-        let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
-        let z = self.s.m.i32(0);
-        Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
@@ -7392,7 +7292,6 @@ impl<'a> Lower<'a> {
                     }
                     // the lane that holds it may be in the other host wave: it gives it through LDS
                     if !self.all_lanes(self.cur_ir) {
-                        need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
                     let cl = self.console_lane();
@@ -7465,7 +7364,6 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
-                        need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
@@ -10855,10 +10753,6 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) => {
-                        let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
-                        (c, taken, not_taken)
-                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -11084,20 +10978,15 @@ impl<'a> Lower<'a> {
                     // the skip bringing "no lane" along. As data it is "some lane of the wave
                     // has the bit" - right only if the wave took that skip together, as the
                     // console does: a lane that skipped alone would bring "some lane" where the
-                    // console has the skipped code's SCC. So the branch must be one the wave
-                    // takes together; else its region is named for `emit`'s retry to widen it.
+                    // console has the skipped code's SCC. So the branch must be uniform.
                     (Some(Val::Missing(_)) | None, true)
                         if self.read_phis.contains(&phi.value)
                             && self.mask_data == MaskData::Console
                             && st.scc_some.contains_key(&arg) =>
                     {
-                        let per_lane = !st.wide.contains(&q)
-                            && matches!(st.exits[q], LaneExit::Branch { when, .. }
+                        let per_lane = matches!(st.exits[q], LaneExit::Branch { when, .. }
                                 if !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))));
                         if per_lane {
-                            for &other in p.blocks[b].preds.iter().filter(|&&o| o != q) {
-                                need(other);
-                            }
                             return Err(Stop::Retry(phi.value, LANE_MASK));
                         }
                         match self.scc_some(arg) {
