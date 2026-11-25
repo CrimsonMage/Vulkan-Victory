@@ -115,7 +115,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let Some((what, len)) = decode::decode(code) else {
         // Rewritten by another thread after this one fetched the old bytes: run it again.
         return match find(rip) {
-            Some(site) if site.state.load(Relaxed) == REWRITTEN => {
+            Some(site) if matches!(site.state.load(Relaxed), REWRITTEN | REWRITING) => {
                 count(site);
                 CONTINUE_EXECUTION
             }
@@ -257,10 +257,11 @@ struct Site {
     state: AtomicU8,
 }
 
-/// [`Site::state`]: not looked at yet, rewritten, or left to the emulation.
+/// [`Site::state`]: not looked at yet, rewritten, left to the emulation, being rewritten.
 const UNTRIED: u8 = 0;
 const REWRITTEN: u8 = 1;
 const EMULATED: u8 = 2;
+const REWRITING: u8 = 3;
 
 /// Sites by address (open addressing); one past the last free slot is emulated, uncounted.
 const SLOTS: usize = 1024;
@@ -334,11 +335,10 @@ impl Stubs {
 }
 
 /// Rewrites the instruction at `at` (its bytes `code`, decoded to `what`) on its first trap,
-/// so it traps no more. Other threads may be running the code around it: the bytes that
-/// change are written in one atomic store (none if they cross an aligned 16 bytes), so a
-/// thread fetches either the old instruction, which traps and is emulated (or, already
-/// rewritten, run again), or the new one. A stub replaces a whole instruction, or a whole
-/// `clzero` loop, which the emulation steps over at once, so no thread is ever inside it.
+/// so it traps no more. Other threads may be running the code around it: [`write_code`]
+/// lets them fetch either the old instruction, which traps and is emulated (or, already
+/// being rewritten, run again), or the new one. A stub replaces a whole instruction, or a
+/// whole `clzero` loop, which the emulation steps over at once, so no thread is ever inside.
 fn rewrite(site: &Site, at: usize, what: &ConsoleOnly, code: &[u8]) {
     static STUBS: std::sync::Mutex<Stubs> = std::sync::Mutex::new(Stubs([(0, 0); 16]));
     if site.state.load(Relaxed) != UNTRIED {
@@ -354,6 +354,7 @@ fn rewrite(site: &Site, at: usize, what: &ConsoleOnly, code: &[u8]) {
     if site.state.load(Relaxed) != UNTRIED {
         return;
     }
+    site.state.store(REWRITING, Relaxed);
     let how = match stub::rewrite(what, code) {
         Some(stub::Rewrite::InPlace(bytes)) => write_code(at, &bytes).then_some("in place"),
         Some(stub::Rewrite::Stub) => (|| {
@@ -386,72 +387,100 @@ fn image_code(at: usize) -> bool {
     found && m.Type == MEM_IMAGE && m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) != 0
 }
 
-/// Writes `bytes` at `at` in one atomic store, of the aligned 8 or 16 bytes of code that hold
-/// them. False if they cross an aligned 16 bytes, or the code changed meanwhile.
+/// Writes `bytes` over the code at `at` so that a thread running it meanwhile fetches either
+/// the old instruction or the new one: in one atomic store when they lie in an aligned 16
+/// bytes; across two, the head first becomes `jmp $` (EB FE), which holds a thread that
+/// arrives meanwhile, then the tail is written, then the head. False if nothing was written
+/// (the head is a single byte, or the page could not be made writable).
 fn write_code(at: usize, bytes: &[u8]) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let n = bytes.len();
-    let width = if at % 8 + n <= 8 {
-        8
-    } else if at % 16 + n <= 16 {
-        16
-    } else {
-        return false;
-    };
-    let word = at & !(width - 1);
-    let off = at - word;
-    let mut old = 0;
-    // SAFETY: the code's own page, made writable for the store and restored after.
-    if unsafe { VirtualProtect(word as *const _, width, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+    let head = 16 - at % 16;
+    if n > head && (head < 2 || n - head > 16) {
         return false;
     }
-    let done = if width == 8 {
-        // SAFETY: aligned, and writable now.
-        let word = unsafe { AtomicU64::from_ptr(word as *mut u64) };
-        let was = word.load(Relaxed);
-        let mut new = was.to_le_bytes();
-        new[off..off + n].copy_from_slice(bytes);
-        word.compare_exchange(was, u64::from_le_bytes(new), Relaxed, Relaxed).is_ok()
-    } else {
-        // SAFETY: aligned, and writable now; a torn read fails the exchange.
-        let was = unsafe { (word as *const u128).read_volatile() };
-        let mut new = was.to_le_bytes();
-        new[off..off + n].copy_from_slice(bytes);
-        // SAFETY: as above.
-        unsafe { exchange16(word as *mut u128, was, u128::from_le_bytes(new)) }
-    };
+    let mut old = 0;
+    // SAFETY: the code's own pages, made writable for the stores and restored after.
+    if unsafe { VirtualProtect(at as *const _, n, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    // SAFETY: writable now, each store in an aligned 16 bytes.
+    unsafe {
+        if n <= head {
+            store(at, bytes);
+        } else {
+            store(at, &[0xEB, 0xFE]);
+            store(at + head, &bytes[head..]);
+            store(at, &bytes[..head]);
+        }
+    }
     // SAFETY: restores the protection found; the range is the code just written.
     unsafe {
-        VirtualProtect(word as *const _, width, old, &mut old);
+        VirtualProtect(at as *const _, n, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), at as *const _, n);
     }
-    done
+    true
 }
 
-/// `lock cmpxchg16b`: `*p = new` if it holds `old`.
+/// `bytes` at `at` in one atomic store: of the aligned 8 bytes that hold them, else of the
+/// aligned 16 (`lock cmpxchg16b`).
+///
+/// # Safety
+/// `bytes` lie in an aligned 16 bytes of writable memory at `at`.
+unsafe fn store(at: usize, bytes: &[u8]) {
+    let (n, off) = (bytes.len(), at % 16);
+    let splice = |was: &mut [u8]| {
+        let from = at % was.len();
+        was[from..from + n].copy_from_slice(bytes);
+    };
+    if at % 8 + n <= 8 {
+        // SAFETY: aligned and writable, as the caller says.
+        let word = unsafe { AtomicU64::from_ptr((at & !7) as *mut u64) };
+        let _ = word.fetch_update(Relaxed, Relaxed, |was| {
+            let mut b = was.to_le_bytes();
+            splice(&mut b);
+            Some(u64::from_le_bytes(b))
+        });
+        return;
+    }
+    debug_assert!(off + n <= 16);
+    let p = (at & !15) as *mut u128;
+    // SAFETY: as the caller says (an exchange that changes nothing reads the 16 bytes whole).
+    let mut was = unsafe { exchange16(p, 0, 0) };
+    loop {
+        let mut b = was.to_le_bytes();
+        splice(&mut b);
+        // SAFETY: as above.
+        let found = unsafe { exchange16(p, was, u128::from_le_bytes(b)) };
+        if found == was {
+            return;
+        }
+        was = found;
+    }
+}
+
+/// `lock cmpxchg16b`: `*p = new` if it holds `old`; returns what it held.
 ///
 /// # Safety
 /// `p` is 16-byte aligned and writable.
-unsafe fn exchange16(p: *mut u128, old: u128, new: u128) -> bool {
-    let done: u8;
+unsafe fn exchange16(p: *mut u128, old: u128, new: u128) -> u128 {
+    let (low, high): (u64, u64);
     // SAFETY: as the caller says; rbx (which the compiler reserves) is swapped in and back.
     unsafe {
         std::arch::asm!(
-            "xchg {low}, rbx",
+            "xchg {new_low}, rbx",
             "lock cmpxchg16b xmmword ptr [{p}]",
-            "sete {done}",
-            "mov rbx, {low}",
+            "mov rbx, {new_low}",
             p = in(reg) p,
-            low = inout(reg) new as u64 => _,
-            done = out(reg_byte) done,
+            new_low = inout(reg) new as u64 => _,
             in("rcx") (new >> 64) as u64,
-            inout("rax") old as u64 => _,
-            inout("rdx") (old >> 64) as u64 => _,
+            inout("rax") old as u64 => low,
+            inout("rdx") (old >> 64) as u64 => high,
         );
     }
-    done != 0
+    u128::from(high) << 64 | u128::from(low)
 }
 
 /// Exceptions dispatched to handlers since the start: access violations on reads (and
@@ -521,7 +550,7 @@ fn stats_line(traps: &[u64; KINDS.len()], before: &[u64; KINDS.len()], dispatche
         .take(5)
         .map(|&(n, at, kind, state)| {
             let place = crate::threads::title_address(at).map_or_else(|| crate::crash::locate(at), |a| format!("{a:#x}"));
-            let state = ["", " (rewritten)", " (emulated)"][state as usize % 3];
+            let state = ["", " (rewritten)", " (emulated)", ""][state as usize % 4];
             format!("{place} {} {n}{state}", KINDS[kind as usize % KINDS.len()])
         })
         .collect();
