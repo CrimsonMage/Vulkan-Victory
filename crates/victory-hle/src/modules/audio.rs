@@ -346,8 +346,10 @@ struct Trace {
     bad_frames: u32,
     /// The loudest sample written.
     peak: i16,
-    /// Milliseconds after enabling when the input ran out.
+    /// Milliseconds after enabling when the input ran out (the first time).
     ended_ms: Option<u128>,
+    /// How often the input ran out and the title gave more afterwards.
+    resumed: u32,
 }
 
 struct Xma {
@@ -437,6 +439,7 @@ impl Xma {
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
+                resumed: 0,
             },
         });
         drop(slot);
@@ -462,6 +465,7 @@ impl Xma {
             bad_frames = t.bad_frames,
             peak = t.peak,
             input_ended_ms = ?t.ended_ms,
+            resumed = t.resumed,
             read_bit = context.field(2, 0, 26),
             input_bits = context.field(0, 0, 12) * xma::PACKET_BYTES as u32 * 8,
             "XMA voice disabled"
@@ -543,12 +547,29 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        if valid == 0 {
+            return false;
+        }
+        // The title gave input again (a stream refilled after it ran dry):
+        // the hardware decodes on from it, it does not stay stopped. A
+        // voice that stopped for good here went silent for the rest of its
+        // stream at the first late refill (refills are slowest when the
+        // title's frames are), and whatever the title times by its
+        // position stopped with it. The decoder was reset by its flush.
+        voice.ended = false;
+        voice.trace.resumed += 1;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!("an XMA voice ran out of input and was given more: decoding goes on (logged once)");
+        });
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -558,7 +579,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
                 voice.pcm.extend(tail);
             }
             voice.ended = true;
-            voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
+            voice.trace.ended_ms.get_or_insert(voice.trace.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
             return !voice.pcm.is_empty();
@@ -1067,6 +1088,19 @@ mod tests {
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+
+        // The title refills input 0 and marks it valid again, as a stream
+        // does after it ran dry: decoding goes on.
+        context.set_field(0, 20, 1, 1);
+        for _ in 0..20 {
+            submit(ADVANCE_XMA_READ, &[1, 4]);
+            xma().pump();
+            if context.field(0, 20, 2) == 0 && context.field(1, 31, 1) == 1 {
+                break;
+            }
+        }
+        assert!(produced(&xma()).unwrap() > 26 * SAMPLES_PER_BLOCK, "decoding went on");
+        assert_eq!(context.field(0, 20, 2), 0, "the refill used up too");
 
         // A count near `u32::MAX` wraps the read block like any other
         // (3 + 0xffff_ffff blocks on a ring of four is block 2); the sum

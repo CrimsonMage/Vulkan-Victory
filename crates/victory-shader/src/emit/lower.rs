@@ -4269,6 +4269,18 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always. At a triangle's edge (and after a
+    /// discard) the quad's other pixels are helper lanes, which only quad
+    /// reads are defined to see; wave reads of them are undefined (0 on
+    /// AMD). A derivative the title takes by hand through `quad_perm` or a
+    /// quad swizzle was then the whole value there, and the texture read
+    /// that used it took the wrong level (after the AMD fork belobug,
+    /// 03629f3; correct on every host, not only AMD).
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4321,6 +4333,23 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream 0601955, as the
+    /// AMD fork belobug carries it in f520772). On the console, whole-quad
+    /// mode puts helper lanes in EXEC, so a loop over first-lane values
+    /// serves them too; on the host, wave operations leave helper lanes
+    /// out, and once only helpers are left such a loop reads no lane and
+    /// runs to its limit. With its own value a helper lane matches in the
+    /// first pass; what it computes only feeds derivatives.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -4413,7 +4442,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6725,7 +6754,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -7617,7 +7646,8 @@ impl<'a> Lower<'a> {
                         self.s.m.select(c, in_lo, lo, hi)
                     }
                 } else {
-                    mine
+                    // A helper lane of a pixel shader takes its own value.
+                    self.helper_reads_own(a, mine)
                 };
                 int(self, r)
             }

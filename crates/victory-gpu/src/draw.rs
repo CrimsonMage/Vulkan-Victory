@@ -2091,6 +2091,44 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The least indirect light after the program that resolves it; the
+        // pass sets its own heap, root signature and pipeline, so the next
+        // draw or dispatch sets the title's again.
+        if self.ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the least indirect light
+    /// ([`crate::ambient`]), if it is the program that resolves that.
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let u = stage.translated().used.iter().find(|u| {
+            u.kind == ResourceType::Uav
+                && u.root == RootType::Table
+                && (u.slot, u.table_offset_dwords) == crate::ambient::LIGHT
+        });
+        let light = u
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Table(table)) => {
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                }
+                _ => None,
+            })
+            .and_then(|v| match v {
+                View::Unordered(r, ..) => Some(r),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if light == 0 {
+            once!("no ambient light: the resolve's tables are not as expected");
+            return false;
+        }
+        crate::ambient::raise(list, light as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

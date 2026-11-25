@@ -77,6 +77,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// The PC-memory buffer (`buffer`, or the card side's `staging`) came
+    /// from `Host::shared_buffer`: when the copy goes it is given to the
+    /// buffer pool (`crate::memcap`) to be used again.
+    pooled: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -155,7 +159,15 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        // At most an eighth of the card's budget unless set: 1,024 MB on a
+        // card of 12 GB (budget about 10,200 MB), about 690 on one of 8 GB
+        // (about 5,500), where the room kept for these copies took the
+        // textures' share.
+        let most = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map_or(1024, |[budget, ..]| (budget >> 20) / 8)
+            .clamp(256, 1024);
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", most))
     })
 }
 
@@ -1948,6 +1960,10 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.pooled {
+            let shared = self.card.as_ref().map_or_else(|| self.buffer.clone(), |card| card.staging.clone());
+            crate::memcap::give(crate::memcap::Kind::Shared, shared);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -2317,6 +2333,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            pooled: false,
         }
     }
 
@@ -3570,6 +3587,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.pooled = true;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3779,6 +3797,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.pooled = true;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3841,7 +3860,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.pooled = true;
+    let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)

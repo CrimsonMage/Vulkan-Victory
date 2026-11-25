@@ -700,6 +700,7 @@ fn log_memory() {
     // budget and use the lines below print.
     if let Some(h) = crate::host::host() {
         h.log_video_memory("with the memory line");
+        crate::memcap::line(h);
     }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.

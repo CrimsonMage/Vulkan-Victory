@@ -1304,6 +1304,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // At the hard line of `crate::memcap` a texture the title fills
+        // gets no host copy now (its draws go without it, as when a
+        // creation fails); the sweep frees idle copies and a later use
+        // makes it. Render targets and textures the host writes are still
+        // made: what they hold exists nowhere else.
+        if fills(&r.desc) && card_full_lately() {
+            CARD_FULL_REFUSED.fetch_add(1, Relaxed);
+            return None;
+        }
         let clear = r
             .host
             .clear
@@ -1425,19 +1434,31 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    // The hard line of `crate::memcap` holds whatever else is said: past
+    // the (capped) budget no copy is made, not even under the floor or a
+    // limit of its own. Run of 2026-11-25: render targets (3.3 GB) and
+    // card buffers had the card full while the floor still let 2 GB of
+    // textures in, and the 8 GB card's driver failed.
+    if crate::memcap::on()
+        && let Some([budget, used, ..]) = video
+        && used >= budget
+    {
+        return false;
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }
     if filled < FLOOR {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match video {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used + crate::shadow::card_room_kept() + targets_room_kept(budget) < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1445,8 +1466,15 @@ pub(crate) fn room() -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072, or three
+/// tenths of the card's `budget` if that is less; 0: none, as before) less
+/// what such copies hold now.
+///
+/// Three tenths: on a card of 8 GB the system's budget is about 5,500 MB
+/// (an RTX 5060 Ti under vkd3d-proton), and 3,072 MB kept for targets plus
+/// the room kept for buffer copies left the textures picked by index under
+/// a gigabyte before their line (20,000 slots waiting in that run). A card
+/// of 12 GB (budget about 10,200 MB) keeps the 3,072 as before.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1461,18 +1489,47 @@ pub(crate) fn room() -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(budget: u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
-    });
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let most = MOST
+        .get_or_init(|| {
+            std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|mb| mb.min(8192) << 20)
+        })
+        .unwrap_or_else(|| (3072u64 << 20).min(budget / 10 * 3));
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// Host copies of textures the title fills not made at the hard line
+/// ([`card_full_lately`]), since the start.
+#[cfg(windows)]
+pub(crate) static CARD_FULL_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the card's memory in use has reached the budget the layer goes
+/// by (`Host::video_memory`, capped by `crate::memcap`), as it was at most
+/// a tenth of a second ago. Always false with `VICTORY_MEMCAP=0`.
+#[cfg(windows)]
+pub(crate) fn card_full_lately() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::memcap::on() {
+        return false;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 1 == tenth {
+        return last & 1 != 0;
+    }
+    let full = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[budget, used, ..]| budget > 0 && used >= budget);
+    LAST.store((tenth << 1) | u64::from(full), Relaxed);
+    full
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question

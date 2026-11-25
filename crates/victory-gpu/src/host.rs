@@ -76,6 +76,17 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started so far (`crate::memcap`: a pooled buffer is handed
+/// out again once those running when it was given have finished).
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished (waited for) so far.
+pub(crate) fn submissions_finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -199,6 +210,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    crate::memcap::trim();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -698,6 +710,14 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
+        // The ceilings of `crate::memcap` come from the adapter's own
+        // memory, not from the budget the system reports (under vkd3d that
+        // budget shrinks with what is free on the card).
+        if let Some(a) = &adapter
+            && let Ok(desc) = a.GetDesc1()
+        {
+            crate::memcap::set_dedicated(desc.DedicatedVideoMemory as u64);
+        }
         Ok(Host {
             device,
             queue,
@@ -1518,8 +1538,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             }
         }
     }
-    // Freed outside the lock.
-    drop(freed);
+    // Outside the lock: to the buffer pool (`crate::memcap`), which frees
+    // what it has no room for.
+    for chunk in freed {
+        crate::memcap::give(crate::memcap::Kind::Upload, chunk._buffer);
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -1940,6 +1963,11 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The list was reset after its submission ran: its upload buffers
+        // are used again (`crate::memcap`) rather than freed.
+        for buffer in std::mem::take(&mut self.uploads) {
+            crate::memcap::give(crate::memcap::Kind::Upload, buffer);
+        }
     }
 }
 
@@ -7295,7 +7323,21 @@ impl Host {
         }
     }
 
+    /// A mapped upload buffer of at least `size` bytes.
+    ///
+    /// Made in a size class (`crate::memcap::class`), and taken from the
+    /// pool of buffers let go if one of that class is free; not made past
+    /// the ceiling of the PC's memory mapped for the card (with 1 GiB more
+    /// than shared buffers get: uploads are what the rest waits on).
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let asked = size;
+        let size = if crate::memcap::on() { crate::memcap::class(crate::memcap::Kind::Upload, size) } else { size };
+        if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Upload, size, asked) {
+            return Some(pooled);
+        }
+        if !crate::memcap::shared_room(self, size, 1 << 30) {
+            return None;
+        }
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -7909,7 +7951,18 @@ impl Host {
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
+    ///
+    /// The card's budget is the one the layer's rules go by: at most the
+    /// ceiling of `crate::memcap` ([`Self::video_memory_raw`]: as the
+    /// system says it).
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+        let mut v = self.video_memory_raw()?;
+        v[0] = crate::memcap::clamp_budget(v[0]);
+        Some(v)
+    }
+
+    /// [`Self::video_memory`] as the system says it.
+    pub(crate) fn video_memory_raw(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -7991,7 +8044,19 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    ///
+    /// Taken from the pool of buffers let go if one of the size is free
+    /// (zeroed, as a new one reads); not made past the ceiling of the PC's
+    /// memory mapped for the card (`crate::memcap`): then `None`, as for a
+    /// failed creation.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let size = size.max(1);
+        if let Some(pooled) = crate::memcap::take(crate::memcap::Kind::Shared, size, size) {
+            return Some(pooled);
+        }
+        if !crate::memcap::shared_room(self, size, 0) {
+            return None;
+        }
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

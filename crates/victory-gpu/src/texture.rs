@@ -468,8 +468,12 @@ impl Drop for Staging {
             if all.1 + self.pooled <= SPARE_MOST.0 {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+                return;
             }
         }
+        // Not kept here (too big, or the spares are full): to the host's
+        // buffer pool (`crate::memcap`), which frees what it cannot keep.
+        crate::memcap::give(crate::memcap::Kind::Upload, self.buffer.clone());
     }
 }
 
