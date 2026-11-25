@@ -26,7 +26,6 @@ walkdir.workspace = true
 diagnostics = [
     "victory-core/diagnostics",
     "victory-hle/diagnostics",
-    "victory-shader/diagnostics",
 ]
 
 [lints]

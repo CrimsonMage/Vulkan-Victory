@@ -6,33 +6,12 @@ use std::ffi::CString;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-#[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
 use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
-
-// Linux: Direct3D 12 comes from a native build of vkd3d-proton (Vulkan
-// underneath). It has no DXGI, so there is no adapter choice and no WARP.
-#[cfg(victory_native_d3d12)]
-#[link(name = "vkd3d-proton-d3d12")]
-unsafe extern "C" {
-    fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
-}
-
-/// The D3D12 library opens its core by bare name, which only finds it on
-/// the system's library path. Opening it from here first uses this
-/// program's own run path, and the later open by name finds it loaded.
-#[cfg(victory_native_d3d12)]
-pub fn load_native_core() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: dlopen with a NUL-terminated name (0x102 = RTLD_NOW | RTLD_GLOBAL).
-    ONCE.call_once(|| unsafe {
-        dlopen(c"libvkd3d-proton-d3d12core.so".as_ptr(), 0x102);
-    });
-}
 
 pub struct Host {
     pub device: ID3D12Device,
@@ -84,55 +63,33 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp`.
     pub fn new(warp: bool) -> Result<Self, String> {
-        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
-            // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
-                let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
-                    && let Some(debug) = debug
-                {
-                    debug.EnableDebugLayer();
-                }
-            }
             let mut device: Option<ID3D12Device> = None;
-            #[cfg(windows)]
-            {
-                if warp {
+            if warp {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
                     let factory: IDXGIFactory4 =
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                } else {
-                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                    // A machine without a graphics card gives the software
-                    // adapter as its default device (a hosted test runner,
-                    // whose first adapter is a display stub that cannot make a
-                    // device): that is no hardware device, and the tests that
-                    // ask for one skip it, as they do where there is none.
-                    if let Some(made) = &device {
-                        let factory: IDXGIFactory4 =
-                            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                        if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                            && let Ok(desc) = adapter.GetDesc1()
-                            && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                        {
-                            return Err("the default device is the software adapter".to_owned());
-                        }
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
                     }
                 }
-            }
-            #[cfg(not(windows))]
-            {
-                load_native_core();
-                if warp {
-                    return Err("no software adapter on this platform".to_owned());
-                }
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -296,7 +253,7 @@ impl Host {
     }
 
     /// The error with the debug layer's messages since the last call, if
-    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    /// the layer is on (forced from outside, the DirectX control panel say).
     fn explained(&self, e: windows::core::Error) -> String {
         let mut text = err(e);
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {

@@ -37,7 +37,6 @@
 //! Anything else is refused there as before ("a wave reduction where not every lane runs") and
 //! left to the forms of the program in which every lane runs that code (`emit`'s retries: the
 //! skips left out, the branches around it taken wave-wide), where the halves do exchange.
-//! `VICTORY_WAVE_OWN_BITS=0` turns this off.
 
 use std::collections::{HashMap, HashSet};
 
@@ -742,8 +741,8 @@ impl Ctx<'_> {
 }
 
 /// The wave ORs of `p` that only steer a loop over each lane's own bits (see the module
-/// notes). `why`: one line on stderr for each wave OR that is not one.
-pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
+/// notes).
+pub(super) fn find(p: &Program, st: &Structured) -> OwnBits {
     let mut out = OwnBits::default();
     let mut ctx: Option<Ctx> = None;
     for b in 0..p.blocks.len() {
@@ -764,19 +763,9 @@ pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
                 if ctx.users.get(&t).is_none_or(|us| us.iter().all(inside)) {
                     continue;
                 }
-                match ctx.site(b, t, x, mask) {
-                    Ok(alike) => {
-                        out.totals.insert(t);
-                        out.alike.extend(alike);
-                    }
-                    Err((offset, what)) => {
-                        if why {
-                            eprintln!(
-                                "WAVE64-OWN-BITS the wave OR at {:#x}: not a loop over the lanes' own bits at {offset:#x}: {what}",
-                                p.blocks[b].insts[s].machine.offset
-                            );
-                        }
-                    }
+                if let Ok(alike) = ctx.site(b, t, x, mask) {
+                    out.totals.insert(t);
+                    out.alike.extend(alike);
                 }
             }
         }
@@ -839,7 +828,7 @@ mod tests {
 
     fn found(p: &Program) -> OwnBits {
         let st = crate::structure::structure(p).unwrap();
-        find(p, &st, false)
+        find(p, &st)
     }
 
     #[test]
