@@ -606,6 +606,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The list as `ID3D12GraphicsCommandList6`, for mesh dispatches: asked
+    /// once, not at every mesh draw (a QueryInterface into the driver).
+    list6: OnceLock<Option<ID3D12GraphicsCommandList6>>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2315,6 +2318,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                list6: OnceLock::new(),
             })
         }
     }
@@ -3089,7 +3093,8 @@ impl Host {
     }
 
     fn submit_timed<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        use crate::frametime::{Wait, waited};
+        use crate::frametime::{Phase, Wait, phase, waited};
+        let part = crate::fast::ticks();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let entered = std::time::Instant::now();
@@ -3112,9 +3117,11 @@ impl Host {
                 waited(Wait::Step, t);
             }
         }
+        let part = phase(Phase::Enter, part);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         crate::descriptor::sync_heaps();
+        let part = phase(Phase::Descriptors, part);
         // Before this submission counts as started (the sweep self-limits
         // to once a second). Nothing need be settled for it: what it lets go
         // of is held by no list, and the lists of flights in the air are
@@ -3134,11 +3141,12 @@ impl Host {
         // Unified memory: the shader writes of submissions that finished
         // are announced (textures over them detile again).
         crate::unified::settle();
+        let part = phase(Phase::Upkeep, part);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut batch = Batch::default();
         // One write-watch asking for everything the submission refreshes:
         // per copy, the span of its refreshed ranges.
-        let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+        let mut spans: crate::fast::FastMap<usize, (usize, usize)> = crate::fast::FastMap::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::Refresh(shadow, address, len) = step
@@ -3153,6 +3161,7 @@ impl Host {
         }
         let ranges: Vec<(usize, usize)> = spans.into_values().collect();
         crate::watch::ask_once(&ranges);
+        let mut part = phase(Phase::Watch, part);
         // Behind flights: the title wrote memory that a flight's shaders may
         // write too, and this submission refreshes it, where its bytes could
         // not be put in beside the flight's writes. The flights land first,
@@ -3163,6 +3172,7 @@ impl Host {
             settle();
             waited(Wait::Merge, t);
             crate::watch::ask_once(&ranges);
+            part = phase(Phase::Enter, part);
         }
         for list in runs {
             list.run_deferred(&mut batch);
@@ -3173,6 +3183,7 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        let part = phase(Phase::Steps, part);
         // The snapshots of the ranges shaders may write, left for now
         // (`crate::shadow::take_snapshots`): the refreshes are done, the
         // lists have not gone to the card.
@@ -3209,6 +3220,7 @@ impl Host {
         for list in runs {
             crate::frametime::submitted(&list.stamps, this_submission);
         }
+        let part = phase(Phase::Copies, part);
         *submitted += 1;
         if late {
             // SAFETY: closed lists; the fence is ours.
@@ -3216,6 +3228,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            phase(Phase::Execute, part);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -3768,6 +3781,12 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// The list as `ID3D12GraphicsCommandList6` (mesh dispatches), asked
+    /// once.
+    pub(crate) fn list6(&self) -> Option<&ID3D12GraphicsCommandList6> {
+        self.list6.get_or_init(|| self.list.cast().ok()).as_ref()
     }
 
     /// Notes what the command about to be recorded does, for the frame

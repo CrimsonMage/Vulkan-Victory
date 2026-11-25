@@ -153,6 +153,9 @@ pub(crate) struct State {
     root_uav_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Of the dynamic slots taken a chunk at a time ([`State::take_slots`]):
+    /// the title heap, the next slot not handed out, the chunk's end.
+    chunk: (usize, u32, u32),
 }
 
 impl Drop for State {
@@ -185,7 +188,32 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.chunk = (0, 0, 0);
         self.tables_gone = true;
+    }
+
+    /// `n` consecutive dynamic slots of title heap `heap` (its host heap
+    /// `host`), held until the list has run: the first's index. Small runs
+    /// come from a chunk of [`CHUNK`] the list takes from the heap at once
+    /// (the rest of the chunk is given back with it): the heap's search
+    /// for free slots is under one lock for all the title's recording
+    /// threads, and a draw took one to three runs.
+    fn take_slots(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        const CHUNK: u32 = 256;
+        let (at, next, end) = self.chunk;
+        if at == heap && end - next >= n {
+            self.chunk.1 += n;
+            return Some(next);
+        }
+        let (first, got) = match (n <= CHUNK / 4).then(|| host.dynamic(CHUNK)).flatten() {
+            Some(first) => (first, CHUNK),
+            None => (host.dynamic(n)?, n),
+        };
+        self.dynamic.push((heap, first, got));
+        if got == CHUNK {
+            self.chunk = (heap, first + n, first + got);
+        }
+        Some(first)
     }
 }
 
@@ -804,7 +832,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack (root constants are at most 64 dwords).
+                let (mut stack, mut spilled) = ([0u32; 64], Vec::new());
+                let values: &mut [u32] = if dwords <= 64 {
+                    &mut stack[..dwords as usize]
+                } else {
+                    spilled.resize(dwords as usize, 0);
+                    &mut spilled
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -988,10 +1023,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.take_slots(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1059,10 +1093,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.take_slots(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -1960,8 +1993,8 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
+            && match list.list6() {
+                Some(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
@@ -1969,7 +2002,7 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                None => false,
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2023,17 +2056,52 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        // The root slots of the tables made afresh, as bits (no allocation
+        // per draw; a root signature has at most 64 parameters).
+        let bit = |slot: u8| 1u128.checked_shl(u32::from(slot)).unwrap_or(0);
+        let mut fresh: u128 = used
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+            .fold(0, |bits, u| bits | bit(u.slot));
+        // A table whose constant buffers all lie in title memory the card
+        // reads in place, on 256 bytes, is read from the title's own slots
+        // like any other: the host slot of each constant view is made in
+        // place there (`HostHeap::mirror`), and no dynamic slots, no view
+        // made again for every entry of the table and no copy of the
+        // constants at submission are needed for the draw. (Not a table a
+        // shader also picks from by a computed index.)
+        let mut in_place: u128 = 0;
+        for slot in (0..128u8).filter(|&slot| fresh & bit(slot) != 0) {
+            if indexed.iter().any(|i| i.table_slot == slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let readable = used.iter().filter(tables).filter(|u| u.slot == slot && u.kind == ResourceType::Cbv).all(|u| {
+                match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                    Some(View::Constant(address, size)) => {
+                        address % 256 == 0
+                            && crate::shadow::find(address, u64::from(size).max(1)).is_some_and(|s| {
+                                s.in_place()
+                                    && s.gpu(address) % 256 == 0
+                                    && s.left(address) >= u64::from(size).next_multiple_of(256)
+                            })
+                    }
+                    _ => false,
+                }
+            });
+            if readable {
+                in_place |= bit(slot);
+            }
+        }
+        fresh &= !in_place;
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh & bit(u.slot) != 0 {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2047,26 +2115,38 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh |= bit(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if fresh & bit(u.slot) == 0 {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        // Of such a table, the slots between the entries the shader names
+        // too, as a table made afresh has them all (descriptor arrays).
+        for slot in (0..128u8).filter(|&slot| in_place & !fresh & bit(slot) != 0) {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let named = || used.iter().filter(tables).filter(move |u| u.slot == slot);
+            let n = named().map(|u| u.table_offset_dwords / 8 + 1).max().unwrap_or(0);
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(first)) = (heap.host(), heap.index(table)) else {
+                continue;
+            };
+            for k in (0..n).filter(|&k| !named().any(|u| u.table_offset_dwords / 8 == k)) {
+                host.mirror(first + k, table + u64::from(k) * 32, true);
+            }
+        }
+        let mut made = Vec::new();
+        for slot in (0..128u8).filter(|&slot| fresh & bit(slot) != 0) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let entries = || used.iter().filter(tables).filter(move |u| u.slot == slot);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2092,8 +2172,7 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -2118,14 +2197,14 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2138,15 +2217,13 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_slots(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -2154,7 +2231,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // On 256 bytes in title memory the card reads in

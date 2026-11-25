@@ -53,7 +53,7 @@ const WAITS_NAMED: [&str; 10] = ["lock", "settle", "reads", "step", "merge", "co
 static WAITS: [[AtomicU64; 2]; 10] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 10];
 
 /// Plain sums ([`Sum`]).
-static SUMS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static SUMS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Sum {
@@ -74,10 +74,6 @@ pub(crate) enum Sum {
     InPlaceBytes,
     /// Bytes of copies in the card's memory named by lists, once per list.
     CardBytes,
-    /// Ticks (`crate::fast::ticks`) in the title's recording calls into our
-    /// lists (state, draws, dispatches), summed over its threads
-    /// ([`recorded`]).
-    RecordTicks,
     /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
     TextureNs,
 }
@@ -86,26 +82,142 @@ pub(crate) fn add(sum: Sum, n: u64) {
     SUMS[sum as usize].fetch_add(n, Relaxed);
 }
 
-/// A recording call of the title took `ticks` (`crate::fast::ticks`).
-/// Summed on the thread and added to [`Sum::RecordTicks`] every 64 calls:
-/// one shared counter bumped by six threads at every call was a cache
-/// line passed between cores a dozen times a draw. What a thread holds
-/// back is at most 63 calls, a few hundred microseconds in a 5 s line.
-pub(crate) fn recorded(ticks: u64) {
-    use std::cell::Cell;
-    thread_local! {
-        static HELD: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
+/// The parts of a submission's preparing (`Host::submit`), for the split
+/// of "in submissions".
+#[derive(Clone, Copy)]
+pub(crate) enum Phase {
+    /// The submission lock and the flights in the air (the waits named
+    /// beside, as waits).
+    Enter,
+    /// Descriptors the title copied into heaps as bytes (`sync_heaps`).
+    Descriptors,
+    /// The sweep of idle copies, slots that waited for a texture, the
+    /// announcement of finished shader writes.
+    Upkeep,
+    /// The write-watch asking for refreshed ranges.
+    Watch,
+    /// The lists' steps on the CPU: refreshes, fills, copies, textures.
+    Steps,
+    /// Snapshots of ranges shaders may write, and the sends to card copies.
+    Copies,
+    /// `ExecuteCommandLists` and the signal.
+    Execute,
+}
+
+const PHASES: usize = 7;
+const PHASES_NAMED: [&str; PHASES] = ["enter", "descriptors", "upkeep", "watch", "steps", "copies", "execute"];
+
+/// Per [`Phase`]: ticks.
+static PHASE_SUMS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
+
+/// The part `phase` of a submission ran from `since` (`crate::fast::ticks`)
+/// until now; returns now, the start of the next part.
+pub(crate) fn phase(phase: Phase, since: u64) -> u64 {
+    let now = crate::fast::ticks();
+    PHASE_SUMS[phase as usize].fetch_add(now.wrapping_sub(since), Relaxed);
+    now
+}
+
+/// What a recording call of the title was, for the split of the
+/// recording time ([`Timed`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Call {
+    /// Root arguments, heaps, views, targets, viewports, pipeline: kept
+    /// for the next draw or set at once.
+    State,
+    Draw,
+    /// Mesh dispatches (the world's geometry).
+    Mesh,
+    Dispatch,
+    /// Indirect executions.
+    Indirect,
+    /// List resets.
+    Reset,
+    /// Work of ours recorded into the title's list (`record_own`).
+    Own,
+    Barrier,
+    /// Buffer, texture and memory copies, resolves, query resolves.
+    Copy,
+    Clear,
+    /// Waits for and writes of memory values.
+    Value,
+}
+
+const CALLS: usize = 11;
+const CALLS_NAMED: [&str; CALLS] =
+    ["state", "draw", "mesh", "dispatch", "indirect", "reset", "own", "barrier", "copy", "clear", "value"];
+/// The kinds up to here go into "recording into our lists" as before
+/// (the calls that pass through the list's draw state); the others are
+/// shown beside it.
+const RECORDING: usize = Call::Own as usize + 1;
+
+/// Per [`Call`]: ticks and calls.
+static CALL_SUMS: [[AtomicU64; 2]; CALLS] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; CALLS];
+
+/// Times one recording call of the title, by kind, from its making to its
+/// drop. Only the outermost on a thread counts (a copy that records a
+/// draw of ours is a copy). Summed on the thread and added to the shared
+/// sums every 64 calls: one shared counter bumped by six threads at every
+/// call was a cache line passed between cores a dozen times a draw. What
+/// a thread holds back is at most 63 calls, well under a millisecond in a
+/// 5 s line.
+pub(crate) struct Timed {
+    kind: Call,
+    since: u64,
+    outer: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Held {
+    depth: u32,
+    calls: u32,
+    sums: [(u64, u64); CALLS],
+}
+
+thread_local! {
+    static HELD: std::cell::Cell<Held> =
+        const { std::cell::Cell::new(Held { depth: 0, calls: 0, sums: [(0, 0); CALLS] }) };
+}
+
+impl Timed {
+    pub(crate) fn new(kind: Call) -> Timed {
+        let outer = HELD.with(|held| {
+            let mut h = held.get();
+            h.depth += 1;
+            held.set(h);
+            h.depth == 1
+        });
+        Timed { kind, since: if outer { crate::fast::ticks() } else { 0 }, outer }
     }
-    HELD.with(|held| {
-        let (sum, calls) = held.get();
-        let (sum, calls) = (sum + ticks, calls + 1);
-        if calls >= 64 {
-            add(Sum::RecordTicks, sum);
-            held.set((0, 0));
-        } else {
-            held.set((sum, calls));
-        }
-    });
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        let ticks = if self.outer { crate::fast::ticks().wrapping_sub(self.since) } else { 0 };
+        HELD.with(|held| {
+            let mut h = held.get();
+            h.depth -= 1;
+            if !self.outer {
+                held.set(h);
+                return;
+            }
+            let k = self.kind as usize;
+            h.sums[k].0 += ticks;
+            h.sums[k].1 += 1;
+            h.calls += 1;
+            if h.calls >= 64 {
+                for (sum, &(t, n)) in CALL_SUMS.iter().zip(&h.sums) {
+                    if n > 0 {
+                        sum[0].fetch_add(t, Relaxed);
+                        sum[1].fetch_add(n, Relaxed);
+                    }
+                }
+                h.sums = [(0, 0); CALLS];
+                h.calls = 0;
+            }
+            held.set(h);
+        });
+    }
 }
 
 /// `since` until now, as nanoseconds of `sum`.
@@ -544,6 +656,29 @@ pub(crate) fn frame() {
         }
     }
     let sums: Vec<u64> = SUMS.iter().map(take).collect();
+    let mut phases = String::from("by part:");
+    for (k, name) in PHASES_NAMED.iter().enumerate() {
+        let ns = crate::fast::ticks_to_ns(take(&PHASE_SUMS[k]));
+        phases.push_str(&format!(" {name} {:.1}", per(ns)));
+    }
+    // The recording by kind of call: ms and calls per frame; the kinds
+    // past `RECORDING` are not in the recording sum.
+    let mut calls = String::from("by call ms/n:");
+    let (mut recording, mut besides) = (0, false);
+    for (k, name) in CALLS_NAMED.iter().enumerate() {
+        let (ticks, n) = (take(&CALL_SUMS[k][0]), take(&CALL_SUMS[k][1]));
+        let ns = crate::fast::ticks_to_ns(ticks);
+        if k < RECORDING {
+            recording += ns;
+        }
+        if n > 0 {
+            if k >= RECORDING && !besides {
+                besides = true;
+                calls.push_str(" | besides:");
+            }
+            calls.push_str(&format!(" {name} {:.1}/{:.0}", per(ns), n as f64 / frames));
+        }
+    }
     let (mut card, mut pipes) = (String::from("no GPU timestamps"), String::new());
     if let Some(g) = gpu().as_mut() {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / g.frequency as f64 / frames;
@@ -568,10 +703,10 @@ pub(crate) fn frame() {
     }
     let fence_set = sums[Sum::FenceSet as usize];
     tracing::info!(
-        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed); \
-         in submissions {:.1} ms ({:.1} of them; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
+        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
+         in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms (fetching shader writes back {:.1} ms, {:.1} MB); title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, card copies {:.0} MB; {pipes}",
-        per(crate::fast::ticks_to_ns(sums[Sum::RecordTicks as usize])),
+        per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
         per(sums[Sum::TextureNs as usize]),
