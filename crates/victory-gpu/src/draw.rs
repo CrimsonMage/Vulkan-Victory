@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use crate::indirect::Cause;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -69,7 +70,7 @@ thread_local! {
     /// While a whole binding is made (`State::bind`): the title memory its
     /// shaders are declared to write, and whether they may write memory
     /// not known by address (by address, buffers picked by index).
-    static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64, Cause)>> = const { std::cell::RefCell::new(Vec::new()) };
     static UNTRACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
@@ -183,7 +184,7 @@ pub(crate) struct State {
     /// (`BIND_WRITES`, `UNTRACKED`): a binding taken from it writes the
     /// same, which ends the list's window of bounded indirect records over
     /// it (`crate::indirect`).
-    writes: [Vec<(u64, u64)>; 2],
+    writes: [Vec<(u64, u64, Cause)>; 2],
     untracked: [bool; 2],
     /// The compute root signature and the root arguments the host list was
     /// last given for the title (what [`State::bind`] and
@@ -206,9 +207,9 @@ enum Replay {
 }
 
 /// Shaders bound now write `[address, address + len)` of title memory.
-fn note_write(list: &HostList, address: u64, len: u64) {
-    BIND_WRITES.with_borrow_mut(|w| w.push((address, len)));
-    list.wrote(address, len);
+fn note_write(list: &HostList, address: u64, len: u64, cause: Cause) {
+    BIND_WRITES.with_borrow_mut(|w| w.push((address, len, cause)));
+    list.wrote(address, len, cause);
 }
 
 impl Drop for State {
@@ -860,8 +861,8 @@ impl State {
         let kind = usize::from(compute);
         if self.bound_already(list, p, compute) || (compute && self.constants_only(list, p)) {
             // It writes what the binding it is taken from writes.
-            for &(address, len) in &self.writes[kind] {
-                list.wrote(address, len);
+            for &(address, len, cause) in &self.writes[kind] {
+                list.wrote(address, len, cause);
             }
             if self.untracked[kind] {
                 list.wrote_somewhere();
@@ -1328,7 +1329,7 @@ impl State {
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
-                note_write(list, a, len);
+                note_write(list, a, len, Cause::RootUav);
             }
         };
         let heap = match self.heaps[0] {
@@ -2896,6 +2897,7 @@ impl State {
             }
             (bounded, from)
         } else {
+            crate::indirect::unbounded();
             (args.buffer.clone(), offset)
         };
         let ran = match kind {
@@ -3039,7 +3041,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() {
                 shadow.gpu_writes(list, address, len);
-                note_write(list, address, len);
+                note_write(list, address, len, Cause::TableUav);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

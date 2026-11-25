@@ -2478,8 +2478,8 @@ impl HostList {
     /// Something recorded from now on writes `[address, address + len)` of
     /// title memory: a bounded window of indirect records over it is done
     /// (`crate::indirect`).
-    pub(crate) fn wrote(&self, address: u64, len: u64) {
-        self.indirect().wrote(address, len);
+    pub(crate) fn wrote(&self, address: u64, len: u64, cause: crate::indirect::Cause) {
+        self.indirect().wrote(address, len, cause);
     }
 
     /// Something recorded from now on may write title memory anywhere.

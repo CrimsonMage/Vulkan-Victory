@@ -842,7 +842,7 @@ fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> b
     }
     s.refresh(list, from, len);
     d.gpu_writes(list, to, len);
-    list.wrote(to, len);
+    list.wrote(to, len, crate::indirect::Cause::Copy);
     crate::indirect::copied_onto(to, len);
     // Ordered with the writes before and the uses after it.
     list.writes_barrier();
