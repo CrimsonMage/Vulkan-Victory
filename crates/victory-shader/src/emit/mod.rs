@@ -382,34 +382,14 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
-            if why {
-                match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
-                }
-            }
-        };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // Each host wave as a wave of its own (`lower::with_local_waves`),
-        // for programs still stopped where not every lane runs.
-        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
-        // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are taken
-        // the same way last of all, each half-wave giving its own results
-        // (approximate: a tile-wide result becomes two half-tile ones);
-        // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
-        let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
-            Ok(()) => true,
-            Err((offset, what)) => {
-                if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
-                }
-                false
-            }
-        };
+        // for programs still stopped where not every lane runs. Where the
+        // wave operations are the allocation idiom ([`lower::wave_local`])
+        // that is exact. Other programs are taken the same way last of all,
+        // each half-wave giving its own results (approximate: a tile-wide
+        // result becomes two half-tile ones).
+        let idiom = |p: &ir::Program, st: &structure::Structured| lower::wave_local(p, st).is_ok();
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
@@ -420,74 +400,34 @@ pub fn emit(
                 Some((p, st, io, res))
             })
         };
-        let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p, false))),
-        ];
-        for (name, f) in &forms {
-            if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
-                report(name, &again);
-                if done(&again) {
-                    return again.map(|(shader, _)| shader);
-                }
+        let forms = [form(ir::without_early_outs(p)), form(ir::without_skips(p, false))];
+        for (p, st, io, res) in forms.iter().flatten() {
+            let again = emit_program(c, native, p, st, io, res);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
-                // Before anything approximate, the exact forms that cost group barriers.
-                // Every skip left out that the code after it cannot see
+                // Before anything approximate, the exact form that costs group barriers:
+                // every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
-                if let Some((p, st, io, res)) = &deep {
+                if let Some((p, st, io, res)) = &form(ir::without_skips(p, true)) {
                     let again = emit_program(c, native, p, st, io, res);
-                    report("without skips, scalars followed", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
                     }
                 }
-                // Still stopped where not every lane runs: the per-lane branches around
-                // those places taken as the console takes them, by the whole wave at once
-                // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
-                    let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
-                    ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
-                    }
-                }
-                if strict {
-                    break;
-                }
             }
-            if !local_on || exact_only {
+            if exact_only {
                 continue;
             }
-            for (name, f) in &forms {
-                if let Some((p, st, io, res)) = f
-                    && idiom(p, st) == exact
-                {
+            for (p, st, io, res) in forms.iter().flatten() {
+                if idiom(p, st) == exact {
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
                     }
@@ -495,29 +435,22 @@ pub fn emit(
             }
             if idiom(p, st) == exact {
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
             }
         }
-        if local_on && !exact_only {
+        if !exact_only {
             // Last: every mask and lane read per host wave.
-            if !strict {
-                for (name, f) in &forms {
-                    if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
-                        if done(&local) {
-                            return local.map(|(shader, _)| shader);
-                        }
-                    }
-                }
+            for (p, st, io, res) in forms.iter().flatten() {
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
+            }
+            let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+            if done(&local) {
+                return local.map(|(shader, _)| shader);
             }
         }
     }
@@ -526,11 +459,9 @@ pub fn emit(
     // lowering has named the skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+            if native.stage == HwStage::Cs && what == lower::LANE_MASK =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -566,7 +497,6 @@ fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
-    why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -576,12 +506,6 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
@@ -598,9 +522,6 @@ fn widen(
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
-            if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
-            }
             return r;
         }
         let more: Vec<usize> = lower::branches_around(&st, &needs)
@@ -609,9 +530,6 @@ fn widen(
             .filter(|b| !wide.contains(b))
             .collect();
         if more.is_empty() {
-            if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
-            }
             return r;
         }
         wide.extend(more);
