@@ -21,13 +21,16 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// too, with the commands they recorded.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    // Sorted and searched: asked at every recorded command (`op`), and the
+    // gate lists hundreds of frames.
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
+        let mut frames: Vec<u64> = list.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+        frames.sort_unstable();
+        frames
     })
-    .contains(&n)
+    .binary_search(&n)
+    .is_ok()
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to

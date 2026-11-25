@@ -26,6 +26,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The same, written under `made`'s lock wherever `made` is, and read
+    /// without it: a draw that reads a slot made from the record it holds
+    /// now ([`HostHeap::mirror`], nearly every table entry of every draw)
+    /// takes no lock. Six recording threads took `made`'s for every one.
+    made_now: Box<[std::sync::atomic::AtomicU64]>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied_page`]; 0: never looked at). Made on first use.
@@ -65,7 +70,7 @@ pub(crate) struct HostHeap {
     buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Mutex<crate::fast::FastSet<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -890,6 +895,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1337,6 +1343,7 @@ impl HostHeap {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
         if key == 0 {
             return;
         }
@@ -1572,6 +1579,14 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            // The same resource again (a dynamic slot of a table made for
+            // a draw, as the draw before made it): nothing to retire.
+            let same = |a: &ID3D12Resource, b: &ID3D12Resource| {
+                windows::core::Interface::as_raw(a) == windows::core::Interface::as_raw(b)
+            };
+            if slot.as_ref().zip(resource.as_ref()).is_some_and(|(a, b)| same(a, b)) {
+                return;
+            }
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
@@ -1796,6 +1811,16 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The slot was made from this very record: only the view to say.
+        // (What the lock below would add is an order with a thread that
+        // makes the slot from another record at this moment, which only a
+        // title writing the slot while a draw reads it could see.)
+        if tag == VIEW_TAG
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1803,6 +1828,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1853,6 +1879,9 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            // Once the slot holds it: a draw that finds the key without the
+            // lock reads a slot that is made.
+            self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
     }

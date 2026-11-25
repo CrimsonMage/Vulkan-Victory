@@ -454,7 +454,7 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   heap (the probe's own queue), and they must match. A mismatch is
   vkd3d-proton's silent fallback; the unit is refused, logged, and its
   buffers keep copies.
-- **Buffers in place** (`shadow.rs`). A title buffer under 16 MiB, or a
+- **Buffers in place** (`shadow.rs`). A title buffer of any size, or a
   4 MiB window of title memory outside buffers, whose memory lies in one
   opened region or one run of one section, becomes a buffer placed over
   the title's own bytes (on the 64 KiB line below them; `Shadow::offset`
@@ -464,10 +464,13 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   CPU prepares while a submission runs waits where it writes (`host.rs`
   `late_blocked`). A view that the title maps anew marks its in-place
   buffers stale and the next ask places new ones.
-- **What stays a copy**: title buffers of 16 MiB and more keep their copy in
-  the card's memory (the title's 174 MB GPU heap: most shaders read it,
-  and the card reads its own memory 16 times faster than the PC's; this
-  path moved about 0.1 MB a frame in the last runs). Also memory that is
+- **What stays a copy**: since 2026-11-25 the title's 174 MB GPU heap is in
+  place too. Its copy in the card's memory cost a hash compare after every
+  submission that wrote it and a fetch of what shaders wrote that waited
+  behind every later submission on the queue ("fetching shader writes back
+  54 ms" a frame), while the card was idle three quarters of the frame;
+  the card now reads it over the bus. A card copy is left only for big
+  buffers whose memory cannot be opened. Also memory that is
   no xmem unit (VIctory's own allocations at title addresses), ranges over
   scattered pages, single-view copies (`exact`), and units that were
   refused.
@@ -498,8 +501,9 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   buffers move from the submitting thread to the card. In exchange, every
   shader read of an in-place buffer crosses the bus at about 12.6 GB/s:
   watch the GPU time per frame.
-- **Card memory:** down by the copies of title buffers under 16 MiB and of
-  the windows (they no longer exist); the big heap's copy stays.
+- **Card memory:** down by the copies of title buffers and of
+  the windows (they no longer exist), the big heap's included (about 350 MB
+  with its "before" twin).
 - **PC memory:** every opened unit is pinned whole: the regions the GPU
   touches (up to about 6 GB on the Series X profile) and the 512 MiB
   sections it touches. The copies in PC memory go.

@@ -29,6 +29,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod fast;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]

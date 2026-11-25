@@ -140,7 +140,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: crate::fast::FastMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -148,9 +148,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -1156,14 +1156,14 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type Ranges = crate::fast::FastMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static RANGES: std::sync::Mutex<Option<crate::fast::FastMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::default()));
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1213,8 +1213,8 @@ impl State {
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut spans: crate::fast::FastMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            crate::fast::FastMap::default();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
@@ -1230,7 +1230,7 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+        static WHOLE: std::sync::Mutex<Option<crate::fast::FastMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
@@ -2109,7 +2109,7 @@ impl State {
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let mut h = crate::fast::Fx::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
@@ -2157,6 +2157,20 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // On 256 bytes in title memory the card reads in
+                        // place: read there, as root constant views are
+                        // (`root_view`), not copied at the submission.
+                        let whole = u64::from(size).next_multiple_of(256);
+                        if address % 256 == 0
+                            && let Some(s) = crate::shadow::find(address, u64::from(size).max(1))
+                            && s.in_place()
+                            && s.gpu(address) % 256 == 0
+                            && s.left(address) >= whole
+                        {
+                            s.refresh(list, address, u64::from(size));
+                            host.constant_at(index, s.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2596,8 +2610,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // (Only with debug lines on: a second lookup of the host copy and
+            // a call into the driver for every texture every draw reads.)
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
