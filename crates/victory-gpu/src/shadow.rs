@@ -1630,8 +1630,12 @@ impl Shadow {
             // may run (a remapped view drops it from the tables).
             if list.first_use(Arc::as_ptr(self) as usize | 1) {
                 list.keep(&self.buffer);
+                crate::frametime::add(crate::frametime::Sum::InPlaceBytes, self.len);
             }
             return;
+        }
+        if self.card.is_some() && list.first_use(Arc::as_ptr(self) as usize | 1) {
+            crate::frametime::add(crate::frametime::Sum::CardBytes, self.len);
         }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
