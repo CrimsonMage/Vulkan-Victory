@@ -253,7 +253,7 @@ impl Host {
     }
 
     /// The error with the debug layer's messages since the last call, if
-    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    /// the layer is on (forced from outside, the DirectX control panel say).
     fn explained(&self, e: windows::core::Error) -> String {
         let mut text = err(e);
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
