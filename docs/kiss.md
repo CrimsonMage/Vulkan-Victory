@@ -23,7 +23,7 @@ the twin; it implements only what is truly console-only.
 | Console tiled texture layouts | Detile once when the data arrives (resource creation, DirectStorage completion, title copies) | `victory-gpu/texture.rs` | works; to move to explicit points |
 | Ray tracing (console BVH format, title's own builder DLL) | Victory's builder in DXIL (`VICTORY_BVH_BUILDER`); until then rays miss (`VICTORY_BVH_MISS`) | `victory-shader/bvh.rs`, `intersect.rs` | partial |
 | 64-lane waves | 32-lane PC waves with emulation in the translator | `victory-shader` | works; keep |
-| Console DirectStorage (`XCRDAPI`) | Plain file reads (or PC DirectStorage), decompression on the CPU | `victory-hle/dstorage.rs` | works |
+| Console DirectStorage (`XCRDAPI`) | Each archive mapped read-only once for the run (page cache); requests inflate/unpack on the CPU straight from the mapping into title memory, one FIFO worker pool, no lock per request (`dstorage streaming` line every 10 s) | `victory-hle/dstorage.rs` | built, not yet run |
 | XMA audio hardware (`AcpHal`), Opus (`xapu`) | Software decode → host audio (XAudio2 / WASAPI) | `victory-hle/audio*`, `apu.rs` | works; reverb (`chad` XDsp) silent |
 | Bink 2 video | The title's own Bink DLL, with XAudio2 passed through | title DLL | works |
 | GameInput, window, lifecycle | GameInput on PC; a Win32 window | `gameinput.rs`, `lifecycle.rs` | works |
