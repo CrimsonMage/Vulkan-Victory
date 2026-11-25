@@ -1122,19 +1122,19 @@ impl Module {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use super::*;
 
     /// `main` with one block and a function of each kind of effect.
-    pub(in crate::emit::bitcode) struct Kit {
-        pub(in crate::emit::bitcode) m: Module,
-        pub(in crate::emit::bitcode) b: usize,
+    struct Kit {
+        m: Module,
+        b: usize,
         pure: V,
         reads: V,
-        pub(in crate::emit::bitcode) writes: V,
+        writes: V,
     }
 
-    pub(in crate::emit::bitcode) fn kit() -> Kit {
+    fn kit() -> Kit {
         let mut m = Module::default();
         let i32t = m.int(32);
         let void = m.void();
@@ -1628,7 +1628,7 @@ pub(super) mod tests {
 
     /// Runs `m` on `inputs`: the stores it makes, in order (and how it
     /// ended). Reads a value before its definition ran: a panic.
-    pub(in crate::emit::bitcode) fn run(m: &Module, inputs: &[u32]) -> Vec<(String, Vec<u64>)> {
+    fn run(m: &Module, inputs: &[u32]) -> Vec<(String, Vec<u64>)> {
         let mut vals: Vec<Option<u64>> = vec![None; m.insts.len()];
         let mut memory = [0u64; 16];
         let mut trace = Vec::new();
