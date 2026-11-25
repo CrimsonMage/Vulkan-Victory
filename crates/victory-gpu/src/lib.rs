@@ -39,6 +39,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod views;
+#[cfg(windows)]
+pub mod mapstat;
 pub mod list;
 pub mod object;
 pub mod pipeline;
