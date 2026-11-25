@@ -122,6 +122,8 @@ struct L<'a> {
     /// Values some instruction other than a memory access reads, or a join
     /// takes (made on first use).
     numbers: Option<HashSet<Value>>,
+    /// Ballots of lane masks made in the current block.
+    ballots: HashMap<Value, (String, String)>,
     /// Heap indices of descriptors chosen by control flow, by join block.
     desc_phis: HashMap<(usize, bool), String>,
     /// Signature elements declared in register order ([`sig_order`]).
@@ -212,7 +214,8 @@ pub(super) struct Mesh {
 }
 
 /// Registers no program reads as numbers (see `lower`).
-const DEAD: [Why; 3] = ["a descriptor's dwords read as data", "a lane mask read as data", "a lane mask"];
+const DEAD: [Why; 4] =
+    ["a descriptor's dwords read as data", "a lane mask read as data", "a lane mask", "barycentrics read as data"];
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
@@ -290,6 +293,7 @@ impl<'a> L<'a> {
             prim_use: Vec::new(),
             wave32: false,
             numbers: None,
+            ballots: HashMap::new(),
             desc_phis: HashMap::new(),
             sorted: false,
             half_io: false,
@@ -321,7 +325,19 @@ impl<'a> L<'a> {
         }
     }
 
+    /// A temporary of the current block, declared where it is made (a
+    /// block's statements share one scope).
     fn fresh(&mut self, prefix: &str, ty: &'static str) -> String {
+        self.tmp += 1;
+        let name = format!("{prefix}{}", self.tmp);
+        if !ty.is_empty() {
+            self.line(&format!("{ty} {name};"));
+        }
+        name
+    }
+
+    /// A variable several blocks set or read, declared at the top.
+    fn fresh_global(&mut self, prefix: &str, ty: &'static str) -> String {
         self.tmp += 1;
         let name = format!("{prefix}{}", self.tmp);
         self.decls.insert(name.clone(), ty);
@@ -380,16 +396,15 @@ impl<'a> L<'a> {
             self.vals.insert(v, Val::U(expr));
             return;
         }
-        self.decls.insert(n.clone(), "uint");
-        self.line(&format!("{n} = {expr};"));
+        // Declared here (`finish`: unless it is a join's).
+        self.line(&format!("\u{1}{n} = {expr};"));
         self.vals.insert(v, Val::U(n));
     }
 
     fn set_b(&mut self, v: Option<Value>, expr: String) {
         let Some(v) = v else { return };
         let n = Self::name(v);
-        self.decls.insert(n.clone(), "bool");
-        self.line(&format!("{n} = {expr};"));
+        self.line(&format!("\u{2}{n} = {expr};"));
         self.vals.insert(v, Val::B(n));
     }
 
@@ -616,6 +631,9 @@ impl<'a> L<'a> {
 
     /// The lane mask whose low dword is `v` as data (a ballot): (low, high).
     fn mask_data(&mut self, v: Value) -> Result<(String, String), Why> {
+        if let Some(x) = self.ballots.get(&v) {
+            return Ok(x.clone());
+        }
         let &b = self.st.masks.get(&v).ok_or("a lane mask read as data")?;
         let e = self.boolean(b)?;
         self.cross_lane("a lane mask read as data");
@@ -624,7 +642,9 @@ impl<'a> L<'a> {
         }
         let n = self.fresh("w", "uint4");
         self.line(&format!("{n} = WaveActiveBallot({e});"));
-        Ok((format!("{n}.x"), if self.native.wave64 { format!("{n}.y") } else { "0u".into() }))
+        let r = (format!("{n}.x"), if self.native.wave64 { format!("{n}.y") } else { "0u".into() });
+        self.ballots.insert(v, r.clone());
+        Ok(r)
     }
 
     // ---- writes ----
@@ -718,10 +738,18 @@ impl<'a> L<'a> {
         }
         self.inputs()?;
         // Every join's variable first: an edge's copies are made where the
-        // edge leaves, before the join's block is lowered.
+        // edge leaves, before the join's block is lowered. The joins of one
+        // register share a variable (`r<register>`): a join's value is dead
+        // once the register joins again, as in the machine code (DXC turns
+        // fewer variables into SSA much faster; giant programs have
+        // thousands of joins).
         for &b in &order {
             for phi in &p.blocks[b].phis {
-                let n = Self::name(phi.value);
+                let n = match phi.reg {
+                    Reg::S(c) => format!("rs{c}"),
+                    Reg::V(c) => format!("rv{c}"),
+                    Reg::Scc => "rscc".to_owned(),
+                };
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
                     _ if self.bad.contains(&phi.value) => Val::Missing("a join of a value without HLSL form"),
@@ -740,6 +768,7 @@ impl<'a> L<'a> {
         for &b in &order {
             self.cur = b;
             self.bmemo.clear();
+            self.ballots.clear();
             self.body = std::mem::take(&mut self.bodies[b]);
             let preds: Vec<usize> = p.blocks[b].preds.iter().copied().filter(|&q| self.rpo[q] != usize::MAX).collect();
             self.exported[b] = !preds.is_empty()
@@ -762,7 +791,11 @@ impl<'a> L<'a> {
         for &(reg, v) in &self.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue,
-                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => continue,
+                // Read only by interpolation, which names them by meaning; as
+                // numbers they have no host value (a join of them is dead).
+                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                    Val::Missing("barycentrics read as data")
+                }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     None if n <= 105 && self.io.initialized_sgprs.is_some_and(|k| n >= k) => Val::U("0u".into()),
@@ -895,7 +928,7 @@ impl<'a> L<'a> {
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
-            Fields::Flat { .. } if name.starts_with("global_") => Err("global memory"),
+            Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
@@ -972,7 +1005,10 @@ impl<'a> L<'a> {
         let Some(k) = blk.preds.iter().position(|&x| x == q) else { return Ok(String::new()) };
         let mut pairs: Vec<(String, String)> = Vec::new();
         for phi in &blk.phis {
-            let target = Self::name(phi.value);
+            let target = match self.vals.get(&phi.value) {
+                Some(Val::U(n) | Val::B(n)) => n.clone(),
+                _ => Self::name(phi.value),
+            };
             let arg = phi.args[k];
             // Lane-mask joins: the incoming mask's lane bit.
             if let Some(edges) = self.st.phi_masks.get(&phi.value) {
@@ -1023,9 +1059,7 @@ impl<'a> L<'a> {
             }
         }
         // Booleans made for the copies sit in the block body (before its exit).
-        let reads_phi = pairs.iter().any(|(_, x)| {
-            blk.phis.iter().any(|p| x.contains(&Self::name(p.value)) || x.contains(&format!("m{}", p.value.0)))
-        });
+        let reads_phi = pairs.iter().any(|(_, x)| pairs.iter().any(|(t, _)| x.contains(t.as_str())));
         let mut s = String::new();
         if reads_phi && pairs.len() > 1 {
             for (n, (t, x)) in pairs.iter().enumerate() {
@@ -1774,7 +1808,8 @@ impl<'a> L<'a> {
                 let (x, y) = (self.lane_heap_index(a, sampler)?, self.lane_heap_index(b, sampler)?);
                 Ok(format!("({cond} ? {x} : {y})"))
             }
-            _ => Err("a per-lane descriptor from a global load or a join"),
+            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            _ => Err("a per-lane descriptor from a join"),
         }
     }
 
@@ -1786,7 +1821,7 @@ impl<'a> L<'a> {
         if let Some(n) = self.desc_phis.get(&(block, sampler)) {
             return Ok(n.clone());
         }
-        let n = self.fresh("d", "uint");
+        let n = self.fresh_global("d", "uint");
         let preds = self.p.blocks[block].preds.clone();
         for (&q, arg) in preds.iter().zip(args) {
             if self.rpo[q] == usize::MAX {
@@ -1808,6 +1843,31 @@ impl<'a> L<'a> {
         }
         self.desc_phis.insert((block, sampler), n.clone());
         Ok(n)
+    }
+
+    /// The heap index of the descriptor at dword `first` of what the global
+    /// load at `load` reads, in each lane: its address over the descriptor
+    /// size (as `emit::lower::fetched_index`).
+    fn fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<String, Why> {
+        const WHY: Why = "a per-lane descriptor load";
+        let a = *self.scalar.get(&load).ok_or("an untracked descriptor load")?;
+        match self.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+            _ => return Err("a descriptor outside the heaps"),
+        }
+        let li: &Inst = &self.p.blocks[load.0].insts[load.1];
+        let Fields::Flat { addr: Some(Operand::Vector { reg, .. }), saddr, offset, .. } = li.fields else {
+            return Err(WHY);
+        };
+        let mut at = self.u(li.read(Reg::V(reg)).ok_or(WHY)?)?;
+        if let Some(Operand::Scalar { code, .. }) = saddr
+            && code != NULL
+        {
+            let base = self.u(li.read(Reg::S(code)).ok_or(WHY)?)?;
+            at = format!("({base} + {at})");
+        }
+        let k = (offset as i32 as u32).wrapping_add(4 * u32::from(first));
+        Ok(format!("(({at} + {}) >> {}u)", lit(k), if sampler { 4 } else { 5 }))
     }
 
     /// A local variable of type `ty` for the descriptor `src` read at
@@ -2478,6 +2538,57 @@ impl<'a> L<'a> {
                 self.line(&format!("{t} = {r};"));
                 int(self, t)
             }
+            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
+                // M0 indexes the source (movrels), the destination (movreld)
+                // or both, from the encoded register up to the VGPRs the
+                // instruction names (a small array kept in VGPRs).
+                let m0 = self.u(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (Some(&Operand::Vector { reg: sreg, .. }), Some(Operand::Vector { reg: dreg, .. })) = (v.src.first(), v.dst)
+                else {
+                    return Err("an M0-relative move");
+                };
+                let value = if name != "v_movreld_b32" {
+                    let t = self.fresh("t", "uint");
+                    self.line(&format!("{t} = 0u;"));
+                    for k in 0..=255u8.saturating_sub(sreg) {
+                        let Some(x) = inst.read(Reg::V(sreg + k)) else { break };
+                        let x = self.u(x)?;
+                        self.line(&format!("if ({m0} == {k}u) {t} = {x};"));
+                    }
+                    t
+                } else {
+                    s(self, 0)?
+                };
+                if name == "v_movrels_b32" {
+                    return int(self, value);
+                }
+                for k in 0..=255u8.saturating_sub(dreg) {
+                    if inst.write(Reg::V(dreg + k)).is_none() {
+                        break;
+                    }
+                    let old = match inst.read(Reg::V(dreg + k)) {
+                        Some(o) => self.u(o)?,
+                        None => "0u".into(),
+                    };
+                    self.write(inst, Reg::V(dreg + k), format!("({m0} == {k}u ? {value} : {old})"), guard)?;
+                }
+                Ok(())
+            }
+            "v_swap_b32" => {
+                let (Some(&Operand::Vector { reg: sreg, .. }), Some(Operand::Vector { reg: dreg, .. })) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swap_b32");
+                };
+                let a = self.u(inst.read(Reg::V(dreg)).ok_or("v_swap_b32")?)?;
+                let b = self.u(inst.read(Reg::V(sreg)).ok_or("v_swap_b32")?)?;
+                let (ta, tb) = (self.fresh("t", "uint"), self.fresh("t", "uint"));
+                self.line(&format!("{ta} = {a}; {tb} = {b};"));
+                self.write(inst, Reg::V(dreg), tb, guard)?;
+                if dreg != sreg {
+                    self.write(inst, Reg::V(sreg), ta, guard)?;
+                }
+                Ok(())
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 self.cross_lane("a lane read");
@@ -2890,7 +3001,25 @@ impl<'a> L<'a> {
     /// the mode its reads use (a different packing shows in the signature
     /// check).
     fn use_input(&mut self, id: usize, c: u8, mode: u8) -> Result<String, Why> {
-        let mode = if self.inputs[id].interp == 1 { 1 } else { mode };
+        let declared = self.inputs[id].interp;
+        let mode = if declared == 1 { 1 } else { mode };
+        // Read at another place of the pixel than declared (center against
+        // centroid, same perspective): evaluated there, the declaration
+        // (and with it the signature's packing) kept.
+        let perspective = |m: u8| matches!(m, 2 | 3 | 6);
+        if declared > 1 && mode > 1 && mode != declared && perspective(mode) == perspective(declared) && self.inputs[id].comp == 3 {
+            let e = &self.inputs[id];
+            let field = format!("i.a{id}");
+            let at = match mode {
+                2 | 4 => format!("EvaluateAttributeSnapped({field}, int2(0, 0))"),
+                3 | 5 => format!("EvaluateAttributeCentroid({field})"),
+                _ => return Err("an input evaluated at a sample"),
+            };
+            let x = if e.cols() == 1 { at } else { format!("{at}.{}", ["x", "y", "z", "w"][usize::from(c)]) };
+            let (used, m) = self.input_use[id];
+            self.input_use[id] = (used | 1 << c, m.or(Some(declared)));
+            return Ok(if e.native16 && self.half_io { format!("asuint(float({x}))") } else { format!("asuint({x})") });
+        }
         let (used, m) = self.input_use[id];
         if m.is_some_and(|m| m != mode) {
             return Err("one input interpolated two ways");
@@ -3067,6 +3196,87 @@ impl<'a> L<'a> {
             [r] => u8::try_from(r).ok(),
             _ => None,
         }
+    }
+
+    // ---- global memory ----
+
+    /// `global_load_*` at an address traced to a root view or the code (as
+    /// `emit::lower::flat`); a load of descriptors from a heap leaves its
+    /// dwords without numbers (the accesses that use them find them by
+    /// address). Title memory by address is refused.
+    fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Flat { dst, .. } = &inst.fields else { unreachable!() };
+        let name = inst.name();
+        let a = *self.scalar.get(&(b, i)).ok_or("an untracked global address")?;
+        if a.param == MEMORY {
+            return Err("title memory by address");
+        }
+        let rest = name.strip_prefix("global_load_").ok_or("a global memory write")?;
+        let (n, sub) = match rest {
+            "dword" => (1u32, None),
+            "dwordx2" => (2, None),
+            "dwordx3" => (3, None),
+            "dwordx4" => (4, None),
+            "ubyte" => (1, Some((8u32, false))),
+            "sbyte" => (1, Some((8, true))),
+            "ushort" => (1, Some((16, false))),
+            "sshort" => (1, Some((16, true))),
+            _ => return Err(name),
+        };
+        let Some(Operand::Vector { reg, .. }) = *dst else { return Err("a global load result") };
+        if a.param != CODE
+            && matches!(
+                self.native.layout.get(a.param).map(|p| p.root),
+                Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)
+            )
+        {
+            for k in 0..n {
+                if let Some(v) = inst.write(Reg::V(reg + k as u8)) {
+                    self.vals.insert(v, Val::Missing("a descriptor's dwords read as data"));
+                }
+            }
+            return Ok(());
+        }
+        let guard = self.guard(b, i)?;
+        let mut off = lit(a.offset);
+        if let Some(d) = a.dynamic {
+            off = format!("({off} + {})", self.u(d)?);
+        }
+        let h = if a.param == CODE {
+            None
+        } else {
+            if let Some(bias) = self.root_bias(a.param) {
+                off = format!("({off} + {bias})");
+            }
+            let src = Source::Built { address: a, bits: 0, words: [0, 0] };
+            Some(self.handle((b, i), &src, "ByteAddressBuffer", false)?)
+        };
+        let o = self.fresh("a", "uint");
+        self.line(&format!("{o} = {off};"));
+        let words = self.native.code.len() as u32 / 4;
+        let dword = |l: &mut Self, at: String| -> String {
+            match &h {
+                Some(h) => format!("{h}.Load({at})"),
+                None => {
+                    l.code_table = Some(words);
+                    format!("code_table[min(({at}) >> 2, {}u)]", words.saturating_sub(1))
+                }
+            }
+        };
+        for k in 0..n {
+            let x = match sub {
+                None => dword(self, format!("{o} + {}u", 4 * k)),
+                Some((width, signed)) => {
+                    let w = dword(self, format!("{o} & ~3u"));
+                    let x = format!("(({w} >> (({o} & 3u) * 8u)) << {}u)", 32 - width);
+                    if signed { format!("uint(int({x}) >> {}u)", 32 - width) } else { format!("({x} >> {}u)", 32 - width) }
+                }
+            };
+            let t = self.fresh("t", "uint");
+            self.line(&format!("{t} = {x};"));
+            self.write(inst, Reg::V(reg + k as u8), t, &guard)?;
+        }
+        Ok(())
     }
 
     // ---- LDS ----
@@ -3873,6 +4083,28 @@ impl<'a> L<'a> {
         }
         let _ = p;
         let body = cfg::structure(&Bl { l: &self }).map_err(|w| ShaderError::Unsupported { offset: 0, what: w })?;
+        // A value is declared where it is defined: its block's statements
+        // come before everything the block dominates (`cfg`), which is where
+        // SSA puts its uses. Joins and lane bits are declared at the top.
+        let decls = self.decls.clone();
+        let mut resolved = String::with_capacity(body.len() + body.len() / 8);
+        for line in body.split_inclusive('\n') {
+            let t = line.trim_start();
+            let indent = &line[..line.len() - t.len()];
+            match t.chars().next() {
+                Some(c @ ('\u{1}' | '\u{2}')) => {
+                    let rest = &t[1..];
+                    let name = rest.split(' ').next().unwrap_or("");
+                    resolved.push_str(indent);
+                    if !decls.contains_key(name) {
+                        resolved.push_str(if c == '\u{1}' { "uint " } else { "bool " });
+                    }
+                    resolved.push_str(rest);
+                }
+                _ => resolved.push_str(line),
+            }
+        }
+        let body = resolved;
         let mut src = String::new();
         src.push_str("// Translated by victory-shader (HLSL backend).\n");
         src.push_str(include_str!("prelude.hlsl"));
@@ -4015,7 +4247,7 @@ impl<'a> L<'a> {
         };
         let _ = ret_decl;
         src.push_str(&head);
-        for (n, ty) in &self.decls {
+        for (n, ty) in &decls {
             if ty.is_empty() {
                 continue;
             }
@@ -4180,6 +4412,8 @@ fn sig_order(sig: &[Sig], sorted: bool) -> Vec<(usize, &Sig)> {
     let mut v: Vec<(usize, &Sig)> = sig.iter().enumerate().collect();
     if sorted {
         v.sort_by_key(|(id, e)| (e.reg.unwrap_or(u32::MAX), e.col(), *id));
+    } else {
+        v.sort_by_key(|(id, e)| (e.order, *id));
     }
     v
 }

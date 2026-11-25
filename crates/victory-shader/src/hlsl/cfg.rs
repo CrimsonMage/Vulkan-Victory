@@ -209,6 +209,9 @@ impl Out<'_> {
             m.sort_by_key(|&c| std::cmp::Reverse(self.g.rpo[c]));
             m
         };
+        // The node's statements come first, before the blocks its merges
+        // follow: everything it dominates is placed after them in the same
+        // scope, so a value it defines is in scope wherever it is used.
         if self.g.header[x] {
             let entry = self.bl.loop_entry(x);
             self.line(&entry);
@@ -216,9 +219,13 @@ impl Out<'_> {
             self.depth += 1;
             ctx.push(Ctx::Loop(x));
             self.passes.push(false);
+            let body = self.bl.body(x).to_owned();
+            self.line(&body);
             self.within(x, &merges, ctx);
             self.close(ctx, "}");
         } else {
+            let body = self.bl.body(x).to_owned();
+            self.line(&body);
             self.within(x, &merges, ctx);
         }
     }
@@ -226,8 +233,6 @@ impl Out<'_> {
     fn within(&mut self, x: usize, merges: &[usize], ctx: &mut Vec<Ctx>) {
         match merges.split_first() {
             None => {
-                let body = self.bl.body(x).to_owned();
-                self.line(&body);
                 match self.bl.end(x).clone() {
                     End::Jump(t) => self.jump(x, t, ctx),
                     End::Branch(cond, t, f) => {

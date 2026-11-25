@@ -73,6 +73,9 @@ pub(crate) struct Sig {
     pub native16: bool,
     /// DXIL interpolation mode from `PSV0` (0 if unknown).
     pub interp: u8,
+    /// Position in the console's declaration order (`PSV0` lists elements
+    /// as declared, the signature part by register).
+    pub order: usize,
 }
 
 impl Sig {
@@ -124,36 +127,64 @@ pub(crate) fn signature(part: &[u8]) -> Result<Vec<Sig>, ShaderError> {
             half: (4..=6).contains(&raw) || u32_at(part, at + 28)? != 0,
             native16: (4..=6).contains(&raw),
             interp: 0,
+            order: i,
         });
     }
     Ok(out)
 }
 
-/// The interpolation mode of each input element from `PSV0` (runtime info
-/// version 1 on), in signature order; empty when the part does not say.
-fn psv_input_modes(psv: &[u8]) -> Vec<u8> {
+/// The signature elements `PSV0` lists (runtime info version 1 on), as
+/// declared: per part (inputs, outputs, primitive outputs) each element's
+/// first register, first column and interpolation mode. Empty when the part
+/// does not say.
+fn psv_elements(psv: &[u8]) -> [Vec<(u8, u8, u8)>; 3] {
+    let none = || [Vec::new(), Vec::new(), Vec::new()];
     let r = |o: usize| crate::dxbc::u32_at(psv, o).ok().map(|x| x as usize);
-    let Some(info) = r(0) else { return Vec::new() };
+    let Some(info) = r(0) else { return none() };
     if info < 36 {
-        return Vec::new();
+        return none();
     }
-    let n_in = psv.get(4 + 28).copied().unwrap_or(0) as usize;
+    let counts = [28, 29, 30].map(|k| psv.get(4 + k).copied().unwrap_or(0) as usize);
     let mut at = 4 + info;
-    let Some(resources) = r(at) else { return Vec::new() };
+    let Some(resources) = r(at) else { return none() };
     at += 4;
     if resources > 0 {
-        let Some(size) = r(at) else { return Vec::new() };
+        let Some(size) = r(at) else { return none() };
         at += 4 + size * resources;
     }
-    let Some(strings) = r(at) else { return Vec::new() };
+    let Some(strings) = r(at) else { return none() };
     at += 4 + strings;
-    let Some(indices) = r(at) else { return Vec::new() };
+    let Some(indices) = r(at) else { return none() };
     at += 4 + 4 * indices;
-    let Some(size) = r(at) else { return Vec::new() };
+    let Some(size) = r(at) else { return none() };
     at += 4;
-    (0..n_in)
-        .map_while(|k| psv.get(at + k * size + 13).copied())
-        .collect()
+    let mut out = none();
+    let mut k = 0;
+    for (part, &n) in counts.iter().enumerate() {
+        for _ in 0..n {
+            let e = at + k * size;
+            k += 1;
+            let (Some(&row), Some(&cols), Some(&interp)) = (psv.get(e + 9), psv.get(e + 10), psv.get(e + 13)) else {
+                return none();
+            };
+            out[part].push((row, cols >> 4 & 3, interp));
+        }
+    }
+    out
+}
+
+/// The `PSV0` elements' interpolation modes and declaration order, matched
+/// to the signature part's elements by register and column.
+fn apply_psv(sig: &mut [Sig], psv: &[(u8, u8, u8)]) {
+    if psv.len() != sig.len() {
+        return;
+    }
+    for (order, &(row, col, interp)) in psv.iter().enumerate() {
+        if let Some(e) = sig.iter_mut().find(|e| e.reg == Some(u32::from(row)) && e.col() == col) {
+            e.interp = interp;
+            e.order = order;
+        }
+    }
 }
 
 /// The console program of `container` as HLSL, its signature elements
@@ -203,20 +234,20 @@ pub fn emit_program(
         }
     };
     let mut inputs = sig(FourCC::ISG1)?;
-    let outputs = sig(FourCC::OSG1)?;
-    if native.stage == HwStage::Ps
-        && let Some(psv) = c.part(FourCC::PSV0)
-    {
-        let modes = psv_input_modes(psv.data);
-        if modes.len() == inputs.len() {
-            for (e, m) in inputs.iter_mut().zip(modes) {
-                e.interp = m;
-            }
+    let mut outputs = sig(FourCC::OSG1)?;
+    let psv = c.part(FourCC::PSV0).map_or_else(|| [Vec::new(), Vec::new(), Vec::new()], |p| psv_elements(p.data));
+    apply_psv(&mut inputs, &psv[0]);
+    apply_psv(&mut outputs, &psv[1]);
+    if native.stage != HwStage::Ps {
+        // (only pixel inputs interpolate)
+        for e in inputs.iter_mut().chain(outputs.iter_mut()) {
+            e.interp = 0;
         }
     }
     let mesh = match &native.io {
         crate::native::StageIo::Ms(ms) => {
             let mut prims = sig(FourCC::PSG1)?;
+            apply_psv(&mut prims, &psv[2]);
             // The console never exports a primitive id or cull flag.
             prims.retain(|e| !matches!(e.sv, 7 | 25));
             // The group id arrives multiplied by max(threads, vertices,
