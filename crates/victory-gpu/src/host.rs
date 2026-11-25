@@ -194,6 +194,8 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The unified-memory probe, if asked for (`VICTORY_UNIFIED`).
     crate::unified::tick();
+    // The views line (`mapstat`), every 10 s.
+    crate::mapstat::tick();
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);

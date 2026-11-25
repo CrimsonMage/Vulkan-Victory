@@ -650,18 +650,44 @@ extern "system" fn copy_page_mappings(
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
+        // Ranges that continue each other (pool pages that follow on, or
+        // unmapped pages) are one request, `(destination, source or 0,
+        // bytes)`: the runtime maps a run of consecutive pages as one view.
+        let mut pending: Option<(u64, u64, u64)> = None;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
+            let next = match r.kind {
+                0 if inside(r.count) => Some(source),
+                2 => Some(0),
+                _ => None,
             };
+            if let (Some((to, from, bytes)), Some(next)) = (pending.as_mut(), next)
+                && *to + *bytes == at
+                && (if next == 0 { *from == 0 } else { *from != 0 && *from + *bytes == next })
+            {
+                *bytes += len;
+                at += len;
+                continue;
+            }
+            if let Some((to, from, bytes)) = pending.take() {
+                ok &= map(to, from, bytes, false);
+            }
+            match next {
+                Some(from) => pending = Some((at, from, len)),
+                None => {
+                    ok &= match r.kind {
+                        1 if inside(1) => map(at, source, len, true),
+                        3 => true,
+                        _ => false,
+                    };
+                }
+            }
             at += len;
+        }
+        if let Some((to, from, bytes)) = pending {
+            ok &= map(to, from, bytes, false);
         }
     }
     if !ok {

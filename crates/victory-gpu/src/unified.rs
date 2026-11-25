@@ -259,6 +259,7 @@ unsafe fn open_unit(device: &ID3D12Device, rig: &mut Option<Rig>, len: u64, home
                 if view.Value.is_null() {
                     return Err("no view of the canary page".to_owned());
                 }
+                crate::mapstat::mapped(crate::mapstat::Site::Canary, K64 as usize);
                 std::ptr::copy_nonoverlapping(canary.as_ptr(), view.Value.cast::<u8>(), 16);
                 (heap, Some(view))
             }
@@ -280,6 +281,7 @@ unsafe fn open_unit(device: &ID3D12Device, rig: &mut Option<Rig>, len: u64, home
         })();
         if let Some(view) = view {
             mem::UnmapViewOfFile(view);
+            crate::mapstat::unmapped(crate::mapstat::Site::Canary, K64 as usize);
         }
         check.map(|()| heap)
     }

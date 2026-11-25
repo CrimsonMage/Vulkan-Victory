@@ -909,8 +909,9 @@ pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
 }
 
 /// Maps the physical pages behind one range of title memory at another,
-/// `(to, from, len)` (`from` 0 unmaps); false on failure.
-pub type PageMapper = fn(u64, u64, u64) -> bool;
+/// `(to, from, len, repeat)` (`from` 0 unmaps; with `repeat`, the one page
+/// at `from` shows at every page of `to`); false on failure.
+pub type PageMapper = fn(u64, u64, u64, bool) -> bool;
 static PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
 
 /// The runtime's page mapper, for the queues' page-mapping copies (memory
