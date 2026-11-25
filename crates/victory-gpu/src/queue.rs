@@ -178,11 +178,7 @@ pub(crate) fn release_held(all: bool) {
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
-                    {
-                        break;
-                    }
+                    Some(&Held::Wait(fence, value)) if !all && !fence_met(fence, value) => break,
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
@@ -242,6 +238,16 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// Whether a queue may pass a wait for `fence` to reach `value`: it has,
+/// or a signal that gets it there is in the line of submissions sent to
+/// the card (`crate::host::late_signalled`). Then what follows goes to the
+/// card behind that signal's submissions, on the one host queue, which runs
+/// them in order: the card waits, not the title's work on the CPU.
+#[cfg(windows)]
+fn fence_met(fence: usize, value: u64) -> bool {
+    crate::fence::completed(fence as This) >= value || crate::host::late_signalled(fence, value)
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or it will
@@ -441,7 +447,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
         let behind = {
             let mut held = lock(&queue(this).held);
-            let behind = !held.is_empty() || now < value;
+            let behind = !held.is_empty() || !fence_met(fence as usize, value);
             if behind {
                 held.push(Held::Wait(fence as usize, value));
             }

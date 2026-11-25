@@ -90,12 +90,15 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if event.is_null() {
         // With submissions sent to the card and not waited for the signal
-        // may be behind them: they land first, which sets it.
+        // may be behind them: the flights ahead of it land, which sets it
+        // (all of them if no signal of it is in the line).
         #[cfg(windows)]
         {
             drop(waiters);
             let t = std::time::Instant::now();
-            crate::host::settle_now();
+            if !crate::host::wait_for_signal(this as usize, value) {
+                crate::host::settle_now();
+            }
             crate::frametime::waited(crate::frametime::Wait::Fence, t);
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
@@ -147,7 +150,14 @@ extern "system" fn creation_flags(this: This) -> u32 {
 }
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
-    (&raw const fence(this).value) as u64
+    value_address(this) as u64
+}
+
+/// The address of the fence's value, where titles also read and wait for
+/// it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn value_address(this: This) -> usize {
+    (&raw const fence(this).value) as usize
 }
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console

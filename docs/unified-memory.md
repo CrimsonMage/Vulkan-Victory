@@ -429,9 +429,9 @@ Proton. It stays in the PC's memory and is opened, as section 1 planned.
 
 ### The switch
 
-`VICTORY_UNIFIED`: unset or `1`, on; `0`, the copies and write watching of
-before (the way back, for comparing in-game); `2`, on plus the probe at the
-first sweep; `3`, also the probe's tile-mapping test. The probe lives in
+`VICTORY_UNIFIED`: unset or `1`, on; `0` is taken as `1` since the copies
+of title buffers went (2026-11-25: there is nothing to go back to); `2`,
+on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. The probe lives in
 `unified_probe.rs`; `VICTORY_UNIFIED_PROBE_MB` and
 `VICTORY_UNIFIED_PROBE_BIG_MB` as before.
 
@@ -454,41 +454,44 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   writes a 16-byte pattern on the canary page, the GPU reads it back
   through the heap (the probe's own queue), and they must match. A mismatch
   is vkd3d-proton's silent fallback; the unit is refused, logged, and its
-  buffers keep copies. (Opening 256 MiB pieces instead, tried in run p7,
+  buffers become buffers of their own (below). (Opening 256 MiB pieces instead, tried in run p7,
   pinned 6,565 of 6,713 MB all the same and split buffers at piece edges.)
-- **Big buffers outside the units** (`unified.rs` `loose`): a title buffer
-  of 16 MiB or more in memory no unit holds (a committed resource's memory
-  from the title's allocator: the 174 MB GPU heap at 0xb9c0000 in run p7)
-  is opened as a heap of its own over its 64 KiB pages (its 4 KiB pages if
-  the next 64 KiB is not committed), checked by a word the GPU must read as
-  the CPU sees it, and let go when that memory is freed. Any committed
-  protection that reads and writes counts, whatever the caching modifiers;
-  view pages victory's guards keep read-only are opened first; memory over
-  views is let go when the title maps anything else there. A refusal logs
-  the first pages that refused (state, protection, type) and is asked again
-  2 s later. Run p8 refused 0xb9c0000 (174 MB), 0xc15940000 (50 MB) and
-  0xc3ddd0000 (24 MB) on a check that wanted plain private read-write
-  pages.
+- **Buffers outside the units** (`unified.rs` `loose`): a title buffer of
+  any size in memory no unit holds (a committed resource's memory from the
+  title's allocator: the 174 MB GPU heap at 0xb9c0000 in run p7; buffers
+  over views at 0xc34530000 in run p10) is opened as a heap of its own over
+  its 64 KiB pages (its 4 KiB pages if the next 64 KiB is not committed or
+  is another heap's), checked by a word the GPU must read as the CPU sees
+  it, and let go when that memory is freed. A committed buffer's memory is
+  64 KiB pages of its own, so no two share a page. Any committed protection
+  that reads and writes counts, whatever the caching modifiers; view pages
+  victory's guards keep read-only are opened first; memory over views is
+  let go when the title maps anything else there. A refusal logs the first
+  pages that refused (state, protection, type) and is asked again 2 s
+  later; pages that lie partly in another heap are refused and said
+  (`its pages lie partly in another heap`).
 - **Buffers in place** (`shadow.rs`). A title buffer of any size, or a
   4 MiB window of title memory outside buffers, whose memory lies in one
-  opened region, one run of one section or one opened big buffer, becomes
-  a buffer placed over the title's own bytes (on the 64 KiB line below
-  them; `Shadow::offset` counts the bias). For it, `refresh` only keeps the
-  buffer alive with the list, a submission takes no snapshot, nothing is
-  copied back, no write watch is asked. Shader writes are still declared,
-  so that what the CPU prepares while a submission runs waits where it
-  writes (`host.rs` `late_blocked`). A view that the title maps anew marks
+  opened region, one run of one section or one opened buffer, becomes a
+  buffer placed over the title's own bytes (on the 64 KiB line below them;
+  `Shadow::offset` counts the bias). A list naming it only keeps it alive;
+  nothing is copied, compared or merged, no write watch is asked. Shader
+  writes are declared, per submission joined, so that CPU steps of a later
+  submission that read there wait for it (`host.rs` `late_blocked`) and
+  textures over it detile again once it has finished
+  (`unified::gpu_wrote`, `settle`). A view that the title maps anew marks
   its in-place buffers stale and the next ask places new ones.
-- **What stays a copy**: since 2026-11-25 the title's 174 MB GPU heap is in
-  place too. Its copy in the card's memory cost a hash compare after every
-  submission that wrote it and a fetch of what shaders wrote that waited
-  behind every later submission on the queue ("fetching shader writes back
-  54 ms" a frame), while the card was idle three quarters of the frame;
-  the card now reads it over the bus. A card copy is left only for big
-  buffers whose memory cannot be opened. Also memory that is
-  no xmem unit (VIctory's own allocations at title addresses), ranges over
-  scattered pages, single-view copies (`exact`), and units that were
-  refused.
+- **Not in place** (since 2026-11-25 the only other kind; card copies,
+  PC copies with snapshots, compares, merges and fetch-backs are gone):
+  a buffer view whose bytes do not start on an element of its in-place
+  buffer (`shadow::exact`: placed buffers start on 64 KiB lines), and
+  memory that does not open, get a buffer of their own in the PC's memory
+  that each submission naming it fills from title memory
+  (`HostList::defer_upload`) and that is never copied back. Shader writes
+  into one stay there until the next fill (`shaders write a buffer that is
+  not in place`, counted in the unified line). The unified line counts
+  them: `not in place (buffers of their own, ...) N made (M MB)`; the frame
+  line's `not in place (filled at submission) Y MB` is what lists name.
 - **Title copies** (`list.rs` `copy_on_card`). A `CopyBufferRegion` or
   buffer `CopyResource` whose destination is in place runs on the card,
   in the list where the title put it, between UAV barriers, as on the
@@ -555,40 +558,45 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
   a page while its view was away for a change and waited instead of
   faulting. F must be 0. The first filler found logs `xmem: a page of
   zeros the title shows at many places`.
-- The gate line (`… fps, … ms/frame …; card memory …`) gives the result;
-  compare with a run at `VICTORY_UNIFIED=0` in the same place.
-- Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms (compare
-  of card copies C), idle I; S submissions/frame (U untimed); title threads
-  recording into our lists R ms (summed; by call ms/n: state, draw, mesh,
-  dispatch, indirect, reset, own | besides: barrier, copy, clear, value);
-  in submissions P ms (… of them; by part: enter, descriptors, upkeep,
-  watch, steps, copies, execute; textures brought up to date T ms),
-  waiting for the card W ms [why ms/n,
-  …]; flights landed in L ms (fetching shader writes back F ms, M MB);
-  title fence events set n/frame, D ms after the ask on average; buffers
-  named by lists: in place (read over the bus) X MB, card copies Y MB; top
-  pipelines (ms of a sampled frame, of A in all): name ms; …`
-  (`frametime.rs`). All per frame. B and I come from GPU timestamps around
-  each submission (B + I ≈ the frame when the card is the limit only if I
-  is small); C is our hash compare of the big heap's card copy. The waits
-  by why: `lock` (submission lock), `settle` (a waited submission, e.g. a
-  saved frame), `reads` (preparing reads what flights write), `step`
-  (`CopyMemoryToMemoryX` on the CPU), `merge` (title bytes under shader
-  writes), `copy-in` (a CPU copy into title memory), `results` (compare
-  ring full), `lists` (256 lists in the air), `fence` (the title blocks
-  without an event), `own` (the card running a waited submission). The
-  pipelines are sampled every 30th frame with a timestamp at each pipeline
-  change of the title's lists. R is the sum of the kinds before the bar
-  (the calls that pass through a list's draw state), each with its ms and
-  calls per frame; barriers, copies, clears and memory-value waits and
-  writes are timed beside it, not in R. The parts of a submission:
-  `enter` (the submission lock and the flights in the air, waits
-  included), `descriptors` (records the title copied into heaps as bytes),
-  `upkeep` (the idle sweep, slots waiting for a texture, finished shader
-  writes announced), `watch` (the write-watch asking), `steps` (the lists'
-  CPU steps: refreshes, fills, copies, textures), `copies` (snapshots and
-  sends to card copies), `execute` (`ExecuteCommandLists` of a submission
-  sent ahead; a waited one counts as the `own` wait).
+- The gate line (`… fps, … ms/frame …; card memory …`) gives the result.
+- Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms, idle
+  I; S submissions/frame (U untimed); title threads recording into our
+  lists R ms (summed; by call ms/n: state, draw, mesh, dispatch, indirect,
+  reset, own | besides: barrier, copy, clear, value); in submissions P ms
+  (… of them; by part: enter, descriptors, upkeep, steps, execute;
+  textures brought up to date T ms), waiting for the card W ms [why ms/n,
+  …]; flights landed in L ms; title fence events set n/frame, D ms after
+  the ask on average; buffers named by lists: in place (read over the bus)
+  X MB, not in place (filled at submission) Y MB; top pipelines (ms of a
+  sampled frame, of A in all): name ms; …` (`frametime.rs`). All per
+  frame. B and I come from GPU timestamps around each submission (B + I ≈
+  the frame when the card is the limit only if I is small). The waits by
+  why: `lock` (submission lock), `settle` (a waited submission, e.g. a
+  saved frame), `reads` (a CPU step reads what flights write: a title copy
+  into it, a texture over it), `step` (`CopyMemoryToMemoryX` on the CPU),
+  `copy-in` (a CPU copy into title memory), `lists` (256 lists in the
+  air), `fence` (the title blocks without an event: only the flights ahead
+  of the fence's signal, all of them if no signal is in the line), `own`
+  (the card running a waited submission). The pipelines are sampled every
+  30th frame with a timestamp at each pipeline change of the title's
+  lists. R is the sum of the kinds before the bar (the calls that pass
+  through a list's draw state), each with its ms and calls per frame;
+  barriers, copies, clears and memory-value waits and writes are timed
+  beside it, not in R. The parts of a submission: `enter` (the submission
+  lock and the flights in the air, waits included), `descriptors` (records
+  the title copied into heaps as bytes), `upkeep` (the sweep, slots waiting
+  for a texture, finished shader writes announced), `steps` (the lists'
+  CPU steps: fills, copies, textures; the timestamps), `execute`
+  (`ExecuteCommandLists` of a submission sent ahead; a waited one counts as
+  the `own` wait).
+- **Fences pass through.** Everything of ours runs on one host queue, in
+  order. A title queue's `Wait` for a fence whose signal is already in the
+  line of flights (`host::late_signalled`), and a list's wait for a memory
+  value that a flight's bottom-of-pipe write or a fence signal in the line
+  meets (`host::late_met`, a fence's value lives at its GPU address), are
+  passed at once: what follows goes to the card behind it, and the card
+  does the waiting. Only waits nothing in the line meets hold the title
+  queue's work on the CPU until flights land.
 
 ### Risks of this build
 
@@ -603,7 +611,10 @@ first sweep; `3`, also the probe's tile-mapping test. The probe lives in
    read title memory live. The title's own CPU writes are ordered by its
    fences (signalled only after landing). VIctory's CPU-side writes are
    ordered by `late_blocked` and the copy wait; a bottom-of-pipe value
-   written at landing (`Late::Write`) is as late as before.
+   written at landing (`Late::Write`) is as late as before. Fills of upload
+   memory that read memory a flight "may write" do not wait (`host.rs`
+   `blocked_by`); with copies gone nothing checks them any more (run 208
+   found the bytes the same 44 times of 44).
 4. **CPU-filled textures in memory DirectStorage once filled** are found
    only by the 64th-frame hash (about two seconds late).
 5. **Remapped views under live descriptor slots** keep the old buffer until

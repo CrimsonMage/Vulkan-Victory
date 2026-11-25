@@ -16,9 +16,9 @@
 //! title fills with the CPU, and is checked by its content hash
 //! (`texture.rs`).
 //!
-//! `VICTORY_UNIFIED`: unset or 1, on (the default); 0, off: the copies and
-//! write watching of before, the way back for comparing; 2, on and the
-//! probe once at the first sweep (`unified_probe.rs`); 3, also the probe's
+//! `VICTORY_UNIFIED`: unset or 1, on (the default; 0 is taken as 1: the
+//! copies of title buffers it went back to are gone); 2, on and the probe
+//! once at the first sweep (`unified_probe.rs`); 3, also the probe's
 //! tile-mapping test.
 //!
 //! A region or a section is opened whole at its first GPU use, and let go
@@ -47,7 +47,13 @@ const TIB: u64 = 1 << 40;
 /// `VICTORY_UNIFIED`, see the module comment.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_UNIFIED").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_UNIFIED").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1) {
+        0 => {
+            tracing::warn!("VICTORY_UNIFIED=0 is gone (title buffers have no copies to go back to): unified memory stays on");
+            1
+        }
+        level => level,
+    })
 }
 
 /// Whether unified memory is on (`VICTORY_UNIFIED` is not 0).
@@ -280,7 +286,7 @@ fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Hom
             }
             Err(why) => {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, why, "unified: title memory NOT opened; its buffers keep copies");
+                tracing::warn!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, why, "unified: title memory NOT opened; its buffers are buffers of their own, filled at each submission");
                 State::Refused
             }
         };
@@ -291,19 +297,17 @@ fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Hom
     }
 }
 
-/// Title buffers of this size and up that lie in no `xmem` unit (memory a
-/// committed resource got from the title's allocator, like its 174 MB GPU
-/// heap at 0xb9c0000, run p7, and the 1.3-12 MB buffers over views at
-/// 0xc34530000-0xc482e0000 of run p10) are opened as a heap of their own,
-/// over the pages that hold them: else they stay a copy in the PC's memory,
-/// snapshotted, compared and merged back after every submission that
-/// writes them. (At 16 MiB, run p10 kept 18 such buffers, 209 MB named a
-/// frame, as card copies: their fetch-back and merge waits were ~200 ms of
-/// every frame.) Smaller buffers would each be a heap and a check of their
-/// own; they keep copies.
-const LOOSE_MIN: u64 = 1 << 20;
-
-/// A heap opened over the pages of one big buffer outside the units.
+/// Title buffers that lie in no `xmem` unit (memory a committed resource
+/// got from the title's allocator, like its 174 MB GPU heap at 0xb9c0000 of
+/// run p7, and the buffers over views at 0xc34530000-0xc482e0000 of run
+/// p10) are opened as a heap of their own, over the pages that hold them,
+/// whatever their size: a committed buffer's memory is 64 KiB pages of its
+/// own (`resource.rs` `footprint`), so no two of them share a page. Else
+/// they would be a buffer of their own filled at each submission
+/// (`crate::shadow`); until 2026-11-25 they were copies compared and merged
+/// back after every submission that wrote them (run p10, at 16 MiB and up:
+/// 18 buffers, 209 MB named a frame, ~200 ms of waits a frame).
+/// A heap opened over the pages of one buffer outside the units.
 struct Loose {
     len: u64,
     heap: ID3D12Heap,
@@ -312,10 +316,10 @@ struct Loose {
     view: bool,
 }
 
-/// The heap of a big buffer outside the units that holds `[start, end)`:
-/// the heap, its bytes, the offset of `start` in it, and whether it lies
-/// over views; opened now for a buffer of [`LOOSE_MIN`] bytes or more over
-/// committed read-write pages ([`usable`]). Over the 64 KiB pages that hold
+/// The heap of a buffer outside the units that holds `[start, end)`: the
+/// heap, its bytes, the offset of `start` in it, and whether it lies over
+/// views; opened now if its pages are committed read-write ([`usable`])
+/// and no other heap holds any of them. Over the 64 KiB pages that hold
 /// the buffer, else over its 4 KiB pages (the next 64 KiB may not be
 /// committed). A view page victory's guards keep read-only is opened first
 /// (memory read in place needs no write tracking). Refused memory is asked
@@ -325,9 +329,6 @@ fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(
         && end <= at as u64 + l.len
     {
         return Some((l.heap.clone(), l.len, start - at as u64, l.view));
-    }
-    if end - start < LOOSE_MIN {
-        return None;
     }
     let now = crate::host::now_ms();
     if u.loose_refused.get(&start).is_some_and(|&until| now < until) {
@@ -340,6 +341,16 @@ fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(
     if u.loose.range(..hi as usize).next_back().is_some_and(|(&at, l)| at as u64 + l.len > lo)
         || u.regions.range(..hi as usize).next_back().is_some_and(|(&at, r)| at as u64 + r.len + K64 > lo)
     {
+        let n = STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 32 || n.is_power_of_two() {
+            tracing::warn!(
+                what = "buffer",
+                at = format_args!("{start:#x}"),
+                kb = (end - start) >> 10,
+                n,
+                "unified: title memory NOT opened: its pages lie partly in another heap opened over a buffer or region; a buffer of its own"
+            );
+        }
         return None;
     }
     let usable_wide = usable(wide.0 as usize, (wide.1 - wide.0) as usize)
@@ -393,7 +404,7 @@ fn loose(device: &ID3D12Device, u: &mut Units, start: u64, end: u64) -> Option<(
         Err(why) => {
             let n = STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 32 || n.is_power_of_two() {
-                tracing::warn!(what = "buffer", at = format_args!("{start:#x}"), mb = (end - start) >> 20, why, n, "unified: title memory NOT opened; its buffers keep copies (asked again in 2 s)");
+                tracing::warn!(what = "buffer", at = format_args!("{start:#x}"), kb = (end - start) >> 10, why, n, "unified: title memory NOT opened; a buffer of its own for now (asked again in 2 s)");
             }
             u.loose_refused.insert(start, now + 2_000);
             None
@@ -685,40 +696,50 @@ pub(crate) fn newest(at: usize, len: usize) -> u64 {
     epochs().newest(at as u64, len as u64)
 }
 
-/// Shader writes through in-place buffers, by the submission that makes
-/// them, until it has finished.
-static GPU_WRITES: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+/// Shader writes through in-place buffers, per submission (in order and
+/// joined), until it has finished.
+#[allow(clippy::type_complexity)]
+static GPU_WRITES: Mutex<Vec<(Vec<(usize, usize)>, u64)>> = Mutex::new(Vec::new());
 
-/// At submission: the submission now being made writes `[at, at + len)`
-/// through an in-place buffer. Announced once it has finished ([`settle`]).
-pub(crate) fn gpu_wrote(at: usize, len: usize) {
-    let number = crate::host::submissions_started();
-    GPU_WRITES.lock().unwrap_or_else(|e| e.into_inner()).push((at, len, number));
+/// At submission: submission `number`'s shaders write `ranges` (in order,
+/// joined) in place. Announced once it has finished ([`settle`]).
+pub(crate) fn gpu_wrote(ranges: &[(usize, usize)], number: u64) {
+    if !ranges.is_empty() {
+        GPU_WRITES.lock().unwrap_or_else(|e| e.into_inner()).push((ranges.to_vec(), number));
+    }
 }
 
 /// Announces the shader writes of the submissions that have finished: the
-/// textures over them are stale, and the copies that remain (`shadow.rs`)
-/// take those pages again.
+/// textures over them are stale.
 pub(crate) fn settle() {
     let finished = crate::host::submissions_finished();
-    let done: Vec<(usize, usize)> = {
+    let done: Vec<Vec<(usize, usize)>> = {
         let mut pending = GPU_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.is_empty() {
+        let landed = pending.iter().take_while(|(_, number)| *number <= finished).count();
+        if landed == 0 {
             return;
         }
-        let mut done = Vec::new();
-        pending.retain(|&(at, len, number)| {
-            let keep = number > finished;
-            if !keep {
-                done.push((at, len));
-            }
-            keep
-        });
-        done
+        pending.drain(..landed).map(|(ranges, _)| ranges).collect()
     };
-    for (at, len) in done {
-        written(at, len);
-        crate::watch::gpu_wrote(at, len);
+    let mut joined = Vec::new();
+    for ranges in &done {
+        joined.extend_from_slice(ranges);
+    }
+    joined.sort_unstable();
+    let mut epochs = epochs();
+    let mut last: Option<(usize, usize)> = None;
+    for (from, to) in joined {
+        match &mut last {
+            Some(l) if from <= l.1 => l.1 = l.1.max(to),
+            _ => {
+                if let Some((a, b)) = last.replace((from, to)) {
+                    epochs.write(a as u64, (b - a) as u64);
+                }
+            }
+        }
+    }
+    if let Some((a, b)) = last {
+        epochs.write(a as u64, (b - a) as u64);
     }
 }
 
@@ -754,11 +775,13 @@ pub(crate) fn tick() {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let (live, live_bytes) = crate::shadow::in_place_live();
+    let own = crate::shadow::own_made();
     let ranges = epochs().len();
     tracing::info!(
         "unified: {} heaps opened ({} MB of title memory), {} refused; buffers in place: {} alive ({} MB), {} placed since the start ({} MB); \
-         title copies on the GPU {}, on the CPU after waiting for the card {}; textures checked for an announced write {}, by their hash {}; \
-         announced-write ranges kept {}",
+         not in place (buffers of their own, filled at each submission that names them) {} made ({} MB), lists whose shaders wrote one {}; \
+         windows let go {}; title copies on the GPU {}, on the CPU after waiting for the card {}; textures checked for an announced write {}, \
+         by their hash {}; announced-write ranges kept {}",
         s[0],
         s[1] >> 20,
         s[2],
@@ -766,6 +789,10 @@ pub(crate) fn tick() {
         live_bytes >> 20,
         s[3],
         s[4] >> 20,
+        own[0],
+        own[1] >> 20,
+        own[2],
+        own[3],
         s[5],
         s[6],
         s[7],
@@ -774,7 +801,7 @@ pub(crate) fn tick() {
     );
     let o: Vec<u64> = OPENING.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "unified opening: title memory open now {} MB (regions {} MB, sections {} MB, big buffers outside them {} MB); pages \
+        "unified opening: title memory open now {} MB (regions {} MB, sections {} MB, buffers outside them {} MB); pages \
          committed for the import {} MB; let go because the title freed the memory {} MB",
         s[1] >> 20,
         o[0] >> 20,
