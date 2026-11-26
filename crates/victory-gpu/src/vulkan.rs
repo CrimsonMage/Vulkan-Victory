@@ -157,11 +157,11 @@ struct Memory {
     /// Imports replaced by larger ones: kept for the run (recorded command
     /// buffers not yet submitted may bind maps that name them).
     retired: Vec<Imported>,
-    /// Loose imports over pages the title mapped anew (`remap.rs`): freed
-    /// some frames later, once the card is past them (frame, ticket,
-    /// import); and their ranges, to import again once every page there is
-    /// usable (base, bytes, frame).
-    dying: Vec<(u64, u64, Imported)>,
+    /// Imports out of use (`remap.rs`), freed once no command buffer that
+    /// may name them is unsubmitted or running; and the ranges of loose
+    /// imports over pages mapped anew, to import again once every page
+    /// there is usable (base, bytes, frame).
+    dying: Vec<(victory_vk::timeline::Mark, Imported)>,
     rejoin: Vec<(usize, usize, u64)>,
     /// The frame, for the pool view's least-recently-touched eviction.
     tick: u64,
@@ -401,10 +401,10 @@ pub fn title_section_gone(handle: usize) {
         import: Some(i), ..
     }) = gone
     {
-        // Fills from it may be in the air.
-        b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
-        // SAFETY: the card has finished everything given so far.
-        unsafe { i.destroy(&b.host) };
+        // Fills from it and recorded copies may still name it.
+        let mut m = memory(b);
+        m.bury(b, i);
+        m.rebuild_map();
     }
 }
 
@@ -450,13 +450,8 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
         return;
     }
     m.rebuild_map();
-    drop(m);
-    if !imports.is_empty() {
-        b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
-        for i in imports {
-            // SAFETY: the card has finished everything given so far.
-            unsafe { i.destroy(&b.host) };
-        }
+    for i in imports {
+        m.bury(b, i);
     }
 }
 
@@ -489,13 +484,12 @@ pub fn title_memory_released(at: usize, len: usize) {
         .filter(|&(&a, r)| a >= at && a + r.len <= at + len)
         .map(|(&a, _)| a)
         .collect();
-    let mut dropped = false;
+    let mut dropped = m.drop_stale_loose(b, at, at + len);
     for a in gone {
         if let Some(Region { import: Some(i), .. }) = m.regions.remove(&a) {
-            // The card may still read it.
-            b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
-            // SAFETY: the card has finished everything given so far.
-            unsafe { i.destroy(&b.host) };
+            // The card, or a command buffer not yet submitted, may still
+            // read it.
+            m.bury(b, i);
             dropped = true;
         }
     }

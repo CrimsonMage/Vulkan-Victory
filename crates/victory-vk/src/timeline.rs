@@ -115,6 +115,8 @@ struct Recorder {
     /// `u64::MAX`: being recorded).
     done_at: u64,
     scratch: Scratch,
+    /// The serial of its current recording ([`Mark`]).
+    serial: u64,
 }
 
 /// An operation given to a line and not yet seen complete.
@@ -143,6 +145,19 @@ struct State {
     lines: Vec<LineState>,
     recorders: Vec<Recorder>,
     next_pair: u32,
+    /// The serial the next recording begins with ([`Mark`]).
+    next_serial: u64,
+}
+
+/// A point in the recordings ([`Timeline::mark`]): something that left use
+/// there may still be named by a command buffer begun before it and not
+/// yet submitted; it is safe to free once every such one is submitted (or
+/// abandoned) and the card has run everything given by then
+/// ([`Timeline::passed`]).
+pub struct Mark {
+    serial: u64,
+    ticket: Option<u64>,
+    since: std::time::Instant,
 }
 
 /// A command buffer being recorded ([`Timeline::begin`]).
@@ -259,6 +274,7 @@ impl Timeline {
                 lines: vec![host_line],
                 recorders: Vec::new(),
                 next_pair: 0,
+                next_serial: 0,
             }),
             lost: AtomicBool::new(false),
         })
@@ -387,6 +403,34 @@ impl Timeline {
         (s.lines[line].last, s.lines[line].label.clone())
     }
 
+    /// A mark at this point of the recordings.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            serial: self.state().next_serial,
+            ticket: None,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// Whether what left use at `mark` is free of the card: every command
+    /// buffer begun before it is submitted or abandoned (or 10 s passed: a
+    /// recording never handed back would hold everything forever), and the
+    /// card has run everything given when that was first seen.
+    pub fn passed(&self, host: &Host, mark: &mut Mark) -> bool {
+        if mark.ticket.is_none() {
+            let s = self.state();
+            let open = s
+                .recorders
+                .iter()
+                .any(|r| r.done_at == u64::MAX && r.serial < mark.serial);
+            if open && mark.since.elapsed() < std::time::Duration::from_secs(10) {
+                return false;
+            }
+            mark.ticket = Some(s.ticket);
+        }
+        self.lost() || self.completed(host) >= mark.ticket.unwrap_or(0)
+    }
+
     /// The value `line` has reached on the card.
     pub fn line_completed(&self, host: &Host, line: Line) -> u64 {
         let sem = self.state().lines[line].semaphore;
@@ -456,6 +500,7 @@ impl Timeline {
             cmd,
             done_at: u64::MAX,
             scratch: Scratch::default(),
+            serial: 0,
         });
         Ok(s.recorders.len() - 1)
     }
@@ -472,7 +517,10 @@ impl Timeline {
                 s.next_pair = s.next_pair.wrapping_add(1);
                 p
             });
+            let serial = s.next_serial;
+            s.next_serial += 1;
             let r = &mut s.recorders[i];
+            r.serial = serial;
             (i, r.pool, r.cmd, std::mem::take(&mut r.scratch), pair)
         };
         scratch.reset();

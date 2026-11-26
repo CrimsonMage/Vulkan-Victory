@@ -8,17 +8,23 @@
 //! import lived. Before, only regions wholly inside the unmapped range were
 //! dropped.
 //!
-//! Now a loose region the unmapped range overlaps leaves the map at once;
-//! its import is freed some frames later, once the card is past it
-//! (recorded command buffers not yet submitted may bind maps that name
-//! it), and the region is imported again, over the pages mapped there now,
-//! as soon as every page of it is committed read-write memory (at the next
+//! Now a loose region the unmapped (or freed) range overlaps leaves the
+//! map at once, and is imported again, over the pages mapped there now, as
+//! soon as every page of it is committed read-write memory (at the next
 //! view `xmem` maps over it, or a later frame).
+//!
+//! **Imports out of use are buried** ([`Memory::bury`]), not freed: a
+//! command buffer recorded before (a copy, a fill, a query resolve, a map
+//! that names the import) may not be submitted yet. Each import is freed
+//! once every command buffer begun before it left use is submitted and
+//! the card has run it (`Timeline::mark`, `Timeline::passed`); vk39's copy
+//! engine faulted on an unmapped device address after an import was freed
+//! once the card had run only what was given so far.
+
+use victory_vk::memory::Imported;
 
 use super::{Backend, Memory, Region, memory};
 
-/// Frames a dropped import outlives its region.
-const LINGER: u64 = 3;
 /// Frames a range waits to be imported again before it is forgotten (its
 /// pages are named again at the next recording that reads them).
 const PATIENCE: u64 = 600;
@@ -33,11 +39,10 @@ impl Memory {
             .filter(|&(&a, r)| r.loose && a + r.len > at && !(a >= at && a + r.len <= end))
             .map(|(&a, _)| a)
             .collect();
-        let ticket = b.timeline.last();
         for a in &over {
             if let Some(r) = self.regions.remove(a) {
                 if let Some(i) = r.import {
-                    self.dying.push((self.tick, ticket, i));
+                    self.bury(b, i);
                 }
                 self.rejoin.push((*a, r.len, self.tick));
                 static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -52,6 +57,12 @@ impl Memory {
             }
         }
         !over.is_empty()
+    }
+
+    /// `i` is out of use: freed once nothing that may name it can still
+    /// run ([`each_frame`]).
+    pub(super) fn bury(&mut self, b: &Backend, i: Imported) {
+        self.dying.push((b.timeline.mark(), i));
     }
 
     /// The ranges waiting to be imported again that overlap `[at, at +
@@ -79,24 +90,35 @@ impl Memory {
     }
 }
 
-/// Every frame: dropped imports the card is past are freed; ranges waiting
-/// to be imported again are tried.
+/// Every frame: buried imports nothing can name any more are freed; ranges
+/// waiting to be imported again are tried.
 pub(super) fn each_frame(b: &Backend) {
     let mut m = memory(b);
     m.rejoin_where(|_, _| true);
     if m.dying.is_empty() {
         return;
     }
-    let done = b.timeline.completed(&b.host);
-    let tick = m.tick;
-    let (ripe, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut m.dying)
-        .into_iter()
-        .partition(|&(frame, ticket, _)| tick >= frame + LINGER && ticket <= done);
+    let mut ripe = Vec::new();
+    let mut keep = Vec::new();
+    for (mut mark, i) in std::mem::take(&mut m.dying) {
+        if b.timeline.passed(&b.host, &mut mark) {
+            ripe.push(i);
+        } else {
+            keep.push((mark, i));
+        }
+    }
     m.dying = keep;
     drop(m);
-    for (_, _, i) in ripe {
-        // SAFETY: out of every map for frames, and the card has finished
-        // everything given until it left.
+    for i in ripe {
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(
+                title = format_args!("{:#x}", i.title_base),
+                device = format_args!("{:#x}..{:#x}", i.device_base, i.device_base + i.len),
+                "Vulkan: an import freed (device addresses)"
+            );
+        }
+        // SAFETY: out of every map, every command buffer begun while it was
+        // in use is submitted, and the card has run them.
         unsafe { i.destroy(&b.host) };
     }
 }
