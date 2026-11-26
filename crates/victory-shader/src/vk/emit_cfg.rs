@@ -31,12 +31,17 @@ impl Emit<'_> {
             self.loop_tree(x, &after, &merges, exit, entry);
         } else {
             let phis = self.f.blocks[x].phis.clone();
+            self.cur = x;
             for (k, &ph) in phis.iter().enumerate() {
-                self.ids[ph as usize] = entry[k];
+                self.set_id(ph, entry[k]);
             }
             let b = self.f.blocks[x].body.clone();
             self.items(&b);
-            self.within(x, &merges);
+            if merges.len() >= DISPATCH_MIN {
+                self.dispatch_loop(x, &merges);
+            } else {
+                self.within(x, &merges);
+            }
         }
     }
 
@@ -54,7 +59,7 @@ impl Emit<'_> {
             self.m.label(body);
             self.block = body;
             self.ctx.push(Ctx::Block(z));
-            self.cons.push(Construct { node: z, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
+            self.cons.push(Construct { node: z, head: usize::MAX, header: h, merge, cont, arrivals: Vec::new(), disp: None });
             self.loop_tree(x, rest, merges, exit, entry);
             self.close();
             self.tree(z);
@@ -68,9 +73,10 @@ impl Emit<'_> {
         self.block = h;
         let tys = self.phi_tys(x);
         let cids: Vec<Id> = phis.iter().map(|_| self.m.id()).collect();
+        self.cur = x;
         for (k, &ph) in phis.iter().enumerate() {
             let id = self.m.op(op::PHI, tys[k], &[entry[k], pre, cids[k], cont]);
-            self.ids[ph as usize] = id;
+            self.set_id(ph, id);
         }
         self.cphi.insert(x, cids);
         self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
@@ -79,7 +85,7 @@ impl Emit<'_> {
         self.m.label(body);
         self.block = body;
         self.ctx.push(Ctx::Loop(x));
-        self.cons.push(Construct { node: x, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
+        self.cons.push(Construct { node: x, head: usize::MAX, header: h, merge, cont, arrivals: Vec::new(), disp: None });
         let b = self.f.blocks[x].body.clone();
         self.items(&b);
         self.within(x, merges);
@@ -123,7 +129,7 @@ impl Emit<'_> {
                 let c = self.id(c);
                 let merge = self.m.id();
                 self.ctx.push(Ctx::Sel(y));
-                self.cons.push(Construct { node: y, head: x, header: 0, merge, cont: 0, passes: false, wanted: 0, arrivals: Vec::new() });
+                self.cons.push(Construct { node: y, head: x, header: 0, merge, cont: 0, arrivals: Vec::new(), disp: None });
                 let header = self.block;
                 let arm = |e: &mut Self, to: usize| -> Id { if to == y { merge } else { e.m.id() } };
                 let (lt, le) = (arm(self, t), arm(self, e));
@@ -155,7 +161,7 @@ impl Emit<'_> {
                 self.m.label(body);
                 self.block = body;
                 self.ctx.push(Ctx::Block(y));
-                self.cons.push(Construct { node: y, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
+                self.cons.push(Construct { node: y, head: usize::MAX, header: h, merge, cont, arrivals: Vec::new(), disp: None });
                 self.within(x, rest);
                 self.close();
                 self.tree(y);
@@ -200,6 +206,9 @@ impl Emit<'_> {
             if matches!(kind, Ctx::Loop(_)) {
                 self.back_phis(c.node, c.header);
             }
+            if let Some(d) = &c.disp {
+                self.disp_phis(d, c.header);
+            }
             self.branch_to(c.header);
         }
         self.m.label(c.merge);
@@ -217,7 +226,12 @@ impl Emit<'_> {
         if c.arrivals.is_empty() || self.ctx.is_empty() {
             return;
         }
-        let ladder = self.ladder(&c.arrivals, &preds);
+        // the block whose code reaches the merge on every path
+        let dom = match kind {
+            Ctx::Block(y) | Ctx::Sel(y) => self.g.idom[y],
+            Ctx::Loop(x) | Ctx::Disp(x) => x,
+        };
+        let ladder = self.ladder(&c.arrivals, &preds, dom);
         self.dispatch(ladder);
     }
 
@@ -226,6 +240,7 @@ impl Emit<'_> {
         match kind {
             Ctx::Block(y) | Ctx::Sel(y) => Some(y),
             Ctx::Loop(x) => self.g.exit[x],
+            Ctx::Disp(_) => None,
         }
     }
 
@@ -246,7 +261,7 @@ impl Emit<'_> {
 
     /// The ladder at a merge: which jump passes (its code, 0 for none) and
     /// the values for each target's phis.
-    fn ladder(&mut self, arr: &[Arrival], preds: &[Id]) -> Ladder {
+    fn ladder(&mut self, arr: &[Arrival], preds: &[Id], dom: usize) -> Ladder {
         let mut possible: Vec<u32> = arr.iter().flat_map(|a| a.possible.iter().copied()).collect();
         possible.sort_unstable();
         possible.dedup();
@@ -259,16 +274,29 @@ impl Emit<'_> {
         let mut vals = Vec::new();
         for t in targets {
             let tys = self.phi_tys(t);
-            let ids = if tys.is_empty() {
-                Vec::new()
-            } else {
-                self.phis_at(&tys, preds, &|p, k| {
-                    arr.iter().find(|a| a.from == p).and_then(|a| a.vals.iter().find(|v| v.0 == t)).map(|v| v.1[k])
-                })
-            };
+            let mut ids = Vec::new();
+            for (k, &ty) in tys.iter().enumerate() {
+                let given = |p: Id| arr.iter().find(|a| a.from == p).and_then(|a| a.vals.iter().find(|v| v.0 == t)).map(|v| v.1[k]);
+                ids.push(match self.available(preds, &given, dom) {
+                    Some(v) => v,
+                    None => self.phis_at(&[ty], preds, &|p, _| given(p))[0],
+                });
+            }
             vals.push((t, ids));
         }
         Ladder { code, possible, vals }
+    }
+
+    /// The one value every jump arriving at a merge brings, if its code
+    /// reaches the merge on every path (then it needs no phi).
+    fn available(&self, preds: &[Id], given: &dyn Fn(Id) -> Option<Id>, dom: usize) -> Option<Id> {
+        let mut vals = preds.iter().filter_map(|&p| given(p));
+        let v = vals.next()?;
+        if vals.any(|w| w != v) {
+            return None;
+        }
+        let d = *self.def_at.get(&v)?;
+        self.g.dominates(d, dom).then_some(v)
     }
 
     /// After a merge, the jumps the ladder carries: those that end at the
@@ -276,6 +304,9 @@ impl Emit<'_> {
     /// pass on through its merge.
     fn dispatch(&mut self, l: Ladder) {
         let outer = self.ctx.len() - 1;
+        if self.cons[outer].disp.is_some() {
+            return self.dispatch_cases(l);
+        }
         let codes: &[bool] = if matches!(self.ctx[outer], Ctx::Loop(_)) { &[true, false] } else { &[false] };
         let mut rest = l.possible.clone();
         for &cont in codes {
@@ -313,7 +344,7 @@ impl Emit<'_> {
 
     /// Opens the true arm of a selection that ends at the next `close_if`;
     /// the arm's label.
-    fn open_if(&mut self, cond: Id) -> Id {
+    pub(super) fn open_if(&mut self, cond: Id) -> Id {
         let (lt, lf) = (self.m.id(), self.m.id());
         self.m.op_void(op::SELECTION_MERGE, &[lf, 0]);
         self.m.op_void(op::BRANCH_CONDITIONAL, &[cond, lt, lf]);
@@ -323,7 +354,7 @@ impl Emit<'_> {
         lt
     }
 
-    fn close_if(&mut self) {
+    pub(super) fn close_if(&mut self) {
         let lf = self.if_merge.pop().unwrap();
         self.m.label(lf);
         self.block = lf;
@@ -368,11 +399,15 @@ impl Emit<'_> {
         }
         let exit_of = self.ctx.iter().rposition(|c| matches!(*c, Ctx::Loop(h) if g.exit[h] == Some(to)));
         let block_at = self.ctx.iter().rposition(|c| *c == Ctx::Block(to) || *c == Ctx::Sel(to));
-        exit_of.max(block_at).expect("a merge after its block")
+        let case_at = (0..self.ctx.len()).rev().find(|&k| self.cons[k].disp.as_ref().is_some_and(|d| d.cases.iter().any(|c| c.0 == to)));
+        exit_of.max(block_at).max(case_at).expect("a merge after its block")
     }
 
     /// A break or continue of construct `i`.
     fn leave_direct(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) {
+        if self.cons[i].disp.is_some() {
+            return self.disp_continue(i, to, &vals);
+        }
         let blk = self.block;
         let list = if back { self.back.entry(to).or_default() } else { self.fwd.entry(to).or_default() };
         list.push((vals, blk));
@@ -395,11 +430,10 @@ impl Emit<'_> {
                 self.bad_sel.push(self.cons[k].head);
             }
         }
-        for k in i + 1..=inner {
-            self.cons[k].passes = true;
-        }
-        self.cons[i].wanted |= 1 << u8::from(back);
-        let k = code(i, back);
+        let k = match &self.cons[i].disp {
+            Some(d) => code_case(i, d.cases.iter().position(|c| c.0 == to).unwrap()),
+            None => code(i, back),
+        };
         let code = self.c32(k);
         let blk = self.block;
         self.cons[inner].arrivals.push(Arrival { from: blk, code, possible: vec![k], vals: vec![(to, vals)] });
@@ -409,14 +443,14 @@ impl Emit<'_> {
 
 /// The jumps a merge passes on: the code of the one taken (0: none), the
 /// codes possible, and each target's phi values.
-struct Ladder {
-    code: Id,
-    possible: Vec<u32>,
-    vals: Vec<(usize, Vec<Id>)>,
+pub(super) struct Ladder {
+    pub(super) code: Id,
+    pub(super) possible: Vec<u32>,
+    pub(super) vals: Vec<(usize, Vec<Id>)>,
 }
 
 impl Ladder {
-    fn of(&self, t: usize) -> Vec<Id> {
+    pub(super) fn of(&self, t: usize) -> Vec<Id> {
         self.vals.iter().find(|v| v.0 == t).map(|v| v.1.clone()).unwrap_or_default()
     }
 }
