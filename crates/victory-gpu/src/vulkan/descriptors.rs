@@ -179,6 +179,7 @@ impl Heaps {
                 .memory_type(needs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL, vk::MemoryPropertyFlags::empty())
                 .ok_or_else(|| anyhow::anyhow!("no memory for the null image"))?;
             let memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(needs.size).memory_type_index(ty), None)?;
+            victory_vk::account::allocated(&b.host, memory, ty, needs.size, victory_vk::account::Kind::Other);
             d.bind_image_memory(image, memory, 0)?;
             let range = vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,

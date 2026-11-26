@@ -35,6 +35,7 @@ mod alloc;
 mod fill;
 
 use alloc::{Block, PLACES, USERS, allocate, memory_type_of, release};
+pub(crate) use alloc::used_mb;
 pub(crate) use fill::{flush, format_bytes, refresh, released, written};
 use crate::object::This;
 use crate::resource::ResourceDesc;

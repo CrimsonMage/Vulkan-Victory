@@ -269,10 +269,8 @@ impl Memory {
 
     /// The memory map from what is imported and the pool views.
     fn rebuild_map(&mut self) {
-        let mut map = MemoryMap::default();
-        let mut add = |r: Range| {
-            let _ = map.insert(r);
-        };
+        let mut ranges = Vec::new();
+        let mut add = |r: Range| ranges.push(r);
         for p in &self.pools {
             add(Range {
                 title_start: p.title_start,
@@ -296,6 +294,15 @@ impl Memory {
                     title_size: len as u64,
                     device_base: i.device_base + offset,
                 });
+            }
+        }
+        let mut map = MemoryMap::default();
+        for r in MemoryMap::coalesce(ranges) {
+            if let Err(e) = map.insert(r) {
+                // Shaders reading there read zeros (and writes are lost).
+                if MAP_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(at = format_args!("{:#x}", r.title_start), mb = r.title_size >> 20, error = %e, "Vulkan: title memory left out of the memory map");
+                }
             }
         }
         map.generation = self.map.generation + 1;
@@ -414,6 +421,37 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
     if let Some(b) = backend() {
         memory(b).reservations.insert(at, len);
     }
+}
+
+/// Every 10 s: all the card memory we allocated, by kind, against the
+/// driver's own count of the card heaps' use (`VK_EXT_memory_budget`);
+/// the difference is the driver's (shader local memory for spills,
+/// internal heaps). Host-heap allocations and imports are listed apart:
+/// they are system memory.
+fn card_memory(b: &Backend) {
+    let (card, host) = victory_vk::account::totals_mb();
+    let (heap_used, heap_budget) = b
+        .host
+        .heaps()
+        .iter()
+        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .filter_map(|(_, bu)| *bu)
+        .fold((0, 0), |(u, t), (budget, usage)| (u + (usage >> 20), t + (budget >> 20)));
+    let ours: u64 = card.iter().sum();
+    tracing::info!(
+        images_mb = card[0],
+        images_bound_mb = images::used_mb(),
+        pool_mb = card[1],
+        buffers_mb = card[3],
+        other_mb = card[4],
+        ours_mb = ours,
+        heap_used_mb = heap_used,
+        heap_budget_mb = heap_budget,
+        driver_mb = heap_used.saturating_sub(ours),
+        host_buffers_mb = host[3],
+        imports_mb = host[2],
+        "Vulkan: card memory"
+    );
 }
 
 /// The live budget: every 60 frames each pool view may take what the
@@ -681,6 +719,9 @@ struct Engine {
 }
 
 static FORCED: AtomicU64 = AtomicU64::new(0);
+/// Ranges the memory map could not take (full, or overlapping another
+/// way), counted for the 10 s line.
+static MAP_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 impl Engine {
     fn signalled(&self, fence: usize, value: u64) -> bool {
@@ -1391,6 +1432,7 @@ fn report(b: &Backend, frame: u64) {
         sections = m.sections.len(),
         sections_imported_mb = imported >> 20,
         map_ranges = m.map.ranges().len(),
+        map_refused = MAP_REFUSED.load(Ordering::Relaxed),
         pool_views = m.pools.len(),
         pool_card_mb = (pool.pages_in_card * PAGE) >> 20,
         pool_blocks = pool.blocks,
@@ -1404,4 +1446,5 @@ fn report(b: &Backend, frame: u64) {
     gpu_stats::collect(b);
     record::report();
     images::report();
+    card_memory(b);
 }

@@ -184,6 +184,7 @@ impl PoolView {
                 }
             };
             d.bind_buffer_memory(buffer, memory, 0)?;
+            crate::account::allocated(host, memory, self.memory_type, bytes, crate::account::Kind::Pool);
             self.blocks.push(Block {
                 memory,
                 buffer,
@@ -486,6 +487,7 @@ impl PoolView {
             d.destroy_buffer(self.buffer, None);
             for b in &self.blocks {
                 d.destroy_buffer(b.buffer, None);
+                crate::account::freed(b.memory);
                 d.free_memory(b.memory, None);
             }
         }

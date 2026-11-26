@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use victory_vk::ash::vk;
 
-use super::super::Backend;
+use super::super::{Backend, lock};
 
 
 const BLOCK: u64 = 256 << 20;
@@ -39,6 +39,7 @@ pub(super) fn allocate(
             )
         }
         .ok()?;
+        victory_vk::account::allocated(&b.host, m, type_index, needs.size, victory_vk::account::Kind::Images);
         return Some((m, u64::MAX));
     }
     let take = |blk: &mut Block| -> Option<u64> {
@@ -73,6 +74,7 @@ pub(super) fn allocate(
         )
     }
     .ok()?;
+    victory_vk::account::allocated(&b.host, memory, type_index, BLOCK, victory_vk::account::Kind::Images);
     let mut blk = Block {
         memory,
         type_index,
@@ -83,8 +85,9 @@ pub(super) fn allocate(
     Some((memory, at))
 }
 
-pub(super) fn release(b: &Backend, blocks: &mut [Block], memory: vk::DeviceMemory, at: u64, size: u64) {
+pub(super) fn release(b: &Backend, blocks: &mut Vec<Block>, memory: vk::DeviceMemory, at: u64, size: u64) {
     if at == u64::MAX {
+        victory_vk::account::freed(memory);
         // SAFETY: a dedicated allocation nothing uses any more.
         unsafe { b.host.device.free_memory(memory, None) };
         return;
@@ -102,6 +105,19 @@ pub(super) fn release(b: &Backend, blocks: &mut [Block], memory: vk::DeviceMemor
         }
         blk.free = merged;
     }
+    // A block nothing uses any more goes back to the driver.
+    if let Some(i) = blocks.iter().position(|k| k.memory == memory && k.free == [(0, BLOCK)]) {
+        let blk = blocks.swap_remove(i);
+        victory_vk::account::freed(blk.memory);
+        // SAFETY: no image is bound to any of it.
+        unsafe { b.host.device.free_memory(blk.memory, None) };
+    }
+}
+
+/// MiB of card memory live images are bound to (aliases counted once).
+pub(crate) fn used_mb() -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    lock(&PLACES).values().filter(|p| seen.insert((p.0, p.1))).map(|p| p.2).sum::<u64>() >> 20
 }
 
 /// Where an image's memory is: (memory, offset or MAX for dedicated, size,

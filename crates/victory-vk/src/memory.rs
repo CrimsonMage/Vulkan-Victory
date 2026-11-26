@@ -143,7 +143,9 @@ impl Imported {
                 bail!("vkAllocateMemory (import of {len:#x} bytes at {at:p}): {e}");
             }
         };
+        crate::account::allocated(host, memory, memory_type, len, crate::account::Kind::Imports);
         if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            crate::account::freed(memory);
             unsafe {
                 device.destroy_buffer(buffer, None);
                 device.free_memory(memory, None);
@@ -174,6 +176,7 @@ impl Imported {
     pub unsafe fn destroy(&self, host: &Host) {
         unsafe {
             host.device.destroy_buffer(self.buffer, None);
+            crate::account::freed(self.memory);
             host.device.free_memory(self.memory, None);
         }
     }
@@ -247,6 +250,7 @@ impl Buffer {
             .memory_type_index(memory_type)
             .push_next(&mut flags);
         let memory = unsafe { device.allocate_memory(&alloc, None) }.context("vkAllocateMemory")?;
+        crate::account::allocated(host, memory, memory_type, needs.size, crate::account::Kind::Buffers);
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
         let mapped = if place == Place::Card {
             std::ptr::null_mut()
@@ -271,6 +275,7 @@ impl Buffer {
     pub unsafe fn destroy(&self, host: &Host) {
         unsafe {
             host.device.destroy_buffer(self.buffer, None);
+            crate::account::freed(self.memory);
             host.device.free_memory(self.memory, None);
         }
     }

@@ -66,6 +66,27 @@ impl MemoryMap {
         Ok(())
     }
 
+    /// `ranges` sorted, with neighbours and overlaps that map title
+    /// addresses to the device the same way (one device offset) joined:
+    /// views of one section side by side, an import and the larger one
+    /// that replaced it.
+    pub fn coalesce(mut ranges: Vec<Range>) -> Vec<Range> {
+        ranges.sort_by_key(|r| (r.title_start, std::cmp::Reverse(r.title_size)));
+        let mut out: Vec<Range> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            if let Some(last) = out.last_mut() {
+                let last_end = last.title_start + last.title_size;
+                let same_offset = r.device_base.wrapping_sub(r.title_start) == last.device_base.wrapping_sub(last.title_start);
+                if r.title_start <= last_end && same_offset {
+                    last.title_size = last.title_size.max(r.title_start + r.title_size - last.title_start);
+                    continue;
+                }
+            }
+            out.push(r);
+        }
+        out
+    }
+
     /// Removes the range that starts at `title_start`.
     pub fn remove(&mut self, title_start: u64) -> Option<Range> {
         let at = self
