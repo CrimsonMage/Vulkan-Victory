@@ -119,6 +119,7 @@ pub(crate) struct Rec {
     /// attributes and buffers found.
     last_push: [u32; 64],
     last_inputs: (usize, usize),
+    last_user: String,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -152,6 +153,7 @@ impl Default for Rec {
             attached: Vec::new(),
             last_push: [0; 64],
             last_inputs: (0, 0),
+            last_user: String::new(),
         }
     }
 }
@@ -445,6 +447,123 @@ fn stage_of(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], name:
         Lookup::Waiting => Err(true),
         Lookup::Failed => Err(false),
     }
+}
+
+/// The vertex attributes of a fetch-shader program (ABI section 6) from
+/// the title's input layout: (location, binding | 0x100 per instance,
+/// format, offset). D3D12's "append aligned" offsets follow the elements
+/// before them in the same slot.
+fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState) -> Vec<(u32, u32, vk::Format, u32)> {
+    if pre.inputs.is_empty() {
+        return Vec::new();
+    }
+    // Every element's offset, in layout order.
+    let mut ends = [0u32; 32];
+    let offsets: Vec<u32> = gs
+        .inputs
+        .iter()
+        .map(|e| {
+            let slot = (e.InputSlot as usize).min(31);
+            let at = if e.AlignedByteOffset == u32::MAX { ends[slot] } else { e.AlignedByteOffset };
+            let bytes = crate::resource::element(e.Format.0 as u32).map_or(4, |(b, _)| b as u32);
+            ends[slot] = at + bytes;
+            at
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (semantic, index, location) in &pre.inputs {
+        let found = gs.inputs.iter().zip(&offsets).find(|(e, _)| {
+            // SAFETY: the element's name points into the state's names.
+            let name = unsafe { e.SemanticName.to_string() }.unwrap_or_default();
+            name.eq_ignore_ascii_case(semantic) && e.SemanticIndex == *index
+        });
+        if let Some((e, &offset)) = found
+            && let Some(f) = victory_vk::gfx10::from_dxgi(e.Format.0 as u32)
+        {
+            let rate = if e.InputSlotClass.0 == 1 { 0x100 } else { 0 };
+            out.push((u32::from(*location), e.InputSlot | rate, f, offset));
+        }
+    }
+    out
+}
+
+/// `VICTORY_VK_DRAW_TEST` (diagnostics): 1 draws with depth, stencil,
+/// culling and blending off and every channel written; 2 also replaces
+/// every pixel program by a constant magenta. A capture then tells draws
+/// that never rasterise from draws that compute zero.
+fn draw_test() -> u32 {
+    static TEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TEST.get_or_init(|| {
+        let t = if cfg!(feature = "diagnostics") {
+            std::env::var("VICTORY_VK_DRAW_TEST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        } else {
+            0
+        };
+        if t > 0 {
+            tracing::info!(test = t, "Vulkan: draw test (VICTORY_VK_DRAW_TEST)");
+        }
+        t
+    })
+}
+
+/// The constant magenta pixel program of draw test 2 (HLSL
+/// `float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }`, compiled
+/// with `glslc -x hlsl`), as a fragment part.
+fn solid_fragment(b: &Backend) -> Option<vk::Pipeline> {
+    const SOLID: &[u32] = &[
+    0x07230203, 0x00010600, 0x000d000b, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000011, 0x00030010, 0x00000004,
+    0x00000007, 0x00030003, 0x00000005, 0x000001f4, 0x000a0004, 0x475f4c47, 0x4c474f4f, 0x70635f45,
+    0x74735f70, 0x5f656c79, 0x656e696c, 0x7269645f, 0x69746365, 0x00006576, 0x00080004, 0x475f4c47,
+    0x4c474f4f, 0x6e695f45, 0x64756c63, 0x69645f65, 0x74636572, 0x00657669, 0x00040005, 0x00000004,
+    0x6e69616d, 0x00000000, 0x00070005, 0x00000011, 0x746e6540, 0x6f507972, 0x4f746e69, 0x75707475,
+    0x00000074, 0x00040047, 0x00000011, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000004, 0x0004002b, 0x00000006, 0x0000000b, 0x3f800000, 0x0004002b, 0x00000006, 0x0000000c,
+    0x00000000, 0x0007002c, 0x00000007, 0x0000000d, 0x0000000b, 0x0000000c, 0x0000000b, 0x0000000b,
+    0x00040020, 0x00000010, 0x00000003, 0x00000007, 0x0004003b, 0x00000010, 0x00000011, 0x00000003,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0003003e,
+    0x00000011, 0x0000000d, 0x000100fd, 0x00010038
+    ];
+    static PART: std::sync::OnceLock<Option<vk::Pipeline>> = std::sync::OnceLock::new();
+    *PART.get_or_init(|| {
+        let layout = stages::layout(b)?;
+        let d = &b.host.device;
+        // SAFETY: valid create infos; the module is kept with the part.
+        unsafe {
+            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(SOLID), None).ok()?;
+            use vk::DynamicState as D;
+            let states = [
+                D::DEPTH_TEST_ENABLE,
+                D::DEPTH_WRITE_ENABLE,
+                D::DEPTH_COMPARE_OP,
+                D::DEPTH_BOUNDS_TEST_ENABLE,
+                D::DEPTH_BOUNDS,
+                D::STENCIL_TEST_ENABLE,
+                D::STENCIL_OP,
+                D::STENCIL_COMPARE_MASK,
+                D::STENCIL_WRITE_MASK,
+                D::STENCIL_REFERENCE,
+            ];
+            let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
+            let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
+            let mut rendering = vk::PipelineRenderingCreateInfo::default();
+            let depth = vk::PipelineDepthStencilStateCreateInfo::default();
+            let samples = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let stage = [vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(module).name(c"main")];
+            let info = vk::GraphicsPipelineCreateInfo::default()
+                .flags(library_flags(b))
+                .stages(&stage)
+                .layout(layout.pipeline)
+                .dynamic_state(&dyn_info)
+                .depth_stencil_state(&depth)
+                .multisample_state(&samples)
+                .push_next(&mut library)
+                .push_next(&mut rendering);
+            d.create_graphics_pipelines(stages::cache(b), &[info], None).ok().map(|p| p[0])
+        }
+    })
 }
 
 /// Counts a skipped draw or dispatch: not ready (`true`) or not to be.
@@ -752,6 +871,13 @@ impl Rec {
             }
         }
         self.last_push = words;
+        if cfg!(feature = "diagnostics") {
+            self.last_user = stages
+                .iter()
+                .flat_map(|s| s.user_data.iter().map(|u| format!("{}<-{}.{}{:?}", u.index, u.slot, u.dword, u.root)))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         // SAFETY: recording into our command buffer; 256 bytes of the layout's range.
         unsafe { b.host.device.cmd_push_constants(cmd, layout.pipeline, vk::ShaderStageFlags::ALL, 0, &bytes) };
@@ -813,22 +939,9 @@ impl Rec {
         }
         self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
-        // Vertex attributes of fetch-shader programs.
-        let mut inputs = Vec::new();
-        for (semantic, index, location) in &pre.inputs {
-            let found = gs.inputs.iter().find(|e| {
-                // SAFETY: the element's name points into the state's names.
-                let name = unsafe { e.SemanticName.to_string() }.unwrap_or_default();
-                name.eq_ignore_ascii_case(semantic) && e.SemanticIndex == *index
-            });
-            if let Some(e) = found
-                && let Some(f) = victory_vk::gfx10::from_dxgi(e.Format.0 as u32)
-            {
-                let rate = if e.InputSlotClass.0 == 1 { 0x100 } else { 0 };
-                inputs.push((u32::from(*location), e.InputSlot | rate, f, if e.AlignedByteOffset == u32::MAX { 0 } else { e.AlignedByteOffset }));
-            }
-        }
+        let inputs = attributes(&pre, gs);
         let fragment = match &pixel {
+            _ if draw_test() >= 2 => solid_fragment(b)?,
             Some(p) => p.part?,
             None => empty_fragment(b)?,
         };
@@ -977,6 +1090,33 @@ impl Rec {
                     e.cmd_set_color_write_mask(cmd, 0, &masks);
                 }
             }
+            if draw_test() >= 1 {
+                self.test_state(b, cmd, count);
+            }
+        }
+    }
+
+    /// Draw test state: nothing hidden, every channel written.
+    ///
+    /// # Safety
+    /// Recording into `cmd`.
+    unsafe fn test_state(&self, b: &'static Backend, cmd: vk::CommandBuffer, count: u32) {
+        let d = &b.host.device;
+        // SAFETY: as the caller says.
+        unsafe {
+            d.cmd_set_cull_mode(cmd, vk::CullModeFlags::NONE);
+            d.cmd_set_depth_test_enable(cmd, false);
+            d.cmd_set_depth_write_enable(cmd, false);
+            d.cmd_set_depth_bounds_test_enable(cmd, false);
+            d.cmd_set_stencil_test_enable(cmd, false);
+            if let Some(e) = super::eds3(b)
+                && b.host.caps.dynamic_blend
+                && count > 0
+            {
+                let n = count as usize;
+                e.cmd_set_color_blend_enable(cmd, 0, &vec![vk::FALSE; n]);
+                e.cmd_set_color_write_mask(cmd, 0, &vec![vk::ColorComponentFlags::RGBA; n]);
+            }
         }
     }
 
@@ -1015,8 +1155,12 @@ impl Rec {
             tracing::info!(
                 what,
                 push = ?push,
-                attributes_and_bindings = self.last_inputs.0,
+                user_data = %self.last_user,
+                attributes = self.last_inputs.0 % 1000,
+                bindings = self.last_inputs.0 / 1000,
+
                 bindings_found = self.last_inputs.1,
+                vertex_views = ?self.vertex.iter().take(4).map(|v| v.map(|v| (format!("{:#x}", v.address), v.size, v.stride))).collect::<Vec<_>>(),
                 index = ?self.index.map(|i| (format!("{:#x}", i.address), i.size, i.format)),
                 pipeline = %names,
                 viewports = ?self.viewports.iter().map(|v| (v.x, v.y, v.width, v.height)).collect::<Vec<_>>(),
