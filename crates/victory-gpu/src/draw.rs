@@ -800,10 +800,17 @@ impl State {
             return ADDRESSES.with_borrow_mut(|addresses| {
                 addresses.clear();
                 crate::frametime::add(crate::frametime::Sum::RootDirectory, roots.len() as u64);
-                for &(slot, _) in roots {
+                for &(slot, writes) in roots {
                     if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                         crate::memory::reach(address, ROOT_VIEW_REACH);
                         addresses.push(address);
+                        // Over the page pool: named for the card's page
+                        // cache (what is written, by `root_memory_writes`).
+                        if !writes && crate::memory::covers(address) {
+                            // (As far as the cache takes a root view in;
+                            // `reach` above demanded its pages.)
+                            crate::memory::named_root(list, address, 128 << 10, false);
+                        }
                     }
                 }
                 crate::memory::ready(list, heap, Some((addresses, &[], false)))
@@ -1506,7 +1513,7 @@ impl State {
             } else {
                 crate::shadow::find(address, 1).map_or(1 << 16, |s| s.left(address)).min(ROOT_VIEW_REACH)
             };
-            crate::memory::named(list, address, reach, true);
+            crate::memory::named_root(list, address, reach, true);
             note_write(list, address, reach, Cause::RootUav);
         }
     }
@@ -2644,10 +2651,15 @@ impl State {
         // A buffer view shaders read by directory, made when the title wrote
         // it: nothing to make or copy; what a shader writes through it is
         // declared written.
-        if let Some((address, len)) = host.by_directory(index, handle) {
+        if let Some((address, len, pool)) = host.by_directory(index, handle) {
             crate::frametime::add(crate::frametime::Sum::TableDirectory, 1);
-            if u.kind == ResourceType::Uav && STORES.get() {
-                crate::memory::named(list, address, len, true);
+            let writes = u.kind == ResourceType::Uav && STORES.get();
+            // (Pool memory read is named for the card's page cache, once
+            // per list.)
+            if writes || pool {
+                crate::memory::named(list, address, len, writes);
+            }
+            if writes {
                 note_write(list, address, len, Cause::TableUav);
             }
             return;

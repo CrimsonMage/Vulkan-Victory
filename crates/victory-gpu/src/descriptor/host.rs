@@ -1413,7 +1413,14 @@ impl HostHeap {
             return view.is_none();
         };
         let words = match view {
-            Some((address, bytes)) => [address as u32, (address >> 32) as u32 & 0xFF | POOL_FLAG, bytes.min(u64::from(u32::MAX)) as u32, 0],
+            // (Dword 3, which shaders do not read: 1 for memory of the page
+            // pool, which the card's page cache may hold: `by_directory`.)
+            Some((address, bytes)) => [
+                address as u32,
+                (address >> 32) as u32 & 0xFF | POOL_FLAG,
+                bytes.min(u64::from(u32::MAX)) as u32,
+                u32::from(crate::memory::covers(address)),
+            ],
             None => [0; 4],
         };
         // SAFETY: inside the table's mapping; shaders read it while we
@@ -2010,8 +2017,10 @@ impl HostHeap {
     /// if the slot was made from the record at `handle` as it is now and
     /// shaders read and write the view by directory (its pool table entry
     /// holds the address): nothing to make or bring up to date for a draw
-    /// that reads it. Without a lock.
-    pub(crate) fn by_directory(&self, index: u32, handle: u64) -> Option<(u64, u64)> {
+    /// that reads it; and whether it is memory of the page pool (which the
+    /// card's page cache takes in for the lists that name it). Without a
+    /// lock.
+    pub(crate) fn by_directory(&self, index: u32, handle: u64) -> Option<(u64, u64, bool)> {
         use victory_shader::emit::{POOL_ENTRY_BYTES, POOL_FLAG, POOL_SLOTS};
         if index >= self.count || index >= POOL_SLOTS - 1 {
             return None;
@@ -2024,11 +2033,12 @@ impl HostHeap {
         }
         let (_, data) = self.pool.get()?.as_ref()?;
         // SAFETY: inside the table's mapping.
-        let words: [u32; 3] = unsafe {
+        let words: [u32; 4] = unsafe {
             let at = (*data as *const u32).add(index as usize * (POOL_ENTRY_BYTES as usize / 4));
-            [at.read_volatile(), at.add(1).read_volatile(), at.add(2).read_volatile()]
+            [at.read_volatile(), at.add(1).read_volatile(), at.add(2).read_volatile(), at.add(3).read_volatile()]
         };
-        (words[1] & POOL_FLAG != 0).then(|| (u64::from(words[0]) | u64::from(words[1] & 0xFF) << 32, u64::from(words[2])))
+        (words[1] & POOL_FLAG != 0)
+            .then(|| (u64::from(words[0]) | u64::from(words[1] & 0xFF) << 32, u64::from(words[2]), words[3] != 0))
     }
 
     /// Makes slot `index` again from the record at `handle`, if the slot
