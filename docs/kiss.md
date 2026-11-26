@@ -142,6 +142,24 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: shader differences closed (`docs/translation-index.md`):
+  clip and cull distances from each program's `PA_CL_VS_OUT_CNTL`
+  (stage data; vertex E+0x1a0, mesh E+0x194: the 1,804 `pos1` exports
+  are clip distances, two vertex programs' cull distances); typed buffer
+  stores encoded per the V#'s FORMAT (`Helper::TypedPack`, checked
+  against the interpreter's reference over 23 formats). Wave64 programs
+  run as one subgroup (915 / 736 listed) stay per half: exact for masks
+  of EXEC and compares, not for constant masks read as numbers or sums
+  across halves (`docs/vulkan-abi.md` section 7). The last guard hit (vk48,
+  guard id 0x7b3296e7) is the BVH builder's copy program
+  c42a31951201f9a0 (`XboxBvhBuilder.dll`, at 0xb4fe0): its spilled
+  user-data table read zeros (the skip removal renamed by register after
+  spill.rs had made the loads entry values: its stride 0, the copy loop
+  never advanced), and its NUM_RECORDS -1 views failed the memory map's
+  range test (the count read 0). Both fixed: the table rewrite runs after
+  the skips, spilled entries read push dwords, a V# reaches the end of
+  its base's range.
+
 - 2026-11-26: the black world: the host refused the world's and the
   characters' mesh programs (`MS_VS_Transform*`, `MS_VS_PedTransform*`)
   before compiling, their output memory over NVIDIA's 32 KiB. Their maxima

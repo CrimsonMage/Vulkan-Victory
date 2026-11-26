@@ -146,7 +146,7 @@ impl Emit<'_> {
         let at = self.ty(at);
         let x = if at != elem { self.m.op(op::BITCAST, elem, &[args[0]]) } else { args[0] };
         let ptr = match slot {
-            OUT_DEPTH | OUT_STENCIL => var,
+            OUT_DEPTH | OUT_STENCIL | OUT_POINT_SIZE | OUT_LAYER | OUT_VIEWPORT => var,
             _ => {
                 let p = self.m.t_ptr(en::SC_OUTPUT, elem);
                 let k = self.c32(u32::from(comp));

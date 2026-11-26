@@ -65,7 +65,7 @@ fn entry(comps: u32, bits: u32, num: u32) -> u32 {
 }
 
 /// The table over all 128 FORMAT codes.
-fn format_table() -> [u32; 128] {
+pub(crate) fn format_table() -> [u32; 128] {
     let mut t = [entry(1, 32, FLOAT); 128];
     for &(codes, comps, bits, num) in FORMATS {
         for &c in codes {
@@ -243,6 +243,141 @@ impl Emit<'_> {
         let x = self.m.op(op::SELECT, u, &[snorm, sn, x]);
         let x = self.m.op(op::SELECT, u, &[unorm, un, x]);
         self.m.op(op::SELECT, u, &[float, fl, x])
+    }
+}
+
+impl Emit<'_> {
+    /// `TypedPack`: the encoder, the decoder's inverse. (shape, the four
+    /// channel registers, d16: 1 when they are 16-bit values) -> the
+    /// element's dwords (bits past it 0). Floats round to nearest even,
+    /// unorm and snorm clamp (NaN to 0) and round to nearest even, integers
+    /// clamp to the channel's range.
+    pub(super) fn write_typed_pack(&mut self, fid: Id) {
+        let (u, b) = (self.t.u32_, self.t.bool_);
+        let v4 = self.m.t_vec(u, 4);
+        let fty = self.m.global_fn_type(v4, &[u, v4, u]);
+        self.m.op_to(op::FUNCTION, v4, fid, &[0, fty]);
+        let (e, vals, d16) = (self.m.id(), self.m.id(), self.m.id());
+        self.m.op_to(55, u, e, &[]);
+        self.m.op_to(55, v4, vals, &[]);
+        self.m.op_to(55, u, d16, &[]);
+        let entry = self.m.id();
+        self.m.label(entry);
+        let field = |s: &mut Self, at: u32, n: u32| {
+            let (a, w) = (s.c32(at), s.c32(n));
+            s.m.op(op::BIT_FIELD_U_EXTRACT, u, &[e, a, w])
+        };
+        let comps = field(self, 0, 3);
+        let bits = field(self, 8, 8);
+        let num = field(self, 16, 3);
+        let is = |s: &mut Self, x: Id, k: u32| {
+            let kk = s.c32(k);
+            s.m.op(op::I_EQUAL, b, &[x, kk])
+        };
+        let kinds = [is(self, num, FLOAT), is(self, num, UNORM), is(self, num, SNORM), is(self, num, SINT)];
+        let ints = {
+            let k = self.c32(UINT);
+            self.m.op(op::U_GREATER_THAN_EQUAL, b, &[num, k])
+        };
+        let z = self.c32(0);
+        let zb = self.m.op(op::I_NOT_EQUAL, b, &[d16, z]);
+        let ten = is(self, bits, 10);
+        let mut words = [z; 4];
+        for c in 0..4u32 {
+            let kc = self.c32(c);
+            let w = if c == 3 {
+                let two = self.c32(2);
+                self.m.op(op::SELECT, u, &[ten, two, bits])
+            } else {
+                bits
+            };
+            let raw = self.m.op(op::COMPOSITE_EXTRACT, u, &[vals, c]);
+            let raw = self.typed_widen(raw, zb, ints, kinds[3]);
+            let r = self.typed_encode(raw, w, kinds);
+            // the channel's dword and bit (every format keeps a channel in one dword)
+            let at = self.m.op(op::I_MUL, u, &[kc, bits]);
+            let k5 = self.c32(5);
+            let dw = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[at, k5]);
+            let k31 = self.c32(31);
+            let sh = self.m.op(op::BITWISE_AND, u, &[at, k31]);
+            let r = self.m.op(op::SHIFT_LEFT_LOGICAL, u, &[r, sh]);
+            let have = self.m.op(op::U_LESS_THAN, b, &[kc, comps]);
+            for (j, word) in words.iter_mut().enumerate() {
+                let kj = self.c32(j as u32);
+                let here = self.m.op(op::I_EQUAL, b, &[dw, kj]);
+                let here = self.m.op(op::LOGICAL_AND, b, &[here, have]);
+                let x = self.m.op(op::SELECT, u, &[here, r, z]);
+                *word = self.m.op(op::BITWISE_OR, u, &[*word, x]);
+            }
+        }
+        let r = self.m.op(op::COMPOSITE_CONSTRUCT, v4, &words);
+        self.m.op_void(254, &[r]); // OpReturnValue
+        self.m.op_void(op::FUNCTION_END, &[]);
+    }
+
+    /// A d16 channel as 32 bits: a half widened to a float, a 16-bit
+    /// integer zero- or sign-extended; `d16` false: as it is.
+    fn typed_widen(&mut self, raw: Id, d16: Id, ints: Id, sint: Id) -> Id {
+        let (u, f) = (self.t.u32_, self.t.f32_);
+        let (z, k16) = (self.c32(0), self.c32(16));
+        let v2 = self.m.t_vec(f, 2);
+        let h = self.m.ext(glsl::UNPACK_HALF_2X16, v2, &[raw]);
+        let h = self.m.op(op::COMPOSITE_EXTRACT, f, &[h, 0]);
+        let h = self.m.op(op::BITCAST, u, &[h]);
+        let lo = self.m.op(op::BIT_FIELD_U_EXTRACT, u, &[raw, z, k16]);
+        let slo = self.m.op(op::BIT_FIELD_S_EXTRACT, u, &[raw, z, k16]);
+        let i = self.m.op(op::SELECT, u, &[sint, slo, lo]);
+        let x = self.m.op(op::SELECT, u, &[ints, i, h]);
+        self.m.op(op::SELECT, u, &[d16, x, raw])
+    }
+
+    /// A 32-bit channel value as a `w`-bit field (low bits) of its number
+    /// type; `kinds` = (float, unorm, snorm, sint) flags.
+    fn typed_encode(&mut self, raw: Id, w: Id, kinds: [Id; 4]) -> Id {
+        let (u, f, b) = (self.t.u32_, self.t.f32_, self.t.bool_);
+        let [float, unorm, snorm, sint] = kinds;
+        let one = self.c32(1);
+        // the field's mask (all ones for 32 bits), the signed range
+        let k32 = self.c32(32);
+        let full = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[w, k32]);
+        let k31 = self.c32(31);
+        let wc = self.m.ext(glsl::U_MIN, u, &[w, k31]);
+        let top = self.m.op(op::SHIFT_LEFT_LOGICAL, u, &[one, wc]);
+        let m = self.m.op(op::I_SUB, u, &[top, one]);
+        let ones = self.c32(u32::MAX);
+        let mask = self.m.op(op::SELECT, u, &[full, ones, m]);
+        let smax = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[mask, one]);
+        let smin = self.m.op(op::NOT, u, &[smax]);
+        let x = self.m.op(op::BITCAST, f, &[raw]);
+        // float: 32 bits as they are, 16 a half
+        let v2 = self.m.t_vec(f, 2);
+        let fz = self.m.c_f32(0);
+        let pair = self.m.op(op::COMPOSITE_CONSTRUCT, v2, &[x, fz]);
+        let half = self.m.ext(glsl::PACK_HALF_2X16, u, &[pair]);
+        let fl = self.m.op(op::SELECT, u, &[full, raw, half]);
+        // unorm, snorm: clamped (NaN to the low end), scaled, rounded
+        let (f0, f1, fm1) = (self.m.c_f32(0), self.m.c_f32(1.0f32.to_bits()), self.m.c_f32((-1.0f32).to_bits()));
+        let cu = self.m.ext(glsl::N_CLAMP, f, &[x, f0, f1]);
+        let cs = self.m.ext(glsl::N_CLAMP, f, &[x, fm1, f1]);
+        let nan = self.m.op(op::IS_NAN, b, &[x]);
+        let cs = self.m.op(op::SELECT, f, &[nan, f0, cs]);
+        let mf = self.m.op(op::CONVERT_U_TO_F, f, &[mask]);
+        let sf = self.m.op(op::CONVERT_U_TO_F, f, &[smax]);
+        let un = self.m.op(op::F_MUL, f, &[cu, mf]);
+        let un = self.m.ext(glsl::ROUND_EVEN, f, &[un]);
+        let un = self.m.op(op::CONVERT_F_TO_U, u, &[un]);
+        let sn = self.m.op(op::F_MUL, f, &[cs, sf]);
+        let sn = self.m.ext(glsl::ROUND_EVEN, f, &[sn]);
+        let sn = self.m.op(op::CONVERT_F_TO_S, u, &[sn]);
+        // integers: clamped to the field's range
+        let ui = self.m.ext(glsl::U_MIN, u, &[raw, mask]);
+        let si = self.m.ext(glsl::S_MAX, u, &[raw, smin]);
+        let si = self.m.ext(glsl::S_MIN, u, &[si, smax]);
+        let r = self.m.op(op::SELECT, u, &[sint, si, ui]);
+        let r = self.m.op(op::SELECT, u, &[snorm, sn, r]);
+        let r = self.m.op(op::SELECT, u, &[unorm, un, r]);
+        let r = self.m.op(op::SELECT, u, &[float, fl, r]);
+        self.m.op(op::BITWISE_AND, u, &[r, mask])
     }
 }
 

@@ -243,11 +243,14 @@ pub fn thread_ir(container: &[u8]) -> Result<(tir::Func, lift::Interface, Native
 }
 
 fn thread_ir_of(c: &Container<'_>, native: &NativeProgram) -> Result<(tir::Func, lift::Interface), ShaderError> {
-    let p = crate::spill::build(native)?;
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // The branches that only skip code when no lane is left for it go: the
     // skipped vector code is guarded by EXEC anyway, and without them the
     // wave's graph is the structured program.
-    let p = crate::ir::without_skips(&p, true).unwrap_or(p);
+    let mut p = crate::ir::without_skips(&p, true).unwrap_or(p);
+    // then a spilled user-data table's loads become entry values (after:
+    // the skips' renaming goes by register and would undo it)
+    crate::spill::user_data(&mut p, native);
     let io = io::raise(&p, native)?;
     let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();

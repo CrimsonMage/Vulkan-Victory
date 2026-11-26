@@ -12,7 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::lift::{Interface, OUT_DEPTH, OUT_POSITION, OUT_PRIMITIVE, OUT_SAMPLE_MASK, OUT_STENCIL};
+use super::lift::{
+    Interface, OUT_CLIP, OUT_CULL, OUT_DEPTH, OUT_LAYER, OUT_POINT_SIZE, OUT_POSITION, OUT_PRIMITIVE, OUT_SAMPLE_MASK, OUT_STENCIL,
+    OUT_VIEWPORT,
+};
 use super::graph::Graph;
 use super::spirv::{Id, Module, en, glsl, op};
 use super::tir::{Builtin, Func, Helper, ImageClass, ImageKind, Interp, Item, Op, S, Sampler, Term, Ty, V, img};
@@ -630,6 +633,7 @@ mod xchg;
 mod bar;
 #[path = "emit_typed.rs"]
 mod typed;
+pub(crate) use typed::format_table;
 #[path = "emit_bvh.rs"]
 mod bvh;
 

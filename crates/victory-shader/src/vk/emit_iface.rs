@@ -251,9 +251,13 @@ impl Emit<'_> {
             return o;
         }
         let (u, f) = (self.t.u32_, self.t.f32_);
+        let (clip, cull) = self.iface.clip_cull;
         let (ty, elem) = match slot {
             OUT_POSITION => (self.m.t_vec(f, 4), f),
-            OUT_DEPTH => (f, f),
+            OUT_CLIP => (self.m.t_array(f, u32::from(clip).max(1)), f),
+            OUT_CULL => (self.m.t_array(f, u32::from(cull).max(1)), f),
+            OUT_DEPTH | OUT_POINT_SIZE => (f, f),
+            OUT_LAYER | OUT_VIEWPORT => (u, u),
             OUT_STENCIL => (u, u),
             OUT_SAMPLE_MASK => (self.m.t_array(u, 1), u),
             _ => {
@@ -267,7 +271,7 @@ impl Emit<'_> {
         let p = self.m.t_ptr(en::SC_OUTPUT, ty);
         let v = self.m.variable(p, en::SC_OUTPUT);
         match slot {
-            OUT_POSITION => self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_POSITION]),
+            OUT_POSITION | OUT_CLIP | OUT_CULL | OUT_POINT_SIZE | OUT_LAYER | OUT_VIEWPORT => self.builtin_output(v, slot),
             OUT_DEPTH => self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_FRAG_DEPTH]),
             OUT_STENCIL => {
                 self.m.extension("SPV_EXT_shader_stencil_export");
@@ -285,6 +289,22 @@ impl Emit<'_> {
         self.interface.push(v);
         self.outputs.insert(slot, (v, elem));
         (v, elem)
+    }
+
+    /// The built-in of an output slot (and its capability).
+    pub(super) fn builtin_output(&mut self, v: Id, slot: u16) {
+        let (bi, cap) = match slot {
+            OUT_CLIP => (en::BI_CLIP_DISTANCE, en::CAP_CLIP_DISTANCE),
+            OUT_CULL => (en::BI_CULL_DISTANCE, en::CAP_CULL_DISTANCE),
+            OUT_POINT_SIZE => (en::BI_POINT_SIZE, 0),
+            OUT_LAYER => (en::BI_LAYER, en::CAP_SHADER_LAYER),
+            OUT_VIEWPORT => (en::BI_VIEWPORT_INDEX, en::CAP_SHADER_VIEWPORT_INDEX),
+            _ => (en::BI_POSITION, 0),
+        };
+        if cap != 0 {
+            self.m.capability(cap);
+        }
+        self.m.decorate(v, en::DEC_BUILTIN, &[bi]);
     }
 
     pub(super) fn lds_var(&mut self) -> Id {
@@ -409,6 +429,10 @@ impl Emit<'_> {
             let (_, fid) = helpers.remove(k);
             self.write_typed_shape(fid);
         }
+        if let Some(k) = helpers.iter().position(|h| h.0 == Helper::TypedPack) {
+            let (_, fid) = helpers.remove(k);
+            self.write_typed_pack(fid);
+        }
         if let Some(k) = helpers.iter().position(|h| h.0 == Helper::BvhRay) {
             let (_, fid) = helpers.remove(k);
             self.write_bvh(fid);
@@ -423,6 +447,7 @@ impl Emit<'_> {
         for (h, fid) in helpers {
             let (u, q) = (self.t.u32_, self.t.u64_);
             let range = h == Helper::TranslateRange;
+            let left_mode = h == Helper::RangeLeft;
             let (ret, params): (Id, Vec<Id>) = if range { (q, vec![q, u]) } else { (q, vec![q]) };
             let fty = self.m.global_fn_type(ret, &params);
             self.m.op_to(op::FUNCTION, ret, fid, &[0, fty]);
@@ -455,6 +480,12 @@ impl Emit<'_> {
                     hit = e.m.op(op::LOGICAL_AND, b, &[hit, fits]);
                     let z = e.c32(0);
                     lim = e.m.op(op::SELECT, u, &[hit, ps[1], z]);
+                }
+                if left_mode {
+                    // the bytes from the address to its range's end
+                    let left = e.m.op(op::I_SUB, q, &[size, d]);
+                    let none = e.m.c_u64(0);
+                    return (e.m.op(op::SELECT, q, &[hit, left, none]), lim);
                 }
                 let dev = e.m.op(op::I_ADD, q, &[base, d]);
                 (e.m.op(op::SELECT, q, &[hit, dev, zero]), lim)

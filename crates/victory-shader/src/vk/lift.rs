@@ -66,6 +66,8 @@ pub struct Interface {
     pub demotes: bool,
     /// Reads barycentrics or per-vertex values (fragmentShaderBarycentric).
     pub per_vertex: bool,
+    /// Clip and cull distances (`PA_CL_VS_OUT_CNTL`): how many of each.
+    pub clip_cull: (u8, u8),
 }
 
 /// How each value is read: above 0 mostly as a float (so loads and phis
@@ -188,6 +190,12 @@ pub const OUT_STENCIL: u16 = 0x102;
 pub const OUT_SAMPLE_MASK: u16 = 0x103;
 /// Mesh: the primitive export (three 10-bit indices, bit 31 culls).
 pub const OUT_PRIMITIVE: u16 = 0x104;
+/// Clip and cull distances (component: the index in the array).
+pub const OUT_CLIP: u16 = 0x105;
+pub const OUT_CULL: u16 = 0x106;
+pub const OUT_POINT_SIZE: u16 = 0x107;
+pub const OUT_LAYER: u16 = 0x108;
+pub const OUT_VIEWPORT: u16 = 0x109;
 
 /// The old value of a lane mask written in a guard: 0 outside it.
 const MASK_FALSE: Value = Value(u32::MAX - 1);

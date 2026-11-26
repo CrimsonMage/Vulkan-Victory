@@ -81,12 +81,18 @@ impl Emit<'_> {
             self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_PRIMITIVE_TRIANGLE_INDICES_EXT]);
             (u, v)
         } else {
-            let v4 = self.m.t_vec(f, 4);
-            let arr = self.m.t_array(v4, self.mesh_vertices());
+            let (clip, cull) = self.iface.clip_cull;
+            let elem = match slot {
+                OUT_CLIP => self.m.t_array(f, u32::from(clip).max(1)),
+                OUT_CULL => self.m.t_array(f, u32::from(cull).max(1)),
+                OUT_POINT_SIZE => f,
+                _ => self.m.t_vec(f, 4),
+            };
+            let arr = self.m.t_array(elem, self.mesh_vertices());
             let p = self.m.t_ptr(en::SC_OUTPUT, arr);
             let v = self.m.variable(p, en::SC_OUTPUT);
-            if slot == OUT_POSITION {
-                self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_POSITION]);
+            if slot >= OUT_POSITION {
+                self.builtin_output(v, slot);
             } else {
                 self.m.decorate(v, en::DEC_LOCATION, &[u32::from(slot)]);
             }
@@ -169,14 +175,17 @@ impl Emit<'_> {
         let x = if self.f.ty(n.args[0]) == Ty::F32 { args[0] } else { self.m.op(op::BITCAST, elem, &[args[0]]) };
         let p = self.m.t_ptr(en::SC_OUTPUT, elem);
         let k = self.c32(u32::from(comp));
+        // a point size is one scalar per vertex
+        let chain = |at: Id| if slot == OUT_POINT_SIZE { vec![var, at] } else { vec![var, at, k] };
         let Some(s) = self.st.mesh_split else {
-            let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, i, k]);
+            let ptr = self.m.op(op::ACCESS_CHAIN, p, &chain(i));
             self.m.op_void(op::STORE, &[ptr, x]);
             return;
         };
         let (inside, at) = self.window_slot(s, i);
+        let ops = chain(at);
         self.when(inside, |e| {
-            let ptr = e.m.op(op::ACCESS_CHAIN, p, &[var, at, k]);
+            let ptr = e.m.op(op::ACCESS_CHAIN, p, &ops);
             e.m.op_void(op::STORE, &[ptr, x]);
         });
     }

@@ -466,9 +466,20 @@ impl<'a> Machine<'a> {
         Ok(match h {
             Helper::Translate => [self.mem.translate(a, 1), 0, 0, 0],
             Helper::TranslateRange => [self.mem.translate(a, self.arg(n, 1, l)[0]), 0, 0, 0],
-            Helper::TypedShape => [0; 4],
-            // (approximate: the first dword as x, alpha 1)
-            Helper::Typed => [self.mem.read(a, 4, !on, v), 0, 0, 0x3F80_0000],
+            Helper::RangeLeft => {
+                let d = a.wrapping_sub(self.mem.range.0);
+                [if d < self.mem.range.1 { self.mem.range.1 - d } else { 0 }, 0, 0, 0]
+            }
+            Helper::TypedShape => [u64::from(super::emit::format_table()[(a & 127) as usize]), 0, 0, 0],
+            Helper::Typed => {
+                let e = self.arg(n, 1, l)[0] as u32;
+                let bytes: Vec<u8> = (0..16).map(|i| self.mem.read(a + i, 1, !on, v) as u8).collect();
+                typed_decode(e, &bytes)
+            }
+            Helper::TypedPack => {
+                let x = self.arg(n, 1, l);
+                typed_pack(a as u32, [x[0] as u32, x[1] as u32, x[2] as u32, x[3] as u32], self.arg(n, 2, l)[0] != 0)
+            }
             Helper::BvhRay => return Err(format!("helper {h:?}")),
         })
     }
@@ -549,14 +560,43 @@ impl<'a> Machine<'a> {
     }
 
     fn spv_op(&mut self, v: V, o: u16, n: &Node, l: usize) -> Result<W, String> {
+        let a: Vec<W> = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
+        let mut p = Pure { f: self.f, notes: Vec::new() };
+        let r = p.spv_op(v, o, n, &a);
+        self.take_notes(p.notes);
+        r
+    }
+
+    fn glsl_op(&mut self, g: u32, n: &Node, l: usize) -> Result<W, String> {
+        let a: Vec<W> = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
+        let mut p = Pure { f: self.f, notes: Vec::new() };
+        let r = p.glsl_op(g, n, &a);
+        self.take_notes(p.notes);
+        r
+    }
+
+    fn take_notes(&mut self, notes: Vec<(V, String)>) {
+        for (v, s) in notes {
+            self.notes.entry(v).or_insert(s);
+        }
+    }
+}
+
+/// The pure operations of the IR (SPIR-V core and GLSL.std.450) on values.
+struct Pure<'a> {
+    f: &'a Func,
+    notes: Vec<(V, String)>,
+}
+
+impl Pure<'_> {
+    fn spv_op(&mut self, v: V, o: u16, n: &Node, a: &[W]) -> Result<W, String> {
         let ty = n.ty;
         let a0t = n.args.first().map(|&a| self.f.ty(a)).unwrap_or(Ty::VOID);
-        let a: Vec<W> = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
         let mut r = [0u64; 4];
         match o {
             op::COMPOSITE_EXTRACT => r[0] = a[0][n.imm[0] as usize],
             op::COMPOSITE_CONSTRUCT => {
-                let parts = n.args.iter().zip(&a).flat_map(|(&x, w)| w[..usize::from(self.f.ty(x).n)].iter().copied());
+                let parts = n.args.iter().zip(a).flat_map(|(&x, w)| w[..usize::from(self.f.ty(x).n)].iter().copied());
                 for (d, c) in r.iter_mut().zip(parts) {
                     *d = c;
                 }
@@ -597,7 +637,7 @@ impl<'a> Machine<'a> {
         let w = width(at.s);
         if matches!(o, op::U_DIV | op::U_MOD | op::S_DIV | op::S_REM) {
             if x[1] == 0 {
-                self.note(v, || "division by zero".into());
+                self.notes.push((v, "division by zero".into()));
                 return Ok(m);
             }
             let (a, b) = (sext(x[0], w), sext(x[1], w));
@@ -622,7 +662,7 @@ impl<'a> Machine<'a> {
             _ => return Err(format!("SPIR-V op {o}")),
         };
         if amount + span.max(1) > w {
-            self.note(v, || format!("op {o}: bits {amount}+{span} of a {w}-bit value (undefined in SPIR-V)"));
+            self.notes.push((v, format!("op {o}: bits {amount}+{span} of a {w}-bit value (undefined in SPIR-V)")));
         }
         let field = |cnt: u64| if cnt >= 64 { u64::MAX } else { (1u64 << cnt) - 1 };
         let s = amount.min(63) as u32;
@@ -640,9 +680,8 @@ impl<'a> Machine<'a> {
         })
     }
 
-    fn glsl_op(&mut self, g: u32, n: &Node, l: usize) -> Result<W, String> {
+    fn glsl_op(&mut self, g: u32, n: &Node, a: &[W]) -> Result<W, String> {
         let at = self.f.ty(n.args[0]);
-        let a: Vec<W> = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
         if let Some(r) = glsl_whole(g, at, a[0]) {
             return Ok(r);
         }
@@ -789,6 +828,65 @@ fn arith(o: u16, ty: Ty, at: Ty, x: &[u64]) -> Option<u64> {
     })
 }
 
+/// A typed element's channels (emit_typed.rs `Typed`): shape `e`, the
+/// element's bytes (16 read; those past it unused).
+pub fn typed_decode(e: u32, bytes: &[u8]) -> W {
+    let (comps, bits, num) = (e & 7, e >> 8 & 0xFF, e >> 16 & 7);
+    let all = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+    let mut r = [0u64; 4];
+    for c in 0..4u32 {
+        let w = if c == 3 && bits == 10 { 2 } else { bits };
+        if c >= comps {
+            r[c as usize] = if c == 3 { u64::from(if num >= 3 { 1 } else { 1.0f32.to_bits() }) } else { 0 };
+            continue;
+        }
+        let raw = ((all >> (c * bits)) as u64 & ((1u64 << w) - 1)) as u32;
+        let max = |b: u32| ((1u64 << b) - 1) as f32;
+        let sx = (sext(u64::from(raw), w) as i32) as f32;
+        r[c as usize] = u64::from(match num {
+            0 if w == 32 => raw,
+            0 => f16_to_f32(raw as u16).to_bits(),
+            1 => (raw as f32 / max(w)).to_bits(),
+            2 => (sx / max(w - 1)).max(-1.0).to_bits(),
+            4 => sext(u64::from(raw), w) as u32,
+            _ => raw,
+        });
+    }
+    r
+}
+
+/// The encoder's reference (emit_typed.rs `TypedPack`): shape `e`, the
+/// channel registers, d16 -> the element's dwords.
+pub fn typed_pack(e: u32, x: [u32; 4], d16: bool) -> W {
+    let (comps, bits, num) = (e & 7, e >> 8 & 0xFF, e >> 16 & 7);
+    let mut out = [0u64; 4];
+    for c in 0..comps.min(4) {
+        let w = if c == 3 && bits == 10 { 2 } else { bits };
+        let raw = x[c as usize];
+        let raw = match (d16, num) {
+            (false, _) => raw,
+            (true, 3) => raw & 0xFFFF,
+            (true, 4) => sext(u64::from(raw & 0xFFFF), 16) as u32,
+            (true, _) => f16_to_f32(raw as u16).to_bits(),
+        };
+        let mask = if w >= 32 { u32::MAX } else { (1 << w) - 1 };
+        let smax = (mask >> 1) as i32;
+        let f = f32::from_bits(raw);
+        let clamp = |lo: f32| if f.is_nan() { 0.0 } else { f.clamp(lo, 1.0) };
+        let v = match num {
+            0 if w == 32 => raw,
+            0 => u32::from(f32_to_f16(f)),
+            1 => (clamp(0.0) * mask as f32).round_ties_even() as u32,
+            2 => (clamp(-1.0) * smax as f32).round_ties_even() as i32 as u32,
+            4 => (raw as i32).clamp(!smax, smax) as u32,
+            _ => raw.min(mask),
+        } & mask;
+        let at = c * bits;
+        out[(at / 32) as usize] |= u64::from(v) << (at % 32);
+    }
+    out
+}
+
 /// A pixel input: a value in [0, 1) per location, component and lane.
 fn input(loc: u8, comp: u8, l: usize, ty: Ty) -> u64 {
     let h = (u32::from(loc) * 4 + u32::from(comp)).wrapping_mul(0x9E37_79B9) ^ (l as u32).wrapping_mul(0x85EB_CA6B);
@@ -869,6 +967,31 @@ mod tests {
         let mut m = Machine::new(&f, 32, Memory::default());
         m.limit = 1000;
         assert_eq!(m.run(), Stop::Limit);
+    }
+
+    #[test]
+    fn typed_elements_encode_and_decode() {
+        let t = crate::vk::emit::format_table();
+        let bytes = |w: W| -> Vec<u8> { w.iter().flat_map(|&d| (d as u32).to_le_bytes()).collect() };
+        let f = |x: f32| x.to_bits();
+        // unorm8 x4 (56): 0.5 rounds to 128 (ties to even), clamps, NaN 0
+        let w = typed_pack(t[56], [f(0.5), f(1.5), f(-1.0), 0x7FC0_0000], false);
+        assert_eq!(w[0], 0x0000_FF80);
+        // snorm16 x4 (66): -1, 1, 0.5 -> 16384, NaN 0
+        let w = typed_pack(t[66], [f(-1.0), f(1.0), f(0.5), 0x7FC0_0000], false);
+        assert_eq!((w[0], w[1]), (0x7FFF_8001, 0x0000_4000));
+        // sint8 x4 (61) clamps; uint16 x1 (11) clamps
+        assert_eq!(typed_pack(t[61], [300, (-300i32) as u32, 5, 0xFFFF_FFFF], false)[0], 0xFF05_807F);
+        assert_eq!(typed_pack(t[11], [70000, 0, 0, 0], false)[0], 0xFFFF);
+        // 10_10_10_2 unorm (50)
+        assert_eq!(typed_pack(t[50], [f(1.0), f(0.0), f(1.0), f(1.0)], false)[0], 0xFFF0_03FF);
+        // float16 x4 (71), d16 data passes halves through
+        let w = typed_pack(t[71], [0x3C00, 0xC000, 0, 0x7BFF], true);
+        assert_eq!((w[0], w[1]), (0xC000_3C00, 0x7BFF_0000));
+        // decode inverts what fits
+        let d = typed_decode(t[65], &bytes(typed_pack(t[65], [f(0.25), f(1.0), f(0.0), f(0.75)], false)));
+        assert_eq!(f32::from_bits(d[1] as u32), 1.0);
+        assert!((f32::from_bits(d[0] as u32) - 0.25).abs() < 1e-4);
     }
 
     #[test]
