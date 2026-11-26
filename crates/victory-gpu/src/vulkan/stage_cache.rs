@@ -28,6 +28,7 @@ fn dir() -> Option<&'static PathBuf> {
             return None;
         }
         tracing::info!(dir = %dir.display(), key = key(), "Vulkan: translations kept on disk");
+        load_registry(&dir);
         Some(dir)
     })
     .as_ref()
@@ -42,6 +43,7 @@ fn key() -> &'static str {
         h.update(MAGIC);
         h.update(&victory_shader::emit::translation_fingerprint());
         h.update(&victory_shader::vk::ABI_VERSION.to_le_bytes());
+        h.update(&victory_shader::vk::semantics::SEMANTICS_VERSION.to_le_bytes());
         h.update(include_bytes!("stage_cache.rs"));
         h.finalize().to_hex()[..16].to_string()
     })
@@ -57,9 +59,56 @@ pub(crate) fn read(full: &[u8; 32]) -> Option<VkShader> {
     decode(&std::fs::read(path(full)?).ok()?)
 }
 
+/// The title's semantic registry (ABI v2 section 6) beside the
+/// translations: its locations are in them, so the two are kept or dropped
+/// together. With no registry file (or one that does not load), the
+/// translations of this key are dropped.
+fn registry_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(format!("semantics-{}.txt", key()))
+}
+
+static SAVED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn load_registry(dir: &std::path::Path) {
+    let p = registry_path(dir);
+    let semantics = victory_shader::vk::Semantics::global();
+    let loaded = std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|text| semantics.load(&text));
+    match loaded {
+        Ok(()) => *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = semantics.save(),
+        Err(e) => {
+            tracing::info!(registry = %p.display(), why = %e, "Vulkan: no semantic registry; the translations kept with it are dropped");
+            let _ = std::fs::remove_file(&p);
+            let tail = format!("-{}.vks", key());
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if entry.file_name().to_string_lossy().ends_with(&tail) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Writes the registry if it grew (before a translation that may use the
+/// new entries is kept).
+fn save_registry(dir: &std::path::Path) {
+    let text = victory_shader::vk::Semantics::global().save();
+    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    if *saved == text {
+        return;
+    }
+    let p = registry_path(dir);
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+        *saved = text;
+    }
+}
+
 /// Keeps `vs`, the translation of the container `full`.
 pub(crate) fn write(full: &[u8; 32], vs: &VkShader) {
     let Some(p) = path(full) else { return };
+    if let Some(dir) = dir() {
+        save_registry(dir);
+    }
     let tmp = p.with_extension("tmp");
     if std::fs::write(&tmp, encode(vs)).is_ok() {
         let _ = std::fs::rename(&tmp, &p);

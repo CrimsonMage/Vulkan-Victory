@@ -37,6 +37,8 @@ pub(crate) struct Heaps {
     sampler: Buffer,
     sampled_at: u64,
     storage_at: u64,
+    /// Set 0 binding 2: 2D-array views of cube images (ABI v2).
+    cube_at: u64,
     sampler_at: u64,
     map_at: u64,
     map_stride: u64,
@@ -71,6 +73,15 @@ struct State {
 /// Views made, samplers made, view writes that found no image.
 pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// The image bindings of set 0.
+#[derive(Clone, Copy)]
+enum Binding {
+    Sampled,
+    Storage,
+    /// 2D-array views of cube images (ABI v2).
+    Cube,
+}
+
 pub(crate) fn heaps(b: &'static Backend) -> Option<&'static Heaps> {
     static HEAPS: OnceLock<Option<Heaps>> = OnceLock::new();
     HEAPS
@@ -90,10 +101,11 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
     let props = victory_vk::descriptors::properties(&b.host).ok_or_else(|| anyhow::anyhow!("no descriptor buffer properties"))?;
     let align = props.descriptor_buffer_offset_alignment.max(1);
     // SAFETY: live layouts.
-    let (sampled_at, storage_at, sampler_at) = unsafe {
+    let (sampled_at, storage_at, cube_at, sampler_at) = unsafe {
         (
             db.get_descriptor_set_layout_binding_offset(layout.sets[0], 0),
             db.get_descriptor_set_layout_binding_offset(layout.sets[0], 1),
+            db.get_descriptor_set_layout_binding_offset(layout.sets[0], 2),
             db.get_descriptor_set_layout_binding_offset(layout.sets[1], 0),
         )
     };
@@ -128,6 +140,7 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
         sampler,
         sampled_at,
         storage_at,
+        cube_at,
         sampler_at,
         map_at,
         map_stride,
@@ -200,8 +213,18 @@ impl Heaps {
                 images::to_general(d, cmd, image, range, vk::ImageLayout::UNDEFINED);
                 d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
             })?;
-            self.write_image(b, 0, view, false);
-            self.write_image(b, 0, view, true);
+            let array = d.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                    .format(format)
+                    .subresource_range(range),
+                None,
+            )?;
+            // Slot 0 is the null image on bindings 0, 1 and 2 (ABI v2).
+            self.write_image(b, 0, view, Binding::Sampled);
+            self.write_image(b, 0, view, Binding::Storage);
+            self.write_image(b, 0, array, Binding::Cube);
             let s = d.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -215,25 +238,24 @@ impl Heaps {
         Ok(())
     }
 
-    fn write_image(&self, b: &Backend, slot: u32, view: vk::ImageView, storage: bool) {
+    fn write_image(&self, b: &Backend, slot: u32, view: vk::ImageView, binding: Binding) {
         let Some(db) = b.host.descriptor_buffer.as_ref() else { return };
         let info = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL);
-        let (ty, data, at, size) = if storage {
-            (
+        let (ty, data, at, size) = match binding {
+            Binding::Storage => (
                 vk::DescriptorType::STORAGE_IMAGE,
                 vk::DescriptorDataEXT { p_storage_image: &info },
                 self.storage_at,
                 self.sizes[1],
-            )
-        } else {
-            (
+            ),
+            Binding::Sampled | Binding::Cube => (
                 vk::DescriptorType::SAMPLED_IMAGE,
                 vk::DescriptorDataEXT { p_sampled_image: &info },
-                self.sampled_at,
+                if matches!(binding, Binding::Cube) { self.cube_at } else { self.sampled_at },
                 self.sizes[0],
-            )
+            ),
         };
         let offset = at as usize + slot as usize * size;
         // SAFETY: the slot lies inside the mapped set-0 range.
@@ -286,9 +308,14 @@ impl Heaps {
             }
             None => return None,
         };
-        self.write_image(b, slot, sampled, false);
+        self.write_image(b, slot, sampled, Binding::Sampled);
         if let Some(st) = storage {
-            self.write_image(b, slot, st, true);
+            self.write_image(b, slot, st, Binding::Storage);
+        }
+        if matches!(key.kind, vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY)
+            && let Some(array) = image.view(b, ViewKey { kind: vk::ImageViewType::TYPE_2D_ARRAY, storage: false, ..key })
+        {
+            self.write_image(b, slot, array, Binding::Cube);
         }
         s.views.insert((image.id, key), slot);
         s.by_image.entry(image.id).or_default().push(slot);

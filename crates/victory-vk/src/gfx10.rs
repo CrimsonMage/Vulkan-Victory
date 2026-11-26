@@ -82,7 +82,11 @@ pub struct Image {
     pub min_lod: f32,
 }
 
-/// The host's word of a T# (WORD7, ABI v1 section 5.2).
+/// WORD6 of every T# the host writes is WORD7 ^ this (ABI v2 section 5.2):
+/// the translator uses WORD7 only when the check holds, else slot 0.
+pub const T_CHECK: u32 = 0x7A3C_5E91;
+
+/// The host's word of a T# (WORD7, ABI v2 section 5.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageSlot {
     /// Index into set 0 bindings 0 and 1 (24 bits).
@@ -95,7 +99,7 @@ pub struct ImageSlot {
 
 impl Image {
     /// The eight dwords, as `ac_build_gfx10_texture_descriptor` fills them,
-    /// WORD6 zero and WORD7 the host's.
+    /// WORD7 the host's and WORD6 its check word.
     pub fn encode(&self, host: ImageSlot) -> [u32; 8] {
         let msaa = matches!(self.kind, ImageType::D2Msaa | ImageType::D2MsaaArray);
         let sample_log2 = 31 - self.samples.max(1).leading_zeros();
@@ -136,6 +140,7 @@ impl Image {
         out[7] = field(host.slot, 0, 24)
             | field(u32::from(host.integer), 24, 1)
             | field(u32::from(host.storage), 25, 1);
+        out[6] = out[7] ^ T_CHECK;
         out
     }
 }
@@ -519,7 +524,7 @@ mod tests {
         assert_eq!((w[3] >> 12) & 0xf, 1, "base level");
         assert_eq!((w[3] >> 16) & 0xf, 3, "last level");
         assert_eq!((w[5] >> 4) & 0xf, 10, "max mip");
-        assert_eq!(w[6], 0);
+        assert_eq!(w[6], w[7] ^ T_CHECK);
         assert_eq!(w[7] & 0xff_ffff, 0xabcde);
         assert_eq!(w[7] >> 24, 1);
     }
