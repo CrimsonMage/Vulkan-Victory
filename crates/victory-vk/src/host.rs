@@ -288,6 +288,40 @@ impl Caps {
     }
 }
 
+/// Queues made in the graphics family (title direct, compute, copy).
+pub const LANES: u32 = 3;
+
+/// One queue of each family the backend uses; `lanes` of the graphics
+/// family's.
+fn queue_infos(
+    graphics: u32,
+    lanes: u32,
+    others: [Option<u32>; 2],
+) -> Vec<vk::DeviceQueueCreateInfo<'static>> {
+    static PRIORITY: [f32; LANES as usize] = [1.0; LANES as usize];
+    let mut infos = vec![
+        vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(graphics)
+            .queue_priorities(&PRIORITY[..lanes as usize]),
+    ];
+    for family in others.into_iter().flatten() {
+        infos.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(family)
+                .queue_priorities(&PRIORITY[..1]),
+        );
+    }
+    infos
+}
+
+/// The graphics family's `lanes` queues.
+fn lane_queues(device: &ash::Device, graphics: u32, lanes: u32) -> Vec<vk::Queue> {
+    // SAFETY: the device was made with `lanes` queues of that family.
+    (0..lanes)
+        .map(|i| unsafe { device.get_device_queue(graphics, i) })
+        .collect()
+}
+
 /// A queue and its family.
 #[derive(Clone, Copy, Debug)]
 pub struct Queue {
@@ -301,6 +335,10 @@ pub struct Queue {
 pub struct Queues {
     /// Graphics + compute + transfer; presents.
     pub graphics: Queue,
+    /// The graphics family's queues, up to [`LANES`] (the first is
+    /// `graphics`): the title's direct, compute and copy queues each run on
+    /// one, so their work can overlap with no ownership transfers.
+    pub lanes: Vec<vk::Queue>,
     /// A compute-only family, if the device has one.
     pub compute: Option<Queue>,
     /// A transfer-only family, if the device has one.
@@ -604,16 +642,8 @@ impl Host {
             vk::QueueFlags::TRANSFER,
             vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
         );
-        let priority = [1.0f32];
-        let queue_infos: Vec<vk::DeviceQueueCreateInfo> = [Some(graphics), compute, transfer]
-            .into_iter()
-            .flatten()
-            .map(|family| {
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family)
-                    .queue_priorities(&priority)
-            })
-            .collect();
+        let lanes = families[graphics as usize].queue_count.clamp(1, LANES);
+        let queue_infos = queue_infos(graphics, lanes, [compute, transfer]);
 
         let device = {
             let mut info = vk::DeviceCreateInfo::default()
@@ -667,6 +697,7 @@ impl Host {
         };
         let queues = Queues {
             graphics: queue(graphics),
+            lanes: lane_queues(&device, graphics, lanes),
             compute: compute.map(queue),
             transfer: transfer.map(queue),
         };

@@ -41,7 +41,9 @@ struct Queue {
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
-/// One thing a waiting queue holds back.
+/// One thing a waiting queue holds back (the D3D12 path; under Vulkan the
+/// one held line is `vulkan/engine.rs`, and this one goes with the D3D12
+/// path).
 #[cfg(windows)]
 enum Held {
     /// The queue waits for the fence (its address) to reach the value.
@@ -260,6 +262,12 @@ fn value_met(wait: &crate::list::ValueWait) -> bool {
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
     unsafe { &*this.cast::<Queue>() }
+}
+
+/// The queue's list type (0 direct, 2 compute, 3 copy).
+#[cfg(windows)]
+pub(crate) fn kind(this: This) -> u32 {
+    queue(this).kind
 }
 
 pub(crate) extern "system" fn create(
@@ -518,8 +526,13 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    // Under Vulkan the card writes its own clock (`vulkan/writes.rs`).
+    #[cfg(windows)]
+    let frequency = crate::vulkan::on().then(crate::vulkan::timestamp_frequency).flatten().unwrap_or(TIMESTAMP_FREQUENCY);
+    #[cfg(not(windows))]
+    let frequency = TIMESTAMP_FREQUENCY;
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(frequency) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;

@@ -77,9 +77,9 @@ required item stops device creation.
 
 | D3D12.X | Vulkan |
 |---|---|
-| Direct queue(s) | the graphics family's queue (also presents) |
-| Compute queue(s) | the compute-only family's queue (graphics queue if there is none) |
-| Copy queue(s), first texture uploads (`texture/ahead.rs`) | the transfer-only family's queue |
+| Direct queue(s) | the graphics family's first queue (also presents), a line (timeline semaphore) per title queue |
+| Compute queue(s) | the graphics family's second queue, a line per title queue (section "Lines and indirect": same family, no ownership transfers) |
+| Copy queue(s) | the graphics family's third queue, a line per title queue; our own uploads and fills go on the host line |
 | `ExecuteCommandLists` | `vkQueueSubmit2` of the lists' command buffers, in order, signalling the queue's **timeline semaphore** |
 | Title fence (`fence.rs`: a 64-bit value at a GPU address) | A queue `Signal` becomes a `vkCmdFillBuffer`/`vkCmdUpdateBuffer` of the value into title memory (the fence's address in the title window, section 3.4) at the end of the submission, after a full barrier. The CPU sees it in place, since title memory is coherent. The submission's timeline value is recorded beside it for CPU waits and events. |
 | Queue `Wait` on a fence another queue signals | a timeline-semaphore wait in the submit (the signal's timeline value is known when the signal was submitted) |
@@ -133,7 +133,9 @@ required item stops device creation.
     buffer views. Vulkan's compute state is separate from graphics
     state, so there is nothing to restore but the title's compute
     pipeline and push constants.
-  - The windows and re-bounding rules of `indirect.rs` stay.
+  - Windows as in `indirect.rs`, kept per command buffer and ended by any
+    dispatch or copy (section "Lines and indirect"); no re-bounding at
+    barriers.
 
 ### 3.3 Pipelines
 
@@ -1060,33 +1062,9 @@ range. The helpers moved to `vulkan/loose.rs`.
 
 **Open, in order** (the coordinator's audit and its comparison list):
 
-1. **One timeline per title queue.** Today `Timeline` is one semaphore on
-   the graphics queue, and every submission waits for the one before.
-   Design:
-   - one `Timeline` per title queue (graphics → graphics queue, compute →
-     the compute queue), each with its own semaphore;
-   - title fence Signal/Wait become semaphore signals and waits between
-     the timelines;
-   - bottom-of-pipe writes are done by the card (`vkCmdUpdateBuffer` into
-     the imported region, `buffer_of`) instead of `write_now` when a
-     flight lands;
-   - memory-value waits stay CPU-side cuts (`Part`).
-   The engine (`vulkan.rs` `Engine`) keeps its lines. Only `submit_part`
-   picks the queue's timeline, and `flights` become per timeline.
-2. **ExecuteIndirect** (`thin/vulkan.rs` → `NotYet::Indirect`).
-   - Signatures hold one argument: draw (16), indexed (20), dispatch (12;
-     type 105 too) or mesh (12). Their records are already Vulkan's
-     command structs.
-   - Plan: end rendering. One compute pass of ours copies `max` records,
-     bounded as `indirect.rs` bounds them, with the count, into a scratch
-     buffer of the command buffer's (a ring freed by timeline value).
-     Then a barrier to `DRAW_INDIRECT`, rendering again, and
-     `vkCmdDraw*IndirectCount` / `vkCmdDispatchIndirect` from it.
-   - The pass needs buffer device addresses. glslc's HLSL has no
-     `vk::RawBufferLoad`, so write the pass in SPIR-V assembly (source in
-     the module notes, `spirv-as`, words embedded) or with the translator's
-     `vk::spirv` builder.
-   - Indirect rectangles (tiled lighting) take the rectangle part.
+1. Done: **one line per title queue** (section "Lines and indirect"
+   below).
+2. Done: **ExecuteIndirect** (same section).
 3. **FSR4 on Vulkan.** `ffx.rs` / `upscale.rs` are D3D12-only, so the
    Series S world will be black on Vulkan. Make it one small linear scale
    pass. Gate it on the DLL and its API version, not this title's offsets.
@@ -1097,14 +1075,125 @@ range. The helpers moved to `vulkan/loose.rs`.
    run time. PresentX with its plane count (up to 8). 2D-array views of
    cube images and the T# tag bits, once the translator sets them in
    `docs/vulkan-abi.md`.
-5. The rest of the earlier list: imports of committed runs only, one held
-   line, `AllocateUploadMemory` blocks, MSAA draws.
+5. The rest of the earlier list: imports of committed runs only,
+   `AllocateUploadMemory` blocks, MSAA draws. (One held line: under
+   Vulkan it is `vulkan/engine.rs` only; `queue.rs`'s `Held` is the D3D12
+   path's and goes with it.)
 6. Done: the clears moved to `record/clear.rs` (record.rs at 916 lines).
 7. Card memory outside heapUsage (vk23: nvidia-smi 6.8 GB, heapUsage
    2.9 GB). Probably shader local memory for spills, which follows the
    pipelines bound. `VK_KHR_pipeline_executable_properties` reports bogus
    figures. No cheap way to measure it in the process was found; the
    translator should cut the spills (per-lane arrays).
+
+### Lines and indirect (2026-11-26, branch `worktree-agent-a53e5cfa3b4ebdc62`)
+
+**One line per title queue** (`victory-vk/src/timeline.rs`,
+`vulkan/engine.rs`, `vulkan/writes.rs`).
+
+- A **line** is a timeline semaphore on one queue of the graphics family.
+  The device now has three graphics-family queues (`host::LANES`): title
+  direct queues run on the first, compute queues on the second, copy
+  queues on the third. Each title queue gets a line of its own at its
+  first use ("a title queue runs on a line of its own").
+  - Why not the compute-only family: images and imported buffers are
+    `EXCLUSIVE`, so another family would need ownership transfers or
+    `CONCURRENT` everywhere, and command buffers are recorded before the
+    queue is known. Same family: no transfers, any command buffer goes to
+    any lane.
+- **The host line** (line 0, first queue) takes our own work: fills,
+  sparse binds, one-shot copies, the present. Each of its operations waits
+  for everything given on every line, so it keeps the order it always had.
+- **A title submission** waits for its line's previous value, the host
+  line's last value (fills and binds before it), and the semaphore waits
+  its queue collected: a fence `Wait` whose `Signal` is in the air on
+  another line, or a memory-value wait met by a write in the air on
+  another line. A `Signal` after such waits first submits a marker that
+  carries them.
+- **Tickets**: every operation also takes one count over all lines.
+  `last`, `completed` and `wait` speak in tickets ("everything given until
+  then"), so image release, staging, descriptor and recorder reuse work as
+  with the one timeline.
+- **Bottom-of-pipe writes by the card**: at the end of their part, after a
+  full barrier, `vkCmdUpdateBuffer` into the imported title memory
+  (`Memory::buffer_of`, imports only), GPU timestamps by
+  `vkCmdWriteTimestamp2` + `vkCmdCopyQueryPoolResults` (64-bit, so 8-byte
+  aligned), then a barrier to `HOST`. The title's
+  `GetTimestampFrequency` answers the card's clock under Vulkan
+  (`1e9 / timestampPeriod`). The CPU still lands writes into the pool's
+  GPU view, into memory not imported yet, unaligned ones and CPU
+  timestamps.
+- Fence signals are still set by the landing thread, which now waits for
+  the first flight of every line (`wait_any`) and lands flights per line.
+- Memory-value waits nothing in the air meets stay CPU-side cuts.
+- **Busy figure**: every recorded command buffer carries a timestamp at its
+  start and its end. The 10 s line "queues, timeline and title memory"
+  has `lines="host … ms/frame …% n=…/frame; direct0 …; compute0 …"`: GPU
+  time per frame of each line's submissions, its share of the wall clock,
+  and submissions per frame. Shares that add up past 100% mean the lines
+  overlapped.
+- What still serialises: each host-line operation (a fill, a sparse
+  bind, the present) waits for every line, and the next title submission
+  waits for it. Bink frames refill textures every frame, so there is at
+  least one such join a frame. Next step if `lines` shows it matters: let
+  fills wait only for the lines that last read their images.
+
+**ExecuteIndirect** (`vulkan/record/indirect.rs`, `vulkan/bound.rs`).
+
+- A signature with one argument (draw, indexed, dispatch or type 105,
+  mesh) runs; others count `not_yet indirect`.
+- The bounding pass is a compute program built in Rust with the
+  translator's `vk::spirv` builder (no file, nothing on the policy
+  allowlist; `spirv-val --target-env vulkan1.3` passes). One thread per
+  record word; it reads the title's records by device address and writes
+  them, bounded as `crate::indirect` bounds them, with the count
+  (`min(count, max)`; a word of `u32::MAX` when there is none) into the
+  **command buffer's scratch**. The scratch belongs to the recorder and is
+  reused when the recorder is (its ticket passed): freed by timeline
+  value.
+- Then a barrier `COMPUTE_SHADER` → `DRAW_INDIRECT`, and
+  `vkCmdDraw(Indexed)Indirect(Count)`, `vkCmdDrawMeshTasksIndirect(Count)EXT`
+  (count forms when `drawIndirectCount` is on) or one
+  `vkCmdDispatchIndirect` per record.
+- Draws bind through `prepare_draw`, so indirect rectangles take the
+  rectangle part. The pass runs over the ABI layout's push constants, so
+  the title's are pushed again at its next draw or dispatch.
+- **Windows**: an execution without a count bounds up to 512 records from
+  its first on. Later executions inside a window read it with no pass,
+  until a dispatch or a copy is recorded (either may write records) or
+  the command buffer ends. Draws that write memory do not end a window
+  (the D3D12 path ended windows for shaders writing by address). The
+  coming UAV clears (#53/54) and FillMemoryWith* should call
+  `Rec::indirect.clear()` too.
+- **The cap**: at most `max`, at most what the title's buffer holds, at
+  most 65,536 records an execution (256 for dispatches), and every record
+  bounded (vertices < 2^23, instances ≤ 2^26 / vertices, groups ≤ 65,535
+  each and ≤ 2^21 in all; mesh y and z cut to 1). Unbounded counts hung
+  the card before (Xid 109).
+- `Vulkan: draws recorded` has `indirect="executions=… passes=…
+  window_hits=… skipped=…"`.
+
+**Expected effect on frame time.**
+
+- What may now run at once on the card: a title compute queue's work
+  beside the direct queue's (async compute), copy-queue work beside both,
+  and work of one queue that another queue's fence wait would have held
+  up behind unrelated work. Before, every submission waited for the one
+  before on one queue.
+- Menus, Bink and loading (where the runs reach today): the frame is
+  CPU-bound (record ~21 ms summed over workers, fills ~9 ms, join up to
+  22 ms), and the title submits ~6 times a frame. Expect no change beyond
+  noise. `lines` will say how much GPU time each queue takes; if `direct0`
+  is far below the frame time, the GPU was never the limit.
+- The world (D3D12 figures, run of 04:53: GPU busy ~112 ms of a ~1,070 ms
+  frame, 32 submissions a frame): the gain is bounded by the smaller of
+  the direct and compute lines' busy time a frame, less the joins at
+  fills and the present, and is only visible once the CPU side gets under
+  the GPU time.
+- ExecuteIndirect adds work that was skipped: ~780 executions a frame in
+  the world (D3D12 figure), so up to ~1,500 passes a frame there (each
+  ends and restarts rendering; D3D12's window hits were about a third).
+  Watch `passes` against `executions`.
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 

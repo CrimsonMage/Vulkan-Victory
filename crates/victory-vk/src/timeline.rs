@@ -1,15 +1,31 @@
-//! The one host queue's line of work (`docs/vulkan-host.md`, "Queues and
-//! fences"): every submission and every sparse bind goes to the graphics
-//! queue behind the one before it and signals the next value of one
-//! timeline semaphore. Values say how far the card has got; nothing is
-//! waited for by fences.
+//! The host's lines of work (`docs/vulkan-host.md`, "Queues and fences").
 //!
-//! Every `vkQueue*` call on the graphics queue (submissions, sparse binds,
-//! the swapchain's submit and present) is made under this module's lock
-//! ([`Timeline::with_queue`]): Vulkan requires a queue's calls to be
-//! externally synchronised, and M2a's first run lost the device with the
-//! present racing the landing thread's submissions.
+//! A **line** is a timeline semaphore on one queue of the graphics family.
+//! Each operation given to a line signals its next value.
+//!
+//! - **The host line** ([`HOST`], the first queue) takes our own work:
+//!   fills, sparse binds and one-shot copies. Each of its operations waits
+//!   for everything given before on every line, so the host's work keeps
+//!   the order it always had.
+//! - **A title line** ([`Timeline::line`]) belongs to one title queue.
+//!   Its submissions wait for the line's previous value, the host line's
+//!   last value, and the waits the caller names (title fences signalled on
+//!   other lines). Title queues of different kinds run on different queues
+//!   ([`crate::host::LANES`]), so their work overlaps on the card.
+//!
+//! Every operation also takes a **ticket**, one count over all lines.
+//! [`Timeline::last`], [`Timeline::completed`] and [`Timeline::wait`] speak
+//! in tickets: "everything given until then". Release, refill and recorder
+//! reuse go by them, as they went by the one timeline before.
+//!
+//! Every `vkQueue*` call is made under this module's lock: Vulkan requires
+//! a queue's calls to be externally synchronised.
+//!
+//! The command buffers of recordings carry a GPU timestamp at their start
+//! and their end. A line's busy time is the sum over its submissions, read
+//! once they complete ([`Timeline::take_stats`]).
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,62 +33,233 @@ use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::host::Host;
+use crate::memory::{Buffer, Place};
 
-/// A one-shot command buffer and the value after which it may be reused.
+/// A line: an index into the timeline's lines.
+pub type Line = usize;
+/// The host's own line.
+pub const HOST: Line = 0;
+
+/// What kind of title queue a line serves (the queue it runs on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Direct,
+    Compute,
+    Copy,
+}
+
+/// Timestamp pairs for the busy figure (two queries each).
+const PAIRS: u32 = 8192;
+/// A recording's first scratch buffer (it doubles as it grows).
+const SCRATCH: u64 = 64 << 10;
+
+/// A command buffer's scratch: card memory its commands write and read
+/// (bounded indirect records), reused once the command buffer has run.
+#[derive(Default)]
+struct Scratch {
+    buffers: Vec<Buffer>,
+    /// The buffer being filled, and bytes used in it.
+    at: usize,
+    used: u64,
+}
+
+/// A part of a recording's scratch.
+#[derive(Clone, Copy, Debug)]
+pub struct ScratchRange {
+    pub buffer: vk::Buffer,
+    pub offset: u64,
+    /// Its device address.
+    pub address: u64,
+}
+
+impl Scratch {
+    fn take(&mut self, host: &Host, bytes: u64) -> Option<ScratchRange> {
+        loop {
+            if let Some(b) = self.buffers.get(self.at) {
+                let offset = self.used.next_multiple_of(16);
+                if offset + bytes <= b.size {
+                    self.used = offset + bytes;
+                    return Some(ScratchRange {
+                        buffer: b.buffer,
+                        offset,
+                        address: b.address + offset,
+                    });
+                }
+                self.at += 1;
+                self.used = 0;
+                continue;
+            }
+            let last = self.buffers.last().map_or(SCRATCH / 2, |b| b.size);
+            let size = (last * 2).max(bytes.next_power_of_two());
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            self.buffers
+                .push(Buffer::new(host, size, usage, Place::Card).ok()?);
+            self.at = self.buffers.len() - 1;
+            self.used = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.at = 0;
+        self.used = 0;
+    }
+}
+
+/// A one-shot command buffer and the ticket after which it may be reused.
 struct Recorder {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
-    /// The value its last submission signals (0: never submitted).
+    /// The ticket its last submission took (0: never submitted;
+    /// `u64::MAX`: being recorded).
     done_at: u64,
+    scratch: Scratch,
+}
+
+/// An operation given to a line and not yet seen complete.
+struct Pending {
+    value: u64,
+    ticket: u64,
+    /// Its timestamp queries (start, end), if timed.
+    timing: Option<(u32, u32)>,
+}
+
+struct LineState {
+    semaphore: vk::Semaphore,
+    queue: vk::Queue,
+    label: String,
+    /// The value the last operation signals.
+    last: u64,
+    pending: VecDeque<Pending>,
+    /// Since the last [`Timeline::take_stats`].
+    submissions: u64,
+    busy_ns: f64,
 }
 
 struct State {
-    /// The value the last operation signals.
-    last: u64,
+    /// The last ticket given.
+    ticket: u64,
+    lines: Vec<LineState>,
     recorders: Vec<Recorder>,
+    next_pair: u32,
 }
 
 /// A command buffer being recorded ([`Timeline::begin`]).
 pub struct Recording {
     index: usize,
     pub cmd: vk::CommandBuffer,
+    /// Its start timestamp's query (the end's is the next).
+    pair: Option<u32>,
+    scratch: Scratch,
+}
+
+impl Recording {
+    /// `bytes` of the command buffer's scratch, 16-byte aligned.
+    pub fn scratch(&mut self, host: &Host, bytes: u64) -> Option<ScratchRange> {
+        self.scratch.take(host, bytes)
+    }
+}
+
+/// A line's figures since the last [`Timeline::take_stats`].
+pub struct LineStats {
+    pub label: String,
+    pub submissions: u64,
+    /// GPU time its submissions took, start to end.
+    pub busy_ms: f64,
 }
 
 pub struct Timeline {
-    pub semaphore: vk::Semaphore,
-    queue: vk::Queue,
+    queues: Vec<vk::Queue>,
     family: u32,
+    timing: Option<vk::QueryPool>,
+    period_ns: f64,
     state: Mutex<State>,
-    /// The device was lost: nothing is given to the queue any more.
+    /// The device was lost: nothing is given to a queue any more.
     lost: AtomicBool,
 }
 
 /// A sparse bind of one buffer: `(buffer, binds)`.
 pub type BufferBinds = (vk::Buffer, Vec<vk::SparseMemoryBind>);
 
+fn semaphore(host: &Host) -> Result<vk::Semaphore> {
+    let mut kind = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    // SAFETY: valid create info; destroyed by `destroy`.
+    unsafe {
+        host.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )
+    }
+    .context("timeline semaphore")
+}
+
+fn line_state(semaphore: vk::Semaphore, queue: vk::Queue, label: String) -> LineState {
+    LineState {
+        semaphore,
+        queue,
+        label,
+        last: 0,
+        pending: VecDeque::new(),
+        submissions: 0,
+        busy_ns: 0.0,
+    }
+}
+
 impl Timeline {
     pub fn new(host: &Host) -> Result<Timeline> {
-        let mut kind = vk::SemaphoreTypeCreateInfo::default()
-            .semaphore_type(vk::SemaphoreType::TIMELINE)
-            .initial_value(0);
+        let host_line = line_state(semaphore(host)?, host.queues.graphics.queue, "host".into());
+        let period_ns = f64::from(host.caps.timestamp_period);
         // SAFETY: valid create info; destroyed by `destroy`.
-        let semaphore = unsafe {
-            host.device.create_semaphore(
-                &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
-                None,
-            )
+        let timing = (period_ns > 0.0)
+            .then(|| unsafe {
+                host.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2 * PAIRS),
+                    None,
+                )
+            })
+            .and_then(|r| r.ok());
+        let mut queues = host.queues.lanes.clone();
+        if queues.is_empty() {
+            queues.push(host.queues.graphics.queue);
         }
-        .context("timeline semaphore")?;
         Ok(Timeline {
-            semaphore,
-            queue: host.queues.graphics.queue,
+            queues,
             family: host.queues.graphics.family,
+            timing,
+            period_ns,
             state: Mutex::new(State {
-                last: 0,
+                ticket: 0,
+                lines: vec![host_line],
                 recorders: Vec::new(),
+                next_pair: 0,
             }),
             lost: AtomicBool::new(false),
         })
+    }
+
+    /// A new title line for a queue of `kind`.
+    pub fn line(&self, host: &Host, kind: Kind) -> Result<Line> {
+        let lane = match kind {
+            Kind::Direct => 0,
+            Kind::Compute => 1,
+            Kind::Copy => 2,
+        }
+        .min(self.queues.len() - 1);
+        let sem = semaphore(host)?;
+        let mut s = self.state();
+        let n = s
+            .lines
+            .iter()
+            .filter(|l| l.label.starts_with(kind_name(kind)))
+            .count();
+        let label = format!("{}{n}", kind_name(kind));
+        s.lines.push(line_state(sem, self.queues[lane], label));
+        Ok(s.lines.len() - 1)
     }
 
     /// Whether the device was lost (every later operation fails at once).
@@ -88,71 +275,287 @@ impl Timeline {
         r
     }
 
-    /// Runs `f` with the queue and the last value given, under the lock
-    /// every queue call takes; `f` returns whether it gave the queue an
-    /// operation signalling `last + 1` (then that is the new last value).
-    pub fn with_queue<R>(&self, f: impl FnOnce(vk::Queue, u64) -> (R, bool)) -> anyhow::Result<R> {
-        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
-        let mut s = self.state();
-        let (r, signalled) = f(self.queue, s.last);
-        if signalled {
-            s.last += 1;
-        }
-        Ok(r)
-    }
-
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The value the last operation given to the queue signals.
-    pub fn last(&self) -> u64 {
-        self.state().last
-    }
-
-    /// How far the card has got.
-    pub fn completed(&self, host: &Host) -> u64 {
-        // SAFETY: a live timeline semaphore.
-        unsafe { host.device.get_semaphore_counter_value(self.semaphore) }.unwrap_or(0)
-    }
-
-    /// Waits until the card has reached `value`, at most `timeout_ns`.
-    pub fn wait(&self, host: &Host, value: u64, timeout_ns: u64) -> bool {
-        let sems = [self.semaphore];
-        let values = [value];
-        // SAFETY: a live timeline semaphore.
-        unsafe {
-            host.device.wait_semaphores(
-                &vk::SemaphoreWaitInfo::default()
-                    .semaphores(&sems)
-                    .values(&values),
-                timeout_ns,
-            )
-        }
-        .is_ok()
-    }
-
-    /// Submits `cmds` (none: a marker that only signals) behind everything
-    /// given before; returns the value it signals.
-    pub fn submit(&self, host: &Host, cmds: &[vk::CommandBuffer]) -> Result<u64> {
+    /// Runs `f` with the host queue and the host line's last value, under
+    /// the lock every queue call takes; `f` returns whether it gave the
+    /// queue an operation signalling the host line's `last + 1`.
+    pub fn with_queue<R>(&self, f: impl FnOnce(vk::Queue, u64) -> (R, bool)) -> Result<R> {
+        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
         let mut s = self.state();
-        unsafe { self.submit_locked(host, &mut s, cmds) }
+        let (r, signalled) = f(self.queues[0], s.lines[HOST].last);
+        if signalled {
+            let value = s.lines[HOST].last + 1;
+            commit(&mut s, HOST, value, None);
+        }
+        Ok(r)
     }
 
-    unsafe fn submit_locked(
+    /// Runs `f` with the host queue and waits for everything given on every
+    /// line (a present), under the lock every queue call takes.
+    pub fn with_queue_joined<R>(
+        &self,
+        f: impl FnOnce(vk::Queue, &[vk::SemaphoreSubmitInfo<'_>]) -> R,
+    ) -> Result<R> {
+        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
+        let s = self.state();
+        let waits = submit_infos(&waits(&s, HOST, &[]));
+        Ok(f(self.queues[0], &waits))
+    }
+
+    /// The last ticket given.
+    pub fn last(&self) -> u64 {
+        self.state().ticket
+    }
+
+    /// The ticket up to which everything has run on the card.
+    pub fn completed(&self, host: &Host) -> u64 {
+        let mut s = self.state();
+        self.completed_locked(host, &mut s)
+    }
+
+    fn completed_locked(&self, host: &Host, s: &mut State) -> u64 {
+        let lost = self.lost();
+        let mut done = s.ticket;
+        for l in &mut s.lines {
+            let reached = if lost {
+                u64::MAX
+            } else {
+                // SAFETY: a live timeline semaphore.
+                unsafe { host.device.get_semaphore_counter_value(l.semaphore) }.unwrap_or(0)
+            };
+            while l.pending.front().is_some_and(|p| p.value <= reached) {
+                let p = l.pending.pop_front().expect("pending");
+                l.busy_ns += p.timing.map_or(0.0, |t| self.elapsed_ns(host, t));
+            }
+            if let Some(p) = l.pending.front() {
+                done = done.min(p.ticket - 1);
+            }
+        }
+        done
+    }
+
+    /// Nanoseconds between two timestamps of a run submission.
+    fn elapsed_ns(&self, host: &Host, (start, end): (u32, u32)) -> f64 {
+        let Some(pool) = self.timing else { return 0.0 };
+        let mut a = [0u64; 1];
+        let mut b = [0u64; 1];
+        // SAFETY: slots of our pool, written by a submission that has run.
+        let read = unsafe {
+            host.device
+                .get_query_pool_results(pool, start, &mut a, vk::QueryResultFlags::TYPE_64)
+                .is_ok()
+                && host
+                    .device
+                    .get_query_pool_results(pool, end, &mut b, vk::QueryResultFlags::TYPE_64)
+                    .is_ok()
+        };
+        if read && b[0] >= a[0] {
+            (b[0] - a[0]) as f64 * self.period_ns
+        } else {
+            0.0
+        }
+    }
+
+    /// The value `line` has reached on the card.
+    pub fn line_completed(&self, host: &Host, line: Line) -> u64 {
+        let sem = self.state().lines[line].semaphore;
+        // SAFETY: a live timeline semaphore.
+        unsafe { host.device.get_semaphore_counter_value(sem) }.unwrap_or(0)
+    }
+
+    /// Waits until everything given up to `ticket` has run, at most
+    /// `timeout_ns`.
+    pub fn wait(&self, host: &Host, ticket: u64, timeout_ns: u64) -> bool {
+        let targets: Vec<(vk::Semaphore, u64)> = {
+            let s = self.state();
+            s.lines
+                .iter()
+                .filter_map(|l| {
+                    let last = l.pending.iter().take_while(|p| p.ticket <= ticket).last()?;
+                    Some((l.semaphore, last.value))
+                })
+                .collect()
+        };
+        wait_semaphores(host, &targets, vk::SemaphoreWaitFlags::empty(), timeout_ns)
+    }
+
+    /// Waits until any of `values` (line, value) is reached, at most
+    /// `timeout_ns`.
+    pub fn wait_any(&self, host: &Host, values: &[(Line, u64)], timeout_ns: u64) -> bool {
+        let targets: Vec<(vk::Semaphore, u64)> = {
+            let s = self.state();
+            values
+                .iter()
+                .map(|&(l, v)| (s.lines[l].semaphore, v))
+                .collect()
+        };
+        wait_semaphores(host, &targets, vk::SemaphoreWaitFlags::ANY, timeout_ns)
+    }
+
+    /// A recorder whose last submission has run (or a new one), taken.
+    fn take_recorder(&self, host: &Host, s: &mut State) -> Result<usize> {
+        let completed = self.completed_locked(host, s);
+        if let Some(i) = s
+            .recorders
+            .iter()
+            .position(|r| r.done_at != u64::MAX && r.done_at <= completed)
+        {
+            s.recorders[i].done_at = u64::MAX;
+            return Ok(i);
+        }
+        let device = &host.device;
+        // SAFETY: valid create and allocate infos.
+        let (pool, cmd) = unsafe {
+            let pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(self.family)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )?;
+            let cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            (pool, cmd)
+        };
+        s.recorders.push(Recorder {
+            pool,
+            cmd,
+            done_at: u64::MAX,
+            scratch: Scratch::default(),
+        });
+        Ok(s.recorders.len() - 1)
+    }
+
+    /// A command buffer to record into on this thread (the list workers
+    /// record parts in parallel), begun, with its start timestamp. Hand it
+    /// back with [`Timeline::submit_on`] or [`Timeline::abandon`].
+    pub fn begin(&self, host: &Host) -> Result<Recording> {
+        let (index, pool, cmd, mut scratch, pair) = {
+            let mut s = self.state();
+            let i = self.take_recorder(host, &mut s)?;
+            let pair = self.timing.map(|_| {
+                let p = 2 * (s.next_pair % PAIRS);
+                s.next_pair = s.next_pair.wrapping_add(1);
+                p
+            });
+            let r = &mut s.recorders[i];
+            (i, r.pool, r.cmd, std::mem::take(&mut r.scratch), pair)
+        };
+        scratch.reset();
+        let device = &host.device;
+        // SAFETY: the recorder's last submission has run and it is ours.
+        unsafe {
+            device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            if let (Some(qp), Some(p)) = (self.timing, pair) {
+                device.cmd_reset_query_pool(cmd, qp, p, 2);
+                device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, qp, p);
+            }
+        }
+        Ok(Recording {
+            index,
+            cmd,
+            pair,
+            scratch,
+        })
+    }
+
+    /// Records a one-shot command buffer with `f` and submits it on the
+    /// host line; returns its ticket.
+    pub fn record(
+        &self,
+        host: &Host,
+        f: impl FnOnce(&ash::Device, vk::CommandBuffer),
+    ) -> Result<u64> {
+        let rec = self.begin(host)?;
+        f(&host.device, rec.cmd);
+        Ok(self.submit(host, HOST, vec![rec], &[])?.1)
+    }
+
+    /// Ends `recordings` (begun by [`Timeline::begin`]) and submits them in
+    /// order as one submission on `line` (none: a marker that only waits and
+    /// signals), behind the line's previous value, the host line's last
+    /// value and `waits` (line, value); on the host line, behind everything
+    /// given before. Returns the line value it signals.
+    pub fn submit_on(
+        &self,
+        host: &Host,
+        line: Line,
+        recordings: Vec<Recording>,
+        waits: &[(Line, u64)],
+    ) -> Result<u64> {
+        Ok(self.submit(host, line, recordings, waits)?.0)
+    }
+
+    /// [`Timeline::submit_on`]: the line value and the ticket.
+    fn submit(
+        &self,
+        host: &Host,
+        line: Line,
+        recordings: Vec<Recording>,
+        waits: &[(Line, u64)],
+    ) -> Result<(u64, u64)> {
+        let device = &host.device;
+        let mut cmds = Vec::with_capacity(recordings.len());
+        for (k, r) in recordings.iter().enumerate() {
+            // SAFETY: begun by `begin`, recorded by its owner only.
+            unsafe {
+                if let (Some(qp), Some(p), true) = (self.timing, r.pair, k + 1 == recordings.len())
+                {
+                    device.cmd_write_timestamp2(
+                        r.cmd,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        qp,
+                        p + 1,
+                    );
+                }
+                device.end_command_buffer(r.cmd)?;
+            }
+            cmds.push(r.cmd);
+        }
+        let timing = match (
+            recordings.first().and_then(|r| r.pair),
+            recordings.last().and_then(|r| r.pair),
+        ) {
+            (Some(a), Some(b)) => Some((a, b + 1)),
+            _ => None,
+        };
+        let mut s = self.state();
+        let r = self.submit_locked(host, &mut s, line, &cmds, waits, timing);
+        let done = if r.is_ok() { s.ticket } else { 0 };
+        for rec in recordings {
+            let recorder = &mut s.recorders[rec.index];
+            recorder.done_at = done;
+            recorder.scratch = rec.scratch;
+        }
+        r.map(|value| (value, done))
+    }
+
+    fn submit_locked(
         &self,
         host: &Host,
         s: &mut State,
+        line: Line,
         cmds: &[vk::CommandBuffer],
+        extra: &[(Line, u64)],
+        timing: Option<(u32, u32)>,
     ) -> Result<u64> {
         anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
-        let value = s.last + 1;
-        let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.semaphore)
-            .value(s.last)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let l = &s.lines[line];
+        let value = l.last + 1;
+        let waits = submit_infos(&waits(s, line, extra));
         let signals = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.semaphore)
+            .semaphore(l.semaphore)
             .value(value)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let infos: Vec<vk::CommandBufferSubmitInfo> = cmds
@@ -163,163 +566,32 @@ impl Timeline {
             .wait_semaphore_infos(&waits)
             .command_buffer_infos(&infos)
             .signal_semaphore_infos(&signals);
-        // SAFETY: the queue is used under the state's lock only.
+        // SAFETY: queues are used under the state's lock only.
         self.check(unsafe {
             host.device
-                .queue_submit2(self.queue, &[submit], vk::Fence::null())
+                .queue_submit2(l.queue, &[submit], vk::Fence::null())
         })
         .context("vkQueueSubmit2")?;
-        s.last = value;
+        commit(s, line, value, timing);
         Ok(value)
-    }
-
-    /// Records a one-shot command buffer with `f` and submits it; returns
-    /// the value it signals.
-    pub fn record(
-        &self,
-        host: &Host,
-        f: impl FnOnce(&ash::Device, vk::CommandBuffer),
-    ) -> Result<u64> {
-        let completed = self.completed(host);
-        let mut s = self.state();
-        let device = &host.device;
-        let at = s
-            .recorders
-            .iter()
-            .position(|r| r.done_at != u64::MAX && r.done_at <= completed);
-        let i = match at {
-            Some(i) => i,
-            None => {
-                // SAFETY: valid create and allocate infos.
-                let (pool, cmd) = unsafe {
-                    let pool = device.create_command_pool(
-                        &vk::CommandPoolCreateInfo::default()
-                            .queue_family_index(self.family)
-                            .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                        None,
-                    )?;
-                    let cmd = device.allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(1),
-                    )?[0];
-                    (pool, cmd)
-                };
-                s.recorders.push(Recorder {
-                    pool,
-                    cmd,
-                    done_at: 0,
-                });
-                s.recorders.len() - 1
-            }
-        };
-        let (pool, cmd) = (s.recorders[i].pool, s.recorders[i].cmd);
-        // SAFETY: the recorder's last submission has completed.
-        unsafe {
-            device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
-            device.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            f(device, cmd);
-            device.end_command_buffer(cmd)?;
-            let value = self.submit_locked(host, &mut s, &[cmd])?;
-            s.recorders[i].done_at = value;
-            Ok(value)
-        }
-    }
-
-    /// A command buffer of the pool's to record into on this thread (M2b:
-    /// the list workers record parts in parallel), begun. Hand it back with
-    /// [`Timeline::submit_recordings`] or [`Timeline::abandon`].
-    pub fn begin(&self, host: &Host) -> Result<Recording> {
-        let completed = self.completed(host);
-        let device = &host.device;
-        let (i, pool, cmd) = {
-            let mut s = self.state();
-            let at = s
-                .recorders
-                .iter()
-                .position(|r| r.done_at != u64::MAX && r.done_at <= completed);
-            let i = match at {
-                Some(i) => i,
-                None => {
-                    // SAFETY: valid create and allocate infos.
-                    let (pool, cmd) = unsafe {
-                        let pool = device.create_command_pool(
-                            &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(self.family)
-                                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                            None,
-                        )?;
-                        let cmd = device.allocate_command_buffers(
-                            &vk::CommandBufferAllocateInfo::default()
-                                .command_pool(pool)
-                                .level(vk::CommandBufferLevel::PRIMARY)
-                                .command_buffer_count(1),
-                        )?[0];
-                        (pool, cmd)
-                    };
-                    s.recorders.push(Recorder {
-                        pool,
-                        cmd,
-                        done_at: 0,
-                    });
-                    s.recorders.len() - 1
-                }
-            };
-            // Taken: no other thread picks it until it is handed back.
-            s.recorders[i].done_at = u64::MAX;
-            (i, s.recorders[i].pool, s.recorders[i].cmd)
-        };
-        // SAFETY: the recorder's last submission has completed and it is ours.
-        unsafe {
-            device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
-            device.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-        }
-        Ok(Recording { index: i, cmd })
-    }
-
-    /// Ends `recordings` (begun by [`Timeline::begin`]) and submits them in
-    /// order as one submission behind everything given before; returns the
-    /// value it signals.
-    pub fn submit_recordings(&self, host: &Host, recordings: Vec<Recording>) -> Result<u64> {
-        let device = &host.device;
-        let mut cmds = Vec::with_capacity(recordings.len());
-        for r in &recordings {
-            // SAFETY: begun by `begin`, recorded by its owner only.
-            unsafe { device.end_command_buffer(r.cmd) }?;
-            cmds.push(r.cmd);
-        }
-        let mut s = self.state();
-        // SAFETY: as `submit`.
-        let r = unsafe { self.submit_locked(host, &mut s, &cmds) };
-        let done = *r.as_ref().unwrap_or(&0);
-        for rec in recordings {
-            s.recorders[rec.index].done_at = done;
-        }
-        r
     }
 
     /// Hands back a recording that is not submitted.
     pub fn abandon(&self, host: &Host, recording: Recording) {
         // SAFETY: begun by `begin`; never submitted.
         let _ = unsafe { host.device.end_command_buffer(recording.cmd) };
-        self.state().recorders[recording.index].done_at = 0;
+        let mut s = self.state();
+        let r = &mut s.recorders[recording.index];
+        r.done_at = 0;
+        r.scratch = recording.scratch;
     }
 
-    /// Binds sparse memory behind everything given before; returns the
-    /// value it signals.
+    /// Binds sparse memory on the host line, behind everything given
+    /// before; returns its ticket.
     pub fn bind_sparse(&self, host: &Host, binds: &[BufferBinds]) -> Result<u64> {
         anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
         let mut s = self.state();
-        let value = s.last + 1;
+        let value = s.lines[HOST].last + 1;
         let infos: Vec<vk::SparseBufferMemoryBindInfo> = binds
             .iter()
             .map(|(buffer, b)| {
@@ -328,26 +600,40 @@ impl Timeline {
                     .binds(b)
             })
             .collect();
-        let wait_values = [s.last];
+        let (wait_sems, wait_values): (Vec<_>, Vec<_>) = waits(&s, HOST, &[]).into_iter().unzip();
         let signal_values = [value];
         let mut values = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
-        let sems = [self.semaphore];
+        let sems = [s.lines[HOST].semaphore];
         let info = vk::BindSparseInfo::default()
-            .wait_semaphores(&sems)
+            .wait_semaphores(&wait_sems)
             .signal_semaphores(&sems)
             .buffer_binds(&infos)
             .push_next(&mut values);
-        // SAFETY: the queue is used under the state's lock only; the binds
+        // SAFETY: queues are used under the state's lock only; the binds
         // name live buffers and memory.
         self.check(unsafe {
             host.device
-                .queue_bind_sparse(self.queue, &[info], vk::Fence::null())
+                .queue_bind_sparse(self.queues[0], &[info], vk::Fence::null())
         })
         .context("vkQueueBindSparse")?;
-        s.last = value;
-        Ok(value)
+        commit(&mut s, HOST, value, None);
+        Ok(s.ticket)
+    }
+
+    /// Each line's submissions and GPU busy time since the last call.
+    pub fn take_stats(&self, host: &Host) -> Vec<LineStats> {
+        let mut s = self.state();
+        self.completed_locked(host, &mut s);
+        s.lines
+            .iter_mut()
+            .map(|l| LineStats {
+                label: l.label.clone(),
+                submissions: std::mem::take(&mut l.submissions),
+                busy_ms: std::mem::take(&mut l.busy_ns) / 1e6,
+            })
+            .collect()
     }
 
     /// # Safety
@@ -357,8 +643,103 @@ impl Timeline {
         unsafe {
             for r in &s.recorders {
                 host.device.destroy_command_pool(r.pool, None);
+                for b in &r.scratch.buffers {
+                    b.destroy(host);
+                }
             }
-            host.device.destroy_semaphore(self.semaphore, None);
+            for l in &s.lines {
+                host.device.destroy_semaphore(l.semaphore, None);
+            }
+            if let Some(qp) = self.timing {
+                host.device.destroy_query_pool(qp, None);
+            }
         }
     }
+}
+
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Direct => "direct",
+        Kind::Compute => "compute",
+        Kind::Copy => "copy",
+    }
+}
+
+/// Notes an operation given to `line` that signals `value`.
+fn commit(s: &mut State, line: Line, value: u64, timing: Option<(u32, u32)>) {
+    s.ticket += 1;
+    let ticket = s.ticket;
+    let l = &mut s.lines[line];
+    l.last = value;
+    l.submissions += 1;
+    l.pending.push_back(Pending {
+        value,
+        ticket,
+        timing,
+    });
+}
+
+/// What an operation on `line` waits for (semaphore, value): the line's
+/// previous value; on the host line every line's last value; on a title
+/// line the host line's last value and `extra`.
+fn waits(s: &State, line: Line, extra: &[(Line, u64)]) -> Vec<(vk::Semaphore, u64)> {
+    let mut w: Vec<(Line, u64)> = Vec::new();
+    let mut add = |l: Line, v: u64| {
+        if v == 0 {
+            return;
+        }
+        match w.iter_mut().find(|(x, _)| *x == l) {
+            Some(e) => e.1 = e.1.max(v),
+            None => w.push((l, v)),
+        }
+    };
+    if line == HOST {
+        for (i, l) in s.lines.iter().enumerate() {
+            add(i, l.last);
+        }
+    } else {
+        add(line, s.lines[line].last);
+        add(HOST, s.lines[HOST].last);
+        for &(l, v) in extra {
+            add(l, v);
+        }
+    }
+    w.into_iter()
+        .map(|(l, v)| (s.lines[l].semaphore, v))
+        .collect()
+}
+
+fn submit_infos(waits: &[(vk::Semaphore, u64)]) -> Vec<vk::SemaphoreSubmitInfo<'static>> {
+    waits
+        .iter()
+        .map(|&(sem, v)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(sem)
+                .value(v)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        })
+        .collect()
+}
+
+fn wait_semaphores(
+    host: &Host,
+    targets: &[(vk::Semaphore, u64)],
+    flags: vk::SemaphoreWaitFlags,
+    timeout_ns: u64,
+) -> bool {
+    if targets.is_empty() {
+        return true;
+    }
+    let (sems, values): (Vec<_>, Vec<_>) = targets.iter().copied().unzip();
+    // SAFETY: live timeline semaphores.
+    unsafe {
+        host.device.wait_semaphores(
+            &vk::SemaphoreWaitInfo::default()
+                .flags(flags)
+                .semaphores(&sems)
+                .values(&values),
+            timeout_ns,
+        )
+    }
+    .is_ok()
 }

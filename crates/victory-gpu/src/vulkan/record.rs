@@ -16,9 +16,11 @@
 //! - **Dynamic rendering** begins at the first draw after the targets
 //!   change and ends at anything that is not a draw. Every image lives in
 //!   `GENERAL`; a title barrier is a full memory barrier.
-//! - **Not yet** (counted in the 10 s line): indirect execution, query
-//!   resolves, MSAA draws, tessellation and geometry stages, line loops
-//!   and quads.
+//! - **Indirect execution** (`record/indirect.rs`): records bounded by a
+//!   pass of ours into the command buffer's scratch, then drawn from it.
+//! - **Not yet** (counted in the 10 s line): query resolves, MSAA draws,
+//!   tessellation and geometry stages, line loops and quads; indirect
+//!   signatures of more than one argument.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +40,7 @@ use victory_shader::{HwStage, RootType};
 
 mod clear;
 mod copy;
+mod indirect;
 mod link;
 mod state;
 
@@ -139,6 +142,8 @@ pub(crate) struct Rec {
     pushed: bool,
     /// The open pass's attachment images (draws are counted on them).
     attached: Vec<Arc<Image>>,
+    /// Bounded indirect records in the command buffer's scratch.
+    indirect: indirect::Windows,
     /// Diagnostics: the last push constants, and the last draw's vertex
     /// attributes and buffers found.
     last_push: [u32; 64],
@@ -182,6 +187,7 @@ impl Default for Rec {
             state_set: None,
             pushed: false,
             attached: Vec::new(),
+            indirect: indirect::Windows::default(),
             last_push: [0; 64],
             last_inputs: (0, 0),
             last_user: String::new(),
@@ -289,6 +295,7 @@ impl Rec {
             self.pass = None;
             self.state_set = None;
             self.pushed = false;
+            self.indirect.clear();
         }
         self.cmd.as_ref().map(|r| r.cmd)
     }
@@ -764,27 +771,38 @@ impl Rec {
     }
 
     pub(crate) fn dispatch(&mut self, b: &'static Backend, x: u32, y: u32, z: u32) {
+        if let Some(cmd) = self.prepare_dispatch(b) {
+            // SAFETY: outside rendering, the pipeline bound.
+            unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
+            STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Everything a dispatch needs bound; `None` (counted) if it is
+    /// skipped. What it writes may be indirect records: no window holds.
+    fn prepare_dispatch(&mut self, b: &'static Backend) -> Option<vk::CommandBuffer> {
         let Some((shaders, _)) = crate::pipeline::parts(self.pipeline) else {
             skipped(false);
-            return;
+            return None;
         };
         let stage = match stage_of(b, shaders, "compute") {
             Ok(Some(s)) => s,
             Ok(None) => {
                 skipped(false);
-                return;
+                return None;
             }
             Err(waiting) => {
                 skipped(waiting);
-                return;
+                return None;
             }
         };
         let Some(pipeline) = stage.part.filter(|_| stage.stage == HwStage::Cs) else {
             skipped(false);
-            return;
+            return None;
         };
         self.end_pass(b);
-        let Some(cmd) = self.cmd(b) else { return };
+        let cmd = self.cmd(b)?;
+        self.indirect.clear();
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
@@ -796,9 +814,8 @@ impl Rec {
                 self.bound_compute = pipeline;
             }
             self.push(b, cmd, &[&stage], true);
-            b.host.device.cmd_dispatch(cmd, x, y, z);
         }
-        STATS[1].fetch_add(1, Ordering::Relaxed);
+        Some(cmd)
     }
 
     pub(crate) fn not_yet(&mut self, why: NotYet) {
@@ -893,6 +910,7 @@ pub(crate) fn report() {
         skipped_no_pipeline = s[3],
         not_yet = s[4],
         not_yet_reasons = %NotYet::text(),
+        indirect = %indirect::text(),
         command_buffers = s[5],
         links = s[6],
         maps_rebound = s[7],

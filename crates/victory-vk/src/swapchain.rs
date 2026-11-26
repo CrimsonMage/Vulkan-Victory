@@ -275,16 +275,13 @@ impl Swapchain {
             let swapchains = [self.swapchain];
             let indices = [index];
             // Behind everything the queue was given, under its lock.
-            let presented = timeline.with_queue(|queue, last| {
-                let waits = [
+            let presented = timeline.with_queue_joined(|queue, joined| {
+                let mut waits = vec![
                     vk::SemaphoreSubmitInfo::default()
                         .semaphore(acquired)
                         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
-                    vk::SemaphoreSubmitInfo::default()
-                        .semaphore(timeline.semaphore)
-                        .value(last)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
                 ];
+                waits.extend_from_slice(joined);
                 let submitted = timeline.check(
                     d.queue_submit2(
                         queue,
@@ -295,10 +292,8 @@ impl Swapchain {
                         fence,
                     ),
                 );
-                if let Err(e) = submitted {
-                    return (Err(e), false);
-                }
-                let r = timeline.check(
+                submitted?;
+                timeline.check(
                     host.swapchain.queue_present(
                         queue,
                         &vk::PresentInfoKHR::default()
@@ -306,8 +301,7 @@ impl Swapchain {
                             .swapchains(&swapchains)
                             .image_indices(&indices),
                     ),
-                );
-                (r, false)
+                )
             })?;
             match presented {
                 Ok(false) => {}
