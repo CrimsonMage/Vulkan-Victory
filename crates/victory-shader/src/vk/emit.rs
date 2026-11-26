@@ -160,6 +160,8 @@ pub struct Emit<'a> {
     /// Every edge into a construct's merge so far.
     merge_preds: HashMap<Id, Vec<Id>>,
     images: HashMap<(u8, bool, bool, bool, u32, bool, u32), Id>,
+    /// R64ui storage images of set 0 binding 3 by (dim, arrayed, ms).
+    images64: HashMap<(u8, bool, bool), Id>,
     samplers: Id,
     spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,
@@ -244,6 +246,7 @@ impl<'a> Emit<'a> {
             cphi: HashMap::new(),
             merge_preds: HashMap::new(),
             images: HashMap::new(),
+            images64: HashMap::new(),
             samplers: 0,
             spec_samplers: HashMap::new(),
             helpers: HashMap::new(),

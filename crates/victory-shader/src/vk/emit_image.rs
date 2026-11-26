@@ -58,7 +58,10 @@ impl Emit<'_> {
                 let (im, _) = self.load_image(c, false, false, false, a.tw);
                 self.m.op(op::IMAGE_QUERY_LEVELS, self.t.u32_, &[im])
             }
-            ImageKind::Atomic(o) => self.img_atomic(o, class, a),
+            ImageKind::Atomic(o) => {
+                let v2 = self.m.t_vec(self.t.u32_, 2);
+                if tid == v2 { self.img_atomic64(o, class, a) } else { self.img_atomic(o, class, a) }
+            }
         }
     }
 
@@ -277,5 +280,117 @@ impl Emit<'_> {
         } else {
             self.m.op(o, u, &[tp, scope, sem, a.data.unwrap()])
         }
+    }
+
+    /// A 64-bit image atomic (data and result: uvec2, low dword first)
+    /// through a texel pointer of the image's R64_UINT storage view, set 0
+    /// binding 3 at the T#'s slot (ABI v5).
+    fn img_atomic64(&mut self, o: u16, class: ImageClass, a: ImgArgs) -> Id {
+        let (u, q) = (self.t.u32_, self.t.u64_);
+        let (var, ity) = self.image64_var(class);
+        let k = self.c32(0xFF_FFFF);
+        let slot = self.m.op(op::BITWISE_AND, u, &[a.tw, k]);
+        let pi = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, ity);
+        let ptr = self.m.op(op::ACCESS_CHAIN, pi, &[var, slot]);
+        let pt = self.m.t_ptr(11, q); // StorageClass Image
+        let s = a.sample.unwrap_or_else(|| self.c32(0));
+        let tp = self.m.op(60, pt, &[ptr, a.coord, s]); // OpImageTexelPointer
+        let (scope, sem) = (self.c32(en::SCOPE_DEVICE), self.c32(0));
+        let x = self.m.op(op::BITCAST, q, &[a.data.unwrap()]);
+        let old = if o == op::ATOMIC_COMPARE_EXCHANGE {
+            let c = self.m.op(op::BITCAST, q, &[a.cmp.unwrap()]);
+            self.m.op(o, q, &[tp, scope, sem, sem, x, c])
+        } else {
+            self.m.op(o, q, &[tp, scope, sem, x])
+        };
+        let v2 = self.m.t_vec(u, 2);
+        self.m.op(op::BITCAST, v2, &[old])
+    }
+
+    /// The `R64ui` storage images of set 0 binding 3, one variable per
+    /// shape.
+    fn image64_var(&mut self, c: ImageClass) -> (Id, Id) {
+        let q = self.t.u64_;
+        // cubes are stored as 2D arrays (as on binding 1)
+        let (dim, arrayed) = if c.dim == 3 { (1, true) } else { (c.dim, c.arrayed) };
+        let ity = self.m.t_image_df(q, u32::from(dim), false, arrayed, c.ms, 2, IMAGE_FORMAT_R64UI);
+        if let Some(&v) = self.images64.get(&(dim, arrayed, c.ms)) {
+            return (v, ity);
+        }
+        self.m.extension("SPV_EXT_shader_image_int64");
+        self.m.capability(CAP_INT64_IMAGE_EXT);
+        self.m.capability(en::CAP_INT64_ATOMICS);
+        if dim == 0 {
+            self.m.capability(en::CAP_IMAGE_1D);
+        }
+        if c.ms {
+            self.m.capability(en::CAP_STORAGE_IMAGE_MULTISAMPLE);
+        }
+        let arr = self.m.t_array(ity, 1 << 20);
+        let p = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
+        let v = self.m.variable(p, en::SC_UNIFORM_CONSTANT);
+        self.m.decorate(v, en::DEC_DESCRIPTOR_SET, &[0]);
+        self.m.decorate(v, en::DEC_BINDING, &[3]);
+        self.interface.push(v);
+        self.images64.insert((dim, arrayed, c.ms), v);
+        (v, ity)
+    }
+}
+
+/// SPIR-V image format `R64ui` and capability `Int64ImageEXT`
+/// (SPV_EXT_shader_image_int64).
+const IMAGE_FORMAT_R64UI: u32 = 40;
+const CAP_INT64_IMAGE_EXT: u32 = 5016;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vk::lift::Interface;
+    use crate::vk::tir::{Block, Func, Node};
+
+    /// Decorations `Binding` of the module's variables.
+    fn bindings(words: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = 5;
+        while at < words.len() {
+            let n = (words[at] >> 16) as usize;
+            if words[at] & 0xffff == 71 && words.get(at + 2) == Some(&33) {
+                out.push(words[at + 3]);
+            }
+            at += n.max(1);
+        }
+        out
+    }
+
+    #[test]
+    fn a_two_dword_atomic_is_a_u64_atomic_on_binding_3() {
+        let mut f = Func::default();
+        let u2 = Ty::vec(S::U32, 2);
+        let tw = f.konst(Ty::U32, 1);
+        let (a, b) = (f.konst(Ty::U32, 2), f.konst(Ty::U32, 3));
+        let coord = f.push(Node { op: Op::Spv(op::COMPOSITE_CONSTRUCT), ty: u2, args: vec![a, b], imm: vec![] });
+        let data = f.push(Node { op: Op::Spv(op::COMPOSITE_CONSTRUCT), ty: u2, args: vec![b, a], imm: vec![] });
+        let class = ImageClass { dim: 1, arrayed: false, ms: false, uint: true, storage: true, dynamic: false, cube_layers: false };
+        let kind = ImageKind::Atomic(op::ATOMIC_U_MAX);
+        let at = f.push(Node { op: Op::Image { kind, class, sampler: Sampler::None, flags: img::DATA }, ty: u2, args: vec![tw, coord, data], imm: vec![] });
+        f.blocks.push(Block { phis: vec![], preds: vec![], body: vec![Item::N(coord), Item::N(data), Item::N(at)], term: Term::Return });
+        let g = Graph::new(&f).unwrap();
+        let iface = Interface::default();
+        let st = Stage {
+            stage: HwStage::Ps,
+            local_size: [1, 1, 1],
+            out_types: HashMap::new(),
+            locs: HashMap::new(),
+            mesh: (0, 0),
+            mesh_split: None,
+            loop_limit: 1 << 14,
+            guard_id: 0,
+            no_sel: HashSet::new(),
+        };
+        let e = Emit::new(&f, &g, &iface, &st).run().unwrap();
+        let u = crate::vk::usage::usage(&e.words);
+        assert!(u.capabilities.contains(&CAP_INT64_IMAGE_EXT));
+        assert!(u.capabilities.contains(&en::CAP_INT64_ATOMICS));
+        assert_eq!(bindings(&e.words), vec![3]);
     }
 }

@@ -240,6 +240,32 @@ fn shape(image: &Image, dimension: u32, desc: Option<&[u32; 10]>, unordered: boo
     }
 }
 
+/// Diagnostics: each distinct unordered view of a 64-bit-class format
+/// (the alpha prepass's V-buffer, whose texels take 64-bit atomics, ABI v5),
+/// once: the resource's and the view's DXGI formats and the image's.
+fn note_wide_uav(image: &Image, resource_format: u32, view_format: u32, format: vk::Format) {
+    if !cfg!(feature = "diagnostics") || images::format_bytes(format) != 8 {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<(u32, u32, vk::Format)>> = std::sync::Mutex::new(Vec::new());
+    let key = (resource_format, view_format, image.format);
+    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.contains(&key) || seen.len() >= 32 {
+        return;
+    }
+    seen.push(key);
+    tracing::info!(
+        resource_dxgi = resource_format,
+        view_dxgi = view_format,
+        image_format = ?image.format,
+        view_format = ?format,
+        width = image.extent.width,
+        height = image.extent.height,
+        usage = ?image.usage,
+        "Vulkan: an unordered view of a 64-bit-class format"
+    );
+}
+
 /// The view's format and aspect for the title's `view_format`, and
 /// whether it reads stencil.
 fn view_format(image: &Image, view_format: u32) -> (vk::Format, vk::ImageAspectFlags, bool) {
@@ -286,6 +312,9 @@ fn texture_words(
     let mapping = if unordered { 0 } else { desc.map_or(0, |d| d[2]) };
     let shape = shape(&image, dimension, desc, unordered);
     let (format, aspect, stencil) = view_format(&image, title_format);
+    if unordered {
+        note_wide_uav(&image, rdesc.format, title_format, format);
+    }
     let comps = components(mapping);
     let key = ViewKey {
         format,

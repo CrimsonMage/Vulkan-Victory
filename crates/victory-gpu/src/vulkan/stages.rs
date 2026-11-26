@@ -25,7 +25,7 @@ use super::Backend;
 use crate::pipeline::Shader;
 
 /// The ABI version the host binds for (`docs/vulkan-abi.md`).
-pub(crate) const HOST_ABI: u32 = 4;
+pub(crate) const HOST_ABI: u32 = 5;
 
 /// Stage workers: half the logical processors, 4 to 8, below the title's
 /// threads (`SetThreadPriority` below normal): draws wait for their stages.
@@ -167,13 +167,20 @@ fn make_layout(b: &Backend) -> anyhow::Result<Layout> {
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(IMAGE_SLOTS)
             .stage_flags(all),
+        // ABI v5: R64_UINT storage views of two-dword images (64-bit image
+        // atomics), at the T#'s slot.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(IMAGE_SLOTS)
+            .stage_flags(all),
     ];
     let samplers = [vk::DescriptorSetLayoutBinding::default()
         .binding(0)
         .descriptor_type(vk::DescriptorType::SAMPLER)
         .descriptor_count(SAMPLER_SLOTS)
         .stage_flags(all)];
-    let partly = [vk::DescriptorBindingFlags::PARTIALLY_BOUND; 3];
+    let partly = [vk::DescriptorBindingFlags::PARTIALLY_BOUND; 4];
     // SAFETY: valid create infos; the layout lives as long as the backend.
     unsafe {
         let set = |bindings: &[vk::DescriptorSetLayoutBinding]| {

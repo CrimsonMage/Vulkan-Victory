@@ -1,8 +1,9 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v4** (2026-11-26: mesh output memory within 32 KiB, a mesh
-program over it split into `VkShader::mesh_parts` host groups in y;
-v3 2026-11-26: the loop guard buffer in push dwords 2–3; v2
+Status: **v5** (2026-11-26: 64-bit image atomics on R64_UINT views of
+two-dword images, set 0 binding 3; v4 2026-11-26: mesh output memory
+within 32 KiB, a mesh program over it split into `VkShader::mesh_parts`
+host groups in y; v3 2026-11-26: the loop guard buffer in push dwords 2–3; v2
 2026-11-26: semantic registry, six-layer 2D-array views of cubes on set 0
 binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
 amended the same day: immediate samplers in set 1 by specialization
@@ -30,7 +31,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 4`
+`ABI_VERSION = 5`
 
 ## 1. Vulkan requirements
 
@@ -189,6 +190,7 @@ the shader.
 | 0 | 0 | `SAMPLED_IMAGE[1 << 20]` | image views, indexed by a T#'s slot |
 | 0 | 1 | `STORAGE_IMAGE[1 << 20]` | storage views of UAV textures, indexed by the same slot |
 | 0 | 2 | `SAMPLED_IMAGE[1 << 20]` | cube and cube-array images as `VK_IMAGE_VIEW_TYPE_2D_ARRAY` views (6 × N layers), indexed by the same slot; other slots may stay unwritten |
+| 0 | 3 | `STORAGE_IMAGE[1 << 20]` | `R64_UINT` storage views of UAV textures of a two-dword format (R32G32 UINT, SINT, SFLOAT), indexed by the same slot, for 64-bit image atomics; other slots stay null |
 | 1 | 0 | `SAMPLER[4096]` | heap samplers, indexed by an S#'s slot; immediate samplers in slots the host reserves |
 | 3 | 0 | `UNIFORM_BUFFER` | the memory map (section 3) |
 
@@ -214,7 +216,22 @@ offsets (`_o`), at (s − 1, t − 1, slice · 6 + face) from the console's
 Other cube samples use binding 0's cube view (filtering across faces stays
 exact there).
 
-**Slot 0 is the null image** on bindings 0, 1 and 2 (a null descriptor, or
+**64-bit image atomics.** An `image_atomic_*` with two data dwords (four
+for `cmpswap`: ACO's 64-bit image atomics, `dmask` 0x3 / 0xf) works on one
+64-bit texel, low dword first: the translator reads the image as
+`OpTypeImage %u64 Dim Sampled=2 Format=R64ui` on binding 3
+(`Int64ImageEXT`, `SPV_EXT_shader_image_int64`) and does a u64 atomic
+through `OpImageTexelPointer`; the result (`glc`) is the old texel's two
+dwords. Other programs keep reading and writing the image as two 32-bit
+channels on bindings 0 and 1. The host makes the R64_UINT view of every
+storage view of such a format (images are `MUTABLE_FORMAT`; R32G32 and
+R64 are one compatibility class) when the device has
+`shaderImageInt64Atomics` and R64_UINT storage atomics, and refuses a
+module with `Int64ImageEXT` on a device without them ("64-bit image
+atomics without shaderImageInt64Atomics"). Binding 3 costs 2^20 storage
+descriptors (4 MiB at NVIDIA's 4 bytes each).
+
+**Slot 0 is the null image** on bindings 0 to 3 (a null descriptor, or
 a 1 × 1 black view where `nullDescriptor` is missing); the host never
 hands it out. A T# that fails the check word (5.2) reads slot 0.
 

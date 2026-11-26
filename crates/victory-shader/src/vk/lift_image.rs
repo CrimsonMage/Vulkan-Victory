@@ -304,37 +304,48 @@ impl Lift<'_> {
         Ok(())
     }
 
+    /// An image atomic. Two data dwords (four for cmpswap) are one 64-bit
+    /// texel, low dword first (ACO's 64-bit image atomics: the alpha
+    /// prepass programs' depth-and-payload maximum): a u64 atomic on the
+    /// image's R64_UINT view (emit_image.rs); the result is the old texel's
+    /// two dwords.
     fn image_atomic(&mut self, m: &mut Mimg) -> Res<()> {
         let opc = atomic_op(m.name).ok_or(unsupported(m.inst.machine.offset, m.name))?;
-        let wide = !m.rest.contains("cmpswap") && m.dmask.count_ones() > 1;
-        if wide {
-            // two data dwords: one 64-bit texel (the alpha prepass programs'
-            // depth-and-payload maximum). Only the low dword takes part
-            // until the host gives such images a 64-bit view.
-            self.approx("a 64-bit image atomic works on the texel's low dword only");
+        let cmpswap = m.rest.contains("cmpswap");
+        let words: u8 = if m.dmask.count_ones() > if cmpswap { 2 } else { 1 } { 2 } else { 1 };
+        if words == 2 && matches!(opc, op::ATOMIC_F_MIN_EXT | op::ATOMIC_F_MAX_EXT) {
+            return Err(unsupported(m.inst.machine.offset, "a 64-bit float image atomic"));
         }
         let coord = self.next_vec(m, m.coords, false)?;
         m.args.push(coord);
-        let x = self.opnd_dw(m.inst, &m.data, 0, false)?;
-        let x = self.u32v(x);
+        let x = self.atomic_word(m, 0, words)?;
         Self::push_opt(m, img::DATA, Some(x));
-        if m.rest.contains("cmpswap") {
-            let y = self.opnd_dw(m.inst, &m.data, 1, false)?;
-            let y = self.u32v(y);
+        if cmpswap {
+            let y = self.atomic_word(m, words, words)?;
             Self::push_opt(m, img::CMP, Some(y));
         }
         let class = ImageClass { uint: true, storage: true, ..m.class };
         let args = std::mem::take(&mut m.args);
-        let r = self.emit(Op::Image { kind: ImageKind::Atomic(opc), class, sampler: Sampler::None, flags: m.flags }, Ty::U32, args);
+        let ty = Ty::vec(S::U32, words);
+        let r = self.emit(Op::Image { kind: ImageKind::Atomic(opc), class, sampler: Sampler::None, flags: m.flags }, ty, args);
         if m.glc {
-            self.def(m.inst, Reg::V(m.dreg), R::D(r));
-            if wide {
-                // the old texel's high dword: not read (see above)
-                let z = self.k32(0);
-                self.def(m.inst, Reg::V(m.dreg + 1), R::D(z));
+            for k in 0..words {
+                let d = if words == 1 { r } else { self.extract(r, u32::from(k)) };
+                self.def(m.inst, Reg::V(m.dreg + k), R::D(d));
             }
         }
         Ok(())
+    }
+
+    /// Data dwords `first..first + words` of an atomic: a u32, or a uvec2
+    /// (low dword first).
+    fn atomic_word(&mut self, m: &Mimg, first: u8, words: u8) -> Res<V> {
+        let mut dws = Vec::new();
+        for k in first..first + words {
+            let x = self.opnd_dw(m.inst, &m.data, k, false)?;
+            dws.push(self.u32v(x));
+        }
+        Ok(if words == 1 { dws[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 2), &dws) })
     }
 
     /// Width, height, depth or layers (1 past the image's), and levels.
