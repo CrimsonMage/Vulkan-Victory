@@ -111,6 +111,23 @@ fn blend_factor(f: D3D12_BLEND) -> vk::BlendFactor {
 }
 
 impl Rec {
+    /// A digest of everything [`dynamic`](Self::dynamic) sets from: the
+    /// state is set again only when it changes within a command buffer
+    /// (binding a pipeline keeps dynamic state).
+    pub(super) fn state_key(&self, gs: &GraphicsState, topology: vk::PrimitiveTopology, count: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (std::ptr::from_ref(gs) as usize, topology.as_raw(), count, self.stencil_ref).hash(&mut h);
+        for v in &self.viewports {
+            [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth].map(f32::to_bits).hash(&mut h);
+        }
+        for r in &self.scissors {
+            (r.offset.x, r.offset.y, r.extent.width, r.extent.height).hash(&mut h);
+        }
+        (self.blend.map(f32::to_bits), self.depth_bounds.0.to_bits(), self.depth_bounds.1.to_bits()).hash(&mut h);
+        h.finish()
+    }
+
     /// Sets every dynamic state the parts declare.
     ///
     /// # Safety

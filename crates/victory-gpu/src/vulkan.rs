@@ -549,6 +549,15 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     }
 }
 
+/// The title released a texture resource (its last reference).
+pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDesc) {
+    if on()
+        && let Some(b) = backend()
+    {
+        images::resource_gone(b, address, desc);
+    }
+}
+
 pub(crate) fn title_memory_released(at: usize, len: usize) {
     let Some(b) = backend() else { return };
     images::released(b, at as u64, len as u64);
