@@ -275,6 +275,11 @@ impl PoolView {
         Ok((unbind, bind))
     }
 
+    /// Bytes of card memory the view's blocks take.
+    pub fn card_bytes(&self) -> u64 {
+        self.blocks.len() as u64 * u64::from(BLOCK_PAGES) * PAGE
+    }
+
     /// A card page for a new physical page: a free one, a new block within
     /// the budget, or the least recently touched page's (evicted).
     fn slot(

@@ -416,6 +416,31 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
     }
 }
 
+/// The live budget: every 60 frames each pool view may take what the
+/// card's budget leaves beside everything else in use now (images,
+/// imports, the swapchain, other programs), less 512 MiB of room; at least
+/// 512 MiB. Without `VK_EXT_memory_budget` the start's figure stays.
+fn follow_budget(b: &Backend, frame: u64) {
+    if frame % 60 != 0 || !b.host.caps.memory_budget {
+        return;
+    }
+    let Some((budget, usage)) = b
+        .host
+        .heaps()
+        .iter()
+        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .filter_map(|(_, bu)| *bu)
+        .max_by_key(|(budget, _)| *budget)
+    else {
+        return;
+    };
+    let mut m = memory(b);
+    for p in &mut m.pools {
+        let others = usage.saturating_sub(p.card_bytes());
+        p.budget = budget.saturating_sub(others).saturating_sub(512 << 20).max(512 << 20);
+    }
+}
+
 /// Bytes of card memory the pool's GPU view may take: the card's budget
 /// less 2 GiB for render targets, textures and the swapchain, at least
 /// 512 MiB.
