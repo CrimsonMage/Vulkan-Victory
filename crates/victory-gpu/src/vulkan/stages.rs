@@ -304,6 +304,40 @@ struct Queue {
 
 static QUEUE: Mutex<Option<Queue>> = Mutex::new(None);
 static WORK: Condvar = Condvar::new();
+/// A stage was made (draws waiting for one look again).
+static DONE: Condvar = Condvar::new();
+
+/// How long a frame's draws and dispatches may wait for their stages, and
+/// how long they waited this frame (µs). The title's GPU watchdog fires
+/// after ~30 s without progress; 2 s a frame keeps far from it.
+const WAIT_BUDGET_US: u64 = 2_000_000;
+static WAITED_US: AtomicU64 = AtomicU64::new(0);
+static WAITED_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+
+/// A frame was presented: its waiting budget starts again.
+pub(crate) fn new_frame() {
+    WAITED_US.store(0, Ordering::Relaxed);
+}
+
+/// As [`lookup`], but a stage being compiled is waited for while the
+/// frame's budget lasts: a draw or dispatch skipped is lost (one-off
+/// passes such as the LUT bakes, a clear drawn as a rectangle), so the
+/// recording waits as a PC game's first use of a pipeline does.
+pub(crate) fn lookup_waiting(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
+    loop {
+        let found = lookup(b, shader);
+        if !matches!(found, Lookup::Waiting) || WAITED_US.load(Ordering::Relaxed) >= WAIT_BUDGET_US {
+            return found;
+        }
+        let t = Instant::now();
+        let q = queue();
+        if q.as_ref().is_some_and(|q| matches!(q.states.get(&shader.full), Some(State::Queued))) {
+            drop(DONE.wait_timeout(q, std::time::Duration::from_millis(20)));
+        }
+        WAITED_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        WAITED_TOTAL_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
 
 fn queue() -> std::sync::MutexGuard<'static, Option<Queue>> {
     QUEUE.lock().unwrap_or_else(|e| e.into_inner())
@@ -442,6 +476,7 @@ fn worker(b: &'static Backend) {
         if let Some(q) = queue().as_mut() {
             q.states.insert(shader.full, state);
         }
+        DONE.notify_all();
     }
 }
 
@@ -819,6 +854,7 @@ pub(crate) fn report() {
         slowest_ms = [0, 1, 2].map(|k| KINDS[k][2].load(Ordering::Relaxed) / 1000).iter().max().copied().unwrap_or(0),
         spirv_kwords = s[8] / 1000,
         from_disk = s[9],
+        draws_waited_ms = WAITED_TOTAL_US.load(Ordering::Relaxed) / 1000,
         translator_abi = victory_shader::vk::ABI_VERSION,
         host_abi = HOST_ABI,
         top_failures = %top.join("; "),

@@ -7,8 +7,9 @@
 //!
 //! - **Pipelines.** A draw links its stages' library parts (`stages`) with a
 //!   vertex-input part and a fragment-output part (the bound targets'
-//!   formats) by a fast link, cached per tuple. A draw whose stage is not
-//!   compiled yet is skipped and counted (the recording never waits).
+//!   formats) by a fast link, cached per tuple. A draw or dispatch whose
+//!   stage is being compiled waits for it, up to 2 s of waiting a frame
+//!   (`stages::lookup_waiting`); past that it is skipped and counted.
 //! - **User data** goes into push constants (ABI section 2) at every draw.
 //! - **Descriptor buffers** and the memory map are bound once per command
 //!   buffer.
@@ -16,8 +17,8 @@
 //!   change and ends at anything that is not a draw. Every image lives in
 //!   `GENERAL`; a title barrier is a full memory barrier.
 //! - **Not yet** (counted in the 10 s line): indirect execution, query
-//!   resolves, clears of rectangles (the whole view is cleared), MSAA
-//!   draws.
+//!   resolves, MSAA draws, tessellation and geometry stages, line loops
+//!   and quads.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

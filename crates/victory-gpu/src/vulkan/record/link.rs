@@ -179,11 +179,12 @@ pub(super) fn link(b: &Backend, key: LinkKey, vertex_input: Option<vk::Pipeline>
     Some(p)
 }
 
-/// Diagnostics: each stage a draw found not ready, once.
+/// Diagnostics: each stage a draw found not ready (after the frame's
+/// waiting budget), once.
 fn waiting_once(s: &crate::pipeline::Shader) {
     static SEEN: Mutex<Option<std::collections::HashSet<[u8; 32]>>> = Mutex::new(None);
     if cfg!(feature = "diagnostics") && lock(&SEEN).get_or_insert_with(Default::default).insert(s.full) {
-        tracing::info!(stage = s.stage, hash = %s.hash, name = %s.name, "Vulkan: a draw waits for a stage (skipped until it is compiled)");
+        tracing::info!(stage = s.stage, hash = %s.hash, name = %s.name, "Vulkan: a draw skipped: its stage was not compiled within the frame's waiting budget");
     }
 }
 
@@ -191,7 +192,7 @@ pub(super) fn stage_of(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shad
     let Some(s) = shaders.iter().find(|s| s.stage == name) else {
         return Ok(None);
     };
-    match stages::lookup(b, s) {
+    match stages::lookup_waiting(b, s) {
         Lookup::Ready(st) => Ok(Some(st)),
         Lookup::Waiting => {
             waiting_once(s);
