@@ -354,6 +354,7 @@ impl Engine {
             return;
         }
         ONCE.call_once(|| {
+            super::guard::at_loss(b);
             for f in &self.flights {
                 let (given, label) = b.timeline.line_given(f.line);
                 let from = f.trail.len().saturating_sub(16);

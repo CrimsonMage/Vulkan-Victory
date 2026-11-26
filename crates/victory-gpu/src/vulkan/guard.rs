@@ -60,6 +60,17 @@ pub(super) fn register(guard_id: u32, name: &str, hash: &str) {
 
 /// After a landing: a loop that gave up since the last check is logged
 /// (once per guard id) and the count is zeroed. Whether one gave up.
+/// At device loss: what the guard buffer holds (loops that gave up in
+/// work that never landed: the hang may be theirs).
+pub(super) fn at_loss(b: &Backend) {
+    let Some(buf) = buffer(b) else { return };
+    // SAFETY: as in `check`.
+    let words = unsafe { &*buf.mapped.cast::<[AtomicU32; 2]>() };
+    let (count, id) = (words[0].load(Ordering::Acquire), words[1].load(Ordering::Acquire));
+    let program = lock(&PROGRAMS).as_ref().and_then(|p| p.get(&id).cloned()).unwrap_or_else(|| "unknown".into());
+    tracing::error!(count, guard_id = format_args!("{id:#010x}"), program = %program, "Vulkan: device lost: the loop guard buffer (invocations that gave up in work not landed, and the last program that did)");
+}
+
 pub(super) fn check(b: &Backend) -> bool {
     let Some(buf) = buffer(b) else { return false };
     // SAFETY: the buffer's coherent mapping, 4-byte aligned; the card
