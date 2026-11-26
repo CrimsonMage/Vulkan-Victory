@@ -63,7 +63,17 @@ impl Lift<'_> {
         {
             return self.kf(0.0);
         }
+        static FORM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let form = FORM.get_or_init(|| std::env::var("VK_LEGACY").unwrap_or_default());
+        if form == "plain" {
+            return p;
+        }
         let z = self.kf(0.0);
+        if form == "nan" {
+            // differs only for a NaN operand times a non-zero one (0, not NaN)
+            let n = self.spv(op::IS_NAN, Ty::BOOL, &[p]);
+            return self.spv(op::SELECT, Ty::F32, &[n, z, p]);
+        }
         let az = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[a, z]);
         let bz = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[b, z]);
         let any = self.spv(op::LOGICAL_OR, Ty::BOOL, &[az, bz]);

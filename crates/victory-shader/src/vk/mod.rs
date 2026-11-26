@@ -215,6 +215,7 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {
         tir::dump(&f);
     }
+    tir::fold_branches(&mut f);
     tir::dce(&mut f);
     tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "1") {
@@ -244,16 +245,21 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         _ => 256,
     };
     let locs = if native.stage == HwStage::Ps { locations(&isg) } else { locations(&osg) };
-    let mut st = emit::Stage { stage: native.stage, local_size, out_types, loop_limit, locs, mesh, state_machine: false };
-    st.state_machine = std::env::var("VK_SM").is_ok_and(|v| v == "1");
-    let e = match emit::Emit::new(&f, &iface, &st).run() {
-        Err(emit::TANGLED_WHY) => {
-            st.state_machine = true;
-            emit::Emit::new(&f, &iface, &st).run()
+    let mut st = emit::Stage { stage: native.stage, local_size, out_types, loop_limit, locs, mesh, no_sel: Default::default() };
+    // Joins as selections; a selection that a jump had to leave through a
+    // dispatch is a block construct in the next attempt (all of them, at worst).
+    let mut e = emit::Emit::new(&f, &iface, &st).run().map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+    for round in 0.. {
+        if e.bad_sel.is_empty() {
+            break;
         }
-        r => r,
+        if round == 8 {
+            st.no_sel = (0..f.blocks.len()).collect();
+        } else {
+            st.no_sel.extend(e.bad_sel.iter().copied());
+        }
+        e = emit::Emit::new(&f, &iface, &st).run().map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     }
-    .map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     // user data
     let window = lift::push_window(native.stage);
     let mut user_data = Vec::new();
