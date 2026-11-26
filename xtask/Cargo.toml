@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Repository maintenance: asset-policy and code-shape enforcement, git hooks."
+description = "Repository maintenance: asset-policy and code-shape enforcement, git hooks, the translation index."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,15 @@ serde.workspace = true
 syn = { version = "2.0.119", features = ["full", "visit"] }
 toml.workspace = true
 walkdir.workspace = true
+# The translation index only (feature `index`), so that the commit hook's
+# build of xtask does not compile the translator.
+victory-shader = { workspace = true, optional = true }
+victory-game = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+memchr = { workspace = true, optional = true }
+
+[features]
+index = ["dep:victory-shader", "dep:victory-game", "dep:blake3", "dep:memchr"]
 
 [lints]
 workspace = true

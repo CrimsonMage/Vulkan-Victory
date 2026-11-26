@@ -13,6 +13,7 @@ pub mod graph;
 pub mod ifconv;
 pub mod lift;
 pub mod pack16;
+pub mod report;
 pub mod semantics;
 pub mod spirv;
 pub mod tir;
@@ -22,6 +23,8 @@ use std::collections::HashMap;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io};
+pub use lift::Approx;
+pub use report::{Report, report};
 pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
@@ -66,7 +69,8 @@ pub struct VkShader {
     pub samplers: Vec<[u32; 4]>,
     pub interface: Vec<Interface>,
     pub local_size: [u32; 3],
-    pub approximate: Vec<&'static str>,
+    /// Approximations taken, once each (`docs/vulkan-abi.md` section 9).
+    pub approximate: Vec<Approx>,
     /// Thread-IR instructions after dead-code removal (statistics).
     pub ir_insts: usize,
     /// What the loop guard writes to the guard buffer's dword 1 when a

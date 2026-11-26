@@ -40,7 +40,7 @@ first draw), from the bytes it passes, wherever it loaded them from
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
-| `xtask` | asset-policy check, git hooks |
+| `xtask` | asset-policy and code-shape checks, git hooks, the translation index |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `victory-game` is platform-level and can be tested with

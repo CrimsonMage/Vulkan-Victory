@@ -1,6 +1,10 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod complexity;
+#[cfg(feature = "index")]
+mod index;
+#[cfg(feature = "index")]
+mod index_md;
 mod policy;
 mod quality;
 
@@ -48,6 +52,22 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy and code-shape checks.
     InstallHooks,
+    /// Translate every shader container of a title's dump (a file such as
+    /// shaders.rpf, or a directory) and write the translation index:
+    /// summary, opcode coverage, refusals, approximations. Runs from a
+    /// release build with the translator (feature `index`).
+    TranslationIndex {
+        /// The title's shader pack, or a directory of its files.
+        #[arg(long)]
+        pack: PathBuf,
+        /// The markdown file to write (default: docs/translation-index.md
+        /// in the workspace).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Worker threads (each holds one container and its translation).
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -68,6 +88,10 @@ fn main() -> Result<()> {
                 update_baseline,
             },
         ),
+        Cmd::TranslationIndex { pack, out, jobs } => {
+            let out = out.unwrap_or_else(|| root.join("docs/translation-index.md"));
+            translation_index(&root, &pack, &out, jobs)
+        }
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -84,6 +108,34 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[cfg(feature = "index")]
+fn translation_index(root: &Path, pack: &Path, out: &Path, jobs: usize) -> Result<()> {
+    index::run(root, pack, out, jobs.max(1))
+}
+
+/// Without the translator: the same command again, from a release build
+/// that has it (the index should show what the shipped translator does).
+#[cfg(not(feature = "index"))]
+fn translation_index(_root: &Path, _pack: &Path, _out: &Path, _jobs: usize) -> Result<()> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "run",
+            "--quiet",
+            "--release",
+            "--package",
+            "xtask",
+            "--features",
+            "index",
+            "--",
+        ])
+        .args(std::env::args_os().skip(1))
+        .status()
+        .context("running cargo")?;
+    anyhow::ensure!(status.success(), "translation-index failed");
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
