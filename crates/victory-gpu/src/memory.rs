@@ -39,8 +39,14 @@
 //!   finds empty are noted (the faults), read back once a frame and given
 //!   copies from the next frame on ([`ready`]).
 //!
+//! - **The card's page cache** (`cache.rs`): pool pages lists name get a
+//!   copy in the card's memory, and the entries of every title page that
+//!   shows such a page name the copy instead of the section.
+//!
 //! Lock order: the directory, then `crate::views`, then the units
 //! (`crate::unified`); the GPU-view pages ([`GPU_PAGES`]) on their own.
+
+mod cache;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +87,9 @@ enum Copy {
     Section(usize, Option<ID3D12Resource>, bool),
     /// A buffer of title memory (raw-address code's regions and buffers).
     Shadow(Arc<Shadow>),
+    /// A block of the card's page cache (`cache.rs`); `None` once given
+    /// back (its views read zeros once no submission can use it).
+    Card(Option<ID3D12Resource>),
 }
 
 /// A heap's memory run: its base (copy 0's slot) and how many copies have
@@ -120,6 +129,8 @@ struct Memory {
     /// address is asked about by every dispatch.
     refused: HashSet<u64>,
     refused_at: u64,
+    /// The card's page cache of pool pages (`cache.rs`).
+    cache: cache::Cache,
 }
 
 // SAFETY: the mapping is of a buffer the struct owns; the heaps named in
@@ -161,6 +172,7 @@ impl Memory {
             frame: u64::MAX,
             refused: HashSet::new(),
             refused_at: 0,
+            cache: cache::Cache::default(),
         }
     }
 
@@ -187,11 +199,17 @@ impl Memory {
         if page >= self.mirror.len() - 1 || self.mirror[page] == entry {
             return;
         }
-        self.mirror[page] = entry;
+        let old = std::mem::replace(&mut self.mirror[page], entry);
+        self.cache.moved(page as u32, old, entry);
+        self.block_dirty(page);
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The directory block of `page` goes to the card at the next [`flush`].
+    fn block_dirty(&mut self, page: usize) {
         let block = page / BLOCK;
         self.dirty[block / 64] |= 1 << (block % 64);
         self.any_dirty = true;
-        STATS[0].fetch_add(1, Ordering::Relaxed);
     }
 
     fn demanded(&self, page: usize) -> bool {
@@ -288,7 +306,8 @@ impl Memory {
                 }
                 // Not opened (yet): reads zeros until it is.
                 Copy::Section(_, None, false) => break,
-                Copy::Section(_, None, true) => heap.null_raw_uav_at(slot),
+                Copy::Section(_, None, true) | Copy::Card(None) => heap.null_raw_uav_at(slot),
+                Copy::Card(Some(buffer)) => heap.raw_uav_at(slot, buffer, 0, cache::BLOCK_BYTES),
                 Copy::Shadow(shadow) => {
                     let (first, len) = shadow.span();
                     // From the 16 bytes at or below the copy's first byte in
@@ -550,66 +569,131 @@ pub(crate) fn heap_gone(key: usize) {
 }
 
 /// At each submission, ahead of its lists: copies numbered since are
-/// opened and given views, and the directory blocks written since go to
+/// opened and given views, the card's page cache takes in the pool pages
+/// `runs` name (`cache.rs`), and the directory blocks written since go to
 /// the card, in a list of ours that runs first (queue order: lists
-/// submitted before still see the entries they ran with).
-pub(crate) fn flush() -> Option<ID3D12CommandList> {
+/// submitted before still see the entries they ran with). Also, per list
+/// of `runs` (empty if none has any): a list of ours to run right after
+/// it, that copies what its shaders wrote into cached pages back to the
+/// pages (`submission`: this one's number).
+pub(crate) fn flush(runs: &[&HostList], submission: u64) -> (Option<ID3D12CommandList>, Vec<Option<ID3D12CommandList>>) {
+    // Read before the directory's lock (the lists' own locks are taken
+    // after it only while recording).
+    let named: Vec<Named> = runs.iter().map(|l| l.pool_names()).collect();
     let mut guard = memory();
-    let m = guard.as_mut()?;
+    let Some(m) = guard.as_mut() else {
+        return (None, Vec::new());
+    };
     m.make_copies();
-    if !m.any_dirty {
-        return None;
+    let plan = m.cache_plan(&named, submission);
+    // Blocks the cache made are copies too.
+    m.make_copies();
+    let needed = m.any_dirty || !plan.is_empty();
+    let head = m.record_head(&plan);
+    if head.is_none() && needed && m.cache.active() {
+        // Entries would name slots nothing copied in, or slots given to
+        // other pages.
+        crate::host::fail(format_args!("the card page cache's copies in or the directory could not be recorded (no list or staging buffer)"));
     }
-    let (directory, _, _) = m.gpu()?;
-    let blocks: Vec<usize> = (0..m.dirty.len() * 64).filter(|&b| m.dirty[b / 64] >> (b % 64) & 1 != 0).collect();
-    let bytes = (blocks.len() * BLOCK * 8) as u64;
-    let (staging, data) = host()?.shared_buffer(bytes)?;
-    for (i, &block) in blocks.iter().enumerate() {
-        let from = &m.mirror[block * BLOCK..(block + 1) * BLOCK];
-        // SAFETY: the staging mapping holds `bytes` bytes; block `i` of it.
-        unsafe { std::ptr::copy_nonoverlapping(from.as_ptr().cast::<u8>(), data.add(i * BLOCK * 8), BLOCK * 8) };
-    }
-    let mut c = own_list()?;
-    // SAFETY: our list, not executing (it came back after its submission
-    // ran); live buffers, each copy inside both.
-    let recorded = unsafe {
-        c.allocator.Reset().and_then(|()| c.list.Reset(&c.allocator, None)).map(|()| {
-            crate::host::order_writes(&c.list, c.list7.as_ref());
-            let mut i = 0;
-            while i < blocks.len() {
-                // Blocks that follow on, as one copy.
-                let mut j = i + 1;
-                while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
-                    j += 1;
+    let after = plan.after.iter().map(cache::record_after).collect();
+    (head, after)
+}
+
+impl Memory {
+    /// The list of ours ahead of a submission: the cache's copies in
+    /// (`plan`), then the directory blocks written since. `None` if there
+    /// is nothing to do.
+    fn record_head(&mut self, plan: &cache::Plan) -> Option<ID3D12CommandList> {
+        if !self.any_dirty && plan.is_empty() {
+            return None;
+        }
+        let (directory, _, _) = self.gpu()?;
+        let blocks: Vec<usize> = if self.any_dirty {
+            (0..self.dirty.len() * 64).filter(|&b| self.dirty[b / 64] >> (b % 64) & 1 != 0).collect()
+        } else {
+            Vec::new()
+        };
+        let staging = if blocks.is_empty() {
+            None
+        } else {
+            let bytes = (blocks.len() * BLOCK * 8) as u64;
+            let (staging, data) = host()?.shared_buffer(bytes)?;
+            for (i, &block) in blocks.iter().enumerate() {
+                // Entries of pages the cache holds name its copy.
+                for k in 0..BLOCK {
+                    let entry = self.cache.entry(self.mirror[block * BLOCK + k]);
+                    // SAFETY: the staging mapping holds `bytes` bytes; entry
+                    // `k` of block `i` of it.
+                    unsafe { data.cast::<u64>().add(i * BLOCK + k).write_unaligned(entry) };
                 }
-                let block_bytes = (BLOCK * 8) as u64;
-                c.list.CopyBufferRegion(
-                    &directory,
-                    blocks[i] as u64 * block_bytes,
-                    &staging,
-                    i as u64 * block_bytes,
-                    (j - i) as u64 * block_bytes,
-                );
-                i = j;
             }
-            crate::host::order_writes(&c.list, c.list7.as_ref());
-        })
+            Some(staging)
+        };
+        let mut c = own_list()?;
+        // SAFETY: our list, not executing (it came back after its submission
+        // ran); live buffers, each copy inside both.
+        let recorded = unsafe {
+            c.allocator.Reset().and_then(|()| c.list.Reset(&c.allocator, None)).map(|()| {
+                crate::host::order_writes(&c.list, c.list7.as_ref());
+                if !plan.is_empty() {
+                    plan.record_in(&c.list, c.list7.as_ref());
+                }
+                if let Some(staging) = &staging {
+                    let mut i = 0;
+                    while i < blocks.len() {
+                        // Blocks that follow on, as one copy.
+                        let mut j = i + 1;
+                        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+                            j += 1;
+                        }
+                        let block_bytes = (BLOCK * 8) as u64;
+                        c.list.CopyBufferRegion(
+                            &directory,
+                            blocks[i] as u64 * block_bytes,
+                            staging,
+                            i as u64 * block_bytes,
+                            (j - i) as u64 * block_bytes,
+                        );
+                        i = j;
+                    }
+                }
+                crate::host::order_writes(&c.list, c.list7.as_ref());
+            })
+        }
+        // SAFETY: our list, recorded above.
+        .and_then(|()| unsafe { c.list.Close() });
+        if let Err(e) = recorded {
+            crate::host::fail(format_args!("the directory of title memory could not be written ({e})"));
+        }
+        self.dirty.fill(0);
+        self.any_dirty = false;
+        STATS[1].fetch_add(blocks.len() as u64, Ordering::Relaxed);
+        crate::frametime::add(crate::frametime::Sum::DirectoryBlocks, blocks.len() as u64);
+        c.kept.extend(plan.kept.iter().cloned());
+        if let Some(staging) = staging {
+            c.kept.push(staging.clone());
+            c.pooled.push(staging);
+        }
+        c.kept.push(directory);
+        let list = c.list.cast().ok();
+        crate::host::retire(Running(Some(c)));
+        list
     }
-    // SAFETY: our list, recorded above.
-    .and_then(|()| unsafe { c.list.Close() });
-    if let Err(e) = recorded {
-        crate::host::fail(format_args!("the directory of title memory could not be written ({e})"));
-    }
-    m.dirty.fill(0);
-    m.any_dirty = false;
-    STATS[1].fetch_add(blocks.len() as u64, Ordering::Relaxed);
-    crate::frametime::add(crate::frametime::Sum::DirectoryBlocks, blocks.len() as u64);
-    c.kept.push(staging.clone());
-    c.kept.push(directory);
-    c.pooled.push(staging);
-    let list = c.list.cast().ok();
-    crate::host::retire(Running(Some(c)));
-    list
+}
+
+/// What a list names of the pool by directory, for the card's page cache
+/// (`HostList::pool_names`): the ranges whose pages it should hold
+/// (address, bytes), the ranges its shaders write by directory, and the
+/// other title memory its shaders or card copies write.
+pub(crate) struct Named {
+    pub(crate) reads: Vec<(u64, u64)>,
+    pub(crate) writes: Vec<(u64, u64)>,
+    pub(crate) other: Vec<(u64, u64)>,
+    /// What shaders that pick buffers from the heap by index may write
+    /// (from, to): not declared view by view.
+    pub(crate) heap: Vec<(u64, u64)>,
+    /// Pool views of the heap such shaders may read (address, bytes).
+    pub(crate) maybe: Vec<(u64, u64)>,
 }
 
 // Page reservations and the GPU view of the pool.
@@ -763,17 +847,75 @@ pub(crate) fn root_reach(address: u64) -> u64 {
 }
 
 /// A list names a pool view of `[address, address + len)`: counted for the
-/// frame line once per list, and with `writes` declared written (CPU steps
-/// of later submissions that read it wait for it, textures over it detile
-/// again once it has run, windows over its pages copy them again).
+/// frame line once per list, its pages taken into the card's page cache
+/// at submission, and with `writes` declared written (CPU steps of later
+/// submissions that read it wait for it, textures over it detile again
+/// once it has run, windows over its pages copy them again, the cache
+/// copies what it wrote back to the pages after the list).
 pub(crate) fn named(list: &HostList, address: u64, len: u64, writes: bool) {
+    named_as(list, address, len, len, writes);
+}
+
+/// The bytes from a root view's address on that the card's page cache
+/// takes in: a root view has no size ([`root_reach`] is only how far it
+/// may go), and a root constant buffer reads at most 64 KiB.
+const ROOT_CACHED: u64 = 128 << 10;
+
+/// [`named`] for a root view over pool memory, `reach` bytes from
+/// `address` on ([`root_reach`]): the cache takes in only its first
+/// [`ROOT_CACHED`] bytes; what lies further is read from the pages unless
+/// something else named it.
+pub(crate) fn named_root(list: &HostList, address: u64, reach: u64, writes: bool) {
+    named_as(list, address, reach, reach.min(ROOT_CACHED), writes);
+}
+
+/// A pool view of the heap, `[address, address + len)`, that shaders which
+/// pick buffers by index may read (`draw.rs` `heap_buffers`, once a frame
+/// for every view of the heap): counted as [`named`] is, and taken into the
+/// card's page cache only where it has room (nothing tells which views
+/// such a shader reads).
+pub(crate) fn named_heap(list: &HostList, address: u64, len: u64) {
+    if list.first_use((address as usize) | 1 << 59) {
+        if !list.used_already((address as usize) | 1 << 62) {
+            crate::frametime::add(crate::frametime::Sum::PoolBytes, len);
+        }
+        list.name_pool_maybe(address, len);
+    }
+}
+
+fn named_as(list: &HostList, address: u64, len: u64, cached: u64, writes: bool) {
     // Title addresses lie below bit 40: another key than any object's.
-    if list.first_use((address as usize) | 1 << 62) {
+    let first = list.first_use((address as usize) | 1 << 62);
+    if first {
         crate::frametime::add(crate::frametime::Sum::PoolBytes, len);
+    }
+    let first_write = writes && list.first_use((address as usize) | 1 << 61);
+    if first || first_write {
+        list.name_pool(address, if first { cached } else { 0 }, first_write.then_some(len));
     }
     if writes {
         list.defer_gpu_write(address as usize, len as usize);
     }
+}
+
+/// Title memory `[at, at + len)` was written by a writer that says so
+/// (`crate::unified::written`: DirectStorage, file reads, page mappings,
+/// title copies on the CPU): the card's copies of those pages are taken
+/// again at the next submission (`cache.rs`).
+pub(crate) fn written(at: u64, len: u64) {
+    cache::written(at, len);
+}
+
+/// A shader writes buffers it picks from the heap by index, and the heap's
+/// unordered access views are not known yet: what it writes into pool pages
+/// the card's page cache holds may be lost (counted in the frame line).
+pub(crate) fn heap_written_unknown() {
+    cache::heap_written_unknown();
+}
+
+/// For the frame line: the card's page cache (`cache.rs`).
+pub(crate) fn cache_text(frames: f64) -> String {
+    cache::frame_text(frames)
 }
 
 /// CPU access to GPU views of the pool (`crate::host::copy_mapped`,

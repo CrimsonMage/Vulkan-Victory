@@ -1379,7 +1379,7 @@ impl State {
                 }
             };
             let writes = uav && STORES.get();
-            crate::memory::named(list, address, reach, writes);
+            crate::memory::named_root(list, address, reach, writes);
             if writes {
                 note_write(list, address, reach, Cause::RootUav);
             }
@@ -1655,7 +1655,7 @@ impl State {
             let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
             // A pool view is read by directory (`crate::memory`).
             if let Some((address, len)) = crate::descriptor::host::pool_range(&view) {
-                crate::memory::named(list, address, len, false);
+                crate::memory::named_heap(list, address, len);
                 if uav {
                     uav_ranges.insert(index, (address, address + len));
                 }
