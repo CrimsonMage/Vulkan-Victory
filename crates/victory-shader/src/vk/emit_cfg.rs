@@ -103,14 +103,9 @@ impl Emit<'_> {
             None => match self.f.blocks[x].term.clone() {
                 Term::Jump(t) => self.jump(x, t),
                 Term::Branch(c, t, e) => {
+                    // both arms leave (an unreachable merge): jumps out of it
+                    // to a selection's merge are not allowed
                     let c = self.id(c);
-                    // both arms leave for different blocks: a plain
-                    // conditional branch (no selection, no unreachable merge)
-                    if self.plain_branch(x, c, t, e) {
-                        return;
-                    }
-                    // else a selection with an unreachable merge; jumps out
-                    // of it to a selection's merge are not allowed
                     let (lt, le, sm) = (self.m.id(), self.m.id(), self.m.id());
                     self.m.op_void(op::SELECTION_MERGE, &[sm, 0]);
                     self.m.op_void(op::BRANCH_CONDITIONAL, &[c, lt, le]);
@@ -176,17 +171,10 @@ impl Emit<'_> {
 
     /// Branches to the merge of construct `k`, noting the edge.
     pub(super) fn to_merge(&mut self, k: usize) {
-        let m = self.note_merge(k);
-        self.branch_to(m);
-    }
-
-    /// Notes the current block as a predecessor of construct `k`'s merge;
-    /// the merge.
-    fn note_merge(&mut self, k: usize) -> Id {
         let m = self.cons[k].merge;
         let blk = self.block;
         self.merge_preds.entry(m).or_default().push(blk);
-        m
+        self.branch_to(m);
     }
 
     /// Phis at a merge: per predecessor, the value it brings or undef.
@@ -374,142 +362,32 @@ impl Emit<'_> {
 
     pub(super) fn jump(&mut self, from: usize, to: usize) {
         let g = self.g;
-        if g.rpo[to] > g.rpo[from] && !g.merge[to] {
-            let vals = self.edge_vals(from, to);
+        let back = g.rpo[to] <= g.rpo[from];
+        let merge = g.merge[to];
+        let vals = self.edge_vals(from, to);
+        if !back && !merge {
             self.pending.insert(to, vals);
             self.tree(to);
             return;
         }
-        let l = self.leave(from, to);
-        self.branch_to(l);
-    }
-
-    /// A two-way branch whose arms leave without a selection: both for
-    /// different blocks outside, or one outside and the other placed here
-    /// (a conditional branch may have one target that is not a break,
-    /// continue or merge). Whether it was.
-    fn plain_branch(&mut self, x: usize, c: Id, t: usize, e: usize) -> bool {
-        match (self.exit_label(x, t), self.exit_label(x, e)) {
-            (Some(a), Some(b)) if a != b => {
-                let (lt, le) = (self.leave(x, t), self.leave(x, e));
-                self.m.op_void(op::BRANCH_CONDITIONAL, &[c, lt, le]);
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                let out_t = self.exit_label(x, t).is_some();
-                let (out, here) = if out_t { (t, e) } else { (e, t) };
-                let lo = self.leave(x, out);
-                let lh = self.m.id();
-                let (lt, le) = if out_t { (lo, lh) } else { (lh, lo) };
-                self.m.op_void(op::BRANCH_CONDITIONAL, &[c, lt, le]);
-                self.m.label(lh);
-                self.block = lh;
-                self.jump(x, here);
-            }
-            (Some(a), Some(b)) => return self.merged_branch(x, c, (t, e), a == b && a == self.cons[self.ctx.len() - 1].merge),
-            _ => return false,
-        }
-        true
-    }
-
-    /// Both arms leave for the same block: one edge whose code (or the
-    /// dispatch state) and values are picked by the condition. `inner`: the
-    /// block is the innermost construct's merge (else a dispatch loop's
-    /// continue target, or neither: no). Whether it was.
-    fn merged_branch(&mut self, x: usize, c: Id, (t, e): (usize, usize), inner: bool) -> bool {
-        let label = self.exit_label(x, t).unwrap();
-        let disp = (0..self.cons.len()).rev().find(|&k| self.cons[k].disp.is_some() && self.cons[k].cont == label);
-        if !inner && disp.is_none() {
-            return false;
-        }
-        let k = self.ctx.len() - 1;
-        let before = self.cons[k].arrivals.len();
-        self.leave(x, t);
-        let mid = self.cons[k].arrivals.len();
-        self.leave(x, e);
-        let after = self.cons[k].arrivals.len();
-        if inner {
-            if let Some(p) = self.merge_preds.get_mut(&label) {
-                p.pop();
-            }
-            self.merge_arrivals(k, c, before, mid, after);
-        } else if let Some(i) = disp {
-            self.merge_conts(i, c);
-        }
-        self.branch_to(label);
-        true
-    }
-
-    /// The arrivals the two arms noted at construct `k`'s merge
-    /// (`before..mid` the first arm's, `mid..after` the second's) as one: a
-    /// direct arm brings code 0.
-    fn merge_arrivals(&mut self, k: usize, c: Id, before: usize, mid: usize, after: usize) {
-        let u = self.t.u32_;
-        let z = self.c32(0);
-        let mut arr: Vec<Arrival> = self.cons[k].arrivals.drain(before..after).collect();
-        let (ct, ce) = match (mid - before, after - mid) {
-            (1, 1) => (arr[0].code, arr[1].code),
-            (1, 0) => (arr[0].code, z),
-            (0, 1) => (z, arr[0].code),
-            _ => unreachable!("an arm noted no arrival"),
-        };
-        let code = self.m.op(op::SELECT, u, &[c, ct, ce]);
-        let mut a = arr.remove(0);
-        for b in arr {
-            a.possible.extend(b.possible);
-            a.vals.extend(b.vals);
-        }
-        a.code = code;
-        self.cons[k].arrivals.push(a);
-    }
-
-    /// The two continue edges the arms noted at dispatch loop `i` as one.
-    fn merge_conts(&mut self, i: usize, c: Id) {
-        let d = self.cons[i].disp.as_mut().unwrap();
-        let (b, a) = (d.conts.pop().unwrap(), d.conts.pop().unwrap());
-        let tys = d.slot_tys.clone();
-        let u = self.t.u32_;
-        let state = self.m.op(op::SELECT, u, &[c, a.0, b.0]);
-        let slots: Vec<Id> = (0..tys.len()).map(|s| self.m.op(op::SELECT, tys[s], &[c, a.1[s], b.1[s]])).collect();
-        self.cons[i].disp.as_mut().unwrap().conts.push((state, slots, a.2));
-    }
-
-    /// Whether construct `i` takes a jump directly: the innermost
-    /// construct, or a loop or block construct with only selections inside
-    /// it (break and continue of the innermost loop are allowed from
-    /// selections).
-    fn direct(&self, i: usize) -> bool {
-        i == self.ctx.len() - 1 || (!matches!(self.ctx[i], Ctx::Sel(_)) && self.ctx[i + 1..].iter().all(|c| matches!(c, Ctx::Sel(_))))
-    }
-
-    /// The label a jump to `to` branches to (none: `to` is placed here).
-    fn exit_label(&self, from: usize, to: usize) -> Option<Id> {
-        let back = self.g.rpo[to] <= self.g.rpo[from];
-        if !back && !self.g.merge[to] {
-            return None;
-        }
         let i = self.target_construct(to, back);
-        let c = &self.cons[i];
-        Some(match self.direct(i) {
-            true if back || c.disp.is_some() => c.cont,
-            true => c.merge,
-            false => self.cons[self.ctx.len() - 1].merge,
-        })
-    }
-
-    /// A jump out to `to` (a back edge or a merge), noted where its target
-    /// takes it; the label to branch to.
-    fn leave(&mut self, from: usize, to: usize) -> Id {
-        let back = self.g.rpo[to] <= self.g.rpo[from];
-        let vals = self.edge_vals(from, to);
-        let i = self.target_construct(to, back);
-        let direct = self.direct(i);
+        let inner = self.ctx.len() - 1;
+        // direct: the innermost construct, or a loop or block construct
+        // with only selections inside it (break and continue of the
+        // innermost loop are allowed from selections)
+        let direct =
+            i == inner || (!matches!(self.ctx[i], Ctx::Sel(_)) && self.ctx[i + 1..].iter().all(|c| matches!(c, Ctx::Sel(_))));
         // leaving a selection with no merge of its own (the arms of a
         // two-way branch) for a selection's merge is not allowed either
-        let into = if direct { i } else { self.ctx.len() - 1 };
+        let into = if direct { i } else { inner };
         if matches!(self.ctx[into], Ctx::Sel(_)) && self.base.iter().any(|&m| m > into) {
             self.bad_sel.push(self.cons[into].head);
         }
-        if direct { self.leave_direct(i, to, back, vals) } else { self.leave_passing(i, to, back, vals) }
+        if direct {
+            self.leave_direct(i, to, back, vals);
+        } else {
+            self.leave_passing(i, to, back, vals);
+        }
     }
 
     /// The construct a jump to `to` ends in: the loop it continues, or the
@@ -526,21 +404,26 @@ impl Emit<'_> {
     }
 
     /// A break or continue of construct `i`.
-    fn leave_direct(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) -> Id {
+    fn leave_direct(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) {
         if self.cons[i].disp.is_some() {
-            return self.disp_edge(i, to, &vals);
+            return self.disp_continue(i, to, &vals);
         }
         let blk = self.block;
         let list = if back { self.back.entry(to).or_default() } else { self.fwd.entry(to).or_default() };
         list.push((vals, blk));
-        if back { self.cons[i].cont } else { self.note_merge(i) }
+        if back {
+            let t = self.cons[i].cont;
+            self.branch_to(t);
+        } else {
+            self.to_merge(i);
+        }
     }
 
     /// Out of several constructs: the code and the values ride a ladder of
     /// phis out to the target. A selection cannot take a dispatched branch
     /// out of a nested one: such a selection's header becomes a block
     /// construct in the next attempt.
-    fn leave_passing(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) -> Id {
+    fn leave_passing(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) {
         let inner = self.ctx.len() - 1;
         for k in i..inner {
             if matches!(self.ctx[k], Ctx::Sel(_)) {
@@ -554,7 +437,7 @@ impl Emit<'_> {
         let code = self.c32(k);
         let blk = self.block;
         self.cons[inner].arrivals.push(Arrival { from: blk, code, possible: vec![k], vals: vec![(to, vals)] });
-        self.note_merge(inner)
+        self.to_merge(inner);
     }
 }
 
@@ -571,4 +454,3 @@ impl Ladder {
         self.vals.iter().find(|v| v.0 == t).map(|v| v.1.clone()).unwrap_or_default()
     }
 }
-
