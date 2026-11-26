@@ -907,6 +907,137 @@ order:
 - `AllocateUploadMemory` blocks the card cannot reach;
 - MSAA draws.
 
+### M2b after vk17–vk19 (2026-11-26, branch `worktree-agent-ab7e5143fb2eb77c0`)
+
+vk19 (b08fedc) matches D3D12 at frames 90, 450 and 960: frame 90 is navy
+with "ACCOUNT PICKER", frame 450 plays the Bink intro, frame 960 shows the
+art in its slanted panel. The run had 1,281 refills by fingerprint, 0
+errors and 0 crash reports. What changed and why:
+
+- **CBVs as the console's** (`descriptors/views.rs`).
+  - The V# now has a 16-byte stride, `size / 16` records and the
+    32_32_32_32_FLOAT format.
+  - The Scaleform batch programs (`VBatchVertex*`) read their matrix and
+    colour-transform rows with `buffer_load idxen`, indexed by the V#'s
+    stride. With stride 0, every row read row 0. Their quads collapsed
+    onto the screen's diagonal: the white line in vk17's frame 90, and the
+    missing navy backdrop, text and panel frame.
+  - Found by disassembling the cached module (`vulkan-stages/*.vks`, the
+    SPIR-V after the header) with `spirv-dis`.
+- **Rectangle lists** (topology 17) go to a geometry stage
+  (`vulkan/rect.rs`, HLSL in the module notes, compiled offline with
+  `glslc`).
+  - Each draw program's rectangle part (its vertex stage plus that
+    geometry stage) is made at its first rectangle draw:
+    `Stage::rect_part`.
+  - `VS_Blit`, the per-frame clear of the UI plane, is one of these draws;
+    it was skipped as `not_yet topology`.
+  - Triangle fans (topology 6) are drawn too. Line loops and quads are
+    still `not_yet`, each value logged once.
+- **CPU-written textures** (`images/fill.rs`).
+  - The fingerprint now reads through the CPU view: `read_title`, so pool
+    memory goes through the pool's CPU view. `cpu_readable` used to leave
+    out the whole pool, so the Bink Y/U/V planes were never refilled. The
+    green frame was YUV(0,0,0) through the Bink shader.
+  - Every image that is not an attachment is checked. An image over
+    memory the card also writes is refilled when the CPU changed it
+    (`cpu_changed`).
+  - The baseline fingerprint is taken at each fill.
+  - CPU reads of the pool's GPU view (`vulkan::read`) go page by page.
+- **Draws wait for compiling stages** (`stages::lookup_waiting`), up to
+  2 s a frame (`WAIT_BUDGET_US`), instead of being skipped.
+  - Cold cache: `draws_waited_ms` was 12,544 over 840 frames.
+  - Warm cache (vk19b): 3,677 over 990 frames, with 303 stages from disk
+    and 367 translated.
+  - The compile backlog (`part_ms_avg` 205, 2,698 queued) is now the
+    first cost of a launch.
+- **Per-draw cost** (`record.rs`, `record/link.rs`, `record/state.rs`).
+  - A recording finds each draw pipeline once per title pipeline and pass
+    formats (`DrawKey` → `Linked`): stage lookups, attributes, parts and
+    link.
+  - Dynamic state is set again only when its digest changes within a
+    command buffer (`state_key`). Push constants are pushed again only
+    when they change.
+  - vk19b frame split: record 29.8 ms, flush 9.0, views 5.2, submit 2.2.
+    That run predates these per-draw changes (5d5f92d); measure again.
+- **Resource release** (`resource.rs` drop → `vulkan::resource_released`
+  → `images::resource_gone`). A released texture's image goes once the
+  card is done with it, and its card memory goes with the last alias.
+  Before, a later resource of the same shape at the address got the stale
+  image, never filled.
+- **Live memory budget** (`vulkan::follow_budget`). Every 60 frames the
+  pool's GPU view may take the card's budget less everything else in use,
+  less 512 MiB (at least 512 MiB), read through `VK_EXT_memory_budget`.
+
+**The crash at victory-image+0x4e8b4be** (vk16 and vk17; none in vk18,
+vk19 or vk19b):
+
+- The function at title+0x4e8b4b0 makes a virtual call (slot 1) on an
+  engine object whose vtable pointer is 0: `mov rax,[rcx]; mov
+  rax,[rax+8]`.
+- The caller (title+0x52479f6) takes the object from a handle table while
+  streaming loads.
+- No GPU result or query feeds it: queries are unused, `not_yet
+  queries=0`.
+- Both crashes came about 0.1 s after a 512 MB section import ("a section
+  imported in place"), at about frame 1030.
+- Crashes at varying title sites appear in D3D12 runs too, before and
+  after the stand-in change (e4e2dd2).
+- Suspects, in order:
+  1. A title race widened by our stalls. The section import pins 512 MB
+     under the memory lock that xmem's remaps also take.
+  2. xmem's filler stand-ins. A stand-in shows a snapshot of zeros while
+     the physical page may be written through other views, until
+     `check_fillers` (every 10 s) and the next mapping change. vk17's
+     mapstat line showed "title writes into stand-ins 0" before the
+     crash, so this is not shown.
+- Next diagnostic: at a crash, report which xmem kind holds `rcx`'s page
+  (view, stand-in, section, region).
+
+**Open, in order** (the coordinator's audit and its comparison list):
+
+1. **One timeline per title queue.** Today `Timeline` is one semaphore on
+   the graphics queue, and every submission waits for the one before.
+   Design:
+   - one `Timeline` per title queue (graphics → graphics queue, compute →
+     the compute queue), each with its own semaphore;
+   - title fence Signal/Wait become semaphore signals and waits between
+     the timelines;
+   - bottom-of-pipe writes are done by the card (`vkCmdUpdateBuffer` into
+     the imported region, `buffer_of`) instead of `write_now` when a
+     flight lands;
+   - memory-value waits stay CPU-side cuts (`Part`).
+   The engine (`vulkan.rs` `Engine`) keeps its lines. Only `submit_part`
+   picks the queue's timeline, and `flights` become per timeline.
+2. **ExecuteIndirect** (`thin/vulkan.rs` → `NotYet::Indirect`).
+   - Signatures hold one argument: draw (16), indexed (20), dispatch (12;
+     type 105 too) or mesh (12). Their records are already Vulkan's
+     command structs.
+   - Plan: end rendering. One compute pass of ours copies `max` records,
+     bounded as `indirect.rs` bounds them, with the count, into a scratch
+     buffer of the command buffer's (a ring freed by timeline value).
+     Then a barrier to `DRAW_INDIRECT`, rendering again, and
+     `vkCmdDraw*IndirectCount` / `vkCmdDispatchIndirect` from it.
+   - The pass needs buffer device addresses. glslc's HLSL has no
+     `vk::RawBufferLoad`, so write the pass in SPIR-V assembly (source in
+     the module notes, `spirv-as`, words embedded) or with the translator's
+     `vk::spirv` builder.
+   - Indirect rectangles (tiled lighting) take the rectangle part.
+3. **FSR4 on Vulkan.** `ffx.rs` / `upscale.rs` are D3D12-only, so the
+   Series S world will be black on Vulkan. Make it one small linear scale
+   pass. Gate it on the DLL and its API version, not this title's offsets.
+4. Missing list slots (#53/54 UAV clears, #61–63 FillMemoryWith*, #81
+   DrawIndexedX, #85 predication, #88/89/90 top/bottom-of-pipe writes,
+   #93 KickoffX, #94 RSSetDepthBiasX). Real occlusion and timestamp
+   queries with resolves into title memory. The slot layout detected at
+   run time. PresentX with its plane count (up to 8). 2D-array views of
+   cube images and the T# tag bits, once the translator sets them in
+   `docs/vulkan-abi.md`.
+5. The rest of the earlier list: imports of committed runs only, one held
+   line, `AllocateUploadMemory` blocks, MSAA draws.
+6. `record.rs` is at 1,001 lines (plan: split; the clears and the
+   diagnostics descriptions could move to `record/`).
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
