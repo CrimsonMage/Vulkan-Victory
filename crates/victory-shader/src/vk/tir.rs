@@ -191,9 +191,6 @@ pub enum Op {
     Barrier,
     /// A block or guard phi: args in predecessor order (guards: inner, outer).
     Phi,
-    /// Load of a block-phi variable / store to it (lowering of block phis).
-    VarLoad(u32),
-    VarStore(u32),
     /// Dynamic index into a function-local array of the args (v_movrel).
     Pick,
 }
@@ -203,7 +200,7 @@ impl Op {
     /// Removable when its result is unused.
     pub fn removable(&self) -> bool {
         self.pure()
-            || matches!(self, Op::Load { .. } | Op::LdsLoad | Op::VarLoad(_) | Op::Phi)
+            || matches!(self, Op::Load { .. } | Op::LdsLoad | Op::Phi)
             || matches!(self, Op::Image { kind, .. } if !matches!(kind, ImageKind::Store { .. } | ImageKind::Atomic(_)))
     }
 
@@ -248,6 +245,9 @@ pub enum Term {
 
 #[derive(Debug, Clone)]
 pub struct Block {
+    /// Phi nodes, args in `preds` order.
+    pub phis: Vec<V>,
+    pub preds: Vec<usize>,
     pub body: Vec<Item>,
     pub term: Term,
 }
@@ -260,8 +260,6 @@ pub struct Func {
     /// emitted at the function's start.
     pub prelude: Vec<V>,
     pub blocks: Vec<Block>,
-    /// Block-phi variables: their types.
-    pub vars: Vec<Ty>,
     global: HashMap<Node, V>,
 }
 
@@ -304,11 +302,6 @@ impl Func {
         }
     }
 
-    pub fn new_var(&mut self, ty: Ty) -> u32 {
-        self.vars.push(ty);
-        (self.vars.len() - 1) as u32
-    }
-
     /// Instructions per block body (guards included), for statistics.
     pub fn count(&self) -> usize {
         fn items(list: &[Item]) -> usize {
@@ -319,7 +312,7 @@ impl Func {
                 })
                 .sum()
         }
-        self.prelude.len() + self.blocks.iter().map(|b| items(&b.body) + 1).sum::<usize>()
+        self.prelude.len() + self.blocks.iter().map(|b| b.phis.len() + items(&b.body) + 1).sum::<usize>()
     }
 }
 
@@ -368,6 +361,7 @@ pub fn dce(f: &mut Func) {
     }
     for b in &mut f.blocks {
         sweep(&live, &mut b.body);
+        b.phis.retain(|p| live[*p as usize]);
     }
     f.prelude.retain(|v| live[*v as usize]);
 }
@@ -391,7 +385,10 @@ pub fn dump(f: &Func) {
     }
     eprintln!("prelude {:?}", f.prelude);
     for (i, b) in f.blocks.iter().enumerate() {
-        eprintln!("block {i}:");
+        eprintln!("block {i}: preds {:?}", b.preds);
+        for p in &b.phis {
+            eprintln!("  %{p} = phi {:?} {:?}", f.node(*p).ty, f.node(*p).args);
+        }
         items(f, &b.body, 1);
         eprintln!("  -> {:?}", b.term);
     }

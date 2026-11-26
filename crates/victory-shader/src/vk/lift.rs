@@ -63,6 +63,9 @@ pub const OUT_DEPTH: u16 = 0x101;
 pub const OUT_STENCIL: u16 = 0x102;
 pub const OUT_SAMPLE_MASK: u16 = 0x103;
 
+/// The old value of a lane mask written in a guard: 0 outside it.
+const MASK_FALSE: Value = Value(u32::MAX - 1);
+
 struct Open {
     cond: V,
     items: Vec<Item>,
@@ -70,6 +73,8 @@ struct Open {
     defs: Vec<(Reg, Value, Value)>,
     defined: HashSet<Value>,
     cse: HashMap<Node, V>,
+    /// Thread-IR values made inside.
+    inner: HashSet<V>,
 }
 
 pub struct Lift<'a> {
@@ -85,8 +90,15 @@ pub struct Lift<'a> {
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
-    /// Block-phi variables per (block, phi index), and whether a mask.
-    phi_vars: Vec<Vec<(u32, bool)>>,
+    /// Undo log of the CSE table (dominator-tree scopes).
+    undo: Vec<(Node, Option<V>)>,
+    no_cse: bool,
+    /// Phi nodes per block (made when the block is lifted; a back edge's
+    /// target is lifted before its source).
+    all_phis: Vec<Vec<V>>,
+    made: Vec<bool>,
+    /// Blocks lifted so far.
+    done: Vec<Option<tir::Block>>,
     interps: HashMap<(usize, usize), &'a io::Interp>,
     site: (usize, usize),
     wave64: bool,
@@ -145,7 +157,11 @@ impl<'a> Lift<'a> {
             open: None,
             guarded: false,
             sel: None,
-            phi_vars: Vec::new(),
+            undo: Vec::new(),
+            no_cse: false,
+            all_phis: vec![Vec::new(); p.blocks.len()],
+            made: vec![false; p.blocks.len()],
+            done: Vec::new(),
             interps: io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             site: (0, 0),
             wave64: p.wave64,
@@ -187,24 +203,47 @@ impl<'a> Lift<'a> {
             {
                 return v;
             }
-            if let Some(&v) = self.cse.get(&node) {
+            if !self.no_cse
+                && let Some(&v) = self.cse.get(&node)
+            {
                 return v;
             }
         }
+        // Conversions of values from outside the guard go outside it, where
+        // the other guards of the block share them.
+        let hoist = self.guarded
+            && matches!(node.op, Op::Spv(op::BITCAST | op::U_CONVERT | op::S_CONVERT | op::COMPOSITE_EXTRACT))
+            && node.args.iter().all(|a| !self.open.as_ref().unwrap().inner.contains(a));
         let v = self.f.push(node.clone());
-        if self.guarded {
+        if self.guarded && !hoist {
             let o = self.open.as_mut().expect("an open guard");
             o.items.push(Item::N(v));
+            o.inner.insert(v);
             if pure {
                 o.cse.insert(node, v);
             }
         } else {
             self.cur.push(Item::N(v));
-            if pure {
-                self.cse.insert(node, v);
+            if pure && !self.no_cse {
+                let old = self.cse.insert(node.clone(), v);
+                self.undo.push((node, old));
             }
         }
         v
+    }
+
+    fn rollback(&mut self, mark: usize) {
+        while self.undo.len() > mark {
+            let (node, old) = self.undo.pop().unwrap();
+            match old {
+                Some(v) => {
+                    self.cse.insert(node, v);
+                }
+                None => {
+                    self.cse.remove(&node);
+                }
+            }
+        }
     }
 
     fn spv(&mut self, opcode: u16, ty: Ty, args: &[V]) -> V {
@@ -319,6 +358,25 @@ impl<'a> Lift<'a> {
                 }
                 _ => {}
             }
+        }
+        if (o == op::U_CONVERT || o == op::S_CONVERT)
+            && let Some(x) = a
+        {
+            let from = self.f.ty(n.args[0]);
+            let bits = match from.s {
+                S::U8 => 8,
+                S::U16 => 16,
+                S::U32 => 32,
+                _ => 64,
+            };
+            let x = if o == op::S_CONVERT && bits < 64 && (x >> (bits - 1)) & 1 != 0 { x | (!0u64 << bits) } else { x };
+            let mask = match ty.s {
+                S::U8 => 0xFF,
+                S::U16 => 0xFFFF,
+                S::U32 => 0xFFFF_FFFF,
+                _ => u64::MAX,
+            };
+            return Some(self.f.konst(ty, x & mask));
         }
         if o == op::SELECT {
             if let Some(cv) = a {
@@ -563,7 +621,7 @@ impl<'a> Lift<'a> {
         if let Some(v) = inst.write(reg) {
             self.vals.insert(v, r);
             if self.guarded
-                && let Reg::V(_) = reg
+                && (matches!(reg, Reg::V(_)) || matches!(r, R::M(..)))
             {
                 let old = inst.read(reg);
                 let o = self.open.as_mut().unwrap();
@@ -571,7 +629,9 @@ impl<'a> Lift<'a> {
                 if let Some(e) = o.defs.iter_mut().find(|d| d.0 == reg) {
                     e.1 = v;
                 } else {
-                    o.defs.push((reg, v, old.unwrap_or(Value(u32::MAX))));
+                    // a lane mask written here: lanes outside the guard get 0
+                    let old = if matches!(reg, Reg::S(_)) { MASK_FALSE } else { old.unwrap_or(Value(u32::MAX)) };
+                    o.defs.push((reg, v, old));
                 }
             }
         }
@@ -788,7 +848,23 @@ impl<'a> Lift<'a> {
     fn close(&mut self) {
         let Some(o) = self.open.take() else { return };
         let mut phis = Vec::new();
+        let mut masks: HashMap<V, V> = HashMap::new();
         for (_, new, old) in o.defs {
+            if let Some(&R::M(inner, half)) = self.vals.get(&new) {
+                let _ = old;
+                let phi = match masks.get(&inner) {
+                    Some(&p) => p,
+                    None => {
+                        let f = self.kb(false);
+                        let p = self.f.push(Node { op: Op::Phi, ty: Ty::BOOL, args: vec![inner, f], imm: Vec::new() });
+                        phis.push(p);
+                        masks.insert(inner, p);
+                        p
+                    }
+                };
+                self.vals.insert(new, R::M(phi, half));
+                continue;
+            }
             let inner = match self.vals.get(&new) {
                 Some(R::D(v)) => *v,
                 _ => continue,
@@ -835,7 +911,14 @@ impl<'a> Lift<'a> {
         }
         if self.open.is_none() {
             self.open =
-                Some(Open { cond: a, items: Vec::new(), defs: Vec::new(), defined: HashSet::new(), cse: HashMap::new() });
+                Some(Open {
+                cond: a,
+                items: Vec::new(),
+                defs: Vec::new(),
+                defined: HashSet::new(),
+                cse: HashMap::new(),
+                inner: HashSet::new(),
+            });
         }
         Ok(true)
     }
@@ -844,34 +927,62 @@ impl<'a> Lift<'a> {
 
     pub fn run(mut self) -> Res<(Func, Interface)> {
         let p = self.p;
-        // Block-phi variables.
-        for b in &p.blocks {
-            let vars = b
-                .phis
-                .iter()
-                .map(|phi| {
-                    let mask = matches!(phi.reg, Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1);
-                    let mask = mask || phi.reg == Reg::Scc;
-                    (self.f.new_var(if mask { Ty::BOOL } else { Ty::U32 }), mask)
-                })
-                .collect();
-            self.phi_vars.push(vars);
-        }
+        // Blocks in dominator-tree preorder: a block's dominators first, so
+        // pure values are shared down the tree (one CSE scope per block).
         let order = ir::reverse_postorder(&p.blocks);
-        let mut blocks: Vec<Option<tir::Block>> = vec![None; p.blocks.len()];
-        for &b in &order {
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            index[b] = i;
+        }
+        let idom = ir::idoms(&p.blocks, &order, &index);
+        let mut children = vec![Vec::new(); p.blocks.len()];
+        for &b in order.iter().skip(1) {
+            if idom[b] != usize::MAX {
+                children[idom[b]].push(b);
+            }
+        }
+        let mut pre = Vec::new();
+        let mut stack = vec![order[0]];
+        while let Some(b) = stack.pop() {
+            pre.push(b);
+            for &c in children[b].iter().rev() {
+                stack.push(c);
+            }
+        }
+        self.done = vec![None; p.blocks.len()];
+        let mut scopes: Vec<(usize, usize)> = Vec::new();
+        for &b in &pre {
+            while let Some(&(top, mark)) = scopes.last() {
+                if top == idom[b] {
+                    break;
+                }
+                self.rollback(mark);
+                scopes.pop();
+            }
+            scopes.push((b, self.undo.len()));
             self.cur = Vec::new();
-            self.cse = HashMap::new();
-            // phis
-            for (k, phi) in p.blocks[b].phis.iter().enumerate() {
-                let (var, mask) = self.phi_vars[b][k];
-                let ty = if mask { Ty::BOOL } else { Ty::U32 };
-                let x = self.emit(Op::VarLoad(var), ty, vec![]);
+            // Phis: lane masks and SCC as booleans, data as f32 when every
+            // value known so far is f32 (back edges convert), else u32.
+            let mut phis = Vec::new();
+            for phi in &p.blocks[b].phis {
+                let mask = matches!(phi.reg, Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1)
+                    || phi.reg == Reg::Scc;
+                let known: Vec<R> = phi.args.iter().filter_map(|a| self.vals.get(a).copied()).collect();
+                let mask = mask || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
+                let ty = if mask {
+                    Ty::BOOL
+                } else if !known.is_empty() && known.iter().all(|r| matches!(r, R::D(v) if self.f.ty(*v) == Ty::F32)) {
+                    Ty::F32
+                } else {
+                    Ty::U32
+                };
+                let x = self.f.push(Node { op: Op::Phi, ty, args: vec![u32::MAX; phi.args.len()], imm: Vec::new() });
+                phis.push(x);
                 let r = if phi.reg == Reg::Scc {
                     R::B(x)
                 } else if mask {
                     let half = match phi.reg {
-                        Reg::S(c) if (c - ir::VCC) % 2 == 1 || c == ir::EXEC + 1 => Half::Hi,
+                        Reg::S(c) if c == ir::VCC + 1 || c == ir::EXEC + 1 => Half::Hi,
                         _ => Half::Lo,
                     };
                     R::M(x, if self.wave64 { half } else { Half::Lo })
@@ -880,7 +991,22 @@ impl<'a> Lift<'a> {
                 };
                 self.vals.insert(phi.value, r);
             }
-            let n = p.blocks[b].insts.len();
+            self.all_phis[b] = phis;
+            self.made[b] = true;
+            // Edges from blocks lifted before: their values, converted at
+            // the end of each source.
+            for (k, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.done[q].is_some() {
+                    let saved_cur = std::mem::take(&mut self.cur);
+                    self.cur = std::mem::take(&mut self.done[q].as_mut().unwrap().body);
+                    self.no_cse = true;
+                    let r = self.edge_k(q, b, k);
+                    self.no_cse = false;
+                    self.done[q].as_mut().unwrap().body = std::mem::replace(&mut self.cur, saved_cur);
+                    r?;
+                }
+            }
+        let n = p.blocks[b].insts.len();
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 self.site = (b, i);
                 if i + 1 == n && matches!(p.blocks[b].exit, Exit::Branch { .. }) {
@@ -921,12 +1047,25 @@ impl<'a> Lift<'a> {
                 }
             };
             let body = std::mem::take(&mut self.cur);
-            blocks[b] = Some(tir::Block { body, term });
+            self.done[b] = Some(tir::Block { phis: self.all_phis[b].clone(), preds: p.blocks[b].preds.clone(), body, term });
+        }
+        // Phi args of edges from blocks never reached.
+        for b in 0..p.blocks.len() {
+            for j in 0..self.all_phis[b].len() {
+                let node = self.all_phis[b][j];
+                let ty = self.f.ty(node);
+                let undef = self.f.global(Op::Undef, ty);
+                for a in &mut self.f.nodes[node as usize].args {
+                    if *a == u32::MAX {
+                        *a = undef;
+                    }
+                }
+            }
         }
         // Unreachable blocks (none from reverse postorder) become returns.
-        self.f.blocks = blocks
+        self.f.blocks = std::mem::take(&mut self.done)
             .into_iter()
-            .map(|b| b.unwrap_or(tir::Block { body: Vec::new(), term: Term::Return }))
+            .map(|b| b.unwrap_or(tir::Block { phis: Vec::new(), preds: Vec::new(), body: Vec::new(), term: Term::Return }))
             .collect();
         Ok((self.f, self.iface))
     }
@@ -941,22 +1080,45 @@ impl<'a> Lift<'a> {
         self.iface.demotes = true;
     }
 
+    /// At the end of `from`: the values the edge gives the phis of a block
+    /// lifted already (a back edge); other targets take theirs when they
+    /// are lifted.
     fn edge(&mut self, from: usize, to: usize) -> Res<()> {
         let p = self.p;
-        let k = p.blocks[to].preds.iter().position(|&q| q == from).ok_or(unsupported(0, "an edge"))?;
+        if !self.made[to] {
+            return Ok(());
+        }
+        for (k, &q) in p.blocks[to].preds.iter().enumerate() {
+            if q == from {
+                self.edge_k(from, to, k)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The values edge `k` (from `from`) gives `to`'s phis, converted to
+    /// their types where the current list is.
+    fn edge_k(&mut self, from: usize, to: usize, k: usize) -> Res<()> {
+        let p = self.p;
         for (j, phi) in p.blocks[to].phis.iter().enumerate() {
-            let (var, mask) = self.phi_vars[to][j];
-            let r = match self.value(phi.args[k], p.blocks[from].offset) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let node = self.all_phis[to][j];
+            let ty = self.f.ty(node);
+            let x = match self.value(phi.args[k], p.blocks[from].offset) {
+                Ok(r) => match ty {
+                    Ty::BOOL if phi.reg == Reg::Scc => self.scc_of(r),
+                    Ty::BOOL => self.mask_of(r),
+                    Ty::F32 => {
+                        let d = self.data(r);
+                        self.f32v(d)
+                    }
+                    _ => {
+                        let d = self.data(r);
+                        self.u32v(d)
+                    }
+                },
+                Err(_) => self.f.global(Op::Undef, ty),
             };
-            let x = if mask {
-                if phi.reg == Reg::Scc { self.scc_of(r) } else { self.mask_of(r) }
-            } else {
-                let d = self.data(r);
-                self.u32v(d)
-            };
-            self.emit(Op::VarStore(var), Ty::VOID, vec![x]);
+            self.f.nodes[node as usize].args[k] = x;
         }
         Ok(())
     }
@@ -988,6 +1150,7 @@ impl<'a> Lift<'a> {
         match &inst.fields {
             Fields::Sop { dst, src, imm } => {
                 let (dst, src, imm) = (*dst, src.clone(), *imm);
+                self.need(inst);
                 self.sop(inst, name, &dst, &src, imm)
             }
             Fields::Sopp { .. } => match name {

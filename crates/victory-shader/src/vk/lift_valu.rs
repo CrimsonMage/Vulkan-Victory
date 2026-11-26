@@ -4,9 +4,10 @@ use super::*;
 
 impl Lift<'_> {
     pub(super) fn valu(&mut self, inst: &Inst, name: &'static str, v: &Valu) -> Res<()> {
-        let sgpr_out = name.starts_with("v_cmp")
-            || v.carry.is_some()
-            || matches!(v.dst, Some(Operand::Scalar { .. }));
+        // EXEC writes and scalar results run unguarded; compares and carries
+        // into lane masks run in the guard (0 for the lanes outside it).
+        let sgpr_out = name.starts_with("v_cmpx")
+            || (matches!(v.dst, Some(Operand::Scalar { .. })) && !name.starts_with("v_cmp"));
         let cross = v.dpp.is_some()
             || matches!(
                 name,
