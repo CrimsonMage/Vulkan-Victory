@@ -395,8 +395,16 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left). The buffer is kept up to
+/// 16 MiB (a movie frame); a bigger texture is read into memory of its own,
+/// given back after: each submitting thread and upload worker kept a
+/// buffer as big as the biggest texture it ever read, for the run.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const KEPT: usize = 16 << 20;
+    let _owner = victory_core::heap::enter(victory_core::heap::Owner::Textures);
+    if size > KEPT {
+        return f(&mut vec![0; size]);
+    }
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {

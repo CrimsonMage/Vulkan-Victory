@@ -162,6 +162,7 @@ pub(crate) struct Ready {
 
 impl Memory {
     fn new() -> Memory {
+        let _owner = victory_core::heap::enter(victory_core::heap::Owner::Directory);
         let pages = MEMORY_PAGES as usize;
         let blocks = pages / BLOCK;
         Memory {
@@ -1187,6 +1188,11 @@ pub(crate) struct OwnList {
 unsafe impl Send for OwnList {}
 
 static SPARE: Mutex<Vec<OwnList>> = Mutex::new(Vec::new());
+
+/// For the process memory line: lists of ours for copies kept spare.
+pub(crate) fn spare_lists() -> usize {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
 
 /// A list of ours in a submission: back to [`SPARE`] once that has run
 /// (`crate::host::retire`).

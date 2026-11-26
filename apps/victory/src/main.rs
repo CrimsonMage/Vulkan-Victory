@@ -14,6 +14,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The diagnostics build counts victory's heap by owner for the process
+/// memory line (`victory_core::heap`).
+#[cfg(feature = "diagnostics")]
+#[global_allocator]
+static HEAP: victory_core::heap::Counting = victory_core::heap::Counting;
+
 #[derive(Parser)]
 #[command(
     name = "victory",

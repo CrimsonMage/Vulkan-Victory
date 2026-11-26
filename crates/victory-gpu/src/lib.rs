@@ -57,6 +57,7 @@ mod primitive;
 pub mod query;
 #[cfg(windows)]
 mod quality;
+mod procmem;
 #[cfg(windows)]
 mod release;
 pub mod queue;
