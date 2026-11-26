@@ -83,6 +83,11 @@ pub const EXTENSIONS: &[Extension] = &[
         "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
     ),
     ext(
+        ext::shader_atomic_float2::NAME,
+        Need::Wanted,
+        "float atomic min/max on title memory (global_atomic_fmin/fmax; SPV_EXT_shader_atomic_float_min_max)",
+    ),
+    ext(
         ext::extended_dynamic_state3::NAME,
         Need::Wanted,
         "blend, raster and depth state set per draw (fewer pipelines)",
@@ -517,6 +522,7 @@ impl Host {
         let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let mut float2 = vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -555,6 +561,7 @@ impl Host {
             }
             f2 = chain_features(f2, on(khr::fragment_shader_barycentric::NAME), &mut bary);
             f2 = chain_features(f2, on(ext::conditional_rendering::NAME), &mut conditional);
+            f2 = chain_features(f2, on(ext::shader_atomic_float2::NAME), &mut float2);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -698,6 +705,7 @@ impl Host {
             }
             info = chain_device(info, has(khr::fragment_shader_barycentric::NAME), &mut bary);
             info = chain_device(info, has(ext::conditional_rendering::NAME), &mut conditional);
+            info = chain_device(info, has(ext::shader_atomic_float2::NAME), &mut float2);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 

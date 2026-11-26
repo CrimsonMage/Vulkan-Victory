@@ -123,6 +123,10 @@ impl Lift<'_> {
             let hi = self.gl(glsl::N_MAX, Ty::F16, &[a, b]);
             let m = self.gl(glsl::N_MIN, Ty::F16, &[hi, c]);
             self.gl(glsl::N_MAX, Ty::F16, &[lo, m])
+        } else if name == "v_min3_f16" || name == "v_max3_f16" {
+            let g = if name == "v_min3_f16" { glsl::N_MIN } else { glsl::N_MAX };
+            let t = self.gl(g, Ty::F16, &[a, b]);
+            self.gl(g, Ty::F16, &[t, c])
         } else {
             self.gl(glsl::FMA, Ty::F16, &[a, b, c])
         };

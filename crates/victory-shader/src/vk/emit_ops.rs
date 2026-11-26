@@ -47,11 +47,27 @@ impl Emit<'_> {
     fn atomic(&mut self, o: u16, ptr: Id, scope: u32, args: &[Id]) -> Id {
         let u = self.t.u32_;
         let (scope, sem) = (self.c32(scope), self.c32(0));
+        if o == op::ATOMIC_F_MIN_EXT || o == op::ATOMIC_F_MAX_EXT {
+            return self.atomic_float(o, ptr, scope, sem, args[1]);
+        }
         if o == op::ATOMIC_COMPARE_EXCHANGE {
             self.m.op(o, u, &[ptr, scope, sem, sem, args[1], args[2]])
         } else {
             self.m.op(o, u, &[ptr, scope, sem, args[1]])
         }
+    }
+
+    /// A float min/max atomic on a u32 pointer: the pointer and value are
+    /// reinterpreted as f32 and the old value returned as its u32 bits.
+    fn atomic_float(&mut self, o: u16, ptr: Id, scope: Id, sem: Id, x: Id) -> Id {
+        let (u, f) = (self.t.u32_, self.t.f32_);
+        self.m.extension("SPV_EXT_shader_atomic_float_min_max");
+        self.m.capability(en::CAP_ATOMIC_FLOAT32_MIN_MAX_EXT);
+        let fp = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, f);
+        let fptr = self.m.op(op::BITCAST, fp, &[ptr]);
+        let fx = self.m.op(op::BITCAST, f, &[x]);
+        let old = self.m.op(o, f, &[fptr, scope, sem, fx]);
+        self.m.op(op::BITCAST, u, &[old])
     }
 
     /// LDS dwords (the index clamped; the lanes outside a flat guard write

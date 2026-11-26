@@ -156,6 +156,8 @@ pub mod op {
     pub const ATOMIC_AND: u16 = 240;
     pub const ATOMIC_OR: u16 = 241;
     pub const ATOMIC_XOR: u16 = 242;
+    pub const ATOMIC_F_MIN_EXT: u16 = 5614;
+    pub const ATOMIC_F_MAX_EXT: u16 = 5615;
     pub const PHI: u16 = 245;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
@@ -217,6 +219,7 @@ pub mod en {
     pub const CAP_STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
     pub const CAP_INT8: u32 = 39;
     pub const CAP_STENCIL_EXPORT: u32 = 5013;
+    pub const CAP_ATOMIC_FLOAT32_MIN_MAX_EXT: u32 = 5612;
     pub const CAP_MESH_SHADING_EXT: u32 = 5283;
     pub const CAP_FRAGMENT_BARYCENTRIC_KHR: u32 = 5284;
     pub const CAP_INT64_ATOMICS: u32 = 12;

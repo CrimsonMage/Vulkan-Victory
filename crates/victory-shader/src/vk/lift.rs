@@ -915,6 +915,9 @@ fn atomic_op(name: &str) -> Option<u16> {
         "xor" | "xor_b32" => op::ATOMIC_XOR,
         "swap" | "wrxchg_rtn_b32" | "wrxchg" => op::ATOMIC_EXCHANGE,
         "cmpswap" | "cmpst" | "cmpst_rtn_b32" => op::ATOMIC_COMPARE_EXCHANGE,
+        // 32-bit float min/max (SPV_EXT_shader_atomic_float_min_max).
+        "fmin" | "min_f32" | "min_rtn_f32" => op::ATOMIC_F_MIN_EXT,
+        "fmax" | "max_f32" | "max_rtn_f32" => op::ATOMIC_F_MAX_EXT,
         _ => return None,
     })
 }
