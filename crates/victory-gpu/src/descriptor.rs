@@ -155,6 +155,11 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    // Under Vulkan the slots hold the console's descriptors: nothing to
+    // mirror (and no host heap would ever take the pending slots).
+    if crate::vulkan::on() {
+        return;
+    }
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -1056,7 +1061,7 @@ pub(crate) extern "system" fn create_heap(
             .flatten(),
     });
     #[cfg(windows)]
-    if visible {
+    if visible && !crate::vulkan::on() {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));

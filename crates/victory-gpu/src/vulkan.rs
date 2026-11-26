@@ -1051,6 +1051,13 @@ pub(crate) fn wait(queue: This, fence: This, value: u64) {
     e.pump(b, false);
 }
 
+/// A fence was signalled by the CPU: lines waiting for it run on.
+pub(crate) fn fence_signalled() {
+    let Some(b) = backend() else { return };
+    engine(b).pump(b, false);
+    b.changed.notify_all();
+}
+
 /// A CPU wait for a fence with no event: blocks until it is reached, or
 /// until nothing given can reach it (then `false`).
 pub(crate) fn wait_for_fence(fence: This, value: u64) -> bool {
