@@ -497,7 +497,7 @@ fn dump_dir() -> Option<&'static std::path::Path> {
 }
 
 /// The device limits modules are checked against, read once.
-fn limits(b: &Backend) -> &'static victory_vk::limits::Limits {
+pub(crate) fn limits(b: &Backend) -> &'static victory_vk::limits::Limits {
     static LIMITS: OnceLock<victory_vk::limits::Limits> = OnceLock::new();
     LIMITS.get_or_init(|| {
         let l = victory_vk::limits::Limits::of(&b.host);
@@ -511,6 +511,8 @@ fn limits(b: &Backend) -> &'static victory_vk::limits::Limits {
             mesh_primitives = l.mesh_primitives,
             mesh_components = l.mesh_components,
             stencil_export = l.stencil_export,
+            mesh_groups = ?l.mesh_groups,
+            mesh_groups_total = l.mesh_groups_total,
             "Vulkan: the limits modules are checked against before they compile"
         );
         l

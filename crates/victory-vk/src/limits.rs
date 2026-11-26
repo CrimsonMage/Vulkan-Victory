@@ -196,6 +196,9 @@ pub struct Limits {
     pub mesh_components: u32,
     pub mesh_vertex_granularity: u32,
     pub mesh_primitive_granularity: u32,
+    /// Mesh task groups a draw may take, per dimension and in all.
+    pub mesh_groups: [u32; 3],
+    pub mesh_groups_total: u32,
     pub vertex_components: u32,
     pub mesh: bool,
     pub stencil_export: bool,
@@ -229,6 +232,8 @@ impl Limits {
             mesh_components: mesh.max_mesh_output_components,
             mesh_vertex_granularity: mesh.mesh_output_per_vertex_granularity.max(1),
             mesh_primitive_granularity: mesh.mesh_output_per_primitive_granularity.max(1),
+            mesh_groups: mesh.max_mesh_work_group_count,
+            mesh_groups_total: mesh.max_mesh_work_group_total_count,
             vertex_components: l.max_vertex_output_components,
             mesh: host.caps.mesh_shader,
             stencil_export: host.caps.has(ash::ext::shader_stencil_export::NAME),
