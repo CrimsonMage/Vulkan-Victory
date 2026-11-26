@@ -93,8 +93,10 @@ const GROW: u64 = 90;
 const SHRINK: u64 = 95;
 /// What of the card stays free besides (the driver's budget less its use):
 /// blocks are made only while this much would be left, and given back
-/// below half of it.
-const FREE_KEEP: u64 = 256 << 20;
+/// below half of it. 1 GiB: under vkd3d the driver keeps ~3 GB of its own
+/// (pipelines, local memory) outside the budget figure, so less left the
+/// card full (run p26: 7.2 GB at frame 990).
+const FREE_KEEP: u64 = 1 << 30;
 /// Blocks at most (6 GiB; the Series S pool is 3,977 MiB, plus twins).
 const MOST_BLOCKS: usize = 96;
 /// Blocks at most when the card's ceiling is not known.
