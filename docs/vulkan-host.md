@@ -1494,6 +1494,32 @@ branch's diag build. If it hangs again, vk29b with
   refills are host-line operations);
 - textures half as sharp as vk28's at medium (expected).
 
+### vk29: not indirect; the loop guard, host side (ABI v3)
+
+vk29 (this branch): the pool held (no unmapped pages, 8,901 refills),
+texture quality medium applied, images ~4.35 GB at the 4.6 GB limit,
+still Xid 109 at frame ~1,024. vk29b with `VICTORY_DIAG_NO_INDIRECT=1`:
+Xid 109 at ~1,260, so not indirect. The hang note never printed (autorun
+kills the game within 0.5 s of the Xid).
+
+Host side of ABI v3 (translator ab78299):
+
+- `HOST_ABI = 3`. Push dwords 2–3 hold the guard buffer's device address
+  (`vulkan/guard.rs`); dwords 0–1 stay 0.
+- **One** 8-byte host-visible guard buffer for all lines, not one per
+  line: command buffers are recorded before the queue that runs them is
+  known, so the pushed address cannot be a line's. The guard id names the
+  program, which is what the report needs.
+- After every landing the host reads dword 0. If it is not 0, it is
+  swapped to 0 and "Vulkan: a shader loop hit its guard" is logged once
+  per guard id, with `count`, `guard_id` and the program's name and hash
+  (registered as each stage is made).
+- The stage cache stores `guard_id` (magic `vkstage2`; old entries are
+  dropped).
+- The hang note fires at 1.0 s. Once any line's oldest submission is
+  1.0 s old, the oldest unfinished submission of every line still running
+  is printed with its trail.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

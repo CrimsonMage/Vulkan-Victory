@@ -27,7 +27,7 @@ use super::Backend;
 use crate::pipeline::Shader;
 
 /// The ABI version the host binds for (`docs/vulkan-abi.md`).
-pub(crate) const HOST_ABI: u32 = 2;
+pub(crate) const HOST_ABI: u32 = 3;
 
 /// Stage workers: few and in the background (the machine's load is kept
 /// low; the title's own threads come first).
@@ -532,6 +532,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[8].fetch_add(vs.spirv.len() as u64, Ordering::Relaxed);
     let hash = hash_hex(&shader.full);
+    super::guard::register(vs.guard_id, &shader.name, &hash);
     let usage = victory_vk::limits::usage(&vs.spirv);
     if let Some(dir) = dump_dir() {
         let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();

@@ -547,6 +547,10 @@ impl Rec {
     fn push(&mut self, b: &Backend, cmd: vk::CommandBuffer, stages: &[&Stage], compute: bool) {
         let Some(layout) = stages::layout(b) else { return };
         let mut words = [0u32; 64];
+        // ABI v3: the loop guard buffer's address in dwords 2–3.
+        let guard = super::guard::address(b);
+        words[2] = guard as u32;
+        words[3] = (guard >> 32) as u32;
         let root = if compute { &self.compute } else { &self.graphics };
         for st in stages {
             for ud in &st.user_data {

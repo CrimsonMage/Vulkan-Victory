@@ -14,7 +14,7 @@ use victory_shader::emit::UserData;
 use victory_shader::vk::{Interface, VkShader};
 use victory_shader::{HwStage, RootType};
 
-const MAGIC: &[u8; 8] = b"vkstage1";
+const MAGIC: &[u8; 8] = b"vkstage2";
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -162,6 +162,7 @@ fn root_of(c: u32) -> RootType {
 fn encode(vs: &VkShader) -> Vec<u8> {
     let mut w: Vec<u32> = vec![stage_code(vs.stage)];
     w.extend(vs.local_size);
+    w.push(vs.guard_id);
     w.push(vs.user_data.len() as u32);
     for u in &vs.user_data {
         w.extend([u.index, u32::from(u.slot), root_code(u.root), u.dword]);
@@ -210,6 +211,7 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     let mut r = Words(&words, 0);
     let stage = stage_of(r.next()?)?;
     let local_size = [r.next()?, r.next()?, r.next()?];
+    let guard_id = r.next()?;
     let n = r.next()? as usize;
     let mut user_data = Vec::with_capacity(n);
     for _ in 0..n {
@@ -232,5 +234,5 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     }
     let n = r.next()? as usize;
     let spirv = r.take(n)?.to_vec();
-    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0 })
+    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id })
 }

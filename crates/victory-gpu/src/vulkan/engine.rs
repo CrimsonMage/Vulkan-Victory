@@ -334,6 +334,7 @@ impl Engine {
                 crate::fence::set(fence as This, v);
             }
         }
+        super::guard::check(b);
     }
 }
 
@@ -521,27 +522,35 @@ fn take_trails(cmds: &mut [Recording]) -> Vec<String> {
 }
 
 /// A submission the card has not finished this long is reported.
-const STALL: Duration = Duration::from_millis(1500);
+const STALL: Duration = Duration::from_millis(1000);
 
-/// Diagnostics, polled every 250 ms: each line's oldest submission in the
-/// air that has not run within [`STALL`] is reported once, with what its
-/// command buffers record and the lines' values (a hang: the shader that
-/// runs too long is in the first such submission of the line that did not
-/// move; the others wait for it).
+/// Diagnostics, polled every 250 ms: when a line's oldest submission in the
+/// air has not run within [`STALL`], the oldest unfinished submission of
+/// every line still running is reported once, with what its command
+/// buffers record and the lines' values (a hang: the shader that runs too
+/// long is in the first such submission of the line that did not move;
+/// the others may wait for it).
 pub(super) fn report_stalls(b: &Backend) {
     static REPORTED: std::sync::Mutex<Vec<(Line, u64)>> = std::sync::Mutex::new(Vec::new());
     if !cfg!(feature = "diagnostics") || b.timeline.lost() {
         return;
     }
     let e = engine(b);
-    let mut seen: Vec<Line> = Vec::new();
+    let mut fronts: Vec<(&Flight, u64)> = Vec::new();
     for f in &e.flights {
-        if seen.contains(&f.line) {
+        if fronts.iter().any(|(g, _)| g.line == f.line) {
             continue;
         }
-        seen.push(f.line);
         let reached = b.timeline.line_completed(&b.host, f.line);
-        if reached >= f.value || f.given.elapsed() < STALL || lock(&REPORTED).contains(&(f.line, f.value)) {
+        if reached < f.value {
+            fronts.push((f, reached));
+        }
+    }
+    if !fronts.iter().any(|(f, _)| f.given.elapsed() >= STALL) {
+        return;
+    }
+    for (f, reached) in fronts {
+        if lock(&REPORTED).contains(&(f.line, f.value)) {
             continue;
         }
         lock(&REPORTED).push((f.line, f.value));

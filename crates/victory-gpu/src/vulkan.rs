@@ -40,6 +40,7 @@ mod compose;
 mod descriptors;
 mod engine;
 mod gpu_stats;
+mod guard;
 mod loose;
 mod paging;
 mod present;
