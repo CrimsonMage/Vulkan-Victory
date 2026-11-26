@@ -248,7 +248,7 @@ fn target_view(b: &Backend, r: &RtvRecord, depth: bool) -> Option<(Arc<Image>, v
     let format = if image.depth() {
         image.format
     } else {
-        let f = if format_word == 0 { None } else { images::color_format(format_word, image.card_written) };
+        let f = if format_word == 0 { None } else { images::color_format(format_word, image.card_written()) };
         f.filter(|f| images::format_bytes(*f) == images::format_bytes(image.format)).unwrap_or(image.format)
     };
     let mip = mip.min(image.mips - 1);

@@ -808,7 +808,7 @@ fn texture_words(
         let aspect = if stencil { vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
         (image.format, aspect, stencil)
     } else {
-        let f = images::color_format(view_format, image.card_written).unwrap_or(image.format);
+        let f = images::color_format(view_format, image.card_written()).unwrap_or(image.format);
         let f = if images::format_bytes(f) == images::format_bytes(image.format) { f } else { image.format };
         (f, vk::ImageAspectFlags::COLOR, false)
     };
