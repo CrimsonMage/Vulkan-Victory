@@ -782,9 +782,23 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         if orders_writes {
             list.writes_barrier();
+            rebound(this, list);
         }
     }
     0
+}
+
+/// After a barrier of the title's that orders writes: the windows of
+/// bounded indirect records that writes ended since are bounded again here
+/// (`crate::indirect::rebound`), and the title's compute bindings set back
+/// after the pass.
+#[cfg(windows)]
+fn rebound(this: This, list: &crate::host::HostList) {
+    if crate::indirect::rebound(list) {
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        state.lock().unwrap_or_else(|e| e.into_inner()).restore_compute(list);
+    }
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -2047,6 +2061,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         list.writes_barrier();
+        rebound(this, list);
     }
     #[cfg(not(windows))]
     let _ = (this, count);

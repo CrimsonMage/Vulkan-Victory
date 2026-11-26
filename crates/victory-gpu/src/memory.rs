@@ -244,6 +244,21 @@ impl Memory {
     }
 }
 
+/// Whether a shader that reads and writes title memory by address reaches
+/// any of `[from, to)`: a page of it has a numbered copy (a page without
+/// one reads zeros and drops stores).
+pub(crate) fn reachable(from: u64, to: u64) -> bool {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_ref() else {
+        return false;
+    };
+    let last = u64::from(MEMORY_PAGES) - 1;
+    (from / PAGE..to.div_ceil(PAGE).min(last)).any(|page| {
+        // SAFETY: inside the directory's mapping (pages below the last).
+        unsafe { m.directory.1.add(page as usize * 2).read_volatile() != 0 }
+    })
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy

@@ -2482,9 +2482,16 @@ impl HostList {
         self.indirect().wrote(address, len, cause);
     }
 
-    /// Something recorded from now on may write title memory anywhere.
-    pub(crate) fn wrote_somewhere(&self) {
-        self.indirect().wrote_somewhere();
+    /// A shader recorded from now on writes title memory by address
+    /// (`crate::indirect`).
+    pub(crate) fn wrote_by_address(&self) {
+        self.indirect().wrote_by_address();
+    }
+
+    /// A shader recorded from now on writes buffers it picks from the heap
+    /// by index (`crate::indirect`).
+    pub(crate) fn wrote_heap(&self) {
+        self.indirect().wrote_heap();
     }
 
     /// The list's bounded indirect records (`crate::indirect`).

@@ -68,8 +68,8 @@ thread_local! {
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While a whole binding is made (`State::bind`): the title memory its
-    /// shaders are declared to write, and whether they may write memory
-    /// not known by address (by address, buffers picked by index).
+    /// shaders are declared to write, and whether they write buffers they
+    /// pick from the heap by index (not known which).
     static BIND_WRITES: std::cell::RefCell<Vec<(u64, u64, Cause)>> = const { std::cell::RefCell::new(Vec::new()) };
     static UNTRACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
@@ -865,7 +865,7 @@ impl State {
                 list.wrote(address, len, cause);
             }
             if self.untracked[kind] {
-                list.wrote_somewhere();
+                list.wrote_heap();
             }
             if compute {
                 part(Part::Skipped, began);
@@ -940,15 +940,11 @@ impl State {
                 part(Part::Tables, at);
             }
             STORES.set(true);
-            // Writes not known by address: through title memory by address,
-            // or to buffers it picks from the heap by index.
-            if t.stores
-                && t.host.root_srvs.iter().any(|&s| {
-                    s == victory_shader::emit::SLOT_MEMORY || s == victory_shader::emit::SLOT_STRIDES
-                })
-            {
+            // Writes to buffers it picks from the heap by index: not known
+            // which.
+            if t.stores && t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES) {
                 UNTRACKED.set(true);
-                list.wrote_somewhere();
+                list.wrote_heap();
             }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -967,6 +963,11 @@ impl State {
                 };
                 if compute {
                     part(Part::Memory, at);
+                }
+                // What it stores by address reaches the pages with copies
+                // (numbered just now included).
+                if writes {
+                    list.wrote_by_address();
                 }
                 Some(ready)
             } else {
@@ -2816,6 +2817,7 @@ impl State {
         (arguments, writable): (u64, bool),
         count: Option<u64>,
     ) -> bool {
+        let began = crate::fast::ticks();
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
@@ -2886,10 +2888,12 @@ impl State {
         // (`crate::indirect`): a pass of ours, if one is recorded, sets a
         // compute root signature and pipeline of its own, and the title's
         // are set back after it.
+        use crate::indirect::{Part, timed};
+        let at = timed(Part::Find, began);
         let (bounded, from) = if writable || crate::indirect::copied(arguments, len) {
             let window = (kind, stride, max);
-            let at = (args.gpu(arguments), arguments);
-            let Some((bounded, from, pass)) = crate::indirect::bounded(list, window, at, args.left(arguments)) else {
+            let records = (args.gpu(arguments), arguments);
+            let Some((bounded, from, pass)) = crate::indirect::bounded(list, window, records, args.left(arguments)) else {
                 return false;
             };
             if pass {
@@ -2900,12 +2904,14 @@ impl State {
             crate::indirect::unbounded();
             (args.buffer.clone(), offset)
         };
+        let at = timed(Part::Bound, at);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        let at = timed(Part::Bind, at);
         if !ran {
             return false;
         }
@@ -2926,6 +2932,7 @@ impl State {
                 count_offset,
             )
         };
+        timed(Part::Execute, at);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

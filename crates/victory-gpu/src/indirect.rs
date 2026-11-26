@@ -23,14 +23,22 @@
 //! its draws one record at a time, each its own execution, at successive
 //! records. A list keeps up to [`WINDOWS`] windows at once, each in its own
 //! part of one copy buffer made once per list. Later executions within a
-//! window read the bounded copy, with
-//! nothing recorded for them, until something recorded since may write the
-//! window's records: a shader or a copy declared to write memory over them
-//! ([`HostList::wrote`]), or a shader whose writes are not known by address
-//! (title memory by address, buffers picked from the heap by index). A
+//! window read the bounded copy, with nothing recorded for them, until
+//! something recorded since may write the window's records: a shader or a
+//! copy declared to write memory over them ([`HostList::wrote`]), a shader
+//! that writes title memory by address where the records have a copy it
+//! reaches, or one that writes buffers it picks from the heap by index. A
 //! barrier alone ends no window (the windows of run p15 were one execution
 //! long, a barrier between every two). The window's records past the ones
 //! the title runs are bounded too and never read.
+//!
+//! A window that executions read and a write ended is bounded again at the
+//! title's next barrier that orders writes ([`rebound`]): the barrier
+//! splits the host's render pass anyway, and the executions after it, in
+//! the title's next render pass, read the copy with no pass of ours
+//! between them (run p18: 1,522 passes a frame at executions, and ~135 µs
+//! of recording per indirect execution outside them, which a pass between
+//! two draws costs the host in ending and starting its render pass again).
 //!
 //! The pass sets a compute root signature and pipeline of its own; the
 //! title's compute root signature and arguments are set back right after
@@ -181,22 +189,48 @@ pub(crate) enum Cause {
     RootUav = 0,
     /// An unordered access view in a shader's table.
     TableUav = 1,
-    /// A shader that writes memory not known by address (title memory by
-    /// address, buffers picked from the heap by index).
-    Untracked = 2,
+    /// A shader that writes title memory by address, where the window's
+    /// records have a copy it reaches (`crate::memory::reachable`).
+    ByAddress = 2,
+    /// A shader that writes buffers it picks from the heap by index.
+    Heap = 3,
     /// A title copy run on the card.
-    Copy = 3,
+    Copy = 4,
 }
 
-/// Since the last frame line: bounding passes and the recording time they
-/// took (ticks), copy buffers made, executions bounded and not, and
-/// windows ended by each [`Cause`].
-static PASSES: AtomicU64 = AtomicU64::new(0);
+/// Since the last frame line: bounding passes (at executions, at the
+/// title's barriers) and the recording time they took (ticks), copy
+/// buffers made, executions bounded and not, windows ended by each
+/// [`Cause`], and the recording time of an indirect execution's parts
+/// ([`Part`]).
+static PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static PASS_TICKS: AtomicU64 = AtomicU64::new(0);
 static MADE: AtomicU64 = AtomicU64::new(0);
 static BOUNDED: AtomicU64 = AtomicU64::new(0);
 static UNBOUNDED: AtomicU64 = AtomicU64::new(0);
-static ENDED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ENDED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The parts of an indirect execution's recording, timed for the frame
+/// line.
+#[derive(Clone, Copy)]
+pub(crate) enum Part {
+    /// Finding its records' window or bounding them (passes included).
+    Bound = 0,
+    /// Binding the title's pipeline and arguments (the draw's preparation).
+    Bind = 1,
+    /// The host's `ExecuteIndirect`.
+    Execute = 2,
+    /// Finding the records' buffers and the signature, before.
+    Find = 3,
+}
+
+/// Adds the ticks since `began` to `part`; the ticks now.
+pub(crate) fn timed(part: Part, began: u64) -> u64 {
+    let now = crate::fast::ticks();
+    PARTS[part as usize].fetch_add(now - began, Relaxed);
+    now
+}
 
 /// An indirect execution ran from its records as they are.
 pub(crate) fn unbounded() {
@@ -206,29 +240,42 @@ pub(crate) fn unbounded() {
 /// The frame line's part, per frame over `frames` frames.
 pub(crate) fn frame_text(frames: f64) -> String {
     let take = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / frames;
+    let ms = |c: &AtomicU64| crate::fast::ticks_to_ns(c.swap(0, Relaxed)) as f64 / 1e6 / frames;
     let ended = ENDED.each_ref().map(take);
-    let ms = crate::fast::ticks_to_ns(PASS_TICKS.swap(0, Relaxed)) as f64 / 1e6 / frames;
+    let parts = PARTS.each_ref().map(ms);
     format!(
-        "indirect bounding per frame: passes {:.1} ({ms:.1} ms), copy buffers made {:.1}, executions bounded {:.0} unbounded {:.0}, windows ended by root UAV {:.1} table UAV {:.1} by address or heap {:.1} card copy {:.1}",
-        take(&PASSES),
+        "indirect bounding per frame: passes at executions {:.1} at barriers {:.1} ({:.1} ms), copy buffers made {:.1}, executions bounded {:.0} unbounded {:.0}, \
+         windows ended by root UAV {:.1} table UAV {:.1} by address {:.1} heap {:.1} card copy {:.1}; indirect call parts ms: find {:.1} bound {:.1} bind {:.1} ExecuteIndirect {:.1}",
+        take(&PASSES[0]),
+        take(&PASSES[1]),
+        ms(&PASS_TICKS),
         take(&MADE),
         take(&BOUNDED),
         take(&UNBOUNDED),
         ended[0],
         ended[1],
         ended[2],
-        ended[3]
+        ended[3],
+        ended[4],
+        parts[3],
+        parts[0],
+        parts[1],
+        parts[2]
     )
 }
 
 /// Windows a list keeps at once (one per argument buffer the title
-/// interleaves).
+/// interleaves), and windows ended by writes that are bounded again at the
+/// title's next barrier.
 const WINDOWS: usize = 8;
 
-/// A bounded window: kind, stride, records, the GPU address of the title
-/// records' first, their title memory (from, to), and where their copy
-/// starts in the list's copy buffer.
-type Bounded = (u32, u32, u32, u64, (u64, u64), u64);
+/// What a window bounds: kind, stride, records, the GPU address of the
+/// title records' first, and their title memory (from, to).
+type Spec = (u32, u32, u32, u64, (u64, u64));
+
+/// A bounded window: what it bounds, where its copy starts in the list's
+/// copy buffer, and whether an execution read it since it was bounded.
+type Bounded = (Spec, u64, bool);
 
 /// A list's copy buffer and the windows bounded into it.
 #[derive(Default)]
@@ -242,26 +289,56 @@ pub(crate) struct Window {
     next: u64,
     /// The windows bounded in this recording, still valid.
     bounded: Vec<Bounded>,
+    /// Windows that executions read and writes ended since: bounded again
+    /// at the title's next barrier ([`rebound`]).
+    stale: Vec<Spec>,
 }
 
 impl Window {
-    /// Something recorded from now on writes `[address, address + len)`.
-    pub(crate) fn wrote(&mut self, address: u64, len: u64, cause: Cause) {
-        let end = address.saturating_add(len);
-        let before = self.bounded.len();
-        self.bounded.retain(|&(.., (from, to), _)| address >= to || end <= from);
-        let ended = before - self.bounded.len();
+    /// Ends the windows `ends` says, by `cause`; the ones executions read
+    /// are bounded again at the title's next barrier.
+    fn end(&mut self, cause: Cause, mut ends: impl FnMut(&Spec) -> bool) {
+        let mut ended = 0;
+        let mut k = 0;
+        while k < self.bounded.len() {
+            let (spec, _, read) = self.bounded[k];
+            if !ends(&spec) {
+                k += 1;
+                continue;
+            }
+            self.bounded.remove(k);
+            ended += 1;
+            if read && !self.stale.contains(&spec) {
+                if self.stale.len() >= WINDOWS {
+                    self.stale.remove(0);
+                }
+                self.stale.push(spec);
+            }
+        }
         if ended > 0 {
-            ENDED[cause as usize].fetch_add(ended as u64, Relaxed);
+            ENDED[cause as usize].fetch_add(ended, Relaxed);
         }
     }
 
-    /// Something recorded from now on may write anywhere.
-    pub(crate) fn wrote_somewhere(&mut self) {
-        if !self.bounded.is_empty() {
-            ENDED[Cause::Untracked as usize].fetch_add(self.bounded.len() as u64, Relaxed);
-            self.bounded.clear();
+    /// Something recorded from now on writes `[address, address + len)`.
+    pub(crate) fn wrote(&mut self, address: u64, len: u64, cause: Cause) {
+        let end = address.saturating_add(len);
+        self.end(cause, |&(.., (from, to))| address < to && end > from);
+    }
+
+    /// A shader recorded from now on writes title memory by address: the
+    /// windows whose records it reaches end.
+    pub(crate) fn wrote_by_address(&mut self) {
+        if self.bounded.is_empty() {
+            return;
         }
+        self.end(Cause::ByAddress, |&(.., (from, to))| crate::memory::reachable(from, to));
+    }
+
+    /// A shader recorded from now on writes buffers it picks from the heap.
+    /// shortcut: which ones is not known; every window ends.
+    pub(crate) fn wrote_heap(&mut self) {
+        self.end(Cause::Heap, |_| true);
     }
 
     /// The list is reset: its buffer was left common when it closed.
@@ -269,6 +346,7 @@ impl Window {
         self.readable = false;
         self.next = 0;
         self.bounded.clear();
+        self.stale.clear();
     }
 
     /// Before the list closes: the buffer goes back to common, where the
@@ -286,6 +364,83 @@ impl Window {
         }
         self.reset();
     }
+
+    /// Records the pass that bounds `spec` into the next part of the copy
+    /// buffer (made or grown first if it must be): where the copy starts.
+    /// The buffer is made once per list and kept; when it is full the next
+    /// window starts again at its beginning (the pass's move of the buffer
+    /// out of `INDIRECT_ARGUMENT` orders it after every execution before)
+    /// and the windows before it are forgotten.
+    fn record(&mut self, list: &HostList, spec: Spec, read: bool) -> Option<u64> {
+        let began = crate::fast::ticks();
+        let (kind, stride, records, src, _) = spec;
+        let bytes = u64::from(records) * u64::from(stride);
+        let pass = pass()?;
+        if self.copy.as_ref().is_none_or(|(_, size)| *size < bytes) {
+            let size = bytes.max(SMALLEST).next_power_of_two();
+            let copy = host()?.uav_buffer(size)?;
+            MADE.fetch_add(1, Relaxed);
+            if let Some((old, _)) = self.copy.replace((copy, size)) {
+                // The list ends with every copy buffer common.
+                if self.readable {
+                    // SAFETY: an open list; the buffer is in `INDIRECT_ARGUMENT`.
+                    unsafe {
+                        list.list.ResourceBarrier(&[transition(
+                            &old,
+                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )])
+                    };
+                }
+                list.keep(&old);
+            }
+            self.readable = false;
+            self.next = 0;
+            self.bounded.clear();
+        }
+        let (copy, size) = self.copy.clone()?;
+        // The next part of the buffer, records on 16 bytes; from the start
+        // again when full (the windows there are forgotten).
+        let mut at = self.next.next_multiple_of(16);
+        if at + bytes > size {
+            at = 0;
+            self.bounded.clear();
+        }
+        if self.bounded.len() >= WINDOWS {
+            self.bounded.remove(0);
+        }
+        let before = if self.readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let constants = [kind, stride, records];
+        // SAFETY: an open list; our root signature and pipeline; the title's
+        // records lie in a live host buffer (`bytes` from `src`), the copy
+        // buffer is the list's and `at + bytes` lies inside it. Moving it out
+        // of `INDIRECT_ARGUMENT` orders this pass's writes after the reads of
+        // the executions before.
+        unsafe {
+            let l = &list.list;
+            l.ResourceBarrier(&[transition(&copy, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetComputeRootSignature(&pass.root);
+            l.SetPipelineState(&pass.pso);
+            l.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src);
+            l.SetComputeRootUnorderedAccessView(2, copy.GetGPUVirtualAddress() + at);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.ResourceBarrier(&[transition(
+                &copy,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        self.readable = true;
+        self.next = at + bytes;
+        self.bounded.push((spec, at, read));
+        PASS_TICKS.fetch_add(crate::fast::ticks() - began, Relaxed);
+        Some(at)
+    }
 }
 
 /// The bounded copy of `max` records of `kind` (PC numbering) `stride`
@@ -295,12 +450,6 @@ impl Window {
 /// its own compute root signature and pipeline: the caller sets the
 /// title's back). `None` if it cannot be bounded: the execution is
 /// dropped.
-///
-/// The copy buffer is made once per list and kept; windows take the next
-/// part of it, and when it is full the next window starts again at its
-/// beginning (the pass's move of the buffer out of `INDIRECT_ARGUMENT`
-/// orders it after every execution before) and the windows before it are
-/// forgotten.
 pub(crate) fn bounded(
     list: &HostList,
     (kind, stride, max): (u32, u32, u32),
@@ -309,18 +458,20 @@ pub(crate) fn bounded(
 ) -> Option<(ID3D12Resource, u64, bool)> {
     let max = max.max(1);
     let mut window = list.indirect();
-    let hit = window.bounded.iter().find_map(|&(k, st, records, first, _, at)| {
-        ((k, st) == (kind, stride)
-            && src >= first
-            && (src - first) % u64::from(stride) == 0
-            && (src - first) / u64::from(stride) + u64::from(max) <= u64::from(records))
-        .then_some(at + (src - first))
+    let hit = window.bounded.iter_mut().find_map(|((k, st, records, first, _), at, read)| {
+        let inside = (*k, *st) == (kind, stride)
+            && src >= *first
+            && (src - *first) % u64::from(stride) == 0
+            && (src - *first) / u64::from(stride) + u64::from(max) <= u64::from(*records);
+        inside.then(|| {
+            *read = true;
+            *at + (src - *first)
+        })
     });
     if let (Some(from), Some((copy, _))) = (hit, &window.copy) {
         BOUNDED.fetch_add(1, Relaxed);
         return Some((copy.clone(), from, false));
     }
-    let began = crate::fast::ticks();
     let records = (u64::from(max).max(u64::from(WINDOW)))
         .min(left / u64::from(stride))
         .max(u64::from(max));
@@ -328,71 +479,33 @@ pub(crate) fn bounded(
     if bytes > u64::from(u32::MAX) {
         return None;
     }
-    let pass = pass()?;
-    if window.copy.as_ref().is_none_or(|(_, size)| *size < bytes) {
-        let size = bytes.max(SMALLEST).next_power_of_two();
-        let copy = host()?.uav_buffer(size)?;
-        MADE.fetch_add(1, Relaxed);
-        if let Some((old, _)) = window.copy.replace((copy, size)) {
-            // The list ends with every copy buffer common.
-            if window.readable {
-                // SAFETY: an open list; the buffer is in `INDIRECT_ARGUMENT`.
-                unsafe {
-                    list.list.ResourceBarrier(&[transition(
-                        &old,
-                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    )])
-                };
-            }
-            list.keep(&old);
-        }
-        window.readable = false;
-        window.next = 0;
-        window.bounded.clear();
-    }
-    let (copy, size) = window.copy.clone()?;
-    // The next part of the buffer, records on 16 bytes; from the start
-    // again when full (the windows there are forgotten).
-    let mut at = window.next.next_multiple_of(16);
-    if at + bytes > size {
-        at = 0;
-        window.bounded.clear();
-    }
-    if window.bounded.len() >= WINDOWS {
-        window.bounded.remove(0);
-    }
-    let before = if window.readable {
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
-    } else {
-        D3D12_RESOURCE_STATE_COMMON
-    };
-    let constants = [kind, stride, records as u32];
-    // SAFETY: an open list; our root signature and pipeline; the title's
-    // records lie in a live host buffer (`left` bytes from `src`), the copy
-    // buffer is the list's and `at + bytes` lies inside it. Moving it out
-    // of `INDIRECT_ARGUMENT` orders this pass's writes after the reads of
-    // the executions before.
-    unsafe {
-        let l = &list.list;
-        l.ResourceBarrier(&[transition(&copy, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-        l.SetComputeRootSignature(&pass.root);
-        l.SetPipelineState(&pass.pso);
-        l.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
-        l.SetComputeRootShaderResourceView(1, src);
-        l.SetComputeRootUnorderedAccessView(2, copy.GetGPUVirtualAddress() + at);
-        l.Dispatch((records as u32).div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[transition(
-            &copy,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        )]);
-    }
-    window.readable = true;
-    window.next = at + bytes;
-    window.bounded.push((kind, stride, records as u32, src, (title, title + bytes), at));
-    PASSES.fetch_add(1, Relaxed);
+    let spec = (kind, stride, records as u32, src, (title, title + bytes));
+    window.stale.retain(|s| *s != spec);
+    let at = window.record(list, spec, true)?;
+    PASSES[0].fetch_add(1, Relaxed);
     BOUNDED.fetch_add(1, Relaxed);
-    PASS_TICKS.fetch_add(crate::fast::ticks() - began, Relaxed);
+    let (copy, _) = window.copy.clone()?;
     Some((copy, at, true))
+}
+
+/// At a barrier of the title's that orders writes (its passes' writes are
+/// done for what follows): the windows executions read and writes ended
+/// since are bounded again here, where the barrier already splits the
+/// host's render pass, so that the executions after it read them with no
+/// pass of ours in between. Whether a pass was recorded (the caller sets
+/// the title's compute bindings back).
+pub(crate) fn rebound(list: &HostList) -> bool {
+    let mut window = list.indirect();
+    if window.stale.is_empty() {
+        return false;
+    }
+    let stale = std::mem::take(&mut window.stale);
+    let mut any = false;
+    for spec in stale {
+        if window.record(list, spec, false).is_some() {
+            PASSES[1].fetch_add(1, Relaxed);
+            any = true;
+        }
+    }
+    any
 }
