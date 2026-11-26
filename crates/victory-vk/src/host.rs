@@ -73,6 +73,16 @@ pub const EXTENSIONS: &[Extension] = &[
         "null descriptors for empty slots",
     ),
     ext(
+        khr::fragment_shader_barycentric::NAME,
+        Need::Wanted,
+        "pixel programs that read per-vertex attributes (v_interp_mov; without it those programs are refused)",
+    ),
+    ext(
+        ext::shader_stencil_export::NAME,
+        Need::Wanted,
+        "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
+    ),
+    ext(
         ext::extended_dynamic_state3::NAME,
         Need::Wanted,
         "blend, raster and depth state set per draw (fewer pipelines)",
@@ -317,6 +327,20 @@ pub struct Host {
     pub instance_extensions: Vec<String>,
 }
 
+/// `f2` with `s` chained when `on`.
+fn chain_features<'a, T: vk::ExtendsPhysicalDeviceFeatures2 + ?Sized>(
+    f2: vk::PhysicalDeviceFeatures2<'a>,
+    on: bool,
+    s: &'a mut T,
+) -> vk::PhysicalDeviceFeatures2<'a> {
+    if on { f2.push_next(s) } else { f2 }
+}
+
+/// `info` with `s` chained when `on`.
+fn chain_device<'a, T: vk::ExtendsDeviceCreateInfo + ?Sized>(info: vk::DeviceCreateInfo<'a>, on: bool, s: &'a mut T) -> vk::DeviceCreateInfo<'a> {
+    if on { info.push_next(s) } else { info }
+}
+
 pub fn version(v: u32) -> String {
     format!(
         "{}.{}.{}",
@@ -444,6 +468,7 @@ impl Host {
         let mut border = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut clip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
         let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
+        let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -480,6 +505,7 @@ impl Host {
             if on(ext::shader_object::NAME) {
                 f2 = f2.push_next(&mut objects);
             }
+            f2 = chain_features(f2, on(khr::fragment_shader_barycentric::NAME), &mut bary);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -497,6 +523,7 @@ impl Host {
         border.p_next = null;
         clip.p_next = null;
         objects.p_next = null;
+        bary.p_next = null;
 
         let features = feature_table(&core, &v11, &v12, &v13);
         let descriptor_buffer = db.descriptor_buffer == vk::TRUE;
@@ -626,6 +653,7 @@ impl Host {
             if shader_object {
                 info = info.push_next(&mut objects);
             }
+            info = chain_device(info, has(khr::fragment_shader_barycentric::NAME), &mut bary);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 

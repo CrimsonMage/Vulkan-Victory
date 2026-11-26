@@ -166,21 +166,113 @@ pub(crate) fn layout(b: &Backend) -> Option<&'static Layout> {
 }
 
 /// What became of a stage.
-#[allow(dead_code)] // the stages are linked from M2b's draws on
 enum State {
     Queued,
-    Done(Stage),
+    Done(Arc<Stage>),
     Failed,
 }
 
-#[allow(dead_code)] // kept for M2b's draws
-struct Stage {
-    stage: HwStage,
+/// A stage translated and compiled, as draws link it.
+pub(crate) struct Stage {
+    pub(crate) stage: HwStage,
+    #[allow(dead_code)] // kept while the part lives
     module: vk::ShaderModule,
-    /// The compiled part (library part or compute pipeline), once the
-    /// translator speaks the host's ABI.
-    part: Option<vk::Pipeline>,
+    /// The compiled part (library part or compute pipeline).
+    pub(crate) part: Option<vk::Pipeline>,
+    /// Push dword <- root parameter (ABI section 2).
+    pub(crate) user_data: Vec<victory_shader::emit::UserData>,
+    /// Vertex attributes read as inputs (fetch-shader programs, ABI
+    /// section 6): semantic, index, location.
+    pub(crate) inputs: Vec<(String, u32, u8)>,
+    #[allow(dead_code)]
     words: usize,
+}
+
+/// What a draw finds for a stage.
+pub(crate) enum Lookup {
+    Ready(Arc<Stage>),
+    /// Queued or being compiled: the draw is skipped and counted.
+    Waiting,
+    /// It does not translate or compile: draws with it are skipped.
+    Failed,
+}
+
+/// The stage of `shader` for a draw: queued at the front if nothing asked
+/// for it before (pipelines the catalog did not know at creation).
+pub(crate) fn lookup(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
+    let mut guard = queue();
+    let q = guard.get_or_insert_with(|| {
+        start(b);
+        Queue {
+            states: HashMap::new(),
+            todo: VecDeque::new(),
+        }
+    });
+    match q.states.get(&shader.full) {
+        Some(State::Done(s)) if s.part.is_some() => Lookup::Ready(s.clone()),
+        Some(State::Done(_) | State::Failed) => Lookup::Failed,
+        Some(State::Queued) => {
+            // Queued at creation, behind the catalog: a draw wants it now.
+            if let Some(i) = q.todo.iter().position(|s| s.full == shader.full)
+                && i > 0
+                && let Some(s) = q.todo.remove(i)
+            {
+                q.todo.push_front(s);
+            }
+            Lookup::Waiting
+        }
+        None => {
+            q.states.insert(shader.full, State::Queued);
+            q.todo.push_front(shader.clone());
+            WORK.notify_one();
+            Lookup::Waiting
+        }
+    }
+}
+
+/// The one `VkPipelineCache` of the run, loaded from the cache folder
+/// (one file per `pipelineCacheUUID`), saved at the end ([`save_cache`]).
+pub(crate) fn cache(b: &Backend) -> vk::PipelineCache {
+    static CACHE: OnceLock<vk::PipelineCache> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let data = cache_file(b).and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
+        // SAFETY: valid create info; a blob of another driver is ignored by
+        // the driver (its header names the device).
+        let made = unsafe {
+            b.host.device.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(&data),
+                None,
+            )
+        };
+        match made {
+            Ok(c) => {
+                tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache");
+                c
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Vulkan: no pipeline cache");
+                vk::PipelineCache::null()
+            }
+        }
+    })
+}
+
+fn cache_file(b: &Backend) -> Option<std::path::PathBuf> {
+    let uuid: String = b.host.caps.pipeline_cache_uuid.iter().map(|x| format!("{x:02x}")).collect();
+    Some(crate::pipeline::cache_dir()?.join(format!("vulkan-{uuid}.bin")))
+}
+
+/// Saves the pipeline cache (at the end of a run).
+pub(crate) fn save_cache(b: &Backend) {
+    let c = cache(b);
+    if c == vk::PipelineCache::null() {
+        return;
+    }
+    // SAFETY: a live cache.
+    if let (Ok(data), Some(f)) = (unsafe { b.host.device.get_pipeline_cache_data(c) }, cache_file(b)) {
+        let _ = std::fs::write(f, &data);
+        tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache saved");
+    }
 }
 
 struct Queue {
@@ -196,29 +288,113 @@ fn queue() -> std::sync::MutexGuard<'static, Option<Queue>> {
 }
 
 /// Totals since the start: translated, failed, unsupported, modules,
-/// parts, translate µs, module µs, part µs, SPIR-V words.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// parts, translate µs, module µs, part µs, SPIR-V words, from the disk
+/// cache.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Per kind (pre-rasterisation, fragment, compute): parts, µs, slowest µs.
+static KINDS: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
 /// Failure reasons and how often.
 static REASONS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
 /// The title created a pipeline with `shaders`: those not seen go to the
 /// stage workers.
 pub(crate) fn created(b: &'static Backend, shaders: &[Arc<Shader>]) {
-    let mut q = queue();
-    let q = q.get_or_insert_with(|| {
+    let mut guard = queue();
+    let q = guard.get_or_insert_with(|| {
         start(b);
         Queue {
             states: HashMap::new(),
             todo: VecDeque::new(),
         }
     });
+    let inline = mode() == Mode::Inline;
+    let mut mine = Vec::new();
     for s in shaders {
         if let std::collections::hash_map::Entry::Vacant(e) = q.states.entry(s.full) {
             e.insert(State::Queued);
-            q.todo.push_back(s.clone());
+            if inline {
+                mine.push(s.clone());
+            } else {
+                q.todo.push_back(s.clone());
+            }
         }
     }
     WORK.notify_all();
+    drop(guard);
+    // Diagnostics: compiled here, on the title's thread, one at a time.
+    for s in mine {
+        let state = make(b, &s);
+        if let Some(q) = queue().as_mut() {
+            q.states.insert(s.full, state);
+        }
+    }
+}
+
+/// How stages are compiled (`VICTORY_VK_STAGES`, diagnostics builds only):
+/// on the stage workers (default), on the title's thread that created the
+/// pipeline, one at a time (`inline`), or not at all, modules only
+/// (`modules`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Workers,
+    Inline,
+    Modules,
+}
+
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Mode::Workers;
+        }
+        let m = match std::env::var("VICTORY_VK_STAGES").as_deref() {
+            Ok("inline") => Mode::Inline,
+            Ok("modules") => Mode::Modules,
+            _ => Mode::Workers,
+        };
+        tracing::info!(mode = ?m, "Vulkan: how stages compile (VICTORY_VK_STAGES)");
+        m
+    })
+}
+
+/// Diagnostics builds: the folder each module's words are written to before
+/// it is compiled (`VICTORY_VK_DUMP`), as `<hash>.<stage>.spv`.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return None;
+        }
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_VK_DUMP")?);
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// The device limits modules are checked against, read once.
+fn limits(b: &Backend) -> &'static victory_vk::limits::Limits {
+    static LIMITS: OnceLock<victory_vk::limits::Limits> = OnceLock::new();
+    LIMITS.get_or_init(|| {
+        let l = victory_vk::limits::Limits::of(&b.host);
+        tracing::info!(
+            compute_invocations = l.compute_invocations,
+            compute_shared = l.compute_shared,
+            mesh_invocations = l.mesh_invocations,
+            mesh_shared = l.mesh_shared,
+            mesh_output_memory = l.mesh_output_memory,
+            mesh_vertices = l.mesh_vertices,
+            mesh_primitives = l.mesh_primitives,
+            mesh_components = l.mesh_components,
+            stencil_export = l.stencil_export,
+            "Vulkan: the limits modules are checked against before they compile"
+        );
+        l
+    })
+}
+
+fn hash_hex(full: &[u8; 32]) -> String {
+    full[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn start(b: &'static Backend) {
@@ -257,11 +433,24 @@ fn fail(why: String) -> State {
     State::Failed
 }
 
-fn make(b: &Backend, shader: &Shader) -> State {
+/// The translation of `shader`: from the disk cache, else translated now
+/// (and kept).
+fn translate(shader: &Shader) -> std::thread::Result<Result<victory_shader::vk::VkShader, victory_shader::ShaderError>> {
+    if let Some(vs) = super::stage_cache::read(&shader.full) {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
+        return Ok(Ok(vs));
+    }
     let t = Instant::now();
     let translated = std::panic::catch_unwind(|| victory_shader::vk::translate(shader.container()));
     STATS[5].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    let vs = match translated {
+    if let Ok(Ok(vs)) = &translated {
+        super::stage_cache::write(&shader.full, vs);
+    }
+    translated
+}
+
+fn make(b: &Backend, shader: &Shader) -> State {
+    let vs = match translate(shader) {
         Ok(Ok(vs)) => vs,
         Ok(Err(e)) => {
             if matches!(e, victory_shader::ShaderError::Unsupported { .. }) {
@@ -279,6 +468,18 @@ fn make(b: &Backend, shader: &Shader) -> State {
     };
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[8].fetch_add(vs.spirv.len() as u64, Ordering::Relaxed);
+    let hash = hash_hex(&shader.full);
+    let usage = victory_vk::limits::usage(&vs.spirv);
+    if let Some(dir) = dump_dir() {
+        let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(dir.join(format!("{hash}.{:?}.spv", vs.stage)), bytes);
+    }
+    if let Some(why) = usage.refused(limits(b)) {
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(stage = ?vs.stage, hash = %hash, why = %why, "Vulkan part: refused before compiling");
+        }
+        return fail(format!("over the device: {why}"));
+    }
     let t = Instant::now();
     // SAFETY: the translator's words, a SPIR-V module.
     let module = unsafe {
@@ -293,11 +494,53 @@ fn make(b: &Backend, shader: &Shader) -> State {
     };
     STATS[3].fetch_add(1, Ordering::Relaxed);
     #[allow(clippy::absurd_extreme_comparisons)]
-    let speaks = victory_shader::vk::ABI_VERSION >= HOST_ABI;
+    let speaks = victory_shader::vk::ABI_VERSION >= HOST_ABI && mode() != Mode::Modules;
     let part = if speaks {
+        // Diagnostics builds name each part before the driver sees it, and
+        // flush: a fault inside the driver ends the process without a word
+        // (winevulkan's ExitProcess(3)), so the last such line names it.
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(
+                stage = ?vs.stage,
+                hash = %hash,
+                words = vs.spirv.len(),
+                samplers = vs.samplers.len(),
+                local = ?usage.local_size,
+                workgroup_bytes = usage.workgroup_bytes,
+                out_vertices = usage.out_vertices,
+                out_primitives = usage.out_primitives,
+                out_locations = usage.out_locations,
+                mesh_out_bytes = usage.mesh_output_bytes(limits(b)),
+                thread = std::thread::current().name().unwrap_or("?"),
+                "Vulkan part: compiling"
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
         let t = Instant::now();
         let p = compile(b, vs.stage, module, &vs.samplers);
-        STATS[7].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(
+                stage = ?vs.stage,
+                hash = %hash,
+                ms = t.elapsed().as_millis() as u64,
+                ok = p.is_ok(),
+                "Vulkan part: compiled"
+            );
+        }
+        let us = t.elapsed().as_micros() as u64;
+        STATS[7].fetch_add(us, Ordering::Relaxed);
+        let kind = match vs.stage {
+            HwStage::Ps => 1,
+            HwStage::Cs => 2,
+            _ => 0,
+        };
+        KINDS[kind][0].fetch_add(1, Ordering::Relaxed);
+        KINDS[kind][1].fetch_add(us, Ordering::Relaxed);
+        KINDS[kind][2].fetch_max(us, Ordering::Relaxed);
+        if us > 2_000_000 {
+            tracing::info!(stage = ?vs.stage, hash = %hash, ms = us / 1000, words = vs.spirv.len(), "Vulkan: a slow part compile");
+        }
         match p {
             Ok(p) => {
                 STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -311,12 +554,20 @@ fn make(b: &Backend, shader: &Shader) -> State {
     } else {
         None
     };
-    State::Done(Stage {
+    let inputs = vs
+        .interface
+        .iter()
+        .filter(|i| i.input && vs.stage != HwStage::Ps)
+        .map(|i| (i.semantic.clone(), i.index, i.location))
+        .collect();
+    State::Done(Arc::new(Stage {
         stage: vs.stage,
         module,
         part,
+        user_data: vs.user_data.clone(),
+        inputs,
         words: vs.spirv.len(),
-    })
+    }))
 }
 
 /// The first of the sampler heap's slots kept for immediate samplers
@@ -344,6 +595,11 @@ fn immediate_slot(words: [u32; 4]) -> u32 {
         }
     };
     IMMEDIATE_FIRST + at as u32
+}
+
+/// The dynamic states of pre-rasterisation parts (also the test parts').
+pub(crate) fn pre_raster_dynamic(b: &Backend) -> Vec<vk::DynamicState> {
+    dynamic(b, false)
 }
 
 /// Dynamic states of the pre-rasterisation and fragment parts
@@ -432,7 +688,7 @@ fn compile(
                 )
                 .layout(layout.pipeline);
             return d
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(cache(b), &[info], None)
                 .map(|p| p[0])
                 .map_err(|(_, e)| anyhow::anyhow!("vkCreateComputePipelines: {e}"));
         }
@@ -476,8 +732,10 @@ fn compile(
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .flags(
-                db | vk::PipelineCreateFlags::LIBRARY_KHR
-                    | vk::PipelineCreateFlags::RETAIN_LINK_TIME_OPTIMIZATION_INFO_EXT,
+                // No RETAIN_LINK_TIME_OPTIMIZATION_INFO: no optimised link is
+                // made yet, and keeping that information costs the driver
+                // a full compile per part.
+                db | vk::PipelineCreateFlags::LIBRARY_KHR,
             )
             .stages(&stages)
             .layout(layout.pipeline)
@@ -489,7 +747,7 @@ fn compile(
         } else {
             info.viewport_state(&viewport).rasterization_state(&raster)
         };
-        d.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        d.create_graphics_pipelines(cache(b), &[info], None)
             .map(|p| p[0])
             .map_err(|(_, e)| anyhow::anyhow!("vkCreateGraphicsPipelines (library part): {e}"))
     }
@@ -526,7 +784,12 @@ pub(crate) fn report() {
         translate_ms_avg = format_args!("{:.2}", per(s[5], s[0] + s[1])),
         module_ms_avg = format_args!("{:.2}", per(s[6], s[3])),
         part_ms_avg = format_args!("{:.2}", per(s[7], s[4])),
+        pre_raster_ms_avg = format_args!("{:.1}", per(KINDS[0][1].load(Ordering::Relaxed), KINDS[0][0].load(Ordering::Relaxed))),
+        fragment_ms_avg = format_args!("{:.1}", per(KINDS[1][1].load(Ordering::Relaxed), KINDS[1][0].load(Ordering::Relaxed))),
+        compute_ms_avg = format_args!("{:.1}", per(KINDS[2][1].load(Ordering::Relaxed), KINDS[2][0].load(Ordering::Relaxed))),
+        slowest_ms = [0, 1, 2].map(|k| KINDS[k][2].load(Ordering::Relaxed) / 1000).iter().max().copied().unwrap_or(0),
         spirv_kwords = s[8] / 1000,
+        from_disk = s[9],
         translator_abi = victory_shader::vk::ABI_VERSION,
         host_abi = HOST_ABI,
         top_failures = %top.join("; "),

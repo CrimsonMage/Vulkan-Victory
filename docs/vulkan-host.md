@@ -723,6 +723,190 @@ written. It holds integrate 30cd6a5 and the translator's ABI v1
 - **Stage workers** compile with no `VkPipelineCache` yet. Load and save
   one per `pipelineCacheUUID` in the run's cache folder.
 
+### M2b as built (2026-11-26, branch `worktree-agent-ad4bc2cc3bbe1cff3`)
+
+Steps (a)–(d) of the handoff above are built and compile; none has run
+yet. The translator is merged at b252e39 (ABI 1, structural self-check).
+
+- **Crash at the first part compiles (vk4).** It was a translator bug
+  (an invalid f16 module, now fixed). winevulkan's thunks end the process
+  with `ExitProcess(3)` after a fault inside the driver, and print nothing
+  under Proton's `WINEDEBUG=-all`. What the host keeps from that hunt:
+  - `victory-vk/src/limits.rs`: every module is checked against the
+    device limits before it compiles: mesh and compute group size, shared
+    memory, mesh output memory and components, capabilities. A module
+    over a limit is refused with a reason (`over the device: ...` in the
+    stage line).
+  - `VK_EXT_shader_stencil_export` is now enabled; the translator emits
+    it. `VK_KHR_fragment_shader_barycentric` is enabled when present.
+  - Diagnostics builds log `Vulkan part: compiling` (flushed) and
+    `Vulkan part: compiled` around each part. `VICTORY_VK_STAGES=inline`
+    compiles on the title's thread; `VICTORY_VK_STAGES=modules` makes
+    modules only. `VICTORY_VK_DUMP=<dir>` writes each module before it
+    compiles.
+- **(a) Descriptors** (`vulkan/descriptors.rs`).
+  - `descriptor::record` writes the console's descriptor into the slot
+    under Vulkan:
+    - a V# for CBVs and buffer views (raw, structured or typed), and for
+      placed buffer views;
+    - a T# for texture views (slot in WORD7; INTEGER and STORAGE bits);
+    - an S# for samplers (slot in WORD3).
+  - Descriptor buffers live in upload memory: set 0 (sampled at binding 0,
+    storage at binding 1), set 1 (samplers), and set 3 (one map UBO
+    descriptor per generation, 256 blocks kept round).
+  - Slots are given per (image, view) and freed when the image goes,
+    after the timeline passes. Slot 0 is a null image and a linear
+    sampler.
+  - Samplers from all three forms (D3D12 description, console
+    description, immediate S# words) meet as one D3D12-shaped description.
+    They are deduplicated, and immediate samplers are written into the
+    top 256 slots before draws.
+  - Regions are imported when an API call first names an address in
+    them (`vulkan::touch`: heap slots, buffer views, root views, tables,
+    heaps, index, vertex and copy addresses), then added to the map.
+- **(b) Card images** (`vulkan/images.rs`).
+  - Images are keyed by title address and shape, so a target's resource
+    and a placed view of its memory are one image. One is made when a
+    view, target or copy first names the texture.
+  - Each flush makes one submission: new images go into `GENERAL` and are
+    cleared, then the textures the card does not write are detiled with
+    `victory_formats` layouts into one staging buffer and copied in.
+  - Fills happen at creation and again at announced writes
+    (`title_memory_written`).
+  - Every image stays in `GENERAL`, and a title barrier is a full memory
+    barrier.
+  - Card memory comes in 256 MiB blocks with first-fit free lists; images
+    over 64 MiB are dedicated allocations.
+  - Images go at `title_memory_released`, once the timeline passes.
+- **(c) Recording** (`vulkan/record.rs`, `list/thin.rs`
+  `translate_vulkan`).
+  - Lists are `thin` under Vulkan, and `ExecuteCommandLists` joins them
+    first.
+  - Each stream is replayed into one command buffer per part
+    (`Timeline::begin`/`submit_recordings`). The command buffer goes to
+    its part at a memory-value wait and at the close. Parts with commands
+    submit them; parts with only writes submit a marker, as before.
+  - Draws fast-link four parts: the stage parts, a vertex-input part (the
+    attributes of fetch-shader programs, ABI §6 amended), and an output
+    part (the bound attachments' formats). Links are cached per tuple.
+    There is no optimised link yet.
+  - Push constants come from `VkShader::user_data` and the list's root
+    arguments.
+  - Descriptor buffers and the map are bound once per command buffer.
+  - Dynamic rendering, plus every dynamic state the parts declare. The
+    viewport is flipped (negative height), with front face as D3D.
+  - Also: clears (the whole view), barriers, buffer, memory, resource and
+    texture copies (texture to texture, buffer to texture, texture to
+    buffer), resolves, dispatches and mesh draws.
+  - A stage that is not ready is queued at the front and its draw is
+    skipped. Skipped draws are counted.
+  - `VkPipelineCache`: one file per `pipelineCacheUUID` in the pipeline
+    cache folder, saved by `save_pipeline_cache`.
+- **(d) Planes** (`vulkan/compose.rs`). Each present clears the image,
+  then draws each plane's rectangle into place: the first as it is, later
+  ones with premultiplied alpha. The pass uses HLSL compiled offline with
+  `glslc -x hlsl` and embedded words; the source is in the module notes.
+- **The 10 s line `Vulkan: draws recorded`** gives these counters:
+  - draws, dispatches, `skipped_not_ready`, `skipped_no_pipeline`,
+    `not_yet` (indirect execution, query resolves, MSAA, clear rects,
+    tessellation, geometry, amplification), `command_buffers`, `links`;
+  - views, samplers, `views_without_image`;
+  - images, fills, `filled_mb`, `images_refused`.
+
+  The queue line also gives `presents_with_planes`.
+
+**Open issues (M2b).**
+
+- **Not run yet.** Expect first-run fixes. Likely places: format or usage
+  combinations an image view refuses (logged once each), regions that
+  shaders reach without an API call naming them (zeros), map generations
+  changing within a command buffer (the recording binds the map at its
+  start).
+- **`AllocateUploadMemory` blocks** (list method 148) are Rust heap
+  memory the card cannot reach. Shaders that read addresses there read
+  zeros. Fix: hand out such blocks from an imported upload arena.
+- **CPU writes to textures without an API call** (movie frames, glyph
+  atlases) are not seen. Only announced writes refill. The D3D12 path
+  watched pages for this. Measure first; then either fingerprint the
+  sampled textures at present, or find the title's own announce point.
+- **Indirect execution** is not recorded yet (counted). Bounding as
+  `indirect.rs` does is the next step for the world.
+- **No optimised link**: fast links only.
+- **MSAA draws** are skipped: the fragment part has static samples 1.
+- **Clear rectangles** are ignored (the whole view is cleared). **UAV
+  clears** (`ClearUnorderedAccessView*`) and **queries** do nothing under
+  Vulkan yet.
+- **A list executed twice** without a reset runs its commands once: its
+  command buffers are one-time and go with the first execution.
+- **CPU reads of the pool's GPU view** after card writes still see the
+  section's home, not the card page (M2a shortcut).
+
+### M2b after the first runs (vk4–vk16, 2026-11-26)
+
+The UI renders on Vulkan from vk16 (f9b0165) on. What the runs found, in
+order:
+
+- **vk4/vk5:** a translator module crashed the driver. winevulkan ends the
+  process silently with `ExitProcess(3)`. Fixed in the translator. The host
+  keeps per-part logging, the limits check and `VICTORY_VK_DUMP`.
+- **vk7–vk13, black planes:** the planes' images were black because draws
+  produced no fragments: their positions collapsed.
+  - The pipeline statistics showed vertices running, primitives passing
+    clipping, and no fragment shaded.
+  - The vertex programs' constants were unreachable. The title's placed
+    descriptor heap (38 MB) lies across several mappings: an allocation of
+    10 MB and a big section view. Only the first piece was in the memory map.
+  - Two bugs:
+    - Loose memory was imported only from the touched page forward, and an
+      overlapping run was refused.
+    - An address inside a big section view counted as mapped even when its
+      section was never imported.
+  - Now:
+    - Loose runs start at their allocation's base, and overlapping runs merge.
+    - Views of unimported sections are imported as loose memory.
+    - Every MiB of a shader-visible heap is imported at its creation.
+    - A command buffer binds a newer map before a draw or dispatch if one
+      appeared since it began.
+- **vk12/vk13, a crash in report():** ash's `get_query_pool_results` takes
+  the element type as the stride. Four queries were written into 32 bytes of
+  stack. Fixed. The 10 s lines are written by a thread of ours.
+- **Images:** one card memory per title memory. An image of another shape
+  over memory that already has an image is bound to the first image's
+  memory, without a clear, and is never filled if any alias is card-written.
+- **CPU-written textures** (movie frames, glyph atlases): fingerprinted at
+  each present (three 16 KiB windows). Recently changed ones are checked
+  every frame, others 256 a frame in turn. Changed ones are refilled.
+- **Clears** clear only the view's mip and slice, and only the given
+  rectangles (vk17).
+- **Translations** are kept on disk (`vulkan-stages/`). A warm launch
+  translates nothing. The pipeline cache is saved every minute.
+- **Diagnostics** (diagnostics builds):
+  - `VICTORY_VK_COMPOSE_TEST=1` (magenta under the planes);
+  - `VICTORY_VK_DRAW_TEST=1|2|3` (state off / constant magenta / full-screen
+    vertices);
+  - per-pipeline draw descriptions (push constants, user data, input layout,
+    vertex bytes, first table and its V#, map reach);
+  - plane texels at captured frames;
+  - `gpu_*` statistics;
+  - `not_yet_reasons`;
+  - stages a draw waited for.
+- **The unmap hook** `title_memory_unmapped` drops the views and imports in
+  the range, and the images over it.
+
+**Open (from the coordinator's audit, in its order):**
+- one timeline per title queue, with bottom-of-pipe values and timestamps
+  written by the card;
+- the leaks: the Vulkan image on resource release, imports of committed runs
+  only;
+- per-draw CPU cost: link cache per pipeline and formats, state set only on
+  change, pool fills batched;
+- one mechanism each: queue.rs's held line, cache.rs, the live memory budget,
+  the D3D12-only hooks under Vulkan;
+- ExecuteIndirect with one bounding pass;
+- the compile backlog (compute parts at ~300 ms average);
+- `AllocateUploadMemory` blocks the card cannot reach;
+- MSAA draws.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

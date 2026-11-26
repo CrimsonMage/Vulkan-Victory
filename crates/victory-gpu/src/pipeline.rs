@@ -773,7 +773,17 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    if crate::vulkan::on() {
+        crate::vulkan::save_cache();
+        return;
+    }
     library::save(true);
+}
+
+/// The folder of the pipeline caches, if one is set.
+#[cfg(windows)]
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    library::dir()
 }
 
 #[cfg(test)]
@@ -897,4 +907,15 @@ mod name_tests {
         assert_eq!(program_name(b"\x00PS_FogColor_Wrapped\x00"), "PS_FogColor");
         assert_eq!(program_name(b"DXBC no name here"), "");
     }
+}
+
+/// What the Vulkan backend links a title pipeline from: its stages'
+/// containers and, for graphics, the state the title gave.
+#[cfg(windows)]
+pub(crate) fn parts<'a>(this: This) -> Option<(&'a [Arc<Shader>], Option<&'a host::GraphicsState>)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    Some((&p.shaders, make::graphics(&p.host)))
 }

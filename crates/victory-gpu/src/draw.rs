@@ -40,17 +40,17 @@ enum Root {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) stride: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
-    address: u64,
-    size: u32,
-    format: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) format: u32,
 }
 
 /// Host states of a depth target, and of a texture shaders read.
