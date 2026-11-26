@@ -122,6 +122,17 @@ fn probe_buffer(b: &Backend) -> Option<(vk::Buffer, usize)> {
     pb.as_ref().map(|p| (p.buffer, p.mapped as usize))
 }
 
+/// The planes' images are named by the present just given: not freed
+/// before the card is past it.
+fn planes_used(b: &'static Backend, planes: &[compose::Shown]) {
+    let given = b.timeline.last();
+    for p in planes {
+        if let Some(i) = images::of_resource(b, p.resource) {
+            i.last_use.fetch_max(given, Ordering::Relaxed);
+        }
+    }
+}
+
 /// One frame: cleared, the planes composed, read back if captured.
 fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::Shown]) {
     let wanted = crate::capture::wanted(frame);
@@ -164,6 +175,7 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         }
         return;
     }
+    planes_used(b, planes);
     super::gputime::tell(b, frame);
     if super::targets::pending(frame) && idle(b) {
         super::targets::save_pending(b, frame);

@@ -146,10 +146,16 @@ fn big(kind: Kind, bytes: u64, total: u64) {
     );
 }
 
-/// Diagnostics: the watcher of big allocations is set.
+/// Diagnostics: a card allocation of 64 MiB or more freed, as it happens.
+fn big_freed(kind: Kind, bytes: u64, total: u64) {
+    tracing::info!(?kind, mb = bytes >> 20, ours_mb = total >> 20, "Vulkan: a big card allocation freed");
+}
+
+/// Diagnostics: the watchers of big allocations and frees are set.
 pub(super) fn watch() {
     if cfg!(feature = "diagnostics") {
         account::watch(big);
+        account::watch_frees(big_freed);
     }
 }
 

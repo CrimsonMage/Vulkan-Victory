@@ -89,7 +89,22 @@ pub fn freed(memory: vk::DeviceMemory) {
     if let Some((kind, bytes, card)) = b.by_memory.remove(&memory) {
         let n = if card { &mut b.card[kind as usize] } else { &mut b.host[kind as usize] };
         *n = n.saturating_sub(bytes);
+        let total: u64 = b.card.iter().sum();
+        drop(g);
+        if card
+            && bytes >= BIG
+            && let Some(f) = FREE_WATCHER.get()
+        {
+            f(kind, bytes, total);
+        }
     }
+}
+
+static FREE_WATCHER: OnceLock<Watcher> = OnceLock::new();
+
+/// Sets the watcher of big card frees (once).
+pub fn watch_frees(f: Watcher) {
+    let _ = FREE_WATCHER.set(f);
 }
 
 /// MiB by kind (images, pool, imports, buffers, other) on card heaps and

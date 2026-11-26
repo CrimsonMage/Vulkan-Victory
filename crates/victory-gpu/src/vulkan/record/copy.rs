@@ -38,6 +38,7 @@ impl Rec {
             b.host.device.cmd_copy_buffer(cmd, sb, db, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: len }]);
             images::full_barrier(&b.host.device, cmd);
         }
+        self.note(|| format!("copy {len} bytes {src:#x} -> {dst:#x}"));
     }
 
     pub(crate) fn copy_memory(&mut self, b: &'static Backend, dst: u64, src: u64, len: u64) {
@@ -78,6 +79,7 @@ impl Rec {
             regions.push(vk::ImageCopy::default().src_subresource(layers(&si, sm)).dst_subresource(layers(&di, mip)).extent(ext));
         }
         self.copy_images(b, &si, &di, &regions);
+        self.note(|| format!("copy image {} -> image {} ({} levels)", si.id, di.id, regions.len()));
         di.written[2].fetch_add(1, Ordering::Relaxed);
         self.keep.extend([si, di]);
     }
@@ -141,6 +143,7 @@ impl Rec {
                     .dst_offset(vk::Offset3D { x: x as i32, y: y as i32, z: z as i32 })
                     .extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
                 self.copy_images(b, &si, &di, &[region]);
+                self.note(|| format!("copy region image {} -> image {}", si.id, di.id));
                 di.written[2].fetch_add(1, Ordering::Relaxed);
                 self.keep.extend([si, di]);
             }
