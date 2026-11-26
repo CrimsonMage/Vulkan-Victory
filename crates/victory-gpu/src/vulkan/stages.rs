@@ -1,9 +1,10 @@
 //! M2b step 1: each shader stage translated to SPIR-V once and compiled
 //! once (`docs/vulkan-host.md`, "Pipelines"), off the title's threads.
 //!
-//! At the title's creation of a pipeline an earlier run used (the catalog,
-//! as the D3D12 path queues them), each of its shader containers not seen
-//! before is queued for the stage workers: [`victory_shader::vk::translate`],
+//! At the title's creation of a pipeline whose stages an earlier run
+//! translated (kept on disk, `stage_cache.rs`), each of its shader
+//! containers not seen before is queued for the stage workers:
+//! [`victory_shader::vk::translate`],
 //! then a `VkShaderModule`. When the translator speaks the host's ABI
 //! ([`HOST_ABI`]), the stage is also compiled: a graphics-pipeline-library
 //! part (pre-rasterisation for vertex programs, fragment shader for pixel
@@ -11,9 +12,6 @@
 //! `docs/vulkan-abi.md` v1. Until then (the translator's code is at ABI 0
 //! while the document is at 1) only modules are made: the run counts what
 //! translates, what fails and why, and what it costs.
-//!
-//! The D3D12 path's translation to DXIL does not run under
-//! `VICTORY_GPU=vulkan` (`pipeline::make::created` hands over here).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -186,7 +184,7 @@ pub(crate) struct Stage {
     /// The compiled part (library part or compute pipeline).
     pub(crate) part: Option<vk::Pipeline>,
     /// Push dword <- root parameter (ABI section 2).
-    pub(crate) user_data: Vec<victory_shader::emit::UserData>,
+    pub(crate) user_data: Vec<victory_shader::vk::UserData>,
     /// Vertex attributes read as inputs (fetch-shader programs, ABI
     /// section 6): semantic, index, location.
     pub(crate) inputs: Vec<(String, u32, u8)>,

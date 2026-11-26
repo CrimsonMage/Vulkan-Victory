@@ -12,10 +12,8 @@
 //! [`compute`] (a pipeline over a SPIR-V program) and, on Windows,
 //! presentation and the probe itself.
 //!
-//! A separate crate, not a module of `victory-gpu`: the backend shares no
-//! code with the D3D12 path it replaces, builds in seconds on its own, and
-//! keeps `ash` out of the D3D12 path until the switch-over (M2 onward wires
-//! it in behind `VICTORY_GPU`).
+//! A separate crate, not a module of `victory-gpu`: it builds in seconds on
+//! its own; `victory-gpu`'s Vulkan backend (`vulkan.rs`) is built on it.
 
 pub use ash;
 

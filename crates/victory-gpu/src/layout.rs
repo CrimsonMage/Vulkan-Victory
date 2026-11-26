@@ -101,7 +101,7 @@ pub(crate) fn gone(at: usize) {
 /// (checked without reading memory that is not there).
 #[cfg(windows)]
 pub(crate) fn names(p: u64, is: impl FnOnce(This) -> bool) -> bool {
-    p != 0 && p % 8 == 0 && crate::texture::committed(p as *const u8, 16) && is(p as This)
+    p != 0 && p % 8 == 0 && crate::host::read_into(p as *const u8, &mut [0u8; 16]) && is(p as This)
 }
 
 #[cfg(windows)]

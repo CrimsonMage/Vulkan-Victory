@@ -1,8 +1,7 @@
 //! The console's own list methods (`super::super::console`) and the
 //! queries, written down on the title's threads like the others and
-//! recorded later: into Vulkan command buffers (`crate::vulkan::record`,
-//! its `console.rs` and `query.rs`), or on the D3D12 path through the list
-//! methods.
+//! recorded later into Vulkan command buffers (`crate::vulkan::record`,
+//! its `console.rs` and `query.rs`).
 
 use super::*;
 use super::super::console as methods;
@@ -159,34 +158,6 @@ extern "system" fn kickoff(this: This) {
 
 extern "system" fn depth_bias(this: This, bias: f32, clamp: f32, slope: f32) {
     front(this).put(DEPTH_BIAS, &[bias.word(), clamp.word(), slope.word()]);
-}
-
-/// One of these calls on the D3D12 path, through the list methods; whether
-/// `op` was one.
-pub(super) fn run(op: u64, list: This, w: &[u64]) -> bool {
-    let u = |k: usize| w.get(k).copied().unwrap_or(0);
-    match op {
-        CLEAR_UAV => methods::clear_uav(list),
-        FILL => {
-            let mut pattern = [0u8; 16];
-            pattern[..8].copy_from_slice(&u(3).to_le_bytes());
-            pattern[8..].copy_from_slice(&u(4).to_le_bytes());
-            methods::fill(list, u(0), u(1), pattern);
-        }
-        DRAW_INDEXED_X => methods::draw_indexed_x(list),
-        PREDICATION => methods::set_predication(list),
-        WRITE => match u(3) {
-            x if x == ValueWrite::Top as u64 && u(2) == 4 => methods::write32_top(list, u(0), u(1) as u32, 0),
-            x if x == ValueWrite::BottomOfShader as u64 => methods::write32_bottom_of_shader(list, u(0), u(1) as u32, 0),
-            x if x == ValueWrite::TopTimestamp as u64 => methods::write64_top(list, u(0), 0, methods::TOP_GPU_TIMESTAMP),
-            x if x == ValueWrite::TopSystemTimestamp as u64 => methods::write64_top(list, u(0), 0, methods::TOP_SYSTEM_TIMESTAMP),
-            _ => methods::write64_top(list, u(0), u(1), 0),
-        },
-        DEPTH_BIAS => methods::depth_bias(list),
-        KICKOFF | BEGIN_QUERY | END_QUERY => {}
-        _ => return false,
-    }
-    true
 }
 
 /// One of these calls recorded into the list's Vulkan command buffer;

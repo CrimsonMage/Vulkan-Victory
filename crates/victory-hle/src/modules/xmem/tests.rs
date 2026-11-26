@@ -42,20 +42,6 @@ fn virtual_alloc_meets_console_constraints() {
     assert_eq!(info.host.State, MEM_COMMIT);
     assert_eq!(info.host.Protect, PAGE_READWRITE);
     assert_eq!(info.flags & GRAPHICS, GRAPHICS);
-    // Write-watched, for the GPU side's copies.
-    let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
-    // SAFETY: room for `count` addresses.
-    let watched = unsafe {
-        windows_sys::Win32::System::Memory::GetWriteWatch(
-            0,
-            p,
-            4 * MIB,
-            found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    };
-    assert_eq!(watched, 0);
     // SAFETY: our own reservation.
     assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
     assert_eq!(query(p).flags, 0);

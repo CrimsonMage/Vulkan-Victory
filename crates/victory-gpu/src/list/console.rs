@@ -1,8 +1,9 @@
 //! The console's own list methods past the PC's (D3D12.X), and the
-//! queries, as the list methods behind the written-down calls (`thin`)
-//! run them on the D3D12 path. Under `VICTORY_GPU=vulkan` the same calls
-//! are recorded into Vulkan instead (`thin/console.rs`,
-//! `vulkan/record/console.rs` and `vulkan/record/query.rs`).
+//! queries, as the base list table has them: what they do without a GPU.
+//! On Windows the calls are written down and recorded into Vulkan
+//! instead (`thin/console.rs`, `vulkan/record/console.rs` and
+//! `vulkan/record/query.rs`); the fake query results here stay for the
+//! query types the Vulkan backend does not measure.
 //!
 //! Slots are the older layout's (the newer one has them two later from
 //! 59 on, as the others), as XCL found them (`hle/d3d12x/list_x.rs`):
@@ -34,14 +35,13 @@ pub(super) const METHODS: [(usize, *const ()); 12] = [
 pub(crate) const TOP_GPU_TIMESTAMP: u32 = 4;
 pub(crate) const TOP_SYSTEM_TIMESTAMP: u32 = 8;
 
-/// A method the D3D12 path does not do (it is going, `docs/vulkan-host.md`):
-/// logged once by name.
+/// A method done only when recorded into Vulkan: logged once by name.
 fn not_done(what: &'static str) {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&what) {
         seen.push(what);
-        tracing::info!(method = what, "a console list method the D3D12 path does not do (the Vulkan backend does)");
+        tracing::info!(method = what, "a console list method without a GPU");
     }
 }
 
@@ -51,8 +51,7 @@ pub(super) extern "system" fn clear_uav(_: This) {
     not_done("ClearUnorderedAccessView");
 }
 
-/// `FillMemoryWith{32,64,128}BitValueX(address, size, value)`: on the D3D12
-/// path the fill is done on the CPU once the list has run.
+/// `FillMemoryWith{32,64,128}BitValueX(address, size, value)`.
 pub(super) extern "system" fn fill32(this: This, address: u64, size: u64, value: u32) {
     fill(this, address, size, pattern(&value.to_le_bytes()));
 }
@@ -71,24 +70,8 @@ pub(crate) fn pattern(bytes: &[u8]) -> [u8; 16] {
     std::array::from_fn(|i| bytes[i % bytes.len()])
 }
 
-pub(super) fn fill(this: This, address: u64, size: u64, pattern: [u8; 16]) {
-    #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && address != 0
-    {
-        let len = size as usize;
-        list.defer(move || {
-            if crate::texture::committed(address as *const u8, len) {
-                // SAFETY: committed title memory.
-                let to = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, len) };
-                for (k, b) in to.iter_mut().enumerate() {
-                    *b = pattern[k % 16];
-                }
-            }
-        });
-    }
-    #[cfg(not(windows))]
-    let _ = (this, address, size, pattern);
+fn fill(_: This, _address: u64, _size: u64, _pattern: [u8; 16]) {
+    not_done("FillMemoryWithValueX");
 }
 
 /// `DrawIndexedX(index address, index format, index count, flags)`.
@@ -132,12 +115,12 @@ pub(super) extern "system" fn depth_bias(_: This) {
     not_done("RSSetDepthBiasX");
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: on the D3D12 path queries
-/// are answered when resolved.
+/// `BeginQuery`/`EndQuery(heap, type, index)`: without a GPU queries are
+/// answered when resolved.
 pub(super) extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)` on the
-/// D3D12 path, and for query types the Vulkan backend does not measure:
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)` without a
+/// GPU, and for query types the Vulkan backend does not measure:
 /// writes each query's result into the buffer once the list has run.
 /// Timestamps (type 2) are the GPU clock then; occlusion counts (0) say a
 /// million samples passed and binary occlusion (1) visible, so nothing is
@@ -153,7 +136,6 @@ pub(crate) extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
-    timed!(Copy);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;

@@ -794,10 +794,9 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             Some(source) => copy(source, out),
             // Straight into the destination. A kernel read into a page that
             // is not there for a moment (its view away while xmem maps it
-            // again, either GPU path) or, on the D3D12 path, into a block
-            // guarded again meanwhile is refused instead of faulting; that
-            // one is read beside and copied in from user mode, where it
-            // faults like the title's own writes (`xmem::on_fault` waits).
+            // again) is refused instead of faulting; that one is read
+            // beside and copied in from user mode, where it faults like the
+            // title's own writes (`xmem::on_fault` waits).
             None => match read_at(request, out) {
                 Err(hr) if REFUSED.contains(&hr) => {
                     STATS.bounced.fetch_add(1, Ordering::Relaxed);
@@ -1004,20 +1003,12 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // The D3D12 path opens its guarded blocks and learns a placed
-        // texture there changes. A kernel read into a block guarded again
-        // meanwhile is refused (`execute` reads that one beside); `fill`'s
-        // own writes fault into the guard.
-        super::xmem::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
-        // Said again now that the bytes are there (upstream's c75fdba holds
-        // the blocks open over the read and marks them once more at its
-        // end): a copy or a texture pass that took the memory while the
-        // read was under way took what was there before.
-        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        // The bytes are there: the GPU side's copies of them follow.
+        victory_gpu::title_memory_written(request.destination as usize, len);
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;

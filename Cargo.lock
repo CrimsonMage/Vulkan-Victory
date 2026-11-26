@@ -695,11 +695,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "tempfile",
  "tracing",
  "victory-core",
  "victory-formats",
- "victory-pipeline",
  "victory-shader",
  "victory-vk",
  "windows",

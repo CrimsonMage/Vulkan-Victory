@@ -1,6 +1,6 @@
 [package]
 name = "victory-gpu"
-description = "D3D12.X command streams and GPU memory, translated onto host D3D12."
+description = "D3D12.X command streams and GPU memory, translated onto host Vulkan."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,12 +14,8 @@ zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
-victory-pipeline.workspace = true
 victory-shader.workspace = true
 victory-vk.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
@@ -29,15 +25,13 @@ diagnostics = []
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_EventLog", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
-    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",

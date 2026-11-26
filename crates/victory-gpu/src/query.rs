@@ -1,7 +1,7 @@
-//! Query heaps: the heap remembers its description. Under
-//! `VICTORY_GPU=vulkan` occlusion and timestamp heaps get a query pool of
-//! the card's (`vulkan/record/query.rs`); otherwise results are plausible
-//! values (`list/console.rs`).
+//! Query heaps: the heap remembers its description. Occlusion and
+//! timestamp heaps get a query pool of the card's
+//! (`vulkan/record/query.rs`); other kinds get plausible values
+//! (`list/console.rs`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};

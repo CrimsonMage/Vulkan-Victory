@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use victory_shader::emit::UserData;
+use victory_shader::vk::UserData;
 use victory_shader::vk::{Interface, VkShader};
 use victory_shader::{HwStage, RootType};
 
@@ -41,7 +41,7 @@ fn key() -> &'static str {
     KEY.get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(MAGIC);
-        h.update(&victory_shader::emit::translation_fingerprint());
+        h.update(&victory_shader::translation_fingerprint());
         h.update(&victory_shader::vk::ABI_VERSION.to_le_bytes());
         h.update(&victory_shader::vk::semantics::SEMANTICS_VERSION.to_le_bytes());
         h.update(include_bytes!("stage_cache.rs"));
@@ -49,9 +49,38 @@ fn key() -> &'static str {
     })
 }
 
-fn path(full: &[u8; 32]) -> Option<PathBuf> {
+fn file_name(full: &[u8; 32]) -> String {
     let name: String = full[..16].iter().map(|b| format!("{b:02x}")).collect();
-    Some(dir()?.join(format!("{name}-{}.vks", key())))
+    format!("{name}-{}.vks", key())
+}
+
+fn path(full: &[u8; 32]) -> Option<PathBuf> {
+    Some(dir()?.join(file_name(full)))
+}
+
+/// The translations kept, by file name: the folder listed once, then each
+/// one written.
+fn kept() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static KEPT: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let kept = KEPT.get_or_init(|| {
+        let names = dir()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".vks"))
+            .collect();
+        std::sync::Mutex::new(names)
+    });
+    kept.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether an earlier run (or this one) kept a translation of the
+/// container `full`: its pipelines were used before, so the title's
+/// creation of one makes its stages ahead of the draws.
+pub(crate) fn known(full: &[u8; 32]) -> bool {
+    dir().is_some() && kept().contains(&file_name(full))
 }
 
 /// The cached translation of the container `full`, if there is one.
@@ -110,8 +139,8 @@ pub(crate) fn write(full: &[u8; 32], vs: &VkShader) {
         save_registry(dir);
     }
     let tmp = p.with_extension("tmp");
-    if std::fs::write(&tmp, encode(vs)).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
+    if std::fs::write(&tmp, encode(vs)).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+        kept().insert(file_name(full));
     }
 }
 

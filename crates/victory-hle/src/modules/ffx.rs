@@ -1,7 +1,7 @@
 //! `amd_fidelityfx_loader_xbox.dll`, the title's AMD FidelityFX loader
 //! (Series S), stays the title's: mapped and bound as its other DLLs. Only
 //! its `ffxDispatch` is ours, for the upscale: that runs the PC way, as a
-//! linear scale (`victory_gpu::upscale`, on either GPU backend), because
+//! linear scale (`victory_gpu::upscale`, recorded into Vulkan), because
 //! the upscaler's programs ship only as ACO-compiled console code that
 //! does not translate. Every other dispatch, and an upscale the scale
 //! cannot take, goes to the title's own `ffxDispatch`.

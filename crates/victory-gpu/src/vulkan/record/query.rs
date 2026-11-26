@@ -87,12 +87,8 @@ fn mark(b: &Backend, heap: usize, index: u32, forced: bool) {
     });
 }
 
-/// Ticks a second of the card's timestamps (`None`: the Vulkan backend
-/// does not run).
+/// Ticks a second of the card's timestamps (`None`: no Vulkan device).
 pub(crate) fn timestamp_frequency() -> Option<u64> {
-    if !super::super::on() {
-        return None;
-    }
     let period = f64::from(super::super::backend()?.host.caps.timestamp_period);
     (period > 0.0).then(|| (1e9 / period).round() as u64)
 }
