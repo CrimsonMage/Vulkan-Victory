@@ -216,6 +216,7 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         tir::dump(&f);
     }
     tir::dce(&mut f);
+    tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "1") {
         tir::dump(&f);
     }
