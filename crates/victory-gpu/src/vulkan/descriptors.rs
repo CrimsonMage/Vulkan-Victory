@@ -323,7 +323,13 @@ impl Heaps {
 
     /// Writes the immediate samplers the stages named since the last call.
     pub(crate) fn immediates(&self, b: &Backend) {
-        let list = lock(&stages::IMMEDIATE).clone();
+        let list = {
+            let all = lock(&stages::IMMEDIATE);
+            if all.len() == lock(&self.state).immediate {
+                return;
+            }
+            all.clone()
+        };
         let mut s = lock(&self.state);
         while s.immediate < list.len() {
             let n = s.immediate;
@@ -400,6 +406,13 @@ impl Heaps {
                 db.cmd_set_descriptor_buffer_offsets(cmd, point, layout.pipeline, 0, &indices, &offsets);
             }
         }
+    }
+}
+
+impl Heaps {
+    /// The slot of a plane's view (the composition pass reads it).
+    pub(crate) fn plane_slot(&self, b: &Backend, image: &Arc<Image>, key: ViewKey) -> Option<u32> {
+        self.image_slot(b, image, key)
     }
 }
 
@@ -605,6 +618,19 @@ pub(crate) fn write(handle: u64, view: &View) {
     }
     let Some(b) = super::backend() else { return };
     let Some(h) = heaps(b) else { return };
+    // The heap the slot is in, and the memory a buffer view names, are read
+    // by the card.
+    super::touch(handle);
+    match view {
+        View::Constant(address, _) => super::touch(*address),
+        View::Shader(r, _) | View::Unordered(r, _, _) => {
+            if let Some((data, _)) = crate::resource::buffer_bytes(*r as crate::object::This) {
+                super::touch(data as u64);
+            }
+        }
+        View::Placed(_, _, desc) => super::touch(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+        _ => {}
+    }
     let words: Vec<u32> = match view {
         View::Sampler(w) => {
             let d = SamplerDesc::from_words(w);

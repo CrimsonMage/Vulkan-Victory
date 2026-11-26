@@ -38,6 +38,7 @@ use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 use victory_vk::swapchain::Swapchain;
 use victory_vk::timeline::{Recording, Timeline};
 
+mod compose;
 mod descriptors;
 mod images;
 pub(crate) mod record;
@@ -123,6 +124,7 @@ struct Region {
     len: usize,
     import: Option<Imported>,
     refused: bool,
+    wanted: bool,
 }
 
 struct Section {
@@ -136,8 +138,11 @@ struct Section {
 #[derive(Default)]
 struct Memory {
     /// `XMemVirtualAlloc` regions: first address -> bytes, and the import
-    /// once made (at the first recording after the region appears: shaders
-    /// read descriptors, constants and buffers there).
+    /// once made: when an API call first names an address in it (a
+    /// descriptor heap, a view, a root argument, an index buffer, a copy),
+    /// at the next recording ([`touch`]), as the D3D12 path opens regions
+    /// that hold a buffer it uses. Regions nothing names (CPU memory) are
+    /// never pinned.
     regions: BTreeMap<usize, Region>,
     sections: HashMap<usize, Section>,
     /// Large views of sections (one run of one section): title address ->
@@ -199,7 +204,7 @@ impl Memory {
     fn import_regions(&mut self, host: &Host) -> bool {
         let mut any = false;
         for (&at, r) in self.regions.iter_mut() {
-            if r.import.is_some() || r.refused {
+            if r.import.is_some() || r.refused || !r.wanted {
                 continue;
             }
             // SAFETY: the region as `xmem` reserved it; committed whole here.
@@ -313,6 +318,7 @@ pub(crate) fn title_region(at: usize, len: usize) {
                 len,
                 import: None,
                 refused: false,
+                wanted: false,
             },
         );
     }
@@ -584,6 +590,8 @@ struct Engine {
 }
 
 static FORCED: AtomicU64 = AtomicU64::new(0);
+/// Presents that showed at least one plane.
+static PLANES_SHOWN: AtomicU64 = AtomicU64::new(0);
 
 impl Engine {
     fn signalled(&self, fence: usize, value: u64) -> bool {
@@ -813,7 +821,40 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
 
 /// The buffer and offset of title address `title`.
 fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
-    memory(b).buffer_of(title)
+    let mut m = memory(b);
+    if let Some(found) = m.buffer_of(title) {
+        return Some(found);
+    }
+    // In a region not imported yet: imported now (the map follows at the
+    // next command buffer).
+    if m.want(title) && m.import_regions(&b.host) {
+        m.rebuild_map();
+    }
+    m.buffer_of(title)
+}
+
+/// An API call named title address `at`: the region holding it is imported
+/// before the next command buffer binds the map.
+pub(crate) fn touch(at: u64) {
+    if at == 0 {
+        return;
+    }
+    if let Some(b) = backend() {
+        memory(b).want(at);
+    }
+}
+
+impl Memory {
+    /// Marks the region holding `at` wanted; whether it is still to import.
+    fn want(&mut self, at: u64) -> bool {
+        match self.regions.range_mut(..=at as usize).next_back() {
+            Some((&base, r)) if at < (base + r.len) as u64 && r.import.is_none() && !r.refused => {
+                r.wanted = true;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
@@ -978,9 +1019,12 @@ fn landing() {
 // ---------------------------------------------------------------------------
 // Presentation
 
-pub(crate) fn present(frame: u64, size: Option<(u32, u32)>) {
+pub(crate) use compose::Shown;
+
+pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     let Some(b) = backend() else { return };
     {
+        images::flush(b);
         let mut e = engine(b);
         e.pump(b, true);
     }
@@ -1025,9 +1069,10 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>) {
     }
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
-            float32: [0.02, 0.03, 0.06, 1.0],
+            float32: [0.0, 0.0, 0.0, 1.0],
         };
-        // SAFETY: the image is in TRANSFER_DST_OPTIMAL while recording.
+        // SAFETY: the image is in TRANSFER_DST_OPTIMAL while recording;
+        // the planes are drawn over the clear and leave it so.
         unsafe {
             d.cmd_clear_color_image(
                 cmd,
@@ -1035,8 +1080,17 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>) {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &color,
                 &[victory_vk::swapchain::color_range()],
-            )
-        };
+            );
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
+            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&barrier));
+            if compose::record(b, cmd, t, planes) {
+                PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     });
     if let Err(e) = r {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -1091,6 +1145,7 @@ fn report(b: &Backend, frame: u64) {
         flights,
         held,
         forced_waits = FORCED.load(Ordering::Relaxed),
+        presents_with_planes = PLANES_SHOWN.load(Ordering::Relaxed),
         regions = m.regions.len(),
         sections = m.sections.len(),
         sections_imported_mb = imported >> 20,

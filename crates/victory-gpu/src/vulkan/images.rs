@@ -92,6 +92,8 @@ pub(crate) struct Image {
     views: Mutex<Vec<(ViewKey, vk::ImageView)>>,
     /// A fill is queued.
     pending: AtomicBool,
+    /// Not yet in GENERAL (the next flush moves and clears it).
+    fresh: AtomicBool,
 }
 
 impl Image {
@@ -363,10 +365,10 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc) -> Option<Arc<I
     match made {
         Some(img) => {
             let img = Arc::new(img);
-            if !img.card_written {
-                img.pending.store(true, Ordering::Relaxed);
-                r.pending.push(img.clone());
-            }
+            // Into GENERAL and cleared at the next flush (ahead of anything
+            // that uses it); filled after that unless the card writes it.
+            img.pending.store(true, Ordering::Relaxed);
+            r.pending.push(img.clone());
             r.images.insert(key, img.clone());
             STATS[0].fetch_add(1, Ordering::Relaxed);
             Some(img)
@@ -478,28 +480,6 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc) -> Option<
     }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     lock(&PLACES).insert(id, (memory, offset, needs.size));
-    // Into GENERAL (and cleared: a target's first draw may blend), on the
-    // timeline ahead of anything that uses it.
-    let aspect = aspect_of(format);
-    let range = vk::ImageSubresourceRange {
-        aspect_mask: aspect,
-        base_mip_level: 0,
-        level_count: vk::REMAINING_MIP_LEVELS,
-        base_array_layer: 0,
-        layer_count: vk::REMAINING_ARRAY_LAYERS,
-    };
-    let _ = b.timeline.record(&b.host, |d, cmd| {
-        // SAFETY: recording into the timeline's one-shot buffer.
-        unsafe {
-            to_general(d, cmd, image, range, vk::ImageLayout::UNDEFINED);
-            if aspect == vk::ImageAspectFlags::COLOR {
-                d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
-            } else {
-                d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue::default(), &[range]);
-            }
-            full_barrier(d, cmd);
-        }
-    });
     let bytes = crate::resource::texture_layout(desc).map_or(0, |t| t.size);
     Some(Image {
         id,
@@ -517,6 +497,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc) -> Option<
         bytes,
         views: Mutex::new(Vec::new()),
         pending: AtomicBool::new(false),
+        fresh: AtomicBool::new(true),
     })
 }
 
@@ -652,34 +633,127 @@ pub(crate) fn flush(b: &Backend) {
     if pending.is_empty() {
         return;
     }
-    for img in pending {
+    // One staging buffer and one submission for everything queued: new
+    // images into GENERAL (cleared), then the fills.
+    let mut jobs = Vec::new();
+    let mut total = 0u64;
+    for img in &pending {
         img.pending.store(false, Ordering::Relaxed);
-        if let Err(e) = fill(b, &img) {
-            once_warn(format!("Vulkan: a texture was not filled: {e:#}"));
+        if img.card_written {
+            continue;
         }
+        match plan(img) {
+            Ok(subs) => {
+                let start = total;
+                total += subs.iter().map(|s| s.bytes.next_multiple_of(16)).sum::<u64>();
+                jobs.push((img.clone(), subs, start));
+            }
+            Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
+        }
+    }
+    let staging = if total > 0 {
+        match Buffer::new(&b.host, total, vk::BufferUsageFlags::TRANSFER_SRC, Place::Upload) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                once_warn(format!("Vulkan: no staging buffer of {} MiB: {e:#}", total >> 20));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut copies: Vec<(vk::Image, Vec<vk::BufferImageCopy>)> = Vec::new();
+    if let Some(st) = &staging {
+        // SAFETY: the staging buffer is mapped and `total` bytes long.
+        let linear = unsafe { std::slice::from_raw_parts_mut(st.mapped, total as usize) };
+        for (img, subs, start) in &jobs {
+            match detile(b, img, subs, &mut linear[*start as usize..], *start) {
+                Ok(regions) => {
+                    STATS[1].fetch_add(1, Ordering::Relaxed);
+                    STATS[2].fetch_add(subs.iter().map(|s| s.bytes).sum::<u64>(), Ordering::Relaxed);
+                    copies.push((img.image, regions));
+                }
+                Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
+            }
+        }
+    }
+    let fresh: Vec<(vk::Image, vk::ImageAspectFlags)> = pending
+        .iter()
+        .filter(|i| i.fresh.swap(false, Ordering::Relaxed))
+        .map(|i| (i.image, i.aspect()))
+        .collect();
+    let buffer = staging.as_ref().map(|s| s.buffer);
+    let value = b.timeline.record(&b.host, |d, cmd| {
+        // SAFETY: recording into the timeline's one-shot buffer.
+        unsafe {
+            for &(image, aspect) in &fresh {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                };
+                to_general(d, cmd, image, range, vk::ImageLayout::UNDEFINED);
+                if aspect == vk::ImageAspectFlags::COLOR {
+                    d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+                } else {
+                    d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue::default(), &[range]);
+                }
+            }
+            full_barrier(d, cmd);
+            if let Some(buffer) = buffer {
+                for (image, regions) in &copies {
+                    if !regions.is_empty() {
+                        d.cmd_copy_buffer_to_image(cmd, buffer, *image, vk::ImageLayout::GENERAL, regions);
+                    }
+                }
+                full_barrier(d, cmd);
+            }
+        }
+    });
+    match (value, staging) {
+        (Ok(v), Some(st)) => {
+            if let Some(r) = registry().as_mut() {
+                r.staging.push((v, st));
+            }
+        }
+        (Err(e), st) => {
+            once_warn(format!("Vulkan: image set-up was not submitted: {e:#}"));
+            if let Some(st) = st {
+                b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
+                // SAFETY: nothing was submitted with it.
+                unsafe { st.destroy(&b.host) };
+            }
+        }
+        _ => {}
     }
 }
 
-/// Detiles `img`'s title memory into a staging buffer and copies it in.
-fn fill(b: &Backend, img: &Image) -> anyhow::Result<()> {
+/// One subresource of a fill: where it goes in the staging buffer.
+struct Sub {
+    slice: u32,
+    mip: u32,
+    extent: vk::Extent3D,
+    row: u64,
+    rows: u64,
+    bytes: u64,
+}
+
+/// The subresources a fill of `img` copies (plane 0, every mip and slice).
+fn plan(img: &Image) -> anyhow::Result<Vec<Sub>> {
     let Some(texture) = crate::resource::texture_layout(&img.desc) else {
         anyhow::bail!("no console layout for format {}", img.desc.format);
     };
-    let plane = &texture.planes[0];
-    let layout = &plane.layout;
-    let tiled = super::read_title(b, img.key.address, layout.size)?;
+    let layout = &texture.planes[0].layout;
     let (element, block) = crate::resource::element(crate::resource::pc_format(img.desc.format))
         .ok_or_else(|| anyhow::anyhow!("no element size"))?;
-    // Stand-in formats have other texel sizes: not filled (they are
-    // targets in practice).
     let vk_bytes = format_bytes(img.format);
     if vk_bytes != 0 && vk_bytes != element as u32 {
         anyhow::bail!("stand-in format {:?}", img.format);
     }
     let slices = if img.kind == vk::ImageType::TYPE_3D { 1 } else { img.layers };
-    let mut regions = Vec::new();
-    let mut total = 0u64;
-    let mut subs = Vec::new();
+    let mut out = Vec::new();
     for slice in 0..slices {
         for mip in 0..img.mips.min(layout.mips.len() as u32) {
             let w = (img.extent.width >> mip).max(1);
@@ -687,49 +761,45 @@ fn fill(b: &Backend, img: &Image) -> anyhow::Result<()> {
             let dd = (img.extent.depth >> mip).max(1);
             let row = u64::from(w).div_ceil(block) * element;
             let rows = u64::from(h).div_ceil(block);
-            let bytes = row * rows * u64::from(dd);
-            subs.push((slice, mip, w, h, dd, row, rows, total));
-            total += bytes.next_multiple_of(16);
+            out.push(Sub {
+                slice,
+                mip,
+                extent: vk::Extent3D { width: w, height: h, depth: dd },
+                row,
+                rows,
+                bytes: row * rows * u64::from(dd),
+            });
         }
     }
-    let staging = Buffer::new(&b.host, total.max(16), vk::BufferUsageFlags::TRANSFER_SRC, Place::Upload)?;
-    // SAFETY: the staging buffer is mapped and `total` bytes long.
-    let linear = unsafe { std::slice::from_raw_parts_mut(staging.mapped, total as usize) };
-    for &(slice, mip, w, h, dd, row, rows, offset) in &subs {
-        let bytes = (row * rows * u64::from(dd)) as usize;
-        let out = &mut linear[offset as usize..offset as usize + bytes];
-        if layout.detile(&tiled, mip, slice, out, row as usize, (row * rows) as usize).is_err() {
-            continue;
+    Ok(out)
+}
+
+/// Detiles `img`'s title memory into `linear` (at `base` in the staging
+/// buffer) and gives the copy regions.
+fn detile(b: &Backend, img: &Image, subs: &[Sub], linear: &mut [u8], base: u64) -> anyhow::Result<Vec<vk::BufferImageCopy>> {
+    let texture = crate::resource::texture_layout(&img.desc).ok_or_else(|| anyhow::anyhow!("no layout"))?;
+    let layout = &texture.planes[0].layout;
+    let tiled = super::read_title(b, img.key.address, layout.size)?;
+    let mut regions = Vec::new();
+    let mut at = 0usize;
+    for s in subs {
+        let out = &mut linear[at..at + s.bytes as usize];
+        if layout.detile(&tiled, s.mip, s.slice, out, s.row as usize, (s.row * s.rows) as usize).is_ok() {
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(base + at as u64)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: img.aspect() & !vk::ImageAspectFlags::STENCIL,
+                        mip_level: s.mip,
+                        base_array_layer: s.slice,
+                        layer_count: 1,
+                    })
+                    .image_extent(s.extent),
+            );
         }
-        regions.push(
-            vk::BufferImageCopy::default()
-                .buffer_offset(offset)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: img.aspect() & !vk::ImageAspectFlags::STENCIL,
-                    mip_level: mip,
-                    base_array_layer: slice,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D { width: w, height: h, depth: dd }),
-        );
+        at += s.bytes.next_multiple_of(16) as usize;
     }
-    let image = img.image;
-    let buffer = staging.buffer;
-    let value = b.timeline.record(&b.host, |d, cmd| {
-        // SAFETY: recording into the timeline's one-shot buffer.
-        unsafe {
-            if !regions.is_empty() {
-                d.cmd_copy_buffer_to_image(cmd, buffer, image, vk::ImageLayout::GENERAL, &regions);
-            }
-            full_barrier(d, cmd);
-        }
-    })?;
-    STATS[1].fetch_add(1, Ordering::Relaxed);
-    STATS[2].fetch_add(total, Ordering::Relaxed);
-    if let Some(r) = registry().as_mut() {
-        r.staging.push((value, staging));
-    }
-    Ok(())
+    Ok(regions)
 }
 
 /// Bytes per texel (or block) of the formats images take; 0 if unknown.

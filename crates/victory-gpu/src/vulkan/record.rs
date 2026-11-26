@@ -169,12 +169,15 @@ pub(crate) fn forget(list: This) {
     }
 }
 
+/// A D3D viewport as Vulkan's, flipped (negative height): the console's
+/// programs put +y up, as D3D does.
 fn d3d_flip(v: &D3D12_VIEWPORT) -> vk::Viewport {
+    let (w, h) = (v.Width.max(1.0), v.Height.max(1.0));
     vk::Viewport {
         x: v.TopLeftX,
-        y: v.TopLeftY + v.Height,
-        width: v.Width,
-        height: -v.Height,
+        y: v.TopLeftY + h,
+        width: w,
+        height: -h,
         min_depth: v.MinDepth.clamp(0.0, 1.0),
         max_depth: v.MaxDepth.clamp(0.0, 1.0),
     }
@@ -532,12 +535,15 @@ impl Rec {
             }
             let heap = crate::descriptor::heap(h);
             self.heaps[usize::from(heap.samplers())] = heap.start;
+            super::touch(heap.start);
         }
     }
     pub(crate) fn table(&mut self, compute: bool, slot: u32, handle: u64) {
+        super::touch(handle);
         self.root(compute).set_address(slot, handle);
     }
     pub(crate) fn view(&mut self, compute: bool, slot: u32, address: u64) {
+        super::touch(address);
         self.root(compute).set_address(slot, address);
     }
     pub(crate) fn constants(&mut self, compute: bool, slot: u32, offset: u32, values: &[u32]) {
@@ -747,6 +753,12 @@ impl Rec {
             skipped(false);
             return None;
         };
+        // Stages the backend does not link yet (tessellation, geometry,
+        // amplification): counted.
+        if shaders.iter().any(|s| matches!(s.stage, "hull" | "domain" | "geometry" | "amplification")) {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let pre = match stage_of(b, shaders, if mesh { "mesh" } else { "vertex" }) {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -782,6 +794,9 @@ impl Rec {
             }
         };
         let cmd = self.cmd(b)?;
+        if let Some(h) = super::descriptors::heaps(b) {
+            h.immediates(b);
+        }
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
         // Vertex attributes of fetch-shader programs.
         let mut inputs = Vec::new();
@@ -1008,6 +1023,9 @@ impl Rec {
         };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        if let Some(h) = super::descriptors::heaps(b) {
+            h.immediates(b);
+        }
         // SAFETY: outside rendering, in our command buffer.
         unsafe {
             if self.bound_compute != pipeline {

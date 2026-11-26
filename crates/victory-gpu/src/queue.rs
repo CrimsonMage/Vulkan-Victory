@@ -347,6 +347,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::vulkan::on() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // What the title's threads wrote down into them is recorded first.
+        crate::list::join(lists);
         crate::vulkan::execute(this, lists);
         return;
     }
@@ -628,7 +630,18 @@ extern "system" fn present(
             .filter_map(|p| crate::resource::texture_memory(unsafe { *p.resources }))
             .map(|(_, desc)| desc.extent())
             .max_by_key(|&(w, h)| u64::from(w) * u64::from(h));
-        crate::vulkan::present(frame, size);
+        let shown: Vec<crate::vulkan::Shown> = given
+            .iter()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            .map(|p| crate::vulkan::Shown {
+                // SAFETY: the plane lists `count` resources; its rectangles
+                // are given or null.
+                resource: unsafe { *p.resources },
+                source: unsafe { p.source.as_ref() }.copied(),
+                placement: unsafe { p.placement.as_ref() }.copied(),
+            })
+            .collect();
+        crate::vulkan::present(frame, size, &shown);
         return S_OK;
     }
     #[cfg(windows)]
