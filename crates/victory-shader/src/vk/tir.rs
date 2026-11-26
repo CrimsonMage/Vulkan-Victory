@@ -71,6 +71,8 @@ pub enum Builtin {
     SubgroupId,
     SubgroupLocalId,
     PrimitiveId,
+    /// BaryCoordKHR / BaryCoordNoPerspKHR (component), centroid, sample.
+    Bary { perspective: bool, centroid: bool, sample: bool, comp: u8 },
 }
 
 /// Interpolation of a pixel input.
@@ -164,6 +166,8 @@ pub enum Op {
     Builtin(Builtin),
     /// Pixel input at a location, component.
     Input { loc: u8, comp: u8, interp: Interp },
+    /// Pixel input read per vertex (`PerVertexKHR`): row, component, vertex.
+    PerVertex { loc: u8, comp: u8, vertex: u8 },
     /// A pure SPIR-V core instruction; operands are the args, then `imm`
     /// literals (Extract indices) in [`Node::imm`].
     Spv(u16),
@@ -216,6 +220,7 @@ impl Op {
                 | Op::MapField(_)
                 | Op::Builtin(_)
                 | Op::Input { .. }
+                | Op::PerVertex { .. }
                 | Op::Spv(_)
                 | Op::Glsl(_)
                 | Op::Call(_)

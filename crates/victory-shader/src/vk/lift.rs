@@ -55,6 +55,8 @@ pub struct Interface {
     /// Pixel: depth / stencil / sample mask exported.
     pub depth: bool,
     pub demotes: bool,
+    /// Reads barycentrics or per-vertex values (fragmentShaderBarycentric).
+    pub per_vertex: bool,
 }
 
 /// How each value is read: above 0 mostly as a float (so loads and phis
@@ -173,6 +175,8 @@ pub struct Lift<'a> {
     sel: Option<V>,
     /// Float or integer use of each value ([`float_uses`]).
     floaty: HashMap<Value, i32>,
+    /// Bumped by every effect and block: loads share within one epoch.
+    epoch: u32,
     /// Undo log of the CSE table (dominator-tree scopes).
     undo: Vec<(Node, Option<V>)>,
     no_cse: bool,
@@ -196,6 +200,8 @@ pub struct Lift<'a> {
     pub unnamed_row: Option<u8>,
     /// Vertex inputs: whether each input-signature row is a float.
     pub vs_float: HashMap<u8, bool>,
+    /// Pixel input rows some site reads per vertex.
+    per_vertex: HashSet<u8>,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -252,6 +258,7 @@ impl<'a> Lift<'a> {
             guarded: false,
             sel: None,
             undo: Vec::new(),
+            epoch: 0,
             floaty: float_uses(p),
             no_cse: false,
             all_phis: vec![Vec::new(); p.blocks.len()],
@@ -266,6 +273,14 @@ impl<'a> Lift<'a> {
             halves: HashMap::new(),
             unnamed_row: None,
             vs_float: HashMap::new(),
+            per_vertex: io
+                .interps
+                .iter()
+                .filter_map(|(_, i)| match i {
+                    io::Interp::Vertex { attribute, vertex: 0 | 1 } | io::Interp::Weighted { attribute } => Some(attribute.row),
+                    _ => None,
+                })
+                .collect(),
         };
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
@@ -297,37 +312,54 @@ impl<'a> Lift<'a> {
             return v;
         }
         let pure = node.op.pure();
-        if pure {
+        // Loads are shared like pure values while nothing in the block has
+        // stored since (the key carries the store epoch).
+        let load = matches!(node.op, Op::Load { .. } | Op::LdsLoad);
+        let key = if load {
+            let mut k = node.clone();
+            k.imm.push(self.epoch);
+            Some(k)
+        } else if pure {
+            Some(node.clone())
+        } else {
+            None
+        };
+        if let Some(k) = &key {
             if self.guarded
                 && let Some(o) = &self.open
-                && let Some(&v) = o.cse.get(&node)
+                && let Some(&v) = o.cse.get(k)
             {
                 return v;
             }
             if !self.no_cse
-                && let Some(&v) = self.cse.get(&node)
+                && let Some(&v) = self.cse.get(k)
             {
                 return v;
             }
         }
-        // Conversions of values from outside the guard go outside it, where
-        // the other guards of the block share them.
+        if !node.op.removable() {
+            self.epoch += 1;
+        }
+        // Pure values and loads of values from outside the guard go outside
+        // it, where the other guards of the block share them.
         let hoist = self.guarded
-            && matches!(node.op, Op::Spv(op::BITCAST | op::U_CONVERT | op::S_CONVERT | op::COMPOSITE_EXTRACT))
+            && key.is_some()
             && node.args.iter().all(|a| !self.open.as_ref().unwrap().inner.contains(a));
-        let v = self.f.push(node.clone());
+        let v = self.f.push(node);
         if self.guarded && !hoist {
             let o = self.open.as_mut().expect("an open guard");
             o.items.push(Item::N(v));
             o.inner.insert(v);
-            if pure {
-                o.cse.insert(node, v);
+            if let Some(k) = key {
+                o.cse.insert(k, v);
             }
         } else {
             self.cur.push(Item::N(v));
-            if pure && !self.no_cse {
-                let old = self.cse.insert(node.clone(), v);
-                self.undo.push((node, old));
+            if let Some(k) = key
+                && !self.no_cse
+            {
+                let old = self.cse.insert(k.clone(), v);
+                self.undo.push((k, old));
             }
         }
         v
@@ -682,9 +714,25 @@ impl<'a> Lift<'a> {
                     self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, s, k)
                 }
                 Input::SampleCoverage => u(self, Builtin::SampleMaskIn),
-                Input::Barycentric { .. } => {
-                    // Only read by interpolation (handled at the v_interp sites).
-                    self.f.konst(Ty::U32, 0)
+                Input::Barycentric { kind, index } => {
+                    // i and j: the weights of vertices 1 and 2
+                    use io::Barycentric as B;
+                    let (perspective, centroid, sample) = match kind {
+                        B::PerspectiveCenter => (true, false, false),
+                        B::PerspectiveCentroid => (true, true, false),
+                        B::PerspectiveSample => (true, false, true),
+                        B::LinearCenter => (false, false, false),
+                        B::LinearCentroid => (false, true, false),
+                        B::LinearSample => (false, false, true),
+                        B::PerspectivePullModel => return Err(unsupported(offset, "pull-model barycentrics")),
+                    };
+                    if index > 1 {
+                        return Err(unsupported(offset, "pull-model barycentrics"));
+                    }
+                    let b = Builtin::Bary { perspective, centroid, sample, comp: index + 1 };
+                    let x = self.f.global(Op::Builtin(b), Ty::F32);
+                    self.iface.per_vertex = true;
+                    x
                 }
                 Input::MeshGroup => {
                     let g = u(self, Builtin::WorkgroupId(0));
@@ -1128,6 +1176,8 @@ impl<'a> Lift<'a> {
             }
             scopes.push((b, self.undo.len()));
             self.cur = Vec::new();
+            // loads are not shared across blocks
+            self.epoch += 1;
             // Phis: lane masks and SCC as booleans, data as f32 when every
             // value known so far is f32 (back edges convert), else u32.
             let mut phis = Vec::new();
@@ -2890,9 +2940,14 @@ impl<'a> Lift<'a> {
                 };
                 (*attribute, Interp::Smooth { perspective, centroid, sample })
             }
-            io::Interp::Vertex { attribute, vertex: 2 } => (*attribute, Interp::Flat),
-            _ => return Err(unsupported(off, "an interpolation of vertex values")),
+            io::Interp::Vertex { attribute, vertex: 2 } if !self.per_vertex.contains(&attribute.row) => {
+                (*attribute, Interp::Flat)
+            }
+            _ => return self.interp_per_vertex(inst, reg, interp),
         };
+        if self.per_vertex.contains(&attr.row) {
+            return self.interp_per_vertex(inst, reg, interp);
+        }
         let name = inst.name();
         let f16 = name.contains("f16");
         // A 16-bit value: half 2c (+1 high) of a packed parameter, one
@@ -2925,6 +2980,80 @@ impl<'a> Lift<'a> {
             self.def(inst, Reg::V(reg), R::D(x));
             return Ok(());
         }
+        self.def(inst, Reg::V(reg), R::D(x));
+        Ok(())
+    }
+}
+
+impl Lift<'_> {
+    /// An attribute some site reads per vertex: every read of it weighs its
+    /// three vertices (VK_KHR_fragment_shader_barycentric), as the
+    /// hardware's P0 + i P10 + j P20.
+    fn interp_per_vertex(&mut self, inst: &Inst, reg: u8, interp: &io::Interp) -> Res<()> {
+        let off = inst.machine.offset;
+        let name = inst.name();
+        if name.contains("f16") {
+            return Err(unsupported(off, "a 16-bit interpolation of vertex values"));
+        }
+        let attribute = match *interp {
+            io::Interp::Interpolated { attribute, .. } | io::Interp::Vertex { attribute, .. } | io::Interp::Weighted { attribute } => attribute,
+        };
+        if attribute.high {
+            return Err(unsupported(off, "a high half of a 32-bit input"));
+        }
+        let (row, c) = (attribute.row, attribute.channel);
+        let p = |l: &mut Self, k: u8| l.f.global(Op::PerVertex { loc: row, comp: c, vertex: k }, Ty::F32);
+        let (p0, p1, p2) = (p(self, 0), p(self, 1), p(self, 2));
+        let p10 = self.spv(op::F_SUB, Ty::F32, &[p1, p0]);
+        let p20 = self.spv(op::F_SUB, Ty::F32, &[p2, p0]);
+        let x = match *interp {
+            io::Interp::Interpolated { barycentric, .. } => {
+                use io::Barycentric as B;
+                let (perspective, centroid, sample) = match barycentric {
+                    B::PerspectiveCenter => (true, false, false),
+                    B::PerspectiveCentroid => (true, true, false),
+                    B::PerspectiveSample => (true, false, true),
+                    B::LinearCenter => (false, false, false),
+                    B::LinearCentroid => (false, true, false),
+                    B::LinearSample => (false, false, true),
+                    B::PerspectivePullModel => return Err(unsupported(off, "pull-model interpolation")),
+                };
+                let b = |l: &mut Self, comp| {
+                    l.f.global(Op::Builtin(Builtin::Bary { perspective, centroid, sample, comp }), Ty::F32)
+                };
+                let (i, j) = (b(self, 1), b(self, 2));
+                let t = self.gl(glsl::FMA, Ty::F32, &[i, p10, p0]);
+                self.gl(glsl::FMA, Ty::F32, &[j, p20, t])
+            }
+            io::Interp::Vertex { vertex: 2, .. } => p0,
+            io::Interp::Vertex { vertex: 0, .. } => p10,
+            io::Interp::Vertex { .. } => p20,
+            io::Interp::Weighted { .. } => {
+                // p1: P0 + i P10; p2: old + j P20 (i, j computed by the program)
+                let (src, old) = match &inst.fields {
+                    Fields::Vintrp { src, .. } => {
+                        let o = self.val(inst, Reg::V(reg))?;
+                        (*src, Some(o))
+                    }
+                    Fields::Valu(v) => (v.src.get(1).copied().ok_or(unsupported(off, "an interpolation"))?, None),
+                    _ => return Err(unsupported(off, "an interpolation")),
+                };
+                let w = self.opnd(inst, &src)?;
+                let w = self.f32v(w);
+                if name.starts_with("v_interp_p1") {
+                    self.gl(glsl::FMA, Ty::F32, &[w, p10, p0])
+                } else {
+                    let old = match (old, &inst.fields) {
+                        (Some(o), _) => self.data(o),
+                        (None, Fields::Valu(v)) => self.opnd(inst, &v.src[2])?,
+                        _ => return Err(unsupported(off, "an interpolation")),
+                    };
+                    let old = self.f32v(old);
+                    self.gl(glsl::FMA, Ty::F32, &[w, p20, old])
+                }
+            }
+        };
+        self.iface.per_vertex = true;
         self.def(inst, Reg::V(reg), R::D(x));
         Ok(())
     }

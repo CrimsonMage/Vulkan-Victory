@@ -24,6 +24,8 @@ pub struct Stage {
     /// Output types per location: 0 float, 1 uint, 2 int.
     pub out_types: HashMap<u16, u8>,
     pub loop_limit: u32,
+    /// Emit the block graph as a state machine (graphs that nest too deep).
+    pub state_machine: bool,
     /// Interface rows and channels to (location, component): the fixed
     /// location of each semantic (`super::SEMANTIC_LOCATIONS`).
     pub locs: HashMap<(u8, u8), (u8, u8)>,
@@ -236,6 +238,8 @@ pub struct Emit<'a> {
     inputs: HashMap<u8, Id>,
     outputs: HashMap<u16, (Id, Id)>,
     lds: Id,
+    /// Constructs jumps passed out of, in all (the nesting metric).
+    passed: usize,
     map_var: Id,
     cull: Id,
     /// Inside a flat guard: its condition (effects go to the sink).
@@ -267,6 +271,12 @@ pub struct Emit<'a> {
     input_locations: Vec<(u8, usize)>,
     frag: bool,
 }
+
+/// Constructs passed by jumps beyond which a graph is emitted as a state
+/// machine instead (39f0e9aeb156a61c passed 670,000: 156 s of NVIDIA
+/// compile; typical programs pass none to a few hundred).
+const TANGLED: usize = 4096;
+pub const TANGLED_WHY: &str = "a graph that nests too deep";
 
 /// Jump codes: construct at stack position i; continue (loop) or exit.
 fn code(i: usize, cont: bool) -> u32 {
@@ -301,6 +311,7 @@ impl<'a> Emit<'a> {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             lds: 0,
+            passed: 0,
             map_var: 0,
             cull: 0,
             pred: None,
@@ -465,11 +476,13 @@ impl<'a> Emit<'a> {
             Builtin::SubgroupId => (en::BI_SUBGROUP_ID, 1, self.t.u32_),
             Builtin::SubgroupLocalId => (en::BI_SUBGROUP_LOCAL_INVOCATION_ID, 1, self.t.u32_),
             Builtin::PrimitiveId => (en::BI_PRIMITIVE_ID, 1, self.t.u32_),
+            Builtin::Bary { perspective, .. } => (if perspective { en::BI_BARY_COORD_KHR } else { 5287 }, 3, self.t.f32_),
         };
         let key = match b {
             Builtin::FragCoord(_) => Builtin::FragCoord(0),
             Builtin::WorkgroupId(_) => Builtin::WorkgroupId(0),
             Builtin::LocalInvocationId(_) => Builtin::LocalInvocationId(0),
+            Builtin::Bary { perspective, centroid, sample, .. } => Builtin::Bary { perspective, centroid, sample, comp: 0 },
             x => x,
         };
         let var = if let Some(&v) = self.builtins.get(&key) {
@@ -487,6 +500,17 @@ impl<'a> Emit<'a> {
             if self.frag && sty != self.t.f32_ && sty != self.t.bool_ && b != Builtin::Helper {
                 self.m.decorate(v, en::DEC_FLAT, &[]);
             }
+            if let Builtin::Bary { centroid, sample, .. } = b {
+                self.m.extension("SPV_KHR_fragment_shader_barycentric");
+                self.m.capability(en::CAP_FRAGMENT_BARYCENTRIC_KHR);
+                if centroid {
+                    self.m.decorate(v, en::DEC_CENTROID, &[]);
+                }
+                if sample {
+                    self.m.capability(en::CAP_SAMPLE_RATE_SHADING);
+                    self.m.decorate(v, en::DEC_SAMPLE, &[]);
+                }
+            }
             if b == Builtin::BaseInstance {
                 self.m.capability(4427); // DrawParameters
             }
@@ -502,6 +526,7 @@ impl<'a> Emit<'a> {
         };
         let comp = match b {
             Builtin::FragCoord(c) | Builtin::WorkgroupId(c) | Builtin::LocalInvocationId(c) => Some(u32::from(c)),
+            Builtin::Bary { comp, .. } => Some(u32::from(comp)),
             Builtin::SampleMaskIn => Some(0),
             _ => None,
         };
@@ -627,6 +652,32 @@ impl<'a> Emit<'a> {
             self.block = lm;
             k += threads;
         }
+    }
+
+    /// A pixel input read per vertex: `PerVertexKHR` array of three vec4s at
+    /// its semantic's location.
+    fn per_vertex_input(&mut self, row: u8, chan: u8, vertex: u8) -> Id {
+        let (loc, comp) = self.st.locs.get(&(row, chan)).copied().unwrap_or((31, chan));
+        let f = self.t.f32_;
+        let var = if let Some(&v) = self.inputs.get(&(0x80 | loc)) {
+            v
+        } else {
+            self.m.extension("SPV_KHR_fragment_shader_barycentric");
+            self.m.capability(en::CAP_FRAGMENT_BARYCENTRIC_KHR);
+            let v4 = self.m.t_vec(f, 4);
+            let arr = self.m.t_array(v4, 3);
+            let p = self.m.t_ptr(en::SC_INPUT, arr);
+            let v = self.m.variable(p, en::SC_INPUT);
+            self.m.decorate(v, en::DEC_LOCATION, &[u32::from(loc)]);
+            self.m.decorate(v, 5285, &[]); // PerVertexKHR
+            self.interface.push(v);
+            self.inputs.insert(0x80 | loc, v);
+            v
+        };
+        let p = self.m.t_ptr(en::SC_INPUT, f);
+        let (kv, kc) = (self.c32(u32::from(vertex)), self.c32(u32::from(comp)));
+        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, kv, kc]);
+        self.m.op(op::LOAD, f, &[ptr])
     }
 
     /// A vertex attribute: Location = its input-signature row, a vec4 of
@@ -814,7 +865,6 @@ impl<'a> Emit<'a> {
         self.m.decorate(one_range, en::DEC_SPEC_ID, &[0]);
         for (h, fid) in helpers {
             let (u, q) = (self.t.u32_, self.t.u64_);
-            let v3 = self.m.t_vec(u, 3);
             let range = h == Helper::TranslateRange;
             let (ret, params): (Id, Vec<Id>) = if range { (q, vec![q, u]) } else { (q, vec![q]) };
             let fty = self.m.global_fn_type(ret, &params);
@@ -1073,6 +1123,7 @@ impl<'a> Emit<'a> {
             }
             Op::Builtin(b) => self.builtin(b),
             Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
+            Op::PerVertex { loc, comp, vertex } => self.per_vertex_input(loc, comp, vertex),
             Op::Spv(o) => {
                 let mut ops = args.clone();
                 ops.extend_from_slice(&n.imm);
@@ -2020,6 +2071,7 @@ impl<'a> Emit<'a> {
             let kinds: Vec<char> = self.ctx[i..].iter().map(|c| if matches!(c, Ctx::Loop(_)) { 'L' } else { 'B' }).collect();
             eprintln!("pass depth {} cont {} {}", inner - i, cont, kinds.iter().collect::<String>());
         }
+        self.passed += inner - i;
         for k in i + 1..=inner {
             self.cons[k].passes = true;
         }
@@ -2101,6 +2153,9 @@ impl<'a> Emit<'a> {
         // record header labels for continue targets lazily: we need the
         // header of each construct when closing it; keep a map cont -> header
         self.tree_root();
+        if !self.st.state_machine && self.passed > TANGLED {
+            return Err(TANGLED_WHY);
+        }
         let body = std::mem::replace(&mut self.m.body, saved);
         // function header
         let fty = self.m.t_func(void);
@@ -2155,6 +2210,181 @@ impl<'a> Emit<'a> {
     }
 
     fn tree_root(&mut self) {
-        self.tree(0);
+        if self.st.state_machine {
+            self.state_machine();
+        } else {
+            self.tree(0);
+        }
+    }
+
+    /// The fallback for graphs whose structure nests too deep (jumps out of
+    /// dozens of constructs): one loop around a switch on the block to run
+    /// next. Block phis and the values a block uses from other blocks go
+    /// through function variables (the driver makes them registers again).
+    fn state_machine(&mut self) {
+        let n = self.f.blocks.len();
+        let (u, b) = (self.t.u32_, self.t.bool_);
+        // where each value is made
+        let mut def = vec![usize::MAX; self.f.nodes.len()];
+        fn walk(list: &[Item], blk: usize, def: &mut [usize], f: &Func) {
+            for it in list {
+                match it {
+                    Item::N(v) => def[*v as usize] = blk,
+                    Item::Guard { body, phis, .. } => {
+                        walk(body, blk, def, f);
+                        for &p in phis {
+                            def[p as usize] = blk;
+                        }
+                    }
+                }
+            }
+        }
+        for (k, blk) in self.f.blocks.iter().enumerate() {
+            walk(&blk.body, k, &mut def, self.f);
+            for &p in &blk.phis {
+                def[p as usize] = k;
+            }
+        }
+        // what each block uses from elsewhere
+        let mut uses: Vec<Vec<V>> = vec![Vec::new(); n];
+        fn used(list: &[Item], f: &Func, out: &mut Vec<V>) {
+            for it in list {
+                match it {
+                    Item::N(v) => out.extend(f.node(*v).args.iter().copied()),
+                    Item::Guard { cond, body, phis } => {
+                        out.push(*cond);
+                        used(body, f, out);
+                        for &p in phis {
+                            out.extend(f.node(p).args.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        for k in 0..n {
+            let mut out = Vec::new();
+            used(&self.f.blocks[k].body, self.f, &mut out);
+            let succ = match self.f.blocks[k].term {
+                Term::Jump(t) => vec![t],
+                Term::Branch(c, t, e2) => {
+                    out.push(c);
+                    vec![t, e2]
+                }
+                Term::Return => vec![],
+            };
+            for s in succ {
+                let sb = &self.f.blocks[s];
+                if let Some(i) = sb.preds.iter().position(|&q| q == k) {
+                    for &p in &sb.phis {
+                        out.push(self.f.node(p).args[i]);
+                    }
+                }
+            }
+            out.retain(|&v| def[v as usize] != usize::MAX && def[v as usize] != k);
+            out.sort_unstable();
+            out.dedup();
+            uses[k] = out;
+        }
+        // a variable per value used elsewhere and per phi
+        let mut var: HashMap<V, Id> = HashMap::new();
+        let mut need: Vec<V> = uses.iter().flatten().copied().collect();
+        for blk in self.f.blocks.iter() {
+            need.extend(blk.phis.iter().copied());
+        }
+        need.sort_unstable();
+        need.dedup();
+        for v in need {
+            let t = self.f.ty(v);
+            let id = self.entry_var(t);
+            var.insert(v, id);
+        }
+        let state = self.entry_var(Ty::U32);
+        let counter = self.entry_var(Ty::U32);
+        let z = self.c32(0);
+        self.m.op_void(op::STORE, &[state, z]);
+        self.m.op_void(op::STORE, &[counter, z]);
+        let (h, merge, cont, sw, smerge) = (self.m.id(), self.m.id(), self.m.id(), self.m.id(), self.m.id());
+        self.branch_to(h);
+        self.m.label(h);
+        self.block = h;
+        self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
+        self.branch_to(sw);
+        self.m.label(sw);
+        self.block = sw;
+        let s = self.m.op(op::LOAD, u, &[state]);
+        let labels: Vec<Id> = (0..n).map(|_| self.m.id()).collect();
+        let mut ops = vec![s, smerge];
+        for (k, &l) in labels.iter().enumerate() {
+            ops.push(k as u32);
+            ops.push(l);
+        }
+        self.m.op_void(op::SELECTION_MERGE, &[smerge, 0]);
+        self.m.op_void(251, &ops); // OpSwitch
+        for k in 0..n {
+            self.m.label(labels[k]);
+            self.block = labels[k];
+            // phis and values from other blocks
+            for &p in &self.f.blocks[k].phis.clone() {
+                let t = self.ty(self.f.ty(p));
+                self.ids[p as usize] = self.m.op(op::LOAD, t, &[var[&p]]);
+            }
+            for &v in &uses[k] {
+                if self.f.blocks[k].phis.contains(&v) {
+                    continue;
+                }
+                let t = self.ty(self.f.ty(v));
+                self.ids[v as usize] = self.m.op(op::LOAD, t, &[var[&v]]);
+            }
+            let body = self.f.blocks[k].body.clone();
+            self.items(&body);
+            // what later blocks read of this one
+            let mine: Vec<V> = var.keys().copied().filter(|&v| def[v as usize] == k && !self.f.blocks[k].phis.contains(&v)).collect();
+            for v in mine {
+                let id = self.id(v);
+                self.m.op_void(op::STORE, &[var[&v], id]);
+            }
+            let edge = |e: &mut Self, to: usize| {
+                let tb = &e.f.blocks[to];
+                if let Some(i) = tb.preds.iter().position(|&q| q == k) {
+                    let pairs: Vec<(V, V)> = tb.phis.iter().map(|&p| (p, e.f.node(p).args[i])).collect();
+                    let vals: Vec<Id> = pairs.iter().map(|&(_, a)| e.id(a)).collect();
+                    for ((p, _), x) in pairs.into_iter().zip(vals) {
+                        e.m.op_void(op::STORE, &[var[&p], x]);
+                    }
+                }
+                let kt = e.c32(to as u32);
+                e.m.op_void(op::STORE, &[state, kt]);
+                e.branch_to(cont);
+            };
+            match self.f.blocks[k].term.clone() {
+                Term::Return => self.m.op_void(op::RETURN, &[]),
+                Term::Jump(t) => edge(self, t),
+                Term::Branch(c, t, e2) => {
+                    let c = self.id(c);
+                    let (lt, le, sm) = (self.m.id(), self.m.id(), self.m.id());
+                    self.m.op_void(op::SELECTION_MERGE, &[sm, 0]);
+                    self.m.op_void(op::BRANCH_CONDITIONAL, &[c, lt, le]);
+                    self.m.label(lt);
+                    edge(self, t);
+                    self.m.label(le);
+                    edge(self, e2);
+                    self.m.label(sm);
+                    self.m.op_void(op::UNREACHABLE, &[]);
+                }
+            }
+        }
+        self.m.label(smerge);
+        self.m.op_void(op::UNREACHABLE, &[]);
+        // the continue target: an iteration limit against hangs
+        self.m.label(cont);
+        let c0 = self.m.op(op::LOAD, u, &[counter]);
+        let one = self.c32(1);
+        let c1 = self.m.op(op::I_ADD, u, &[c0, one]);
+        self.m.op_void(op::STORE, &[counter, c1]);
+        let lim = self.c32(1 << 24);
+        let over = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[c1, lim]);
+        self.m.op_void(op::BRANCH_CONDITIONAL, &[over, merge, h]);
+        self.m.label(merge);
+        self.m.op_void(op::RETURN, &[]);
     }
 }
