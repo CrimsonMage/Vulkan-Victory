@@ -867,6 +867,9 @@ impl<'a> Lift<'a> {
         if let (Some(a), Some(b)) = (self.f.as_const(lo), self.f.as_const(hi)) {
             return self.f.konst(Ty::U64, a | (b << 32));
         }
+        if self.f.as_const(hi) == Some(0) {
+            return self.spv(op::U_CONVERT, Ty::U64, &[lo]);
+        }
         let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 2), &[lo, hi]);
         self.spv(op::BITCAST, Ty::U64, &[v2])
     }
@@ -2098,22 +2101,27 @@ impl<'a> Lift<'a> {
         let max = self.f.konst(Ty::U64, 0xFFFF_FFFF);
         let bytes64 = self.gl(glsl::U_MIN, Ty::U64, &[bytes64, max]);
         let bytes = self.spv(op::U_CONVERT, Ty::U32, &[bytes64]);
-        let r = self.emit(Op::Call(Helper::TranslateRange), Ty::vec(S::U32, 3), vec![base, bytes]);
-        let dlo = self.extract(r, 0);
-        let dhi = self.extract(r, 1);
-        let dev = self.u64_of(dlo, dhi);
-        let limit = self.extract(r, 2);
+        // the device base, or the zero block when the bytes are in no range
+        let dev = self.emit(Op::Call(Helper::TranslateRange), Ty::U64, vec![base, bytes]);
+        let zero = self.fallback(false);
+        let mapped = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[dev, zero]);
+        let z = self.k32(0);
+        let limit = self.spv(op::SELECT, Ty::U32, &[mapped, bytes, z]);
         VSharp { dev, limit, stride, w3: w[3] }
     }
 
     /// Device address for `bytes` at byte offset `o` of a V#, or the zero
     /// (loads) / sink (stores) block when out of bounds.
     fn buffer_addr(&mut self, vs: &VSharp, o: V, bytes: u32, store: bool) -> V {
+        // in bounds: o + bytes <= limit, as o < (limit >= bytes ? limit - bytes + 1 : 0)
+        // (the bound is shared by the accesses of a V#)
         let kb = self.k32(bytes);
         let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
-        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
-        let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
-        let ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le]);
+        let k1 = self.k32(bytes.wrapping_sub(1));
+        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, k1]);
+        let z = self.k32(0);
+        let lim = self.spv(op::SELECT, Ty::U32, &[room, lim, z]);
+        let ok = self.spv(op::U_LESS_THAN, Ty::BOOL, &[o, lim]);
         let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
         let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
         let fallback = self.fallback(store);

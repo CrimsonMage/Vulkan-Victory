@@ -330,7 +330,15 @@ impl Lift<'_> {
             }
             "v_cndmask_b32" => {
                 let m = self.opnd_mask(inst, &v.src[2])?;
-                let float = v.abs != 0 || v.neg != 0;
+                // floats stay floats (constants follow the other side)
+                let raw: Vec<V> = (0..2).map(|i| self.opnd(inst, &v.src[i])).collect::<Res<_>>()?;
+                let is_f = |l: &Self, x: V| l.f.ty(x) == Ty::F32;
+                let is_c = |l: &Self, x: V| l.f.as_const(x).is_some();
+                let float = v.abs != 0
+                    || v.neg != 0
+                    || (v.sdwa.is_none()
+                        && raw.iter().any(|&x| is_f(self, x))
+                        && raw.iter().all(|&x| is_f(self, x) || is_c(self, x)));
                 let (a, b) = if float {
                     (self.fsrc(inst, v, 0)?, self.fsrc(inst, v, 1)?)
                 } else {

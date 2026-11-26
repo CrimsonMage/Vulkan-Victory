@@ -86,8 +86,8 @@ pub enum Interp {
 pub enum Helper {
     /// (title address u64) -> device address u64 of `zero` when unmapped.
     Translate,
-    /// (title base u64, bytes u32) -> vec2: device base (as two u32), byte
-    /// limit (0 when not fully inside one range).
+    /// (title base u64, bytes u32) -> device base u64, or the zero block
+    /// when the bytes are not inside one range.
     TranslateRange,
     /// (device address u64, V# FORMAT u32) -> uvec4: a typed buffer
     /// element decoded (floats as their bits; missing channels 0, alpha 1).

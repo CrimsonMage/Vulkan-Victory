@@ -62,6 +62,13 @@ struct Graph {
     header: Vec<bool>,
     merge: Vec<bool>,
     children: Vec<Vec<usize>>,
+    /// Per loop header: the exit placed at the loop construct's merge (a
+    /// merge child of the header outside the loop, the most entered), so
+    /// leaving the loop for it is a plain break.
+    exit: Vec<Option<usize>>,
+    /// Per loop header: its merge children outside the loop placed after
+    /// the exit (their blocks wrap the loop).
+    after_exit: Vec<Vec<usize>>,
 }
 
 impl Graph {
@@ -159,12 +166,46 @@ impl Graph {
                 }
             }
         }
-        let merge = forward.iter().map(|&k| k >= 2).collect();
+        let merge: Vec<bool> = forward.iter().map(|&k| k >= 2).collect();
         let mut children = vec![Vec::new(); n];
         for &b in order.iter().skip(1) {
             children[idom[b]].push(b);
         }
-        Ok(Graph { rpo, header, merge, children })
+        // natural loops: what reaches a back edge's source without the header
+        let mut exit = vec![None; n];
+        let mut after_exit = vec![Vec::new(); n];
+        for &h in &order {
+            if !header[h] {
+                continue;
+            }
+            let mut inside = vec![false; n];
+            inside[h] = true;
+            let mut work: Vec<usize> = preds[h].iter().copied().filter(|&p| rpo[p] >= rpo[h]).collect();
+            while let Some(b) = work.pop() {
+                if std::mem::replace(&mut inside[b], true) {
+                    continue;
+                }
+                work.extend(preds[b].iter().copied());
+            }
+            let mut best: Option<(usize, usize)> = None;
+            for &c in &children[h] {
+                if !merge[c] || inside[c] {
+                    continue;
+                }
+                let edges = preds[c].iter().filter(|&&p| inside[p]).count();
+                if edges > 0 && best.is_none_or(|b| edges > b.1) {
+                    best = Some((c, edges));
+                }
+            }
+            exit[h] = best.map(|b| b.0);
+            if let Some((y, _)) = best {
+                let mut after: Vec<usize> =
+                    children[h].iter().copied().filter(|&c| merge[c] && !inside[c] && rpo[c] > rpo[y]).collect();
+                after.sort_by_key(|&c| std::cmp::Reverse(rpo[c]));
+                after_exit[h] = after;
+            }
+        }
+        Ok(Graph { rpo, header, merge, children, exit, after_exit })
     }
 }
 
@@ -775,7 +816,7 @@ impl<'a> Emit<'a> {
             let (u, q) = (self.t.u32_, self.t.u64_);
             let v3 = self.m.t_vec(u, 3);
             let range = h == Helper::TranslateRange;
-            let (ret, params): (Id, Vec<Id>) = if range { (v3, vec![q, u]) } else { (q, vec![q]) };
+            let (ret, params): (Id, Vec<Id>) = if range { (q, vec![q, u]) } else { (q, vec![q]) };
             let fty = self.m.global_fn_type(ret, &params);
             self.m.op_to(op::FUNCTION, ret, fid, &[0, fty]);
             let ps: Vec<Id> = params
@@ -813,16 +854,7 @@ impl<'a> Emit<'a> {
             };
             if Self::no_search() {
                 let r0 = through(self, z);
-                let out = if range {
-                    let v2 = self.m.t_vec(u, 2);
-                    let pair = self.m.op(op::BITCAST, v2, &[r0.0]);
-                    let lo = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 0]);
-                    let hi = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 1]);
-                    self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[lo, hi, r0.1])
-                } else {
-                    r0.0
-                };
-                self.m.op_void(254, &[out]);
+                self.m.op_void(254, &[r0.0]);
                 self.m.op_void(op::FUNCTION_END, &[]);
                 continue;
             }
@@ -853,17 +885,7 @@ impl<'a> Emit<'a> {
             self.m.op_void(op::BRANCH, &[lm]);
             self.m.label(lm);
             let res = self.m.op(op::PHI, q, &[r0.0, lf, r1.0, ls]);
-            let out = if range {
-                let lim = self.m.op(op::PHI, u, &[r0.1, lf, r1.1, ls]);
-                let v2 = self.m.t_vec(u, 2);
-                let pair = self.m.op(op::BITCAST, v2, &[res]);
-                let lo = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 0]);
-                let hi = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 1]);
-                self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[lo, hi, lim])
-            } else {
-                res
-            };
-            self.m.op_void(254, &[out]); // OpReturnValue
+            self.m.op_void(254, &[res]); // OpReturnValue
             self.m.op_void(op::FUNCTION_END, &[]);
         }
     }
@@ -1645,47 +1667,81 @@ impl<'a> Emit<'a> {
 
     fn tree(&mut self, x: usize) {
         let g = self.g.as_ref().unwrap();
-        let mut merges: Vec<usize> = g.children[x].iter().copied().filter(|&c| g.merge[c]).collect();
+        let exit = if g.header[x] { g.exit[x] } else { None };
+        let after: Vec<usize> = if exit.is_some() { g.after_exit[x].clone() } else { Vec::new() };
+        let mut merges: Vec<usize> = g.children[x]
+            .iter()
+            .copied()
+            .filter(|&c| g.merge[c] && Some(c) != exit && !after.contains(&c))
+            .collect();
         merges.sort_by_key(|&c| std::cmp::Reverse(g.rpo[c]));
         let header = g.header[x];
         let entry = self.pending.remove(&x).unwrap_or_default();
-        let phis = self.f.blocks[x].phis.clone();
         if header {
-            let counter = self.entry_var(Ty::U32);
-            let z = self.c32(0);
-            self.m.op_void(op::STORE, &[counter, z]);
-            let (h, merge, cont) = (self.m.id(), self.m.id(), self.m.id());
-            let pre = self.block;
-            self.branch_to(h);
-            self.m.label(h);
-            self.block = h;
-            let tys = self.phi_tys(x);
-            let cids: Vec<Id> = phis.iter().map(|_| self.m.id()).collect();
-            for (k, &ph) in phis.iter().enumerate() {
-                let id = self.m.op(op::PHI, tys[k], &[entry[k], pre, cids[k], cont]);
-                self.ids[ph as usize] = id;
-            }
-            self.cphi.insert(x, cids);
-            self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
-            let body = self.m.id();
-            self.branch_to(body);
-            self.m.label(body);
-            self.block = body;
-            self.ctx.push(Ctx::Loop(x));
-            self.cons.push(Construct { node: x, header: h, merge, cont, passes: false, wanted: 0, counter: Some(counter) });
-            let b = self.f.blocks[x].body.clone();
-            self.items(&b);
-            self.within(x, &merges);
-            self.close();
-            // a loop is left only by jumps to outer constructs
-            self.m.op_void(op::UNREACHABLE, &[]);
+            self.loop_tree(x, &after, &merges, exit, entry);
         } else {
+            let phis = self.f.blocks[x].phis.clone();
             for (k, &ph) in phis.iter().enumerate() {
                 self.ids[ph as usize] = entry[k];
             }
             let b = self.f.blocks[x].body.clone();
             self.items(&b);
             self.within(x, &merges);
+        }
+    }
+
+    /// A loop headed by `x`: the blocks of the merges that follow its exit
+    /// wrap it; the exit comes at the loop construct's merge.
+    fn loop_tree(&mut self, x: usize, after: &[usize], merges: &[usize], exit: Option<usize>, entry: Vec<Id>) {
+        if let Some((&z, rest)) = after.split_first() {
+            let (h, merge, cont) = (self.m.id(), self.m.id(), self.m.id());
+            self.branch_to(h);
+            self.m.label(h);
+            self.block = h;
+            self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
+            let body = self.m.id();
+            self.branch_to(body);
+            self.m.label(body);
+            self.block = body;
+            self.ctx.push(Ctx::Block(z));
+            self.cons.push(Construct { node: z, header: h, merge, cont, passes: false, wanted: 0, counter: None });
+            self.loop_tree(x, rest, merges, exit, entry);
+            self.close();
+            self.tree(z);
+            return;
+        }
+        let phis = self.f.blocks[x].phis.clone();
+        let counter = self.entry_var(Ty::U32);
+        let z = self.c32(0);
+        self.m.op_void(op::STORE, &[counter, z]);
+        let (h, merge, cont) = (self.m.id(), self.m.id(), self.m.id());
+        let pre = self.block;
+        self.branch_to(h);
+        self.m.label(h);
+        self.block = h;
+        let tys = self.phi_tys(x);
+        let cids: Vec<Id> = phis.iter().map(|_| self.m.id()).collect();
+        for (k, &ph) in phis.iter().enumerate() {
+            let id = self.m.op(op::PHI, tys[k], &[entry[k], pre, cids[k], cont]);
+            self.ids[ph as usize] = id;
+        }
+        self.cphi.insert(x, cids);
+        self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
+        let body = self.m.id();
+        self.branch_to(body);
+        self.m.label(body);
+        self.block = body;
+        self.ctx.push(Ctx::Loop(x));
+        self.cons.push(Construct { node: x, header: h, merge, cont, passes: false, wanted: 0, counter: Some(counter) });
+        let b = self.f.blocks[x].body.clone();
+        self.items(&b);
+        self.within(x, merges);
+        self.close();
+        match exit {
+            // the loop's exit follows it
+            Some(y) => self.tree(y),
+            // a loop is left only by jumps to outer constructs
+            None => self.m.op_void(op::UNREACHABLE, &[]),
         }
     }
 
@@ -1806,19 +1862,27 @@ impl<'a> Emit<'a> {
                 let nj = self.m.op(op::SELECT, u, &[over, ret, cur]);
                 self.m.op_void(op::STORE, &[jmp, nj]);
                 self.m.op_void(op::BRANCH_CONDITIONAL, &[over, c.merge, h]);
+                // the limit path reaches the merge with no values
+                self.pass_in.entry(c.merge).or_default().push(c.cont);
             }
             None => self.branch_to(h),
         }
         self.m.label(c.merge);
         self.block = c.merge;
-        if let Ctx::Block(y) = kind
-            && !self.f.blocks[y].phis.is_empty()
-        {
-            let inc = self.fwd.remove(&y).unwrap_or_default();
-            let ids = self.merge_phis(y, c.merge, inc);
-            self.pending.insert(y, ids);
-        } else {
-            self.pass_in.remove(&c.merge);
+        // the block placed at this merge: a Block's node, or a loop's exit
+        let at_merge = match kind {
+            Ctx::Block(y) => Some(y),
+            Ctx::Loop(x) => self.g.as_ref().unwrap().exit[x],
+        };
+        match at_merge {
+            Some(y) if !self.f.blocks[y].phis.is_empty() => {
+                let inc = self.fwd.remove(&y).unwrap_or_default();
+                let ids = self.merge_phis(y, c.merge, inc);
+                self.pending.insert(y, ids);
+            }
+            _ => {
+                self.pass_in.remove(&c.merge);
+            }
         }
         let i = self.ctx.len();
         if c.counter.is_some() {
@@ -1864,12 +1928,17 @@ impl<'a> Emit<'a> {
                     self.arrive(node, true);
                     self.cons[outer].cont
                 } else {
-                    if matches!(outer_kind, Ctx::Block(_)) {
-                        self.arrive(node, false);
-                    } else {
-                        let m = self.cons[outer].merge;
-                        let blk = self.block;
-                        self.pass_in.entry(m).or_default().push(blk);
+                    let exit = match outer_kind {
+                        Ctx::Block(y) => Some(y),
+                        Ctx::Loop(x) => self.g.as_ref().unwrap().exit[x],
+                    };
+                    match exit {
+                        Some(y) => self.arrive(y, false),
+                        None => {
+                            let m = self.cons[outer].merge;
+                            let blk = self.block;
+                            self.pass_in.entry(m).or_default().push(blk);
+                        }
                     }
                     self.cons[outer].merge
                 };
@@ -1897,11 +1966,21 @@ impl<'a> Emit<'a> {
         let back = g.rpo[to] <= g.rpo[from];
         let merge = g.merge[to];
         let vals = self.edge_vals(from, to);
+        let exit_of = (!back && merge)
+            .then(|| self.ctx.iter().rposition(|c| matches!(*c, Ctx::Loop(h) if g.exit[h] == Some(to))))
+            .flatten();
+        let block_at = (!back && merge).then(|| self.ctx.iter().rposition(|c| *c == Ctx::Block(to))).flatten();
         if back || merge {
+            // the innermost of the construct ending at `to`: a Block, or a Loop it exits
             let i = if back {
                 self.ctx.iter().rposition(|c| *c == Ctx::Loop(to)).expect("a back edge inside its loop")
             } else {
-                self.ctx.iter().rposition(|c| *c == Ctx::Block(to)).expect("a merge after its block")
+                match (exit_of, block_at) {
+                    (Some(a), Some(b)) => a.max(b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => panic!("a merge after its block: {from} -> {to}, ctx {:?}, exits {:?}", self.ctx, self.ctx.iter().map(|c| match c { Ctx::Loop(h) => g.exit[*h], _ => None }).collect::<Vec<_>>()),
+                }
             };
             let inner = self.ctx.len() - 1;
             if i == inner {
@@ -1936,6 +2015,10 @@ impl<'a> Emit<'a> {
             let t = if cont { self.cons[i].cont } else { self.cons[i].merge };
             self.branch_to(t);
             return;
+        }
+        if std::env::var_os("VK_STAT").is_some() {
+            let kinds: Vec<char> = self.ctx[i..].iter().map(|c| if matches!(c, Ctx::Loop(_)) { 'L' } else { 'B' }).collect();
+            eprintln!("pass depth {} cont {} {}", inner - i, cont, kinds.iter().collect::<String>());
         }
         for k in i + 1..=inner {
             self.cons[k].passes = true;
