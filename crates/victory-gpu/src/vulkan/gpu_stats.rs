@@ -92,7 +92,9 @@ pub(crate) fn collect(b: &Backend) {
     let Some(Some(pool)) = guard.as_mut() else { return };
     let mut left = Vec::new();
     for &slot in &pool.pending {
-        let mut out = [0u64; 4];
+        // One query: its four counters as one element (ash takes the
+        // element as the stride and the slice length as the query count).
+        let mut out = [[0u64; 4]; 1];
         // SAFETY: a slot of our pool; no wait, so an unfinished one says
         // NOT_READY and is read later.
         let r = unsafe {
@@ -100,7 +102,7 @@ pub(crate) fn collect(b: &Backend) {
         };
         match r {
             Ok(()) => {
-                for (k, v) in out.iter().enumerate() {
+                for (k, v) in out[0].iter().enumerate() {
                     SUMS[k].fetch_add(*v, Ordering::Relaxed);
                 }
                 SUMS[4].fetch_add(1, Ordering::Relaxed);

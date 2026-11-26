@@ -1194,6 +1194,26 @@ impl Rec {
         }
     }
 
+    /// Diagnostics: the descriptor the first table of the vertex program
+    /// points at (push dword 12), the memory its V# names as the CPU sees
+    /// it, and whether the memory map reaches that memory.
+    fn table_text(&self) -> String {
+        let table = u64::from(self.last_push[12]);
+        let Some(b) = super::backend() else { return String::new() };
+        if table == 0 {
+            return String::new();
+        }
+        let Ok(v) = super::read_title(b, table, 16) else { return format!("table {table:#x} unreadable") };
+        let w: Vec<u32> = v.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let base = u64::from(w[0]) | (u64::from(w[1] & 0xffff) << 32);
+        let mapped = super::map_reaches(b, table);
+        let base_mapped = super::map_reaches(b, base);
+        let bytes = super::read_title(b, base, 64)
+            .map(|v| v.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|e| format!("{e:#}"));
+        format!("table {table:#x} (mapped {mapped}) V# {w:08x?} base {base:#x} (mapped {base_mapped}) bytes {bytes}")
+    }
+
     /// Diagnostics: the first 48 bytes of vertex view 0.
     fn vertex_bytes(&self) -> String {
         let Some(v) = self.vertex[0] else { return String::new() };
@@ -1273,6 +1293,7 @@ impl Rec {
                 push = ?push,
                 user_data = %self.last_user,
                 layout = %self.last_layout,
+                table0 = %self.table_text(),
                 vertex_bytes = %self.vertex_bytes(),
                 attributes = self.last_inputs.0 % 1000,
                 bindings = self.last_inputs.0 / 1000,

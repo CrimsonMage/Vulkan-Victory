@@ -43,6 +43,7 @@ mod descriptors;
 mod gpu_stats;
 mod images;
 pub(crate) mod record;
+mod stage_cache;
 mod stages;
 
 use crate::list::ValueWait;
@@ -866,6 +867,11 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
         m.rebuild_map();
     }
     (m.map.generation, m.map.block(zero, sink))
+}
+
+/// Diagnostics: whether the current memory map has a range holding `at`.
+fn map_reaches(b: &Backend, at: u64) -> bool {
+    memory(b).map.range_of(at).is_some()
 }
 
 /// Whether `[at, at + len)` is title memory the CPU reads at its own

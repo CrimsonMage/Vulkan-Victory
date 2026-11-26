@@ -288,8 +288,9 @@ fn queue() -> std::sync::MutexGuard<'static, Option<Queue>> {
 }
 
 /// Totals since the start: translated, failed, unsupported, modules,
-/// parts, translate µs, module µs, part µs, SPIR-V words.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// parts, translate µs, module µs, part µs, SPIR-V words, from the disk
+/// cache.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// Per kind (pre-rasterisation, fragment, compute): parts, µs, slowest µs.
 static KINDS: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
 /// Failure reasons and how often.
@@ -432,11 +433,24 @@ fn fail(why: String) -> State {
     State::Failed
 }
 
-fn make(b: &Backend, shader: &Shader) -> State {
+/// The translation of `shader`: from the disk cache, else translated now
+/// (and kept).
+fn translate(shader: &Shader) -> std::thread::Result<Result<victory_shader::vk::VkShader, victory_shader::ShaderError>> {
+    if let Some(vs) = super::stage_cache::read(&shader.full) {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
+        return Ok(Ok(vs));
+    }
     let t = Instant::now();
     let translated = std::panic::catch_unwind(|| victory_shader::vk::translate(shader.container()));
     STATS[5].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    let vs = match translated {
+    if let Ok(Ok(vs)) = &translated {
+        super::stage_cache::write(&shader.full, vs);
+    }
+    translated
+}
+
+fn make(b: &Backend, shader: &Shader) -> State {
+    let vs = match translate(shader) {
         Ok(Ok(vs)) => vs,
         Ok(Err(e)) => {
             if matches!(e, victory_shader::ShaderError::Unsupported { .. }) {
@@ -775,6 +789,7 @@ pub(crate) fn report() {
         compute_ms_avg = format_args!("{:.1}", per(KINDS[2][1].load(Ordering::Relaxed), KINDS[2][0].load(Ordering::Relaxed))),
         slowest_ms = [0, 1, 2].map(|k| KINDS[k][2].load(Ordering::Relaxed) / 1000).iter().max().copied().unwrap_or(0),
         spirv_kwords = s[8] / 1000,
+        from_disk = s[9],
         translator_abi = victory_shader::vk::ABI_VERSION,
         host_abi = HOST_ABI,
         top_failures = %top.join("; "),
