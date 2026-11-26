@@ -373,6 +373,18 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc) -> Option<Arc<I
     if let Some(i) = r.images.get(&key) {
         return Some(i.clone());
     }
+    if let Some((other, _)) = r.images.range(Key { dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false, ..key }..).next()
+        && other.address == address
+    {
+        tracing::info!(
+            at = format_args!("{address:#x}"),
+            was = ?other,
+            now = ?key,
+            format = desc.format,
+            flags = desc.flags,
+            "Vulkan: a second image over the same title memory (another shape)"
+        );
+    }
     let made = make(b, r, key, desc);
     match made {
         Some(img) => {

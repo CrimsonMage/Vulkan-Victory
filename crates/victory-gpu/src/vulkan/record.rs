@@ -115,6 +115,10 @@ pub(crate) struct Rec {
     keep: Vec<Arc<Image>>,
     /// The open pass's attachment images (draws are counted on them).
     attached: Vec<Arc<Image>>,
+    /// Diagnostics: the last push constants, and the last draw's vertex
+    /// attributes and buffers found.
+    last_push: [u32; 64],
+    last_inputs: (usize, usize),
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -146,6 +150,8 @@ impl Default for Rec {
             bound_compute: vk::Pipeline::null(),
             keep: Vec::new(),
             attached: Vec::new(),
+            last_push: [0; 64],
+            last_inputs: (0, 0),
         }
     }
 }
@@ -727,7 +733,7 @@ impl Rec {
     }
 
     /// The push constants of the stages (ABI section 2).
-    fn push(&self, b: &Backend, cmd: vk::CommandBuffer, stages: &[&Stage], compute: bool) {
+    fn push(&mut self, b: &Backend, cmd: vk::CommandBuffer, stages: &[&Stage], compute: bool) {
         let Some(layout) = stages::layout(b) else { return };
         let mut words = [0u32; 64];
         let root = if compute { &self.compute } else { &self.graphics };
@@ -745,6 +751,7 @@ impl Rec {
                 };
             }
         }
+        self.last_push = words;
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         // SAFETY: recording into our command buffer; 256 bytes of the layout's range.
         unsafe { b.host.device.cmd_push_constants(cmd, layout.pipeline, vk::ShaderStageFlags::ALL, 0, &bytes) };
@@ -804,6 +811,7 @@ impl Rec {
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
+        self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
         // Vertex attributes of fetch-shader programs.
         let mut inputs = Vec::new();
@@ -858,14 +866,18 @@ impl Rec {
                     order.push(binding & 0xff);
                 }
             }
+            let mut found = 0;
+            let wanted = order.len();
             for slot in order {
                 let v = self.vertex.get(slot as usize).copied().flatten();
                 if let Some(v) = v
                     && let Some((buf, off)) = super::buffer_of(b, v.address)
                 {
                     d.cmd_bind_vertex_buffers2(cmd, slot, &[buf], &[off], Some(&[u64::from(v.size)]), Some(&[u64::from(v.stride)]));
+                    found += 1;
                 }
             }
+            self.last_inputs = (inputs.len() + 1000 * wanted, found);
         }
         Some(cmd)
     }
@@ -983,13 +995,29 @@ impl Rec {
         for i in &self.attached {
             i.written[0].fetch_add(1, Ordering::Relaxed);
         }
-        if cfg!(feature = "diagnostics") && n < 24 {
+        // Diagnostics: the first two draws of each of the first 64 pipelines.
+        static SEEN: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+        let describe = cfg!(feature = "diagnostics") && {
+            let mut seen = lock(&SEEN);
+            let m = seen.get_or_insert_with(HashMap::new);
+            let known = m.len();
+            let c = m.entry(self.pipeline as usize).or_insert(0);
+            *c += 1;
+            *c <= 2 && known < 64
+        };
+        let _ = n;
+        if describe {
             let names = crate::pipeline::parts(self.pipeline)
                 .map(|(s, _)| s.iter().map(|s| format!("{}:{}", s.stage, s.name)).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
             let targets: Vec<String> = self.attached.iter().map(|i| format!("{}@{:#x} {:?} {}x{}", i.id, i.key.address, i.format, i.extent.width, i.extent.height)).collect();
+            let push: Vec<String> = self.last_push.iter().enumerate().filter(|(_, w)| **w != 0).map(|(k, w)| format!("{k}:{w:#x}")).collect();
             tracing::info!(
                 what,
+                push = ?push,
+                attributes_and_bindings = self.last_inputs.0,
+                bindings_found = self.last_inputs.1,
+                index = ?self.index.map(|i| (format!("{:#x}", i.address), i.size, i.format)),
                 pipeline = %names,
                 viewports = ?self.viewports.iter().map(|v| (v.x, v.y, v.width, v.height)).collect::<Vec<_>>(),
                 scissors = ?self.scissors.iter().map(|s| (s.offset.x, s.offset.y, s.extent.width, s.extent.height)).collect::<Vec<_>>(),

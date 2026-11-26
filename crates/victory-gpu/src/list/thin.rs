@@ -36,6 +36,8 @@
 //! lists at once, as the title's threads did before; what lists share was
 //! made for that then.
 
+mod vulkan;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -615,7 +617,7 @@ pub(super) fn own(this: This, f: Own) {
 /// was a reset (what the draw state kept of the stream before is let go).
 fn translate(list: This, stream: &[u64]) -> (u64, bool) {
     if crate::vulkan::on() {
-        return translate_vulkan(list, stream);
+        return vulkan::translate(list, stream);
     }
     let (mut i, mut calls, mut reset) = (0, 0, false);
     while i < stream.len() {
@@ -709,158 +711,6 @@ fn translate(list: This, stream: &[u64]) -> (u64, bool) {
             _ => {}
         }
     }
-    (calls, reset)
-}
-
-/// [`translate`] under `VICTORY_GPU=vulkan`: the calls are recorded into
-/// Vulkan command buffers (`crate::vulkan::record`). Waits, writes and
-/// resets still go through the list's methods, which hand them to the
-/// Vulkan backend's queue lines.
-fn translate_vulkan(list: This, stream: &[u64]) -> (u64, bool) {
-    use crate::vulkan::record;
-    let Some(b) = crate::vulkan::backend_for_recording() else {
-        return (0, false);
-    };
-    let started = std::time::Instant::now();
-    let mut rec = record::take(list);
-    let (mut i, mut calls, mut reset) = (0, 0, false);
-    let slice = |w: &[u64], from: usize, n: usize| -> &[u32] {
-        let p = at::<u32>(w, from, n);
-        if p.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(p, n) } }
-    };
-    while i < stream.len() {
-        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
-        let w = &stream[i + 1..i + 1 + len];
-        i += 1 + len;
-        calls += 1;
-        let u = |k: usize| w.get(k).copied().unwrap_or(0);
-        let n = u(0) as usize;
-        match op {
-            x if x == Plain::TOPOLOGY as u64 => rec.topology(u(0) as u32),
-            x if x == Plain::STENCIL_REF as u64 => rec.stencil_ref(u(0) as u32),
-            x if x == Plain::DEPTH_BOUNDS as u64 => rec.depth_bounds(f32::unword(u(0)), f32::unword(u(1))),
-            x if x == Plain::COMPUTE_TABLE as u64 => rec.table(true, u(0) as u32, u(1)),
-            x if x == Plain::GRAPHICS_TABLE as u64 => rec.table(false, u(0) as u32, u(1)),
-            x if x == Plain::COMPUTE_CONSTANT as u64 => rec.constants(true, u(0) as u32, u(2) as u32, &[u(1) as u32]),
-            x if x == Plain::GRAPHICS_CONSTANT as u64 => rec.constants(false, u(0) as u32, u(2) as u32, &[u(1) as u32]),
-            x if x == Plain::COMPUTE_VIEW as u64 => rec.view(true, u(0) as u32, u(1)),
-            x if x == Plain::GRAPHICS_VIEW as u64 => rec.view(false, u(0) as u32, u(1)),
-            x if x == Plain::SET_PIPELINE as u64 => rec.set_pipeline(u(0) as This),
-            x if x == Plain::DRAW as u64 => rec.draw(b, u(0) as u32, u(1) as u32, u(2) as u32, u(3) as u32),
-            x if x == Plain::DRAW_INDEXED as u64 => {
-                rec.draw_indexed(b, u(0) as u32, u(1) as u32, u(2) as u32, u(3) as i32, u(4) as u32)
-            }
-            x if x == Plain::DISPATCH as u64 || x == Plain::DISPATCH_X as u64 => {
-                rec.dispatch(b, u(0) as u32, u(1) as u32, u(2) as u32)
-            }
-            x if x == Plain::DISPATCH_MESH as u64 => rec.draw_mesh(b, u(0) as u32, u(1) as u32, u(2) as u32),
-            x if x == Plain::DISPATCH_MESH_X as u64 => rec.draw_mesh(b, u(0) as u32, 1, 1),
-            x if x == Plain::COPY_BUFFER as u64 => {
-                rec.copy_buffer_region(b, u(0) as This, u(1), u(2) as This, u(3), u(4))
-            }
-            x if x == Plain::COPY_RESOURCE as u64 || x == Plain::COPY_RESOURCE_X as u64 => {
-                rec.copy_resource(b, u(0) as This, u(1) as This)
-            }
-            x if x == Plain::COPY_MEMORY as u64 => rec.copy_memory(b, u(0), u(1), u(2)),
-            x if x == Plain::RESOLVE as u64 => rec.resolve(b, u(0) as This, u(1) as u32, u(2) as This, u(3) as u32),
-            x if x == Plain::EXECUTE_INDIRECT as u64 || x == Plain::RESOLVE_QUERIES as u64 => rec.not_yet(),
-            x if x == Plain::WAIT_VALUE as u64 || x == Plain::WAIT_VALUE64 as u64 => {
-                // What was recorded so far goes before the wait.
-                rec.cut(list, b);
-                run_plain(op, list, w);
-            }
-            x if x < Plain::END as u64 => {
-                run_plain(op, list, w);
-            }
-            RESET => {
-                rec.reset(b, w[0] as This);
-                let allocator: This = std::ptr::NonNull::<Object>::dangling().as_ptr().cast_const();
-                let _ = super::reset(list, allocator, w[0] as This);
-                reset = true;
-            }
-            CLOSE => rec.cut(list, b),
-            UPLOAD => {
-                // SAFETY: made by `allocate_upload`, named once.
-                let block = *unsafe { Box::from_raw(w[0] as *mut Vec<u8>) };
-                // SAFETY: one of our lists.
-                let uploads = unsafe { &(*list.cast::<List>()).uploads };
-                uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
-            }
-            OWN => {
-                // SAFETY: made by `own`, named once (nothing of ours records
-                // into Vulkan lists this way yet).
-                drop(*unsafe { Box::from_raw(w[0] as *mut Own) });
-            }
-            BARRIER | BARRIER_GROUPS => rec.barrier(b),
-            VIEWPORTS => {
-                let p = at::<D3D12_VIEWPORT>(w, 1, n);
-                rec.viewports(if p.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(p, n) } });
-            }
-            SCISSORS => {
-                let p = at::<RECT>(w, 1, n);
-                rec.scissors(if p.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(p, n) } });
-            }
-            BLEND_FACTOR => {
-                let p = at::<[f32; 4]>(w, 1, n);
-                rec.blend_factor(if p.is_null() { None } else { Some(unsafe { *p }) });
-            }
-            HEAPS => {
-                let p = at::<This>(w, 1, n);
-                rec.heaps(if p.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(p, n) } });
-            }
-            COMPUTE_CONSTANTS | GRAPHICS_CONSTANTS => {
-                let count = u(1) as usize;
-                rec.constants(op == COMPUTE_CONSTANTS, u(0) as u32, (u(0) >> 32) as u32, slice(w, 2, count));
-            }
-            INDEX_BUFFER => {
-                let p = at::<IndexView>(w, 1, n);
-                rec.index_buffer(if p.is_null() { None } else { Some(unsafe { p.read_unaligned() }) });
-            }
-            VERTEX_BUFFERS => {
-                let (start, count) = (u(0) as u32, (u(0) >> 32) as usize);
-                if u(1) != 0 {
-                    let p = at::<VertexView>(w, 2, count);
-                    if !p.is_null() {
-                        // SAFETY: `count` views were written down.
-                        let views: Vec<VertexView> = (0..count).map(|k| unsafe { p.add(k).read_unaligned() }).collect();
-                        rec.vertex_buffers(start, &views);
-                    }
-                }
-            }
-            TARGETS => {
-                let read = |k: usize| -> RtvRecord {
-                    // SAFETY: the record was copied whole into the stream.
-                    unsafe { (w[3 + k * RECORD..].as_ptr() as *const RtvRecord).read_unaligned() }
-                };
-                let colors: Vec<Option<RtvRecord>> = (0..n).map(|k| (u(1) >> k & 1 != 0).then(|| read(k))).collect();
-                let depth = (u(2) != 0).then(|| read(n));
-                rec.targets(&colors, depth);
-            }
-            CLEAR_RTV => {
-                // SAFETY: the record and the colour were copied into the stream.
-                let r = unsafe { (w[1..].as_ptr() as *const RtvRecord).read_unaligned() };
-                let color = unsafe { (at_or::<[f32; 4]>(w, 1 + RECORD)).read_unaligned() };
-                crate::vulkan::record::rects_ignored(if n == 0 { &[] } else { unsafe { std::slice::from_raw_parts(at::<Rect>(w, 1 + RECORD + 2, n), n) } });
-                rec.clear_color(b, &r, color);
-            }
-            CLEAR_DSV => {
-                // SAFETY: the record was copied into the stream.
-                let r = unsafe { (w[3..].as_ptr() as *const RtvRecord).read_unaligned() };
-                rec.clear_depth(b, &r, u(1) as u32, f32::unword(u(2)), (u(1) >> 32) as u8);
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (u(1) >> 32) != 0;
-                // SAFETY: the locations (and box) were copied into the stream.
-                let (dst, src) = unsafe { (at_or::<CopyLocation>(w, 2).read_unaligned(), at_or::<CopyLocation>(w, 2 + step).read_unaligned()) };
-                let bx = boxed.then(|| unsafe { at_or::<[u32; 6]>(w, 2 + 2 * step).read_unaligned() });
-                rec.copy_texture(b, &dst, u(0) as u32, (u(0) >> 32) as u32, u(1) as u32, &src, bx);
-            }
-            _ => {}
-        }
-    }
-    record::put(list, rec);
-    crate::vulkan::split(crate::vulkan::Split::Record, started);
     (calls, reset)
 }
 

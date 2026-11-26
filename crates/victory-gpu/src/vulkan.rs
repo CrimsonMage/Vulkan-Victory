@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use victory_vk::ash::vk;
@@ -1229,22 +1229,25 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     }
     // Diagnostics: at captured frames, what wrote each plane's image, and a
     // few texels of plane 0 read back.
-    let probe = (cfg!(feature = "diagnostics") && capture.is_some())
-        .then(|| planes.first().and_then(|p| images::of_resource(b, p.resource)))
-        .flatten()
-        .filter(|i| !i.depth());
+    let probes: Vec<Arc<images::Image>> = if cfg!(feature = "diagnostics") && capture.is_some() {
+        planes.iter().filter_map(|p| images::of_resource(b, p.resource)).filter(|i| !i.depth()).take(4).collect()
+    } else {
+        Vec::new()
+    };
     if capture.is_some() && cfg!(feature = "diagnostics") {
         for (n, p) in planes.iter().enumerate() {
             tracing::info!(frame, plane = n, what = %images::describe(b, p.resource), "Vulkan: a plane at a captured frame");
         }
     }
-    let probe_buffer = probe.as_ref().and_then(|_| {
-        let mut pb = lock(&PROBE);
-        if pb.is_none() {
-            *pb = victory_vk::memory::Buffer::new(&b.host, 256, vk::BufferUsageFlags::TRANSFER_DST, victory_vk::memory::Place::Readback).ok();
-        }
-        pb.as_ref().map(|p| (p.buffer, p.mapped as usize))
-    });
+    let probe_buffer = (!probes.is_empty())
+        .then(|| {
+            let mut pb = lock(&PROBE);
+            if pb.is_none() {
+                *pb = victory_vk::memory::Buffer::new(&b.host, 256, vk::BufferUsageFlags::TRANSFER_DST, victory_vk::memory::Place::Readback).ok();
+            }
+            pb.as_ref().map(|p| (p.buffer, p.mapped as usize))
+        })
+        .flatten();
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
             float32: if test { [1.0, 0.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] },
@@ -1268,7 +1271,8 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
             if compose::record(b, cmd, t, planes) {
                 PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
             }
-            if let (Some(img), Some((pbuf, _))) = (&probe, probe_buffer) {
+            for (pn, img) in probes.iter().enumerate() {
+                let Some((pbuf, _)) = probe_buffer else { break };
                 // Four texels: the centre and a quarter in, of mip 0 layer 0.
                 let (w, h) = (img.extent.width, img.extent.height);
                 let at = [(w / 2, h / 2), (w / 4, h / 4), (3 * w / 4, h / 4), (w / 4, 3 * h / 4)];
@@ -1277,7 +1281,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
                     .enumerate()
                     .map(|(k, &(x, y))| {
                         vk::BufferImageCopy::default()
-                            .buffer_offset(k as u64 * 16)
+                            .buffer_offset((pn * 4 + k) as u64 * 16)
                             .image_subresource(vk::ImageSubresourceLayers {
                                 aspect_mask: vk::ImageAspectFlags::COLOR,
                                 mip_level: 0,
@@ -1329,11 +1333,12 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
             // copy into it has finished.
             let rows = unsafe { std::slice::from_raw_parts(mapped as *const u8, size as usize) };
             crate::capture::save(frame, extent.width, extent.height, extent.width as usize * 4, bgra, rows);
-            if let (Some(img), Some((_, mapped))) = (&probe, probe_buffer) {
-                // SAFETY: 64 bytes of the mapped probe buffer, copied into.
-                let texels = unsafe { std::slice::from_raw_parts(mapped as *const u8, 64) };
+            for (pn, img) in probes.iter().enumerate() {
+                let Some((_, mapped)) = probe_buffer else { break };
+                // SAFETY: 64 bytes a plane of the mapped probe buffer, copied into.
+                let texels = unsafe { std::slice::from_raw_parts((mapped as *const u8).add(pn * 64), 64) };
                 let hex: Vec<String> = texels.chunks(16).map(|c| c[..images::format_bytes(img.format).clamp(1, 16) as usize].iter().map(|x| format!("{x:02x}")).collect()).collect();
-                tracing::info!(frame, format = ?img.format, texels = ?hex, "Vulkan: plane 0 texels (centre, then three quarter points)");
+                tracing::info!(frame, plane = pn, image = img.id, format = ?img.format, texels = ?hex, "Vulkan: plane texels (centre, then three quarter points)");
             }
         }
     }
