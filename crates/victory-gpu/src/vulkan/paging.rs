@@ -42,8 +42,8 @@ pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     // the memory lock): the title streams by mapping fresh pages under new
     // textures and taking old ones away, so images follow its live ones.
     images::released(b, to64, pages.len() as u64 * PAGE, images::Dropped::Remapped);
-    let mut m = memory(b);
-    let m = &mut *m;
+    let mut m_guard = memory(b);
+    let m = &mut *m_guard;
     if !m.pools.iter().any(|p| p.contains(to64)) && !new_view(b, m, to) {
         return;
     }
@@ -54,6 +54,8 @@ pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     {
         tracing::error!(error = %format!("{e:#}"), "Vulkan: pages of the pool's GPU view were not mapped");
     }
+    drop(m_guard);
+    super::stale::copied(b, to64, pages.len() as u64 * PAGE);
 }
 
 /// The pool's GPU view over the page reservation holding `to`, made now.
@@ -165,6 +167,8 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
             tracing::error!(error = %format!("{e:#}"), "Vulkan: an announced write was not taken into the pool's GPU view");
         }
     }
+    drop(guard);
+    super::stale::copied(b, at, len);
 }
 
 /// A recording names `[at, at + len)`: if it is pool memory, its evicted

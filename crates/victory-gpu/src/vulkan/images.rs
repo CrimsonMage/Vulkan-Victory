@@ -112,11 +112,17 @@ pub(crate) struct Image {
     /// Diagnostics: draws into it as an attachment, clears, copies into it,
     /// fills.
     pub(crate) written: [AtomicU64; 4],
-    /// The fingerprint of its title memory when last checked (0: never),
-    /// and the frame until which it is checked every present (it changed
-    /// lately: a movie frame, a glyph atlas).
+    /// The fingerprint of its title memory when last filled or checked
+    /// (0: never).
     hash: AtomicU64,
-    hot_until: AtomicU64,
+    /// The present its fingerprint is checked at next, and the presents
+    /// between checks: 1 after a fill or a change, doubling while nothing
+    /// changes (`fill::refresh`).
+    next_check: AtomicU64,
+    check_every: std::sync::atomic::AtomicU32,
+    /// The CPU changed it after its first fill (a glyph cache, a movie
+    /// plane): checked often from then on.
+    dynamic: AtomicBool,
     /// Its title memory changed under the CPU since the last fill (the
     /// fingerprint): filled again even over memory the card also writes
     /// (the CPU's write is the newer content, as on the console).
@@ -349,6 +355,8 @@ pub(crate) fn report() {
         dropped_resource = n(&DROPPED, 3),
         dropped_overlaid = n(&DROPPED, 4),
         not_fitting_aliases = UNFIT.load(Ordering::Relaxed),
+        fingerprinted_mb = fill::CHECKED.load(Ordering::Relaxed) >> 20,
+        cpu_changed_fills = n(&STATS, 4),
         made_at = %top.join(" "),
         "Vulkan: images"
     );
@@ -636,7 +644,9 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         fresh: AtomicBool::new(true),
         written: [const { AtomicU64::new(0) }; 4],
         hash: AtomicU64::new(0),
-        hot_until: AtomicU64::new(0),
+        next_check: AtomicU64::new(0),
+        check_every: std::sync::atomic::AtomicU32::new(1),
+        dynamic: AtomicBool::new(false),
         cpu_changed: AtomicBool::new(false),
     })
 }

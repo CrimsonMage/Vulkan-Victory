@@ -392,69 +392,64 @@ pub(crate) fn format_bytes(f: vk::Format) -> u32 {
 
 /// Textures the title fills that changed without an API call saying so
 /// (movie frames, glyph atlases: the CPU writes them in place). At each
-/// present their memory's fingerprint (three 16 KiB windows read through
-/// the CPU view, [`fingerprint`]) is compared: every texture that changed
-/// in the last 120 frames, and up to [`ROUND`] others in turn. A changed
-/// one is filled again at the next flush. Pool memory is read through the
-/// pool's CPU view (the GPU view's pages have no CPU mapping at their
-/// address: the Bink planes, vk17's green frames). Images the card writes
-/// as well are checked too: the card never changes title memory under an
-/// image, so a changed fingerprint is the CPU's write. (The D3D12 path
-/// watched pages for this; a fingerprint is the cheap form of the check.)
+/// present the images that are due have their memory's [`fingerprint`]
+/// compared with the one of their last fill; a changed one is filled again
+/// at the next flush. An image is due one present after its fill or a
+/// change, then twice as late each time nothing changed, up to `SETTLED`
+/// presents (`DYNAMIC` for one that ever changed: a glyph cache gets new
+/// letters all the time). The old rule checked 256 images a present in
+/// turn: with 35,000 live images new letters showed as stale boxes for a
+/// hundred presents and more (vk47).
+///
+/// Pool memory is read through the pool's CPU view (the GPU view's pages
+/// have no CPU mapping at their address: the Bink planes, vk17's green
+/// frames). Images the card writes as well are checked too: the card never
+/// changes title memory under an image, so a changed fingerprint is the
+/// CPU's write.
 pub(crate) fn refresh(b: &Backend, frame: u64) {
-    const ROUND: usize = 256;
-    static CURSOR: Mutex<Option<Key>> = Mutex::new(None);
-    let candidates: Vec<Arc<Image>> = {
+    /// Title bytes fingerprinted a present at most.
+    const BUDGET: u64 = 16 << 20;
+    /// Presents between the checks of an image that never changed, and of
+    /// one that did, at most.
+    const SETTLED: u32 = 256;
+    const DYNAMIC: u32 = 4;
+    let mut due: Vec<Arc<Image>> = {
         let guard = registry();
         let Some(r) = guard.as_ref() else { return };
-        let mut cursor = lock(&CURSOR);
-        let mut out: Vec<Arc<Image>> = r
-            .images
-            .values()
-            .filter(|i| !i.attachment() && i.hot_until.load(Ordering::Relaxed) >= frame)
-            .cloned()
-            .collect();
-        let start = cursor.unwrap_or(Key {
-            address: 0,
-            dimension: 0,
-            width: 0,
-            height: 0,
-            depth_or_array: 0,
-            mips: 0,
-            element: 0,
-            samples: 0,
-            depth: false,
-        });
-        let mut last = None;
-        for (k, i) in r.images.range(start..).filter(|(_, i)| !i.attachment()).take(ROUND) {
-            out.push(i.clone());
-            last = Some(*k);
-        }
-        *cursor = match last {
-            Some(mut k) => {
-                k.samples += 1;
-                Some(k)
-            }
-            None => None,
-        };
-        out
+        r.images.values().filter(|i| !i.attachment() && i.next_check.load(Ordering::Relaxed) <= frame).cloned().collect()
     };
-    let mut changed = Vec::new();
-    for img in candidates {
+    // the longest overdue first: what the budget leaves waits a present
+    due.sort_by_key(|i| i.next_check.load(Ordering::Relaxed));
+    let (mut spent, mut changed) = (0, Vec::new());
+    for img in due {
+        if spent >= BUDGET {
+            break;
+        }
         if img.bytes == 0 || img.pending.load(Ordering::Relaxed) {
             continue;
         }
-        let Some(h) = fingerprint(b, img.key.address, img.bytes) else { continue };
+        let Some(h) = fingerprint(b, img.key.address, img.bytes) else {
+            img.next_check.store(frame + u64::from(SETTLED), Ordering::Relaxed);
+            continue;
+        };
+        spent += fingerprinted(img.bytes);
         let was = img.hash.swap(h, Ordering::Relaxed);
-        if was != 0 && was != h {
-            img.hot_until.store(frame + 120, Ordering::Relaxed);
+        let every = if was != 0 && was != h {
+            img.dynamic.store(true, Ordering::Relaxed);
             img.cpu_changed.store(true, Ordering::Relaxed);
             changed_once(&img);
             if !img.pending.swap(true, Ordering::Relaxed) {
-                changed.push(img);
+                changed.push(img.clone());
             }
-        }
+            1
+        } else {
+            let most = if img.dynamic.load(Ordering::Relaxed) { DYNAMIC } else { SETTLED };
+            (img.check_every.load(Ordering::Relaxed) * 2).min(most)
+        };
+        img.check_every.store(every, Ordering::Relaxed);
+        img.next_check.store(frame + u64::from(every), Ordering::Relaxed);
     }
+    CHECKED.fetch_add(spent, Ordering::Relaxed);
     if !changed.is_empty() {
         STATS[4].fetch_add(changed.len() as u64, Ordering::Relaxed);
         if let Some(r) = registry().as_mut() {
@@ -463,6 +458,18 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
     }
 }
 
+/// Title bytes fingerprinted by [`refresh`] so far (diagnostics).
+pub(crate) static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Textures up to this size are fingerprinted whole; bigger ones in three
+/// windows.
+const WHOLE: u64 = 4 << 20;
+const WINDOW: u64 = 16 << 10;
+
+/// Bytes [`fingerprint`] reads of an image of `len` bytes.
+fn fingerprinted(len: u64) -> u64 {
+    if len <= WHOLE { len } else { 3 * WINDOW }
+}
 
 /// A fingerprint (never 0) of `[at, at + len)` read through its CPU view
 /// (`read_title`: pool pages through the pool's CPU view); `None` where
@@ -471,8 +478,6 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
 /// missing) changes outside any window. Bigger ones are hashed in three
 /// 16 KiB windows (movie frames, rewritten whole).
 fn fingerprint(b: &Backend, at: u64, len: u64) -> Option<u64> {
-    const WINDOW: u64 = 16 << 10;
-    const WHOLE: u64 = 4 << 20;
     if !super::super::cpu_readable(b, at, len) {
         return None;
     }
@@ -489,7 +494,7 @@ fn fingerprint(b: &Backend, at: u64, len: u64) -> Option<u64> {
 /// Diagnostics: the first images the CPU changed, once each.
 fn changed_once(img: &Image) {
     static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if cfg!(feature = "diagnostics") && img.hot_until.load(Ordering::Relaxed) != 0 && img.written[3].load(Ordering::Relaxed) <= 1 && LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+    if cfg!(feature = "diagnostics") && img.written[3].load(Ordering::Relaxed) <= 1 && LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
         tracing::info!(
             image = img.id,
             at = format_args!("{:#x}", img.key.address),

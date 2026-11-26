@@ -35,6 +35,7 @@ use victory_vk::timeline::Timeline;
 mod bound;
 mod baking;
 mod slow;
+mod stale;
 mod budget;
 mod compose;
 mod descriptors;
@@ -895,10 +896,12 @@ fn report(b: &Backend, frame: u64) {
         pool_binds = pool.binds,
         "Vulkan: queues, timeline and title memory"
     );
+    drop(m);
     stages::report();
     gpu_stats::collect(b);
     record::report();
     images::report();
+    stale::report(b);
     card_memory(b);
 }
 
