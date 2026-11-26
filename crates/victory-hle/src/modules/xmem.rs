@@ -173,6 +173,11 @@ pub extern "system" fn XMemVirtualAlloc(
         RESERVED.write().unwrap_or_else(|e| e.into_inner()).insert(at as usize, size);
         install_fault_handler();
     }
+    // A reservation physical pages are mapped into, page by page: the GPU
+    // reaches it by directory (`victory_gpu::memory`).
+    if placeholder && !at.is_null() && victory_gpu::unified_on() {
+        victory_gpu::title_page_reservation(at as usize, size.next_multiple_of(PAGE));
+    }
     if unified && !at.is_null() {
         let canary = (at as usize + title_bytes) as *const c_void;
         // SAFETY: the last page of the reservation just made, ours.
@@ -480,6 +485,9 @@ struct Physical {
     /// Pages found holding data when a request showed them at several
     /// places: views, as any page.
     not_fillers: std::collections::HashSet<(usize, usize)>,
+    /// The pages of GPU views of the pool, by address: the page shown
+    /// there ([`Slice::key`]); no view shows them ([`map_alias`]).
+    aliased: HashMap<usize, (usize, usize)>,
 }
 
 /// What is mapped at an address: `len` bytes showing the slices from
@@ -953,47 +961,75 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): the title maps
-/// pages into a pool view, then has the GPU map them into its tiled heap.
-/// One view per run of consecutive pages; with `repeat`, the one page at
-/// `from` at every page of `to`. False if a source page is not mapped
-/// physical memory.
+/// its pool whole into a pool view once, then has the GPU map pool pages
+/// one by one into the GPU view of its pool, which its CPU never touches.
+/// So no host view is made there (they were ~62k single-page views, half
+/// the mapping churn): the GPU side keeps the pages in its directory, and
+/// reads them for the CPU through each section's whole view
+/// ([`Section::whole`], `victory_gpu::title_pages_aliased`). With
+/// `repeat`, the one page at `from` at every page of `to`. False if a
+/// source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64, repeat: bool) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    let mut physical = physical();
-    let mut runs = Vec::new();
+    let n = len / PAGE;
     let mut found = true;
-    if from != 0 {
-        let mut slices = Vec::new();
-        for k in (0..len).step_by(PAGE) {
-            let at = if repeat { from } else { from + k };
-            let Some(slice) = physical
-                .views
-                .range(..=at)
-                .next_back()
-                .filter(|(base, m)| at < *base + m.len)
-                .map(|(base, m)| Slice { index: m.index_at(*base, at), section: m.slice.section.clone() })
-            else {
-                found = false;
-                break;
+    let mut pages: Vec<Option<victory_gpu::GpuPage>> = vec![None; n];
+    {
+        let mut physical = physical();
+        let mut slices: Vec<Option<Slice>> = vec![None; n];
+        if from != 0 {
+            for (k, slot) in slices.iter_mut().enumerate() {
+                let at = if repeat { from } else { from + k * PAGE };
+                let Some(slice) = physical
+                    .views
+                    .range(..=at)
+                    .next_back()
+                    .filter(|(base, m)| at < *base + m.len)
+                    .map(|(base, m)| Slice { index: m.index_at(*base, at), section: m.slice.section.clone() })
+                else {
+                    found = false;
+                    break;
+                };
+                *slot = Some(slice);
+            }
+        }
+        // Views an older path mapped there go (nothing else maps there).
+        if physical.views.range(..to + len).next_back().is_some_and(|(base, m)| base + m.len > to) {
+            let changing = victory_gpu::title_memory_remapping();
+            unfill_dirty(&mut physical);
+            show(&mut physical, to, len, &[], Site::Alias);
+            drop(changing);
+        }
+        for (k, slice) in slices.iter().enumerate() {
+            let at = to + k * PAGE;
+            // Where each page shows, for writes through our own views
+            // (`shown_at`, DirectStorage).
+            if let Some(old) = physical.aliased.remove(&at)
+                && let Some(addresses) = physical.shown.get_mut(&old)
+            {
+                addresses.retain(|&a| a != at);
+                if addresses.is_empty() {
+                    physical.shown.remove(&old);
+                }
+            }
+            let Some(slice) = slice else {
+                continue;
             };
-            slices.push(slice);
-        }
-        note_fillers(&mut physical, &slices);
-        for (k, slice) in slices.into_iter().enumerate() {
-            push_page(&mut runs, to + k * PAGE, slice);
+            let Some(whole) = slice.section.whole() else {
+                found = false;
+                continue;
+            };
+            physical.aliased.insert(at, slice.key(0));
+            physical.shown.entry(slice.key(0)).or_default().push(at);
+            pages[k] = Some(victory_gpu::GpuPage {
+                section: slice.section.handle as usize,
+                offset: (slice.index * PAGE) as u64,
+                cpu: whole + slice.index * PAGE,
+            });
         }
     }
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let changing = victory_gpu::title_memory_remapping();
-    unfill_dirty(&mut physical);
-    let shown = show(&mut physical, to, len, &runs, Site::Alias);
-    drop((changing, physical));
-    victory_gpu::mapstat::tick();
-    // Unmapped: what victory holds for that memory goes.
-    if from == 0 && shown {
-        victory_gpu::title_memory_released(to, len);
-    }
-    shown && found
+    victory_gpu::title_pages_aliased(to, &pages);
+    found
 }
 
 /// Makes `[base, base + len)` show `runs` (which lie in it, in address
@@ -1866,12 +1902,14 @@ mod tests {
             1
         );
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
-        // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
+        // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`,
+        // with no host view there (the GPU side keeps the page); writes
+        // into the page are told at `b` too.
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64, false));
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
-        assert!(map_alias(b as u64, 0, PAGE as u64, false));
         assert_eq!(query(b).host.State, MEM_RESERVE);
+        assert!(shown_at(&pages[2..], 0, 1).contains(&(b as usize, 1)));
+        assert!(map_alias(b as u64, 0, PAGE as u64, false));
+        assert!(!shown_at(&pages[2..], 0, 1).contains(&(b as usize, 1)));
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64, false));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);

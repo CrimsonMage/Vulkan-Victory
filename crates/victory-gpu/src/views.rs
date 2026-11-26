@@ -39,17 +39,28 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
-    // Windows over these addresses look their pages up again.
+    // Windows over these addresses look their pages up again, and the
+    // directory's entries there follow (`crate::memory`).
     crate::gather::remapped(at as u64, len as u64);
+    crate::memory::views_changed(at as u64, len as u64);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    // The directory's entries there follow (`crate::memory`).
+    for (base, bytes) in gone(at, len) {
+        crate::memory::views_changed(base as u64, bytes as u64);
+    }
+}
+
+/// Forgets the views over `[at, at + len)`; returns them (address, bytes).
+fn gone(at: usize, len: usize) -> Vec<(usize, usize)> {
     let mut v = views();
+    let mut out = Vec::new();
     if v.views.is_empty() {
-        return;
+        return out;
     }
     // A length of 0 (a free of a whole allocation) names the view at `at`
     // alone; an empty range would also make the range below panic.
@@ -60,6 +71,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
+        out.push((base, bytes));
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
@@ -71,6 +83,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+    out
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.

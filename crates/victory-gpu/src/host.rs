@@ -1211,12 +1211,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of title memory in place.
+    /// Shaders write a range (address, bytes) of title memory in place or
+    /// by directory (`crate::memory`).
     GpuWrite(usize, usize),
-    /// Shaders write a range (address, bytes) of a window over scattered
-    /// pages (`crate::gather`): scattered back into its pages after the
-    /// list.
-    WindowWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1536,7 +1533,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList]) -> Option<Blocked>
                     }
                 }
                 Step::Run(_) => return Some(Blocked::Run),
-                Step::Fill(..) | Step::GpuWrite(..) | Step::WindowWrite(..) | Step::Host(_) => {}
+                Step::Fill(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -1813,7 +1810,7 @@ fn declared_writes(runs: &[&HostList]) -> Declared {
     for list in runs {
         let deferred = list.deferred();
         let ranges = deferred.copies.iter().filter_map(|step| match *step {
-            Step::GpuWrite(address, len) | Step::WindowWrite(_, address, len) => Some((address, address + len)),
+            Step::GpuWrite(address, len) => Some((address, address + len)),
             _ => None,
         });
         join_ranges(&mut back, ranges);
@@ -2185,20 +2182,22 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            // Windows over scattered pages: what the title changed of their
-            // pages is copied in before the list, what its shaders wrote
-            // into them is copied out after it (`crate::gather`).
-            let [before, after] = list.window_copies();
-            if let Some(before) = before {
+            // Windows over scattered pages (the fallback): what the title
+            // changed of their pages is copied in before the list
+            // (`crate::gather`).
+            if let Some(before) = list.window_copies() {
                 lists.push(Some(before));
             }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
-            if let Some(after) = after {
-                lists.push(Some(after));
-            }
+        }
+        // The directory of title memory: entries written since (remaps,
+        // pages named), ahead of every list of this submission
+        // (`crate::memory`).
+        if let Some(directory) = crate::memory::flush() {
+            lists.insert(0, Some(directory));
         }
         // What its shaders write in place, announced once it has finished.
         let back = declared_writes(runs);
@@ -2816,23 +2815,15 @@ impl HostList {
         order_writes(&self.list, list7.as_ref());
     }
 
-    /// The copies around the list for the windows over scattered pages it
-    /// names and writes (`crate::gather::around`): before it, after it.
-    fn window_copies(&self) -> [Option<ID3D12CommandList>; 2] {
-        let (named, writes, in_place) = {
+    /// The copies before the list for the windows over scattered pages it
+    /// names (`crate::gather::around`).
+    fn window_copies(&self) -> Option<ID3D12CommandList> {
+        let (named, written) = {
             let deferred = self.deferred();
-            let writes: Vec<_> = deferred
-                .copies
-                .iter()
-                .filter_map(|step| match step {
-                    Step::WindowWrite(shadow, address, len) => Some((shadow.clone(), *address as u64, *len as u64)),
-                    _ => None,
-                })
-                .collect();
-            if deferred.windows.is_empty() && writes.is_empty() && !crate::gather::any() {
-                return [None, None];
+            if deferred.windows.is_empty() && !crate::gather::any() {
+                return None;
             }
-            let in_place: Vec<(u64, u64)> = deferred
+            let written: Vec<(u64, u64)> = deferred
                 .copies
                 .iter()
                 .filter_map(|step| match *step {
@@ -2840,9 +2831,9 @@ impl HostList {
                     _ => None,
                 })
                 .collect();
-            (deferred.windows.clone(), writes, in_place)
+            (deferred.windows.clone(), written)
         };
-        crate::gather::around(&named, &writes, &in_place)
+        crate::gather::around(&named, &written)
     }
 }
 
@@ -2958,20 +2949,8 @@ impl HostList {
         self.deferred().windows.push(shadow.clone());
     }
 
-    /// Shaders of the list write `[address, address + len)` of a window
-    /// over scattered pages: copied back into its pages after the list
-    /// (`crate::gather`), and declared as a write in place is. Once per
-    /// range until a title copy intervenes.
-    pub(crate) fn defer_window_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let mut deferred = self.deferred();
-        // Title addresses lie below bit 63: another key than a write in place.
-        if deferred.declared.insert((address | 1 << 63, len)) {
-            deferred.copies.push(Step::WindowWrite(shadow.clone(), address, len));
-        }
-    }
-
     /// Shaders of the list write `[address, address + len)` of title
-    /// memory in place: announced once the submission has finished, and
+    /// memory in place or by directory: announced once the submission has finished, and
     /// waited for by CPU steps of later submissions that read it. Declared
     /// once per range until a title copy intervenes.
     pub(crate) fn defer_gpu_write(&self, address: usize, len: usize) {
@@ -3113,7 +3092,7 @@ impl HostList {
                 Step::Host(work) => work(),
                 // Collected for the submission ([`declared_writes`],
                 // `HostList::window_copies`).
-                Step::GpuWrite(..) | Step::WindowWrite(..) => {}
+                Step::GpuWrite(..) => {}
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         let t = std::time::Instant::now();
@@ -3160,6 +3139,19 @@ impl Batch {
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     if len == 0 {
+        return;
+    }
+    // The GPU view of the pool has no host view: it is read and written
+    // through its pages' sections, unmapped pages reading zeros and taking
+    // no writes (`crate::memory`).
+    if title_dst && crate::memory::gpu_view(dst as u64, len as u64) {
+        let mut bytes = vec![0u8; len];
+        copy_mapped(bytes.as_mut_ptr(), src, len, false);
+        crate::memory::write(dst as u64, bytes.as_ptr(), len);
+        return;
+    }
+    if crate::memory::gpu_view(src as u64, len as u64) {
+        crate::memory::read(src as u64, dst, len, true);
         return;
     }
     // A title destination that is not all mapped is left alone. Asking
@@ -3244,6 +3236,10 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // The GPU view of the pool: through its pages (`crate::memory`).
+    if crate::memory::gpu_view(src as u64, len as u64) {
+        return crate::memory::read(src as u64, dst, len, false);
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;

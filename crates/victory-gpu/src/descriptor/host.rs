@@ -63,6 +63,11 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the pool table, per slot the title address and bytes of
+    /// a pool view (`victory_shader::emit::MEMORY_RUN_POOL`,
+    /// `crate::memory`): a buffer of the PC's memory and its mapping, made
+    /// at the first pool view or memory run.
+    pool: std::sync::OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -95,6 +100,15 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        // Out of the directory's memory runs before its slots go.
+        if !self.sampler {
+            crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
+        }
+    }
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -908,6 +922,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            pool: std::sync::OnceLock::new(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1321,7 +1336,7 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.cpu(slot)) {
+            if let Some(kept) = self.make_slot(slot, &view) {
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -1357,7 +1372,88 @@ impl HostHeap {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
+        self.pool_entry(index, None);
         self.keep(index, None);
+    }
+
+    /// The pool table (`crate::memory`): its buffer and its mapping, made
+    /// the first time; none if the PC's memory refuses it.
+    pub(crate) fn pool_table(&self) -> Option<(&ID3D12Resource, *mut u32)> {
+        if self.sampler {
+            return None;
+        }
+        let made = self.pool.get_or_init(|| {
+            use victory_shader::emit::{POOL_ENTRY_BYTES, POOL_SLOTS};
+            let bytes = u64::from(POOL_SLOTS) * u64::from(POOL_ENTRY_BYTES);
+            let Some((buffer, data)) = host()?.shared_buffer(bytes) else {
+                tracing::warn!(mb = bytes >> 20, "no pool table for a view heap: views over the page pool keep their windows");
+                return None;
+            };
+            // SAFETY: the buffer's whole mapping.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            Some((buffer, data as usize))
+        });
+        made.as_ref().map(|(b, d)| (b, *d as *mut u32))
+    }
+
+    /// Writes slot `index`'s pool table entry: a pool view of `[address,
+    /// address + bytes)`, or none (nothing is made for a heap without a
+    /// table and no pool view). False if there is no table to say it in.
+    fn pool_entry(&self, index: u32, view: Option<(u64, u64)>) -> bool {
+        use victory_shader::emit::{POOL_ENTRY_BYTES, POOL_FLAG, POOL_SLOTS};
+        // (The last entry stays empty: it stands for no root view.)
+        if index >= POOL_SLOTS - 1 {
+            return false;
+        }
+        let table = match view {
+            Some(_) => self.pool_table(),
+            None => self.pool.get().and_then(|t| t.as_ref()).map(|(b, d)| (b, *d as *mut u32)),
+        };
+        let Some((_, data)) = table else {
+            return view.is_none();
+        };
+        let words = match view {
+            Some((address, bytes)) => [address as u32, (address >> 32) as u32 & 0xFF | POOL_FLAG, bytes.min(u64::from(u32::MAX)) as u32, 0],
+            None => [0; 4],
+        };
+        // SAFETY: inside the table's mapping; shaders read it while we
+        // write (a slot is rewritten only when the title rewrites it, as its
+        // descriptor is).
+        unsafe {
+            let at = data.add(index as usize * (POOL_ENTRY_BYTES as usize / 4));
+            for (k, w) in words.iter().enumerate() {
+                at.add(k).write_volatile(*w);
+            }
+        }
+        true
+    }
+
+    /// Makes slot `index` from `view` (`make`), or, for a pool view
+    /// (`pool_range`), a null view whose pool table entry holds its title
+    /// address and bytes: shaders read and write its bytes through the
+    /// directory (`crate::memory`).
+    fn make_slot(&self, index: u32, view: &View) -> Option<Kept> {
+        if let Some((address, bytes)) = pool_range(view)
+            && self.pool_entry(index, Some((address, bytes)))
+        {
+            crate::memory::demand(address, bytes);
+            null_for(view, self.cpu(index));
+            return Some(None);
+        }
+        self.pool_entry(index, None);
+        make(view, self.cpu(index))
+    }
+
+    /// Makes dynamic slot `index` stand for a root view over pool memory at
+    /// `address` (`bytes` from it): a null raw view (`uav`: unordered) and
+    /// its pool table entry. False if there is no table.
+    pub(crate) fn pool_root_at(&self, index: u32, address: u64, bytes: u64, uav: bool) -> bool {
+        if uav {
+            self.null_raw_uav_at(index);
+        } else {
+            self.null_raw_at(index);
+        }
+        self.pool_entry(index, Some((address, bytes)))
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -1564,7 +1660,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = self.make_slot(index, view);
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -1577,6 +1673,7 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+            self.pool_entry(index, None);
         }
         self.keep(index, None);
     }
@@ -1606,6 +1703,8 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        // (Dynamic slots are taken again: no pool view's entry stays.)
+        self.pool_entry(index, None);
         let Some(host) = host() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1632,6 +1731,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
+        self.pool_entry(index, None);
         null_buffer_view(self.cpu(index));
         self.keep(index, None);
     }
@@ -1641,6 +1741,7 @@ impl HostHeap {
     /// root UAV with a size, whose accesses past it do nothing instead of
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        self.pool_entry(index, None);
         let Some(host) = host() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1671,6 +1772,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        self.pool_entry(index, None);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1707,6 +1809,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.pool_entry(index, None);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -1879,7 +1982,7 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                self.make_slot(index, &view)
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1993,6 +2096,42 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
+}
+
+/// The title memory of a pool view (`crate::memory`): a constant buffer
+/// view, or a raw or structured buffer view, over pool memory (a page
+/// reservation of the title's, mapped page by page); its address and
+/// bytes. Typed buffer views keep their windows (their format is the
+/// host's to decode).
+pub(crate) fn pool_range(view: &View) -> Option<(u64, u64)> {
+    let typed = |words: &[u32; 10], unordered: bool| {
+        let (format, stride, raw) = if unordered {
+            let d = uav_desc(words);
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { d.Anonymous.Buffer };
+            (d.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0)
+        } else {
+            let d = srv_desc(words);
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { d.Anonymous.Buffer };
+            (d.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0)
+        };
+        !raw && stride == 0 && format != DXGI_FORMAT_UNKNOWN
+    };
+    let range = match view {
+        &View::Constant(address, size) => (address, u64::from(size)),
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_some() && !typed(desc, false) => {
+            buffer_range(view)?
+        }
+        View::Unordered(r, _, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_some() && !typed(desc, true) => {
+            buffer_range(view)?
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == 1 && !typed(desc[..10].try_into().ok()?, *unordered) => {
+            buffer_range(view)?
+        }
+        _ => return None,
+    };
+    (range.1 > 0 && crate::memory::covers(range.0)).then_some(range)
 }
 
 /// The title memory a buffer shader or unordered access view reads: its

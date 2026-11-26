@@ -111,6 +111,7 @@ driver errors and no new crash, and the captures look no worse.
 | 21 | Indirect and dispatch recording (~640 ms CPU/frame) | subagent | running |
 | 22 | Submission pass-through: last card copies in place, no merge wait, fences to the GPU | subagent | running |
 | 23 | Windows over scattered pool pages gathered on the card from the opened sections (GPU copies of runs of pages, again only on remaps and announced writes; written ranges copied back after the list); dispatches with only new root constants set their user data alone; dispatch binding split in the frame line | subagent | built, not yet run |
+| 24 | Pool memory by directory: raw, structured and constant views over page reservations read and written through the 64 KiB directory onto the opened sections (pool table per heap slot, uniform branch in the translator, 64 KiB edges split); directory in card memory written by GPU copies at the head of each submission; the pool's GPU view has no host views (entries from the page-mapping copies; the CPU reads it through the sections); windows only for typed views, index/indirect/vertex buffers, card copies, spilled programs' root views; copy-out deleted; frame line `pool by directory MB, windows MB` | subagent | built, not yet run |
 | 19 | Memory: levels on demand by default, release on title frees, room-only eviction, big buffers in place | subagent | merged |
 | 20 | `globallycoherent` UAVs, device-scope barriers and fenced atomics for compute programs that sync across groups (the BVH builder's, and any with `buffer_gl1_inv`); builder still off by default (`VICTORY_BVH_BUILDER=1` to try). Placed textures picked by index whose memory holds only zeros get no host copy until data arrives | subagent | built, not yet run |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
@@ -231,3 +232,11 @@ driver errors and no new crash, and the captures look no worse.
   don't translate (wave64 first-lane reads); being fixed.
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
+- 2026-11-25: pool memory goes by directory (workstream 24): the one way
+  the GPU sees title memory outside opened buffers. Static analysis of the
+  executable: the GPU view of the pool is filled only by
+  `CopyPageMappingsBatchX` (one page per range) and never touched by the
+  CPU, so it gets no host views at all (the ~62k single-page views); its
+  entries come from the batches, and victory's CPU reads of it go through
+  the sections' whole views. Windows stay only as the fallback, without
+  copy-out.

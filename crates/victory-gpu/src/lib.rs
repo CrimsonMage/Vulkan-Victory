@@ -96,6 +96,8 @@ pub use unified::{on as unified_on, title_region, title_section, title_section_g
 #[cfg(windows)]
 pub use views::title_memory_view;
 #[cfg(windows)]
+pub use memory::{GpuPage, page_reservation as title_page_reservation, title_pages_aliased};
+#[cfg(windows)]
 pub use watch::{
     mapping_lock_held, remapping_over, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_written,

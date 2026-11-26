@@ -27,33 +27,59 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
-/// Title memory by address (`resource::MEMORY`): console code reads and
-/// writes through raw 40-bit addresses it takes from root constants,
-/// descriptors and other memory (the ray-tracing structure builder and the
-/// programs that walk its structures). The host keeps copies of the title
-/// memory shaders use; a shader with such an access finds the copy by the
-/// address:
+/// Title memory outside the buffers the host places over it, by its title
+/// address (`docs/unified-memory.md`, "Title memory by directory"): console
+/// code that reads and writes through raw 40-bit addresses
+/// (`resource::MEMORY`: the ray-tracing structure builder and the programs
+/// that walk its structures), and buffer views over the title's page pool
+/// ("pool views": the title maps that memory page by page in scattered
+/// order, so no host buffer spans it). A shader finds the host memory by
+/// the address in a **directory** of [`MEMORY_PAGES`] entries of two
+/// dwords, one per 64 KiB of title address space: the number of the host
+/// copy holding that page (0: none) and the page's byte offset in it. A
+/// copy is a raw view over an opened section of the title's physical pages
+/// (the page pool), or over a buffer the host placed over title memory.
 ///
-/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
-///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
-///   address space: the number of the host copy holding that page (0: none
-///   yet) and the page's byte offset in that copy;
-/// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
-///   reads zeros and drops writes;
-/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
-pub const SLOT_MEMORY: u8 = 254;
-/// See [`SLOT_MEMORY`].
-pub const SLOT_FAULTS: u8 = 253;
-/// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+/// Everything lies in a run of view-heap slots the host keeps in every
+/// view heap, found from `base`, the user-data dword of kind
+/// [`USER_MEMORY_BASE`]:
+///
+/// - `base - MEMORY_RUN_POOL`: the **pool table** of this heap, a raw SRV of
+///   [`POOL_SLOTS`] entries of [`POOL_ENTRY_BYTES`]: for heap slot `i`,
+///   dwords (title address low, bits 32 to 39 | [`POOL_FLAG`], bytes, 0).
+///   With the flag the view at slot `i` is a pool view: its host
+///   descriptor is null, and the shader reads and writes the view's bytes
+///   through the directory from that address on;
+/// - `base - MEMORY_RUN_FAULTS`: a raw UAV of [`MEMORY_FAULTS`] dwords
+///   taking the page numbers of raw-address accesses that found no copy
+///   (dword 0 a sink), which the host reads to make those copies;
+/// - `base - MEMORY_RUN_DIRECTORY`: the directory, a raw SRV;
+/// - `base`: a raw UAV that reads zeros and drops writes (copy 0);
+/// - `base + n`: copy `n`, a raw UAV.
+pub const MEMORY_RUN_POOL: u32 = 3;
+/// See [`MEMORY_RUN_POOL`].
+pub const MEMORY_RUN_FAULTS: u32 = 2;
+/// See [`MEMORY_RUN_POOL`].
+pub const MEMORY_RUN_DIRECTORY: u32 = 1;
+/// Entries of the directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the faults buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Entries of a pool table: heap slots past it read the last.
+pub const POOL_SLOTS: u32 = SLOT_STRIDES_COUNT;
+/// Bytes of a pool table entry.
+pub const POOL_ENTRY_BYTES: u32 = 16;
+/// The bit of a pool table entry's second dword that marks a pool view.
+pub const POOL_FLAG: u32 = 1 << 31;
 /// `RootType::Other` code of a user-data dword the host computes: the view
-/// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+/// heap slot of copy 0 of the memory run ([`MEMORY_RUN_POOL`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
+/// `RootType::Other` code of a user-data dword the host computes: the heap
+/// slot whose pool table entry describes the root view of root parameter
+/// `slot` ([`POOL_SLOTS`] - 1, whose entry is never a pool view, for none;
+/// [`MEMORY_RUN_POOL`]). A root view over the page
+/// pool is read through the directory as a pool view in the heap is.
+pub const USER_ROOT_POOL: u32 = 0x104;
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
 /// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:

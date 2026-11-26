@@ -284,7 +284,11 @@ pub(crate) fn source(page: u64) -> Option<(Home, u64)> {
     if !on() || page >= TIB {
         return None;
     }
-    if let Some((section, offset)) = crate::views::section_page(page as usize) {
+    // A page of the GPU view of the pool: no host view shows it.
+    let viewed = crate::memory::gpu_page(page)
+        .map(|p| (p.section, p.offset))
+        .or_else(|| crate::views::section_page(page as usize));
+    if let Some((section, offset)) = viewed {
         let u = units();
         let unit = u.sections.get(&section)?;
         return (offset + K64 <= unit.len && !matches!(unit.state, State::Refused)).then_some((Home::Section(section), offset));
@@ -303,6 +307,18 @@ pub(crate) fn spans(at: u64, len: u64, out: &mut Vec<(Home, u64, u64)>) {
         return;
     }
     let end = at.saturating_add(len);
+    if crate::memory::gpu_view(at, len) {
+        // The GPU view of the pool, page by page.
+        let mut a = at;
+        while a < end {
+            let stop = ((a & !(K64 - 1)) + K64).min(end);
+            if let Some(p) = crate::memory::gpu_page(a) {
+                out.push((Home::Section(p.section), p.offset + (a & (K64 - 1)), stop - a));
+            }
+            a = stop;
+        }
+        return;
+    }
     for (base, bytes, section, offset) in crate::views::section_spans(at as usize, end as usize) {
         let (lo, hi) = ((base as u64).max(at), (base as u64 + bytes as u64).min(end));
         if lo < hi {
@@ -345,6 +361,26 @@ pub(crate) fn span_buffer(home: Home, offset: u64) -> Option<(ID3D12Resource, u6
     let buffer = place_resource(&host.device, &heap, first, &buffer_desc(width, flags), D3D12_RESOURCE_STATE_COMMON).ok()?;
     u.chunks.insert((home, chunk), buffer.clone());
     Some((buffer, offset - first))
+}
+
+/// A buffer over the whole heap of section `handle` (opened now if it was
+/// not yet), for the directory's copy of it (`crate::memory`). Kept until
+/// the section goes.
+pub(crate) fn section_buffer(handle: usize) -> Option<ID3D12Resource> {
+    let host = crate::host::host()?;
+    let mut u = units();
+    let home = Home::Section(handle);
+    if let Some(buffer) = u.chunks.get(&(home, u64::MAX)) {
+        return Some(buffer.clone());
+    }
+    let u = &mut *u;
+    let unit = u.sections.get_mut(&handle)?;
+    let (heap, size) = open(&host.device, &mut u.rig, unit, home)?;
+    let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    let buffer = place_resource(&host.device, &heap, 0, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON).ok()?;
+    // (Under a chunk number no window copy uses.)
+    u.chunks.insert((home, u64::MAX), buffer.clone());
+    Some(buffer)
 }
 
 /// Whether the 64 KiB page at `page` is committed memory the title may
@@ -871,9 +907,12 @@ pub(crate) fn tick() {
     let own = crate::shadow::own_made();
     let ranges = epochs().len();
     let windows = crate::gather::live();
+    let d = crate::memory::stats();
     tracing::info!(
         "unified: {} heaps opened ({} MB of title memory), {} refused; buffers in place: {} alive ({} MB), {} placed since the start ({} MB); \
-         windows over scattered pages (copies on the card gathered from their pages) {} alive ({} MB), {} made; \
+         by directory: pages of the pool's GPU view mapped {} ({} MB), entries written {}, directory blocks copied to the card {}, \
+         sections opened as copies {}, refused {}; \
+         windows over scattered pages (fallback: copies on the card gathered from their pages) {} alive ({} MB), {} made; \
          not in place (buffers of their own, filled at each submission that names them) {} made ({} MB), lists whose shaders wrote one {}; \
          windows let go {}; title copies on the GPU {}, on the CPU after waiting for the card {}; textures checked for an announced write {}, \
          by their hash {}; announced-write ranges kept {}",
@@ -884,6 +923,12 @@ pub(crate) fn tick() {
         live_bytes >> 20,
         s[3],
         s[4] >> 20,
+        d[0],
+        d[0] >> 4,
+        d[1],
+        d[2],
+        d[3],
+        d[4],
         windows[0],
         windows[1] >> 20,
         windows[2],

@@ -54,8 +54,9 @@ Windows-only test tools (D3D12 device, `dxil.dll`).
   address used as a pointer, a stride). `resource.rs` traces them; the
   lowering takes such dwords from user data the host fills
   (`USER_VIEW_ADDRESS`, `USER_VIEW_BIAS`), the per-slot stride table
-  (`SLOT_STRIDES`) or the host's copies of title memory (`SLOT_MEMORY`,
-  `SLOT_FAULTS`); see the constants in `emit/shader.rs` and the module
+  (`SLOT_STRIDES`) or title memory by directory (`MEMORY_RUN_POOL`: the
+  directory, the pool table and the copies in a run of view-heap slots);
+  see the constants in `emit/shader.rs` and the module
   notes of `emit/mod.rs` for the binding contract.
 - **Loops** get an iteration limit (128 pixel, 256 vertex/mesh, 4,096
   compute; `Lower::count_iteration`) so data the host lacks cannot hang

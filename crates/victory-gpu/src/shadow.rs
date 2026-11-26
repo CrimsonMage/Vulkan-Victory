@@ -6,11 +6,14 @@
 //! watched and nothing compared. A title GPU address inside the buffer is
 //! the same offset in the host buffer (plus [`Shadow::offset`]'s bias).
 //!
-//! A window over the title's scattered pages (a 4 MiB window that is not
-//! one run of one section) is a buffer on the card gathered from the
-//! pages' opened heaps by GPU copies, again only for pages the title
-//! remaps or announces written, and scattered back into them after a list
-//! whose shaders write it ([`crate::gather`]): the pages stay its home.
+//! Raw, structured and constant views over the title's page pool do not
+//! come here: shaders reach them by directory ([`crate::memory`]). For
+//! what the directory cannot express (index, vertex and indirect buffers,
+//! card copies, typed views), a window over the title's scattered pages (a
+//! 4 MiB window that is not one run of one section) is a buffer on the
+//! card gathered from the pages' opened heaps by GPU copies, again only
+//! for pages the title remaps or announces written ([`crate::gather`]);
+//! what shaders write into it stays there.
 //!
 //! What cannot be placed so has one fallback, a buffer of its own in the
 //! PC's memory that each submission naming it fills from title memory
@@ -227,11 +230,6 @@ impl Shadow {
         self.refresh(list, address, len);
         if self.in_place {
             list.defer_gpu_write(address as usize, len as usize);
-            return;
-        }
-        if self.gather.is_some() && crate::gather::copy_out() {
-            // Copied back into its pages after the list.
-            list.defer_window_write(self, address as usize, len as usize);
             return;
         }
         let n = LOST.fetch_add(1, Ordering::Relaxed) + 1;
@@ -591,6 +589,13 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // (it holds every ask in it, also a root view's, whose length is not
     // known).
     if let Some(shadow) = take(&mut map, (start, len)) {
+        return Some(shadow);
+    }
+    // The GPU view of the pool has no host view: never one run, never in
+    // place (`crate::memory`).
+    if crate::memory::gpu_view(start, len) {
+        let shadow = Shadow::gathered(start, len)?;
+        map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
     // Asked once per window until the title maps there anew (it was asked
