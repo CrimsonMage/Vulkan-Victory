@@ -380,7 +380,7 @@ pub(crate) fn title_memory_view(at: usize, len: usize, section: usize, offset: u
 /// given so far (its pages are gone from the process).
 pub(crate) fn title_memory_unmapped(at: usize, len: usize) {
     let Some(b) = backend() else { return };
-    images::released(b, at as u64, len as u64);
+    images::released(b, at as u64, len as u64, images::Dropped::Unmapped);
     let mut m = memory(b);
     let end = at + len;
     let before = m.views.len();
@@ -459,9 +459,13 @@ pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
         return;
     };
+    let to64 = to as u64;
+    // Images over pages that now show other memory (or none) go (before
+    // the memory lock): the title streams by mapping fresh pages under new
+    // textures and taking old ones away, so images follow its live ones.
+    images::released(b, to64, pages.len() as u64 * PAGE, images::Dropped::Remapped);
     let mut m = memory(b);
     let m = &mut *m;
-    let to64 = to as u64;
     if !m.pools.iter().any(|p| p.contains(to64)) {
         let Some((&at, &len)) = m
             .reservations
@@ -585,7 +589,7 @@ pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDe
 
 pub(crate) fn title_memory_released(at: usize, len: usize) {
     let Some(b) = backend() else { return };
-    images::released(b, at as u64, len as u64);
+    images::released(b, at as u64, len as u64, images::Dropped::Freed);
     let mut m = memory(b);
     let gone: Vec<usize> = m
         .regions
@@ -1399,4 +1403,5 @@ fn report(b: &Backend, frame: u64) {
     stages::report();
     gpu_stats::collect(b);
     record::report();
+    images::report();
 }

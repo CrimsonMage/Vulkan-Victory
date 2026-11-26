@@ -277,7 +277,7 @@ fn texture_words(
     unordered: bool,
 ) -> Vec<u32> {
     let dimension = desc.map_or(0, |d| d[1]);
-    let Some(image) = images::at(b, address, rdesc) else {
+    let Some(image) = images::at(b, address, rdesc, true) else {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         return null_texture(dimension, unordered);
     };

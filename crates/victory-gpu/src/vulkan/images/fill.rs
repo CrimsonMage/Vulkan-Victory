@@ -40,21 +40,27 @@ pub(crate) fn written(at: u64, len: u64) {
     r.pending.extend(hit);
 }
 
-/// The title freed `[at, at + len)`: images there go once the card is done.
-pub(crate) fn released(b: &Backend, at: u64, len: u64) {
+/// The title freed, unmapped or remapped `[at, at + len)`: images over
+/// any of it go once the card is done (counted by `why`, [`Dropped`]). An
+/// image made there later is filled from what the memory holds then.
+pub(crate) fn released(b: &Backend, at: u64, len: u64, why: super::Dropped) {
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
+    // Images start at most 4 GiB before the range.
+    let from = Key { address: at.saturating_sub(4 << 30), dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false };
     let gone: Vec<Key> = r
         .images
-        .keys()
-        .filter(|k| k.address >= at && k.address < at + len)
-        .copied()
+        .range(from..)
+        .take_while(|(k, _)| k.address < at + len)
+        .filter(|(k, i)| k.address + i.bytes.max(1) > at)
+        .map(|(k, _)| *k)
         .collect();
     let value = b.timeline.last();
     for k in gone {
         if let Some(img) = r.images.remove(&k) {
             super::super::descriptors::image_gone(img.id);
             r.dropped.push((value, img));
+            super::DROPPED[why as usize].fetch_add(1, Ordering::Relaxed);
         }
     }
 }

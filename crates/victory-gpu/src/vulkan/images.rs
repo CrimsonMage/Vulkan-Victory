@@ -261,6 +261,47 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// refills found by fingerprint.
 pub(crate) static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+/// Why images went: the title freed the memory, unmapped it, remapped its
+/// pages, released the resource.
+#[derive(Clone, Copy)]
+pub(crate) enum Dropped {
+    Freed,
+    Unmapped,
+    Remapped,
+    Resource,
+}
+
+pub(crate) static DROPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Images made by what named them first (a view, a resource: target, copy,
+/// plane), and by 256 MiB of title address (diagnostics: where they come from).
+pub(crate) static MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static MADE_AT: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+
+/// The images' part of the 10 s line: made and dropped by reason, the
+/// address ranges most images were made in, images on memory of their own
+/// over another's (aliases that did not fit).
+pub(crate) fn report() {
+    let n = |a: &[AtomicU64], i: usize| a[i].load(Ordering::Relaxed);
+    let mut top: Vec<(u64, u64)> = lock(&MADE_AT).as_ref().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default();
+    top.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+    let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{:#x}+256M:{v}", k << 28)).collect();
+    tracing::info!(
+        live = count(),
+        made_by_view = n(&MADE, 0),
+        made_by_resource = n(&MADE, 1),
+        dropped_freed = n(&DROPPED, 0),
+        dropped_unmapped = n(&DROPPED, 1),
+        dropped_remapped = n(&DROPPED, 2),
+        dropped_resource = n(&DROPPED, 3),
+        not_fitting_aliases = UNFIT.load(Ordering::Relaxed),
+        made_at = %top.join(" "),
+        "Vulkan: images"
+    );
+}
+
+static UNFIT: AtomicU64 = AtomicU64::new(0);
+
 fn registry() -> std::sync::MutexGuard<'static, Option<Registry>> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -276,6 +317,7 @@ pub(crate) fn resource_gone(b: &Backend, address: u64, desc: &ResourceDesc) {
     if let Some(img) = r.images.remove(&key) {
         super::descriptors::image_gone(img.id);
         r.dropped.push((b.timeline.last(), img));
+        DROPPED[Dropped::Resource as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -302,12 +344,12 @@ fn key_of(address: u64, desc: &ResourceDesc) -> Option<Key> {
 /// The image of title texture `resource` (made the first time).
 pub(crate) fn of_resource(b: &Backend, resource: This) -> Option<Arc<Image>> {
     let (data, desc) = crate::resource::texture_memory(resource)?;
-    at(b, data as u64, &desc)
+    at(b, data as u64, &desc, false)
 }
 
-/// The image of the texture described by `desc` at title address
-/// `address` (made the first time).
-pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc) -> Option<Arc<Image>> {
+/// The image over `address` of `desc`'s shape, made the first time
+/// (`by_view`: a descriptor named it first, else a resource did).
+pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) -> Option<Arc<Image>> {
     let key = key_of(address, desc)?;
     let mut guard = registry();
     let r = guard.get_or_insert_with(Registry::default);
@@ -340,6 +382,8 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc) -> Option<Arc<I
             r.pending.push(img.clone());
             r.images.insert(key, img.clone());
             STATS[0].fetch_add(1, Ordering::Relaxed);
+            MADE[usize::from(!by_view)].fetch_add(1, Ordering::Relaxed);
+            *lock(&MADE_AT).get_or_insert_with(Default::default).entry(address >> 28).or_insert(0) += 1;
             Some(img)
         }
         None => {
@@ -440,6 +484,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         needs.size <= size && needs.memory_type_bits & (1 << ty) != 0
     });
     if alias.is_some() && shared.is_none() {
+        UNFIT.fetch_add(1, Ordering::Relaxed);
         once_warn(format!("Vulkan: an image over the same title memory does not fit the first one's card memory ({} KiB)", needs.size >> 10));
     }
     let Some((memory, offset)) = shared.map(|(m, o, _, _)| (m, o)).or_else(|| allocate(b, &mut r.blocks, needs)) else {
