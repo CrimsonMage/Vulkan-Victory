@@ -39,13 +39,32 @@ const SAMPLER_SLOTS: u32 = 4096;
 /// Push constants: one 256-byte block for every stage (ABI v1).
 const PUSH_BYTES: u32 = 256;
 
+/// Where translated programs read the memory map (`docs/vulkan-abi.md`
+/// section 3): a uniform buffer at set [`MAP_SET`] binding 0, one small
+/// block per map version, bound once per command buffer. The one place
+/// that says how the map is reached: a change of the ABI (a push-constant
+/// pointer instead) is an edit here and in the binding of the block.
+/// (Read through the push-constant pointer, NVIDIA compiled the largest
+/// program in ~9-10 s against 0.26 s from a uniform buffer.)
+pub(crate) const MAP_SET: usize = 3;
+
+fn map_binding() -> vk::DescriptorSetLayoutBinding<'static> {
+    vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::ALL)
+}
+
 /// The one pipeline layout of ABI v1 (sets 0 and 1 as descriptor buffers).
 #[allow(dead_code)] // the sets are bound from M2b's draws on
 pub(crate) struct Layout {
-    pub(crate) sets: [vk::DescriptorSetLayout; 2],
+    /// Set 0 images, set 1 samplers (heap and immutable, proposal 8), set
+    /// 2 empty (no per-pipeline set any more), set [`MAP_SET`] the map.
+    pub(crate) sets: [vk::DescriptorSetLayout; 4],
     pub(crate) pipeline: vk::PipelineLayout,
     /// Bytes of each set in its descriptor buffer.
-    pub(crate) set_bytes: [u64; 2],
+    pub(crate) set_bytes: [u64; 4],
 }
 
 fn make_layout(b: &Backend) -> anyhow::Result<Layout> {
@@ -89,7 +108,12 @@ fn make_layout(b: &Backend) -> anyhow::Result<Layout> {
         };
         let s0 = set(&images)?;
         let s1 = set(&samplers)?;
-        let sets = [s0, s1];
+        let s2 = set(&[])?;
+        let s3 = set(&[map_binding()])?;
+        let mut sets = [s2; 4];
+        sets[0] = s0;
+        sets[1] = s1;
+        sets[MAP_SET] = s3;
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(all)
             .offset(0)
@@ -104,8 +128,10 @@ fn make_layout(b: &Backend) -> anyhow::Result<Layout> {
             Some(db) => [
                 db.get_descriptor_set_layout_size(s0),
                 db.get_descriptor_set_layout_size(s1),
+                db.get_descriptor_set_layout_size(s2),
+                db.get_descriptor_set_layout_size(s3),
             ],
-            None => [0, 0],
+            None => [0; 4],
         };
         Ok(Layout {
             sets,
@@ -127,7 +153,7 @@ pub(crate) fn layout(b: &Backend) -> Option<&'static Layout> {
                     image_set_mb = l.set_bytes[0] >> 20,
                     sampler_set_kb = l.set_bytes[1] >> 10,
                     descriptor_buffer = b.host.caps.descriptor_buffer,
-                    "Vulkan: the ABI v1 pipeline layout (set 0 images, set 1 samplers, 256 bytes of push constants)"
+                    "Vulkan: the ABI v1 pipeline layout (set 0 images, set 1 samplers, set 3 the memory map, 256 bytes of push constants)"
                 );
                 Some(l)
             }
