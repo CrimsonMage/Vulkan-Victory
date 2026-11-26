@@ -260,6 +260,19 @@ impl Memory {
         self.unmade = true;
         let n = self.copies.len() as u32;
         self.chunks.insert((home, chunk), n);
+        // Every page of the chunk at once (a region is not remapped): a
+        // root view or buffer read past the pages asked for still finds
+        // its bytes.
+        if let crate::unified::Home::Region(base) = home {
+            let first = base as u64 + chunk * crate::unified::CHUNK;
+            let last = u64::from(MEMORY_PAGES) - 1;
+            let len = crate::unified::region_len(base).map_or(0, |len| len.saturating_sub(chunk * crate::unified::CHUNK).min(crate::unified::CHUNK));
+            for page in first / PAGE..(first + len).div_ceil(PAGE).min(last) {
+                let at = page * PAGE - first;
+                self.demand(page as usize);
+                self.set(page as usize, u64::from(n) | at << 32);
+            }
+        }
         Some(n)
     }
 

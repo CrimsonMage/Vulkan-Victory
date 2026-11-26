@@ -159,6 +159,11 @@ pub(crate) fn region_holds(at: u64, len: u64) -> bool {
         .is_some_and(|(&base, &(bytes, refused))| !refused && at.saturating_add(len) <= base as u64 + bytes)
 }
 
+/// The bytes of the region that starts at `base`, if there is one.
+pub(crate) fn region_len(base: usize) -> Option<u64> {
+    REGIONS.read().unwrap_or_else(|e| e.into_inner()).get(&base).map(|r| r.0)
+}
+
 /// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
 /// of 64 KiB), with a committed canary page of its own right after it.
 pub fn title_region(at: usize, len: usize) {
