@@ -176,7 +176,7 @@ impl Memory {
             }
         }
         let i = s.import.as_ref()?;
-        (key.1 < i.len).then_some(Source {
+        (key.1.is_multiple_of(PAGE) && key.1 + PAGE <= i.len).then_some(Source {
             buffer: i.buffer,
             offset: key.1,
         })
@@ -254,7 +254,7 @@ pub(crate) fn title_section_gone(handle: usize) {
     }) = gone
     {
         // Fills from it may be in the air.
-        b.timeline.wait(&b.host, b.timeline.last(), u64::MAX);
+        b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
         // SAFETY: the card has finished everything given so far.
         unsafe { i.destroy(&b.host) };
     }
@@ -293,7 +293,9 @@ fn pool_budget(host: &Host) -> u64 {
 }
 
 pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
-    let Some(b) = backend() else { return };
+    let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
+        return;
+    };
     let mut m = memory(b);
     let m = &mut *m;
     let to64 = to as u64;
@@ -321,6 +323,7 @@ pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
                     mb = len >> 20,
                     device = format_args!("{:#x}", view.device_base),
                     budget_mb = budget >> 20,
+                    unbound_pages_read_zeros = b.host.caps.non_resident_strict,
                     "Vulkan: the pool's GPU view is a sparse buffer of card pages"
                 );
                 m.pools.push(view);
@@ -372,7 +375,9 @@ pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
 }
 
 pub(crate) fn title_memory_written(at: usize, len: usize) {
-    let Some(b) = backend() else { return };
+    let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
+        return;
+    };
     let mut guard = memory(b);
     let m = &mut *guard;
     let (at, len) = (at as u64, len as u64);
@@ -393,7 +398,7 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     for view in &mut m.pools {
         let r = view.written(&b.host, &b.timeline, at, len, tick, |key: PageKey| {
             let &(buffer, len) = sources.get(&key.0)?;
-            (key.1 < len).then_some(Source {
+            (key.1.is_multiple_of(PAGE) && key.1 + PAGE <= len).then_some(Source {
                 buffer,
                 offset: key.1,
             })
@@ -534,7 +539,11 @@ impl Engine {
                                         signals: Vec::new(),
                                     }),
                                     Err(e) => {
-                                        tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
+                                        if b.timeline.lost() {
+                                            lost_once();
+                                        } else {
+                                            tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
+                                        }
                                         for (at, what, bytes) in part.writes {
                                             write_now(b, at, what, bytes);
                                         }
@@ -702,6 +711,16 @@ fn start_landing() {
     });
 }
 
+/// Says once, loudly, that the device was lost.
+fn lost_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::error!(
+            "Vulkan: the device was lost; the run goes on without the card (bottom-of-pipe writes and fence signals on the CPU, no presents)"
+        )
+    });
+}
+
 /// Follows the timeline: lands flights in order (their writes, then their
 /// signals) and runs the queues' lines on.
 fn landing() {
@@ -717,9 +736,16 @@ fn landing() {
             next
         };
         let Some(value) = next else { continue };
-        if !b.timeline.wait(&b.host, value, 100_000_000) {
+        // A lost device reaches nothing: what is in the air lands now, so
+        // that the title's fences still move (its writes and signals on
+        // the CPU, as without a card).
+        let lost = b.timeline.lost();
+        if lost {
+            lost_once();
+        } else if !b.timeline.wait(&b.host, value, 100_000_000) {
             continue;
         }
+        let value = if lost { u64::MAX } else { value };
         let mut e = engine(b);
         while e.flights.front().is_some_and(|f| f.value <= value) {
             let f = e.flights.pop_front().expect("flight");
@@ -780,8 +806,11 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>) {
         }
     }
     let Some(s) = sc.as_mut() else { return };
-    let last = b.timeline.last();
-    let r = s.frame(&b.host, Some((b.timeline.semaphore, last)), |d, cmd, t| {
+    if b.timeline.lost() {
+        lost_once();
+        return;
+    }
+    let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
             float32: [0.02, 0.03, 0.06, 1.0],
         };

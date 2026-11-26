@@ -3,8 +3,15 @@
 //! queue behind the one before it and signals the next value of one
 //! timeline semaphore. Values say how far the card has got; nothing is
 //! waited for by fences.
+//!
+//! Every `vkQueue*` call on the graphics queue (submissions, sparse binds,
+//! the swapchain's submit and present) is made under this module's lock
+//! ([`Timeline::with_queue`]): Vulkan requires a queue's calls to be
+//! externally synchronised, and M2a's first run lost the device with the
+//! present racing the landing thread's submissions.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -30,6 +37,8 @@ pub struct Timeline {
     queue: vk::Queue,
     family: u32,
     state: Mutex<State>,
+    /// The device was lost: nothing is given to the queue any more.
+    lost: AtomicBool,
 }
 
 /// A sparse bind of one buffer: `(buffer, binds)`.
@@ -56,7 +65,34 @@ impl Timeline {
                 last: 0,
                 recorders: Vec::new(),
             }),
+            lost: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the device was lost (every later operation fails at once).
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+
+    /// Notes a queue call's result: a lost device is remembered.
+    pub fn check<T>(&self, r: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
+        if let Err(vk::Result::ERROR_DEVICE_LOST) = r {
+            self.lost.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// Runs `f` with the queue and the last value given, under the lock
+    /// every queue call takes; `f` returns whether it gave the queue an
+    /// operation signalling `last + 1` (then that is the new last value).
+    pub fn with_queue<R>(&self, f: impl FnOnce(vk::Queue, u64) -> (R, bool)) -> anyhow::Result<R> {
+        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
+        let mut s = self.state();
+        let (r, signalled) = f(self.queue, s.last);
+        if signalled {
+            s.last += 1;
+        }
+        Ok(r)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -103,6 +139,7 @@ impl Timeline {
         s: &mut State,
         cmds: &[vk::CommandBuffer],
     ) -> Result<u64> {
+        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
         let value = s.last + 1;
         let waits = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.semaphore)
@@ -121,10 +158,10 @@ impl Timeline {
             .command_buffer_infos(&infos)
             .signal_semaphore_infos(&signals);
         // SAFETY: the queue is used under the state's lock only.
-        unsafe {
+        self.check(unsafe {
             host.device
                 .queue_submit2(self.queue, &[submit], vk::Fence::null())
-        }
+        })
         .context("vkQueueSubmit2")?;
         s.last = value;
         Ok(value)
@@ -188,6 +225,7 @@ impl Timeline {
     /// Binds sparse memory behind everything given before; returns the
     /// value it signals.
     pub fn bind_sparse(&self, host: &Host, binds: &[BufferBinds]) -> Result<u64> {
+        anyhow::ensure!(!self.lost(), "the Vulkan device was lost");
         let mut s = self.state();
         let value = s.last + 1;
         let infos: Vec<vk::SparseBufferMemoryBindInfo> = binds
@@ -211,10 +249,10 @@ impl Timeline {
             .push_next(&mut values);
         // SAFETY: the queue is used under the state's lock only; the binds
         // name live buffers and memory.
-        unsafe {
+        self.check(unsafe {
             host.device
                 .queue_bind_sparse(self.queue, &[info], vk::Fence::null())
-        }
+        })
         .context("vkQueueBindSparse")?;
         s.last = value;
         Ok(value)
