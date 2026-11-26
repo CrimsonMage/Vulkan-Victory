@@ -31,9 +31,9 @@ pub(crate) fn listed(n: u64) -> bool {
     .is_ok()
 }
 
-/// Whether frame `n` is saved.
+/// Whether frame `n` is saved (never in a build without diagnostics).
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    cfg!(feature = "diagnostics") && folder().is_some() && (n.is_power_of_two() || listed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

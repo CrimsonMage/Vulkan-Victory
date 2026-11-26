@@ -15,7 +15,7 @@
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees.
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod capture;
 pub mod console;
 mod descriptor;
