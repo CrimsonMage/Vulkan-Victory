@@ -66,6 +66,8 @@ struct Flight {
     /// Diagnostics: when it was given, and what its command buffers record.
     given: Instant,
     trail: Vec<String>,
+    /// Beside each note of `trail`: its descriptor table addresses.
+    tables: Vec<Vec<u32>>,
 }
 
 /// A title queue: its line of the host's, its items, and the semaphore
@@ -276,7 +278,7 @@ impl Engine {
             images::flush(b);
         }
         let cpu = super::writes::record(b, &mut cmds, &part.writes);
-        let trail = take_trails(&mut cmds);
+        let (trail, tables) = take_trails(&mut cmds);
         match b.timeline.submit_on(&b.host, line, cmds, &waits) {
             Ok(value) => {
                 self.remember(line, value, &trail);
@@ -288,6 +290,7 @@ impl Engine {
                 signals: Vec::new(),
                 given: Instant::now(),
                 trail,
+                tables,
                 });
             }
             Err(e) => {
@@ -353,7 +356,18 @@ impl Engine {
         ONCE.call_once(|| {
             for f in &self.flights {
                 let (given, label) = b.timeline.line_given(f.line);
-                let tail = &f.trail[f.trail.len().saturating_sub(16)..];
+                let from = f.trail.len().saturating_sub(16);
+                let tail = &f.trail[from..];
+                // The last 4 draws or dispatches: the T#s their tables hold.
+                for (note, tables) in f.trail[from..].iter().zip(&f.tables[from.min(f.tables.len())..]).rev().filter(|(_, t)| !t.is_empty()).take(4) {
+                    tracing::error!(
+                        line = %label,
+                        value = f.value,
+                        note = %note,
+                        tsharps = %tsharps(b, tables),
+                        "Vulkan: device lost: a draw's descriptor tables"
+                    );
+                }
                 tracing::error!(
                     line = %label,
                     value = f.value,
@@ -592,20 +606,51 @@ pub(super) fn start_landing() {
 }
 
 /// Diagnostics: the notes of a submission's command buffers.
-fn take_trails(cmds: &mut [Recording]) -> Vec<String> {
+fn take_trails(cmds: &mut [Recording]) -> (Vec<String>, Vec<Vec<u32>>) {
     if !cfg!(feature = "diagnostics") {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut out = Vec::new();
+    let (mut out, mut tables) = (Vec::new(), Vec::new());
     for (k, r) in cmds.iter_mut().enumerate() {
         let t = std::mem::take(&mut r.trail);
         if t.notes.is_empty() {
             continue;
         }
         out.push(format!("cmd {k} ({} notes before)", t.earlier));
+        tables.push(Vec::new());
         out.extend(t.notes);
+        tables.extend(t.tables);
     }
-    out
+    (out, tables)
+}
+
+/// Diagnostics at a device loss: the T#s in the first 16 descriptors (32
+/// bytes each) at each table address, decoded, with the view the host
+/// wrote at each one's slot.
+fn tsharps(b: &Backend, tables: &[u32]) -> String {
+    let mut out = Vec::new();
+    for &t in tables.iter().take(3) {
+        let Ok(bytes) = super::read_title(b, u64::from(t), 16 * 32) else {
+            out.push(format!("table {t:#x}: unreadable"));
+            continue;
+        };
+        for (k, d) in bytes.chunks_exact(32).enumerate() {
+            let w: Vec<u32> = d.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if w[6] ^ w[7] != 0x7A3C_5E91 {
+                continue;
+            }
+            let slot = w[7] & 0xff_ffff;
+            out.push(format!(
+                "table {t:#x}[{k}]: TYPE={} fmt={:#x} slot={slot} int={} storage={} host={}",
+                w[3] >> 28,
+                (w[1] >> 20) & 0x1ff,
+                w[7] >> 24 & 1,
+                w[7] >> 25 & 1,
+                super::descriptors::slot_view(slot)
+            ));
+        }
+    }
+    out.join("; ")
 }
 
 /// A submission the card has not finished this long is reported.

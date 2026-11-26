@@ -236,6 +236,14 @@ impl Heaps {
             self.write_image(b, 0, view, Binding::Sampled);
             self.write_image(b, 0, view, Binding::Storage);
             self.write_image(b, 0, array, Binding::Cube);
+            // Null descriptors fit every image type a shader declares (a 2D
+            // view of one texel does not fit a 3D, cube or arrayed
+            // variable: vk42's Illegal Instruction Parameter).
+            if b.host.caps.null_descriptor {
+                for binding in [Binding::Sampled, Binding::Storage, Binding::Cube] {
+                    self.write_null(b, binding);
+                }
+            }
             let s = d.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -284,6 +292,30 @@ impl Heaps {
         for (bytes, at) in [(&n[0], self.sampled_at), (&n[1], self.storage_at), (&n[2], self.cube_at)] {
             // SAFETY: the slot lies inside the mapped set-0 range.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.resource.mapped.add(at as usize + slot as usize * bytes.len()), bytes.len()) };
+        }
+    }
+
+    /// Slot 0 of `binding`: a null descriptor (`nullDescriptor`).
+    fn write_null(&self, b: &Backend, binding: Binding) {
+        let Some(db) = b.host.descriptor_buffer.as_ref() else { return };
+        let (ty, data, at, size) = match binding {
+            Binding::Storage => (
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::DescriptorDataEXT { p_storage_image: std::ptr::null() },
+                self.storage_at,
+                self.sizes[1],
+            ),
+            Binding::Sampled | Binding::Cube => (
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::DescriptorDataEXT { p_sampled_image: std::ptr::null() },
+                if matches!(binding, Binding::Cube) { self.cube_at } else { self.sampled_at },
+                self.sizes[0],
+            ),
+        };
+        // SAFETY: slot 0 lies inside the mapped set-0 range.
+        unsafe {
+            let out = std::slice::from_raw_parts_mut(self.resource.mapped.add(at as usize), size);
+            db.get_descriptor(&vk::DescriptorGetInfoEXT::default().ty(ty).data(data), out);
         }
     }
 
@@ -492,6 +524,18 @@ impl Heaps {
     pub(crate) fn plane_slot(&self, b: &Backend, image: &Arc<Image>, key: ViewKey) -> Option<u32> {
         self.image_slot(b, image, key)
     }
+}
+
+/// Diagnostics: what the host wrote at image slot `slot` (view type,
+/// format, storage, image), or that it holds the null descriptor.
+pub(crate) fn slot_view(slot: u32) -> String {
+    let Some(b) = super::backend() else { return "?".into() };
+    let Some(h) = heaps(b) else { return "?".into() };
+    let s = lock(&h.state);
+    let found = s.views.iter().find(|(_, v)| **v == slot).map(|((id, k), _)| {
+        format!("image {id} view {:?} {:?} mips {}+{} layers {}+{} storage={}", k.kind, k.format, k.base_mip, k.mips, k.base_layer, k.layers, k.storage)
+    });
+    found.unwrap_or_else(|| if slot < s.next { "null (freed)".into() } else { "null (never given)".into() })
 }
 
 /// The image `id` is gone: its slots are reused once the card is done.

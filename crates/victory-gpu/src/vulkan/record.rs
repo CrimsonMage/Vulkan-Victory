@@ -165,6 +165,8 @@ pub(crate) struct Rec {
     /// the guard id of the compute stage last bound for a dispatch.
     noted: This,
     guard_id: u32,
+    /// Diagnostics: the descriptor table addresses of the last push.
+    last_tables: Vec<u32>,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -209,6 +211,7 @@ impl Default for Rec {
             last_layout: String::new(),
             noted: std::ptr::null(),
             guard_id: 0,
+            last_tables: Vec::new(),
             console: console::State::default(),
         }
     }
@@ -579,6 +582,15 @@ impl Rec {
         self.last_push = words;
         self.pushed = true;
         if cfg!(feature = "diagnostics") {
+            self.last_tables = stages
+                .iter()
+                .flat_map(|s| s.user_data.iter())
+                .filter(|u| matches!(u.root, RootType::Table) && (u.index as usize) < 64)
+                .map(|u| words[u.index as usize])
+                .filter(|&w| w != 0)
+                .collect();
+            self.last_tables.sort_unstable();
+            self.last_tables.dedup();
             self.last_user = stages
                 .iter()
                 .flat_map(|s| s.user_data.iter().map(|u| format!("{}<-{}.{}{:?}", u.index, u.slot, u.dword, u.root)))
