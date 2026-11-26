@@ -54,13 +54,6 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
     (spilled.iter().map(|e| e.0).min() == Some(FIRST) && registers >= 2).then_some(spilled)
 }
 
-/// Whether `native` reads its root parameters from a spilled user-data
-/// table. (In the title exactly the compute programs of the
-/// console's ray-tracing structure builder do.)
-pub fn is_spilled(native: &NativeProgram) -> bool {
-    spilled(native).is_some()
-}
-
 /// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
 /// how many loads it replaced. Nothing changes unless the program is a
 /// compute program whose layout has entries past its user SGPRs, the first

@@ -1,25 +1,25 @@
-//! Xbox Series shaders to host shaders.
+//! Xbox Series shaders to SPIR-V.
 //!
 //! An Xbox Series shader is a standard DXBC container ([`dxbc`]). Its `DXIL`
 //! part ([`dxil`]) may carry Xbox additions around the LLVM bitcode: an
 //! `XDAT` table before it indexing blobs after it, among them `xbop`
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
-//! console-only intrinsics, so the GFX10 code is translated in general.
+//! console-only intrinsics, so the GFX10 code is translated in general:
+//! decoded ([`gfx10`], [`native`]), lifted into SSA ([`ir`], [`spill`],
+//! [`io`]) and emitted as SPIR-V for the Vulkan host ([`vk`]).
 
-pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
-pub mod emit;
 pub mod gfx10;
-pub mod hlsl;
 pub mod io;
 pub mod ir;
 pub mod native;
-pub mod resource;
 pub mod sampler;
 pub mod spill;
-pub mod structure;
 pub mod vk;
+/// Whole-wave sections (from the removed DXIL emitter), kept for their port
+/// into `vk/`; not used by the SPIR-V path yet.
+#[allow(dead_code)]
 pub mod wave;
 
 pub use dxbc::{Container, FourCC, Part};
