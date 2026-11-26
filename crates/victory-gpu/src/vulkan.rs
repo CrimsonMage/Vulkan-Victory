@@ -40,6 +40,7 @@ use victory_vk::timeline::{Recording, Timeline};
 
 mod compose;
 mod descriptors;
+mod gpu_stats;
 mod images;
 pub(crate) mod record;
 mod stages;
@@ -1433,5 +1434,6 @@ fn report(b: &Backend, frame: u64) {
         "Vulkan: queues, timeline and title memory"
     );
     stages::report();
+    gpu_stats::collect(b);
     record::report();
 }

@@ -583,6 +583,11 @@ fn immediate_slot(words: [u32; 4]) -> u32 {
     IMMEDIATE_FIRST + at as u32
 }
 
+/// The dynamic states of pre-rasterisation parts (also the test parts').
+pub(crate) fn pre_raster_dynamic(b: &Backend) -> Vec<vk::DynamicState> {
+    dynamic(b, false)
+}
+
 /// Dynamic states of the pre-rasterisation and fragment parts
 /// (`victory_vk::graphics` uses the same lists for the probe).
 fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {

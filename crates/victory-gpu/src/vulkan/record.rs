@@ -91,6 +91,8 @@ struct PassKey {
 /// What a list records with, between its calls.
 pub(crate) struct Rec {
     cmd: Option<Recording>,
+    /// The statistics query of the command buffer (diagnostics).
+    query: Option<u32>,
     pipeline: This,
     graphics: Root,
     compute: Root,
@@ -130,6 +132,7 @@ impl Default for Rec {
     fn default() -> Rec {
         Rec {
             cmd: None,
+            query: None,
             pipeline: std::ptr::null(),
             graphics: Root::default(),
             compute: Root::default(),
@@ -489,7 +492,8 @@ fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState) -> Vec<(u3
 
 /// `VICTORY_VK_DRAW_TEST` (diagnostics): 1 draws with depth, stencil,
 /// culling and blending off and every channel written; 2 also replaces
-/// every pixel program by a constant magenta. A capture then tells draws
+/// every pixel program by a constant magenta; 3 also every vertex program
+/// by a triangle over the whole target. A capture then tells draws
 /// that never rasterise from draws that compute zero.
 fn draw_test() -> u32 {
     static TEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -566,6 +570,68 @@ fn solid_fragment(b: &Backend) -> Option<vk::Pipeline> {
     })
 }
 
+/// The vertex program of draw test 3: a triangle over the whole target
+/// from the vertex index (HLSL `float4 main(uint id : SV_VertexID) :
+/// SV_Position { float2 t = float2((id << 1) & 2, id & 2); return
+/// float4(t * 2 - 1, 0.5, 1); }`, compiled with `glslc -x hlsl`), as a
+/// pre-rasterisation part.
+fn fullscreen_vertex(b: &Backend) -> Option<vk::Pipeline> {
+    const FULL: &[u32] = &[
+        0x07230203, 0x00010600, 0x000d000b, 0x00000045, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+        0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+        0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000002a, 0x0000002d, 0x00030003,
+        0x00000005, 0x000001f4, 0x000a0004, 0x475f4c47, 0x4c474f4f, 0x70635f45, 0x74735f70, 0x5f656c79,
+        0x656e696c, 0x7269645f, 0x69746365, 0x00006576, 0x00080004, 0x475f4c47, 0x4c474f4f, 0x6e695f45,
+        0x64756c63, 0x69645f65, 0x74636572, 0x00657669, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+        0x00030005, 0x0000002a, 0x00006469, 0x00070005, 0x0000002d, 0x746e6540, 0x6f507972, 0x4f746e69,
+        0x75707475, 0x00000074, 0x00040047, 0x0000002a, 0x0000000b, 0x0000002a, 0x00040047, 0x0000002d,
+        0x0000000b, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015,
+        0x00000006, 0x00000020, 0x00000000, 0x00030016, 0x00000008, 0x00000020, 0x00040017, 0x00000009,
+        0x00000008, 0x00000004, 0x00040017, 0x0000000e, 0x00000008, 0x00000002, 0x00040015, 0x00000012,
+        0x00000020, 0x00000001, 0x0004002b, 0x00000012, 0x00000013, 0x00000001, 0x0004002b, 0x00000006,
+        0x00000015, 0x00000002, 0x0004002b, 0x00000008, 0x0000001d, 0x40000000, 0x0004002b, 0x00000008,
+        0x0000001f, 0x3f800000, 0x0004002b, 0x00000008, 0x00000022, 0x3f000000, 0x00040020, 0x00000029,
+        0x00000001, 0x00000006, 0x0004003b, 0x00000029, 0x0000002a, 0x00000001, 0x00040020, 0x0000002c,
+        0x00000003, 0x00000009, 0x0004003b, 0x0000002c, 0x0000002d, 0x00000003, 0x0005002c, 0x0000000e,
+        0x00000044, 0x0000001f, 0x0000001f, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+        0x000200f8, 0x00000005, 0x0004003d, 0x00000006, 0x0000002b, 0x0000002a, 0x000500c4, 0x00000006,
+        0x00000036, 0x0000002b, 0x00000013, 0x000500c7, 0x00000006, 0x00000037, 0x00000036, 0x00000015,
+        0x00040070, 0x00000008, 0x00000038, 0x00000037, 0x000500c7, 0x00000006, 0x0000003a, 0x0000002b,
+        0x00000015, 0x00040070, 0x00000008, 0x0000003b, 0x0000003a, 0x00050050, 0x0000000e, 0x0000003c,
+        0x00000038, 0x0000003b, 0x0005008e, 0x0000000e, 0x0000003e, 0x0000003c, 0x0000001d, 0x00050083,
+        0x0000000e, 0x00000040, 0x0000003e, 0x00000044, 0x00050051, 0x00000008, 0x00000041, 0x00000040,
+        0x00000000, 0x00050051, 0x00000008, 0x00000042, 0x00000040, 0x00000001, 0x00070050, 0x00000009,
+        0x00000043, 0x00000041, 0x00000042, 0x00000022, 0x0000001f, 0x0003003e, 0x0000002d, 0x00000043,
+        0x000100fd, 0x00010038
+    ];
+    static PART: std::sync::OnceLock<Option<vk::Pipeline>> = std::sync::OnceLock::new();
+    *PART.get_or_init(|| {
+        let layout = stages::layout(b)?;
+        let d = &b.host.device;
+        // SAFETY: valid create infos; the module is kept with the part.
+        unsafe {
+            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(FULL), None).ok()?;
+            let states = stages::pre_raster_dynamic(b);
+            let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
+            let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS);
+            let mut rendering = vk::PipelineRenderingCreateInfo::default();
+            let viewport = vk::PipelineViewportStateCreateInfo::default();
+            let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).line_width(1.0);
+            let stage = [vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(module).name(c"main")];
+            let info = vk::GraphicsPipelineCreateInfo::default()
+                .flags(library_flags(b))
+                .stages(&stage)
+                .layout(layout.pipeline)
+                .dynamic_state(&dyn_info)
+                .viewport_state(&viewport)
+                .rasterization_state(&raster)
+                .push_next(&mut library)
+                .push_next(&mut rendering);
+            d.create_graphics_pipelines(stages::cache(b), &[info], None).ok().map(|p| p[0])
+        }
+    })
+}
+
 /// Counts a skipped draw or dispatch: not ready (`true`) or not to be.
 fn skipped(waiting: bool) {
     STATS[if waiting { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
@@ -581,6 +647,8 @@ impl Rec {
             let map = heaps.map_offset(b, generation, &block);
             // SAFETY: recording into our own command buffer.
             unsafe { heaps.bind(b, rec.cmd, map) };
+            // SAFETY: outside rendering in our new command buffer.
+            self.query = unsafe { super::gpu_stats::begin(b, rec.cmd) };
             STATS[5].fetch_add(1, Ordering::Relaxed);
             self.cmd = Some(rec);
             self.bound = vk::Pipeline::null();
@@ -604,6 +672,10 @@ impl Rec {
     pub(crate) fn cut(&mut self, list: This, b: &Backend) {
         self.end_pass(b);
         if let Some(rec) = self.cmd.take() {
+            if let Some(slot) = self.query.take() {
+                // SAFETY: outside rendering, before the buffer ends.
+                unsafe { super::gpu_stats::end(b, rec.cmd, slot, true) };
+            }
             super::part_commands(list, rec);
         }
     }
@@ -611,6 +683,10 @@ impl Rec {
     pub(crate) fn abandon(&mut self, b: &Backend) {
         self.end_pass(b);
         if let Some(rec) = self.cmd.take() {
+            if let Some(slot) = self.query.take() {
+                // SAFETY: outside rendering, before the buffer ends.
+                unsafe { super::gpu_stats::end(b, rec.cmd, slot, false) };
+            }
             b.timeline.abandon(&b.host, rec);
         }
     }
@@ -948,7 +1024,7 @@ impl Rec {
         let output = part(b, &[], formats, count, depth, true)?;
         let vertex_input = if mesh { None } else { Some(part(b, &inputs, [vk::Format::UNDEFINED; 8], 0, vk::Format::UNDEFINED, false)?) };
         let key = LinkKey {
-            pre: pre.part?,
+            pre: if draw_test() >= 3 && !mesh { fullscreen_vertex(b)? } else { pre.part? },
             fragment,
             colors: formats,
             count,
@@ -1110,6 +1186,14 @@ impl Rec {
             d.cmd_set_depth_bounds_test_enable(cmd, false);
             d.cmd_set_stencil_test_enable(cmd, false);
             if let Some(e) = super::eds3(b)
+                && b.host.caps.dynamic_raster
+            {
+                e.cmd_set_sample_mask(cmd, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
+                e.cmd_set_alpha_to_coverage_enable(cmd, false);
+                e.cmd_set_polygon_mode(cmd, vk::PolygonMode::FILL);
+                e.cmd_set_depth_clamp_enable(cmd, false);
+            }
+            if let Some(e) = super::eds3(b)
                 && b.host.caps.dynamic_blend
                 && count > 0
             {
@@ -1166,6 +1250,7 @@ impl Rec {
                 viewports = ?self.viewports.iter().map(|v| (v.x, v.y, v.width, v.height)).collect::<Vec<_>>(),
                 scissors = ?self.scissors.iter().map(|s| (s.offset.x, s.offset.y, s.extent.width, s.extent.height)).collect::<Vec<_>>(),
                 topology = self.topology,
+                sample_mask = format_args!("{:#x}", crate::pipeline::parts(self.pipeline).and_then(|(_, g)| g).map_or(0, |g| g.sample_mask)),
                 targets = ?targets,
                 "Vulkan: a draw recorded"
             );
@@ -1447,6 +1532,11 @@ pub(crate) fn report() {
         filled_mb = i[2] >> 20,
         images_refused = i[3],
         refills_by_fingerprint = i[4],
+        gpu_vs = super::gpu_stats::SUMS[0].load(Ordering::Relaxed),
+        gpu_clip_in = super::gpu_stats::SUMS[1].load(Ordering::Relaxed),
+        gpu_clip_out = super::gpu_stats::SUMS[2].load(Ordering::Relaxed),
+        gpu_fs = super::gpu_stats::SUMS[3].load(Ordering::Relaxed),
+        gpu_counted_buffers = super::gpu_stats::SUMS[4].load(Ordering::Relaxed),
         "Vulkan: draws recorded"
     );
 }
