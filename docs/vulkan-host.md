@@ -1344,6 +1344,48 @@ arguments. Look for these lines:
   ends and restarts rendering; D3D12's window hits were about a third).
   Watch `passes` against `executions`.
 
+### The card-memory ceiling (vk27, 2026-11-26)
+
+vk27 was killed by the VRAM watchdog at frame ~1,024, when world loading
+began: the process went 3,105 → 6,442 MiB in ~3 s.
+
+- **The likely cause: the pool's live budget.** At frame 840
+  `follow_budget` gave the pool's GPU view the card's budget less
+  everything else in use less 512 MiB: 6,734 − (2,880 − 256) − 512 =
+  3,598 MiB, against 256 MiB in use. World loading then showed pages of
+  four new 512 MiB sections in the pool ("a section imported in place" at
+  10:46:16–19). Each page shown takes a card page, so the pool could grow
+  by ~3.3 GB before eviction started, which matches the jump. Images were
+  allocating at the same time, against a budget figure up to 60 frames
+  old.
+- Ruled out: the 4K plane (3840x2160 RGBA8, 33 MB), MSAA (`not_yet
+  msaa=0`; no MSAA draws), the descriptor buffers (host memory,
+  `host_buffers_mb=32`), imports (host memory; `imports_mb` was already
+  3,857 while the process showed 3,105 MiB on the card).
+- **The rule** (`vulkan/budget.rs`):
+  - everything of ours on the card stays under 4.5 GiB (`CEILING`), and
+    never grows into the last 1 GiB of the card's budget (`limit`: the
+    budget less the others' use, driver spills included);
+  - the pool's GPU view gets a fixed share: at most 1.5 GiB, less what the
+    rest of ours takes past its part, at least 256 MiB. It is checked every
+    10 frames. A view over its share gives blocks back at once
+    (`PoolView::shrink`: the emptiest blocks' pages are evicted and
+    unbound, and the memory is freed once the card is past the unbinds);
+  - a new image block (256 MiB, or a dedicated allocation over 64 MiB) that
+    would cross the limit by more than 512 MiB is refused, counted in
+    `images_refused`, with a warning "card memory for images refused".
+- **What tells** (diagnostics builds): "Vulkan: a big card allocation"
+  (kind, mb, ours_mb) for every allocation of 64 MiB or more, as it
+  happens. The "Vulkan: card memory" line (now with `limit_mb`) is
+  printed whenever ours or the heap's use moves by 256 MiB, polled every
+  250 ms, besides every 10 s.
+- Costs to watch: an evicted or given-back pool page reads zeros until the
+  title maps or announces it again (shortcut, as before), so a working set
+  over 1.5 GiB shows as `pool_evicted` and missing content. A frame that
+  maps more than the share of fresh pages fails with "pages of the pool's
+  GPU view were not mapped". Idle images are not evicted: dropping one
+  would leave the descriptors that name it empty.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

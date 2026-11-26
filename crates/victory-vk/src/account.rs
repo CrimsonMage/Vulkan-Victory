@@ -4,7 +4,7 @@
 //! the driver's own (shader local memory for spills, internal heaps).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
 
@@ -36,6 +36,20 @@ struct Book {
 
 static BOOK: Mutex<Option<Book>> = Mutex::new(None);
 
+/// Allocations of card memory at least this big are told to the watcher.
+pub const BIG: u64 = 64 << 20;
+
+/// Told each allocation of card memory of [`BIG`] or more: what, bytes,
+/// and ours on card heaps after it.
+pub type Watcher = fn(Kind, u64, u64);
+
+static WATCHER: OnceLock<Watcher> = OnceLock::new();
+
+/// Sets the watcher of big card allocations (once).
+pub fn watch(f: Watcher) {
+    let _ = WATCHER.set(f);
+}
+
 fn book() -> std::sync::MutexGuard<'static, Option<Book>> {
     BOOK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -53,6 +67,19 @@ pub fn allocated(host: &Host, memory: vk::DeviceMemory, type_index: u32, bytes: 
     } else {
         b.host[kind as usize] += bytes;
     }
+    let total: u64 = b.card.iter().sum();
+    drop(g);
+    if card
+        && bytes >= BIG
+        && let Some(f) = WATCHER.get()
+    {
+        f(kind, bytes, total);
+    }
+}
+
+/// Bytes of ours on card heaps.
+pub fn card_total() -> u64 {
+    book().as_ref().map_or(0, |b| b.card.iter().sum())
 }
 
 /// `memory` is about to be freed.

@@ -58,6 +58,9 @@ struct Block {
     /// A plain buffer over the whole block: the destination of fills.
     buffer: vk::Buffer,
     free: Vec<u32>,
+    /// Given back ([`PoolView::shrink`]): no page is taken from it, and its
+    /// memory is freed (null) once the card is past its unbinds.
+    dead: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +100,8 @@ pub struct PoolView {
     /// Bytes of card memory the view may take.
     pub budget: u64,
     pub stats: Stats,
+    /// Blocks given back, freed once the timeline passes the ticket.
+    retired: Vec<(u64, usize)>,
 }
 
 impl PoolView {
@@ -152,6 +157,7 @@ impl PoolView {
             bound: HashMap::new(),
             budget,
             stats: Stats::default(),
+            retired: Vec::new(),
         };
         let _ = timeline;
         view.grow(host)?;
@@ -184,12 +190,28 @@ impl PoolView {
                 }
             };
             d.bind_buffer_memory(buffer, memory, 0)?;
-            crate::account::allocated(host, memory, self.memory_type, bytes, crate::account::Kind::Pool);
-            self.blocks.push(Block {
+            crate::account::allocated(
+                host,
+                memory,
+                self.memory_type,
+                bytes,
+                crate::account::Kind::Pool,
+            );
+            let block = Block {
                 memory,
                 buffer,
                 free: (0..BLOCK_PAGES).rev().collect(),
-            });
+                dead: false,
+            };
+            // A freed block's place is taken again (slots name blocks by place).
+            match self
+                .blocks
+                .iter()
+                .position(|b| b.dead && b.memory == vk::DeviceMemory::null())
+            {
+                Some(i) => self.blocks[i] = block,
+                None => self.blocks.push(block),
+            }
         }
         self.stats.blocks += 1;
         Ok(())
@@ -276,9 +298,68 @@ impl PoolView {
         Ok((unbind, bind))
     }
 
-    /// Bytes of card memory the view's blocks take.
+    /// Bytes of card memory the view's live blocks take.
     pub fn card_bytes(&self) -> u64 {
-        self.blocks.len() as u64 * u64::from(BLOCK_PAGES) * PAGE
+        self.blocks.iter().filter(|b| !b.dead).count() as u64 * u64::from(BLOCK_PAGES) * PAGE
+    }
+
+    /// Gives card memory back until the view's blocks take at most
+    /// `target` bytes: the blocks with the fewest pages in use are emptied
+    /// (their pages evicted and unbound, as an eviction does) and freed once
+    /// the card is past the unbinds.
+    pub fn shrink(&mut self, host: &Host, timeline: &Timeline, target: u64) -> Result<()> {
+        self.free_retired(host, timeline);
+        let mut binds = Vec::new();
+        let mut emptied = Vec::new();
+        while self.card_bytes() > target {
+            let Some(i) = (0..self.blocks.len())
+                .filter(|&i| !self.blocks[i].dead)
+                .max_by_key(|&i| self.blocks[i].free.len())
+            else {
+                break;
+            };
+            for p in self.pages.values_mut() {
+                if p.slot.is_some_and(|s| s.block as usize == i) {
+                    p.slot = None;
+                    binds.extend(p.shown.iter().map(|&t| (t, None)));
+                    self.stats.evicted += 1;
+                    self.stats.pages_in_card -= 1;
+                }
+            }
+            self.blocks[i].free.clear();
+            self.blocks[i].dead = true;
+            emptied.push(i);
+        }
+        if emptied.is_empty() {
+            return Ok(());
+        }
+        self.flush(host, timeline, Vec::new(), binds)?;
+        let ticket = timeline.last();
+        self.retired
+            .extend(emptied.into_iter().map(|i| (ticket, i)));
+        Ok(())
+    }
+
+    /// Frees the blocks given back whose unbinds the card has passed.
+    fn free_retired(&mut self, host: &Host, timeline: &Timeline) {
+        if self.retired.is_empty() {
+            return;
+        }
+        let done = timeline.completed(host);
+        let d = &host.device;
+        for &(_, i) in self.retired.iter().filter(|(t, _)| *t <= done) {
+            let b = &mut self.blocks[i];
+            // SAFETY: nothing is bound to the block and no submission that
+            // used it is still running.
+            unsafe {
+                d.destroy_buffer(b.buffer, None);
+                crate::account::freed(b.memory);
+                d.free_memory(b.memory, None);
+            }
+            b.memory = vk::DeviceMemory::null();
+            b.buffer = vk::Buffer::null();
+        }
+        self.retired.retain(|(t, _)| *t > done);
     }
 
     /// A card page for a new physical page: a free one, a new block within
@@ -286,13 +367,15 @@ impl PoolView {
     fn slot(
         &mut self,
         host: &Host,
+        timeline: &Timeline,
         tick: u64,
         binds: &mut Vec<(u64, Option<Slot>)>,
     ) -> Result<Slot> {
         if let Some(s) = self.take() {
             return Ok(s);
         }
-        let used = self.blocks.len() as u64 * u64::from(BLOCK_PAGES) * PAGE;
+        self.free_retired(host, timeline);
+        let used = self.card_bytes();
         if used + u64::from(BLOCK_PAGES) * PAGE <= self.budget.max(used + 1)
             && self.grow(host).is_ok()
         {
@@ -358,7 +441,7 @@ impl PoolView {
             let slot = match self.pages.get(key).and_then(|p| p.slot) {
                 Some(s) => s,
                 None => {
-                    let s = self.slot(host, tick, &mut binds)?;
+                    let s = self.slot(host, timeline, tick, &mut binds)?;
                     fills.push((*source, s));
                     self.stats.pages_in_card += 1;
                     let entry = self.pages.entry(*key).or_insert(Page {
@@ -452,7 +535,7 @@ impl PoolView {
             let slot = match self.pages.get(&key).and_then(|p| p.slot) {
                 Some(s) => s,
                 None => {
-                    let s = self.slot(host, tick, &mut binds)?;
+                    let s = self.slot(host, timeline, tick, &mut binds)?;
                     let p = self.pages.get_mut(&key).expect("bound page");
                     p.slot = Some(s);
                     let shown = p.shown.clone();

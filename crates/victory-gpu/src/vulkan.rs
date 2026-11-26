@@ -35,6 +35,7 @@ use victory_vk::swapchain::Swapchain;
 use victory_vk::timeline::Timeline;
 
 mod bound;
+mod budget;
 mod compose;
 mod descriptors;
 mod engine;
@@ -425,76 +426,6 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
     }
 }
 
-/// Every 10 s: all the card memory we allocated, by kind, against the
-/// driver's own count of the card heaps' use (`VK_EXT_memory_budget`);
-/// the difference is the driver's (shader local memory for spills,
-/// internal heaps). Host-heap allocations and imports are listed apart:
-/// they are system memory.
-fn card_memory(b: &Backend) {
-    let (card, host) = victory_vk::account::totals_mb();
-    let (heap_used, heap_budget) = b
-        .host
-        .heaps()
-        .iter()
-        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .filter_map(|(_, bu)| *bu)
-        .fold((0, 0), |(u, t), (budget, usage)| (u + (usage >> 20), t + (budget >> 20)));
-    let ours: u64 = card.iter().sum();
-    tracing::info!(
-        images_mb = card[0],
-        images_bound_mb = images::used_mb(),
-        pool_mb = card[1],
-        buffers_mb = card[3],
-        other_mb = card[4],
-        ours_mb = ours,
-        heap_used_mb = heap_used,
-        heap_budget_mb = heap_budget,
-        driver_mb = heap_used.saturating_sub(ours),
-        host_buffers_mb = host[3],
-        imports_mb = host[2],
-        "Vulkan: card memory"
-    );
-}
-
-/// The live budget: every 60 frames each pool view may take what the
-/// card's budget leaves beside everything else in use now (images,
-/// imports, the swapchain, other programs), less 512 MiB of room; at least
-/// 512 MiB. Without `VK_EXT_memory_budget` the start's figure stays.
-fn follow_budget(b: &Backend, frame: u64) {
-    if frame % 60 != 0 || !b.host.caps.memory_budget {
-        return;
-    }
-    let Some((budget, usage)) = b
-        .host
-        .heaps()
-        .iter()
-        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .filter_map(|(_, bu)| *bu)
-        .max_by_key(|(budget, _)| *budget)
-    else {
-        return;
-    };
-    let mut m = memory(b);
-    for p in &mut m.pools {
-        let others = usage.saturating_sub(p.card_bytes());
-        p.budget = budget.saturating_sub(others).saturating_sub(512 << 20).max(512 << 20);
-    }
-}
-
-/// Bytes of card memory the pool's GPU view may take: the card's budget
-/// less 2 GiB for render targets, textures and the swapchain, at least
-/// 512 MiB.
-fn pool_budget(host: &Host) -> u64 {
-    let card = host
-        .heaps()
-        .iter()
-        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .map(|(h, budget)| budget.map_or(h.size, |(b, _)| b))
-        .max()
-        .unwrap_or(0);
-    card.saturating_sub(2 << 30).max(512 << 20)
-}
-
 pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
         return;
@@ -522,7 +453,7 @@ pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
             }
             return;
         };
-        let budget = pool_budget(&b.host);
+        let budget = pool_start(&b.host);
         match PoolView::new(&b.host, &b.timeline, at as u64, len as u64, budget) {
             Ok(view) => {
                 tracing::info!(
@@ -693,6 +624,7 @@ pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader
 // Queues and fences (`engine.rs`)
 
 pub(crate) use engine::{execute, fence_signalled, list_released, list_reset, list_wait, list_write, part_commands, signal, wait, wait_for_fence};
+use budget::{card_memory, follow_budget, pool_start};
 use engine::{engine, lost_once, start_landing};
 
 /// Ranges the memory map could not take (full, or overlapping another
@@ -950,9 +882,15 @@ fn start_reports() {
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("victory-vk-report".into()).spawn(|| {
             let Some(b) = backend() else { return };
+            budget::watch();
+            let mut last = Instant::now();
             loop {
-                std::thread::sleep(Duration::from_secs(10));
-                report(b, FRAME.load(Ordering::Relaxed));
+                std::thread::sleep(Duration::from_millis(250));
+                budget::steps(b);
+                if last.elapsed() >= Duration::from_secs(10) {
+                    last = Instant::now();
+                    report(b, FRAME.load(Ordering::Relaxed));
+                }
             }
         });
     });

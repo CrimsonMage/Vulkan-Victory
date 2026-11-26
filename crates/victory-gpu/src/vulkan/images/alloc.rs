@@ -29,6 +29,9 @@ pub(super) fn allocate(
         vk::MemoryPropertyFlags::HOST_VISIBLE,
     )?;
     if needs.size > BLOCK / 4 {
+        if !super::super::budget::fits(&b.host, needs.size) {
+            return None;
+        }
         // SAFETY: valid allocate info.
         let m = unsafe {
             b.host.device.allocate_memory(
@@ -63,6 +66,9 @@ pub(super) fn allocate(
         if let Some(at) = take(blk) {
             return Some((blk.memory, at));
         }
+    }
+    if !super::super::budget::fits(&b.host, BLOCK) {
+        return None;
     }
     // SAFETY: valid allocate info.
     let memory = unsafe {
