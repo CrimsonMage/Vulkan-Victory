@@ -1012,6 +1012,29 @@ images, 6.7 GiB of card memory).
 - Watch `dropped_remapped` against frames: a title that maps the same
   pages again every frame would remake images every frame.
 
+**Card memory (vk21: 6,700 MiB per process, pool 233 MiB, 1,739 images).**
+- cb051bf adds the 10 s line `Vulkan: card memory`:
+  - `images_mb` (allocated) and `images_bound_mb` (live);
+  - `pool_mb`, `buffers_mb`, `other_mb` and `ours_mb`;
+  - `heap_used_mb` / `heap_budget_mb` (`VK_EXT_memory_budget`);
+  - `driver_mb` = heap use less ours: shader local memory for spills and
+    internal heaps;
+  - host buffers and imports apart.
+- Empty 256 MiB image blocks now go back to the driver.
+- If `driver_mb` is large, the spills are the translator's (big per-lane
+  arrays).
+
+**The memory map is full** (vk21 `map_ranges=64`, the ABI cap).
+- The map took 151 loose regions under 1 MiB at 0xad2b00000.. (64 KiB
+  title allocations), one import and one range each. Ranges past 64 were
+  dropped silently, and shaders read zeros there.
+- cb051bf coalesces neighbours and overlaps that share one device offset,
+  and logs and counts what the map still cannot take (`map_refused`).
+- The loose imports themselves need joining: import the union of
+  neighbouring loose allocations when every page between them is
+  committed (as grown loose memory is imported again), so the map stays
+  far under 64. In the end, the title window: one range.
+
 **ABI v2 (approved, waiting for the translator's commit):**
 - a title-wide semantic registry for `vk::translate`, persisted beside
   the stage cache, with its version in the cache key;
