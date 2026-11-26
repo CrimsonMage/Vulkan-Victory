@@ -424,6 +424,7 @@ impl Lift<'_> {
                 self.write_half(inst, v, x)
             }
             "v_pk_fma_f16" | "v_pk_mul_f16" | "v_pk_add_f16" | "v_pk_max_f16" | "v_pk_min_f16" => self.op_pk_fma_f16(inst, name, v, a_exec),
+            "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16" | "v_pk_ashrrev_i16" => self.op_pk_shift_b16(inst, name, v, a_exec),
             _ => Err(unsupported(off, name)),
         }
     }
@@ -875,6 +876,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_fma_f16" | "v_mad_f16" | "v_fmac_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" => 5,
         "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_exp_f16" | "v_log_f16" | "v_sin_f16" | "v_cos_f16" | "v_trunc_f16" | "v_floor_f16" | "v_ceil_f16" | "v_fract_f16" | "v_rndne_f16" => 5,
         "v_pk_fma_f16" | "v_pk_mul_f16" | "v_pk_add_f16" | "v_pk_max_f16" | "v_pk_min_f16" => 5,
+        "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16" | "v_pk_ashrrev_i16" => 5,
         "v_lshrrev_b16" | "v_lshlrev_b16" | "v_ashrrev_i16" | "v_add_nc_u16" | "v_sub_nc_u16" | "v_mul_lo_u16" => 6,
         "v_cvt_f32_u32" | "v_cvt_f32_i32" => 7,
         "v_cvt_u32_f32" | "v_cvt_i32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => 7,

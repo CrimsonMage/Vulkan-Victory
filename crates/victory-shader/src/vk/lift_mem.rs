@@ -572,7 +572,9 @@ impl Lift<'_> {
                 let v = self.lds_read_small(inst, &addr, o16, name)?;
                 self.def(inst, Reg::V(need_d()?), R::D(v));
             }
-            "ds_write_b16" | "ds_write_b8" => self.lds_write_small(inst, &addr, o16, &data[0], name)?,
+            "ds_write_b16" | "ds_write_b8" | "ds_write_b16_d16_hi" | "ds_write_b8_d16_hi" => {
+                self.lds_write_small(inst, &addr, o16, &data[0], name)?
+            }
             _ if name.starts_with("ds_") && atomic_op(name).is_some() => {
                 let i = self.lds_index(inst, &addr, o16)?;
                 let r = self.lds_atomic(inst, i, &data, name)?;
@@ -639,9 +641,14 @@ impl Lift<'_> {
     /// lanes writing the other bytes are kept).
     fn lds_write_small(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, src: &Operand, name: &str) -> Res<()> {
         let (i, sh) = self.lds_byte(inst, addr, o16)?;
-        let m = self.k32(if name.ends_with("16") { 0xFFFF } else { 0xFF });
+        let m = self.k32(if name.starts_with("ds_write_b16") { 0xFFFF } else { 0xFF });
         let x = self.opnd_dw(inst, src, 0, false)?;
-        let x = self.u32v(x);
+        let mut x = self.u32v(x);
+        if name.ends_with("_d16_hi") {
+            // the data's high 16 bits
+            let k16 = self.k32(16);
+            x = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[x, k16]);
+        }
         let x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
         let xs = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[x, sh]);
         let ms = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[m, sh]);

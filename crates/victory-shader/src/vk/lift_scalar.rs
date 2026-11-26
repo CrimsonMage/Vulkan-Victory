@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// The `src_pops_exiting_wave_id` operand.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+
 impl Lift<'_> {
     pub(super) fn sop(&mut self, inst: &Inst, name: &'static str, dst: &Option<Operand>, src: &[Operand], imm: Option<u16>) -> Res<()> {
         let off = inst.machine.offset;
@@ -405,6 +408,9 @@ impl Lift<'_> {
         if s.b64 && base == "bfm" {
             return Err(unsupported(off, s.name));
         }
+        if base == "add" && matches!(s.src.first(), Some(Operand::Const(POPS_EXITING_WAVE_ID))) {
+            return self.pops_distance(s);
+        }
         let a = match s.imm {
             Some(_) => self.opnd(inst, &s.dst.unwrap())?,
             None => self.opnd(inst, &s.src[0])?,
@@ -471,6 +477,20 @@ impl Lift<'_> {
         let both = self.spv(op::BITWISE_AND, Ty::U32, &[px, qx]);
         let z = self.k32(0);
         self.spv(op::S_LESS_THAN, Ty::BOOL, &[both, z])
+    }
+
+    /// The pixel-ordering wait of an ordered pixel program (POPS):
+    /// `src_pops_exiting_wave_id + x` is how far the waves ahead of this
+    /// one have got, which the program compares with the wave it overlaps
+    /// and sleeps on. The PC runs overlapping pixels of a draw in no fixed
+    /// order, so every earlier wave counts as exited: the largest distance,
+    /// and the wait ends at once.
+    fn pops_distance(&mut self, s: &Sop) -> Res<()> {
+        self.approx("pixel ordering (POPS) is not kept: overlapping pixels of one draw run in any order");
+        let (r, no) = (self.k32(u32::MAX), self.f.konst(Ty::BOOL, 0));
+        self.sdst(s.inst, s.dst, 0, R::D(r));
+        self.def(s.inst, Reg::Scc, R::B(no));
+        Ok(())
     }
 
     /// Add (with carry in for addc); SCC: unsigned carry or signed overflow.

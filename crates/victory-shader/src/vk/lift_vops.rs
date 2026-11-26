@@ -179,6 +179,38 @@ impl Lift<'_> {
         Ok(())
     }
 
+    /// Packed 16-bit integer shifts: each half of src1 shifted by the low
+    /// four bits of the matching half of src0 (op_sel/op_sel_hi pick the
+    /// halves).
+    pub(super) fn op_pk_shift_b16(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
+        let off = inst.machine.offset;
+        let (k15, k16) = (self.k32(15), self.k32(16));
+        let mut src = Vec::new();
+        for i in 0..2 {
+            let x = self.opnd_dw(inst, &v.src[i], 0, true)?;
+            src.push(self.u32v(x));
+        }
+        let (z, ext) = (self.k32(0), if name == "v_pk_ashrrev_i16" { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT });
+        let o = match name {
+            "v_pk_lshlrev_b16" => op::SHIFT_LEFT_LOGICAL,
+            "v_pk_lshrrev_b16" => op::SHIFT_RIGHT_LOGICAL,
+            _ => op::SHIFT_RIGHT_ARITHMETIC,
+        };
+        let mut res = Vec::new();
+        for sel in [v.opsel, v.opsel_hi] {
+            let at = |i: u32| if sel >> i & 1 != 0 { k16 } else { z };
+            let sh = self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[src[0], at(0), k16]);
+            let sh = self.spv(op::BITWISE_AND, Ty::U32, &[sh, k15]);
+            let x = self.spv(ext, Ty::U32, &[src[1], at(1), k16]);
+            res.push(self.spv(o, Ty::U32, &[x, sh]));
+        }
+        let lo = self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[res[0], z, k16]);
+        let x = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[lo, res[1], k16, k16]);
+        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err(unsupported(off, name)) };
+        self.def(inst, Reg::V(reg), R::D(x));
+        Ok(())
+    }
+
     pub(super) fn op_lshrrev_b16(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let a = self.usrc(inst, v, 0)?;
         let b = self.usrc(inst, v, 1)?;

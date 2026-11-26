@@ -482,6 +482,21 @@ fn unspill(
 /// Rename register reads and writes after changing edges in a reducible graph.
 fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
     let order = reverse_postorder(&blocks);
+    // Blocks the entry never reaches (code after an unconditional jump, a
+    // jump-table tail) define nothing: they are emptied and dropped from
+    // their successors' predecessors, so no read or phi argument is left
+    // without a value (it was `NONE`, which panicked in the phi cleanup).
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        block.preds.retain(|&p| reachable[p]);
+        if !reachable[b] {
+            block.insts.clear();
+            block.phis.clear();
+        }
+    }
     let (live_in, live_out) = liveness(&blocks, &order);
     let mut values = 0u32;
     let mut new_value = || {
