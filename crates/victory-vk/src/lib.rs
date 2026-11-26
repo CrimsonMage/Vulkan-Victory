@@ -21,6 +21,7 @@ pub use ash;
 
 pub mod compute;
 pub mod descriptors;
+pub mod gfx10;
 pub mod graphics;
 pub mod host;
 pub mod map;
