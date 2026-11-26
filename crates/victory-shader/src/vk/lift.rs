@@ -141,6 +141,8 @@ pub const OUT_POSITION: u16 = 0x100;
 pub const OUT_DEPTH: u16 = 0x101;
 pub const OUT_STENCIL: u16 = 0x102;
 pub const OUT_SAMPLE_MASK: u16 = 0x103;
+/// Mesh: the primitive export (three 10-bit indices, bit 31 culls).
+pub const OUT_PRIMITIVE: u16 = 0x104;
 
 /// The old value of a lane mask written in a guard: 0 outside it.
 const MASK_FALSE: Value = Value(u32::MAX - 1);
@@ -183,6 +185,8 @@ pub struct Lift<'a> {
     interps: HashMap<(usize, usize), &'a io::Interp>,
     site: (usize, usize),
     wave64: bool,
+    /// Mesh: what the group id arrives multiplied by.
+    pub mesh_stride: u32,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -247,6 +251,7 @@ impl<'a> Lift<'a> {
             interps: io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             site: (0, 0),
             wave64: p.wave64,
+            mesh_stride: 0,
         };
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
@@ -508,6 +513,33 @@ impl<'a> Lift<'a> {
         self.f.global(Op::Builtin(Builtin::SubgroupLocalId), Ty::U32)
     }
 
+    /// The console wave of this invocation: a console wave64 of a group is
+    /// two host subgroups.
+    fn console_wave(&mut self) -> V {
+        let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+        if self.wave64 {
+            let one = self.k32(1);
+            self.global_bin(op::SHIFT_RIGHT_LOGICAL, Ty::U32, sg, one)
+        } else {
+            sg
+        }
+    }
+
+    /// The console lane of this invocation (wave64: the odd subgroup of a
+    /// pair is the upper half).
+    fn console_lane(&mut self) -> V {
+        let lane = self.lane();
+        if !self.wave64 || !matches!(self.native.stage, HwStage::Cs | HwStage::Ms) {
+            return lane;
+        }
+        let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+        let one = self.k32(1);
+        let half = self.global_bin(op::BITWISE_AND, Ty::U32, sg, one);
+        let k5 = self.k32(5);
+        let up = self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, half, k5);
+        self.global_bin(op::BITWISE_OR, Ty::U32, up, lane)
+    }
+
     fn ballot(&mut self, b: V) -> V {
         if let Some(c) = self.f.as_const(b) {
             return self.k32(if c != 0 { u32::MAX } else { 0 });
@@ -630,6 +662,17 @@ impl<'a> Lift<'a> {
                 Input::Barycentric { .. } => {
                     // Only read by interpolation (handled at the v_interp sites).
                     self.f.konst(Ty::U32, 0)
+                }
+                Input::MeshGroup => {
+                    let g = u(self, Builtin::WorkgroupId(0));
+                    let k = self.k32(self.mesh_stride);
+                    self.global_bin(op::I_MUL, Ty::U32, g, k)
+                }
+                Input::MergedWaveInfo | Input::GroupInfo => {
+                    // the wave's index in the group in bits 24-27 (mesh)
+                    let w = self.console_wave();
+                    let k = self.k32(if input == Input::GroupInfo { 6 } else { 24 });
+                    self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, w, k)
                 }
                 _ => return Err(unsupported(offset, "a system input")),
             };
@@ -1257,7 +1300,9 @@ impl<'a> Lift<'a> {
                     self.emit(Op::Barrier, Ty::VOID, vec![]);
                     Ok(())
                 }
-                "s_sendmsg" | "s_sendmsghalt" if self.native.stage != HwStage::Ms => Ok(()),
+                // Mesh output counts: the module declares the maxima at its
+                // start (primitives culled until exported).
+                "s_sendmsg" | "s_sendmsghalt" => Ok(()),
                 "s_endpgm" | "s_branch" | "s_icache_inv" | "s_round_mode" | "s_denorm_mode" | "s_wakeup" => Ok(()),
                 _ => Err(unsupported(off, name)),
             },
@@ -2576,7 +2621,10 @@ impl<'a> Lift<'a> {
         let slot: u16 = match e.target {
             Target::Color(n) => u16::from(n),
             Target::Position(0) => OUT_POSITION,
-            Target::Position(_) => return Err(unsupported(off, "a position export past pos0")),
+            Target::Position(_) => {
+                self.approx("clip and cull distances (pos1+ exports) left out");
+                return Ok(());
+            }
             Target::Param { row, .. } => u16::from(row),
             Target::Null | Target::Unread => return Ok(()),
             Target::Depth => {
@@ -2598,14 +2646,23 @@ impl<'a> Lift<'a> {
                 }
                 return Ok(());
             }
-            _ => return Err(unsupported(off, "a mesh or primitive export")),
+            Target::Primitive => OUT_PRIMITIVE,
+            Target::PrimitiveParam { .. } => return Err(unsupported(off, "a per-primitive output")),
         };
+        // mesh: vertex and primitive n are written by thread n of the group
+        let index = (self.native.stage == HwStage::Ms)
+            .then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32));
         for (c, v) in e.values.iter().enumerate() {
             if let Some(v) = v {
                 let r = self.value(*v, off)?;
                 let x = self.data(r);
-                self.emit(Op::Output { slot, comp: c as u8 }, Ty::VOID, vec![x]);
+                let mut args = vec![x];
+                args.extend(index);
+                self.emit(Op::Output { slot, comp: c as u8 }, Ty::VOID, args);
                 self.note_output(slot, c as u8);
+                if slot == OUT_PRIMITIVE {
+                    break;
+                }
             }
         }
         Ok(())

@@ -567,6 +567,18 @@ impl Module {
         let t = self.t_bool();
         self.constant(if v { op::CONSTANT_TRUE } else { op::CONSTANT_FALSE }, t, &[])
     }
+    /// OpSpecConstant of a 32-bit type (not deduplicated).
+    pub fn spec_u32(&mut self, ty: Id, default: u32) -> Id {
+        let id = self.id();
+        put(&mut self.globals, op::SPEC_CONSTANT, &[ty, id, default]);
+        id
+    }
+    /// OpSpecConstantTrue (not deduplicated: each gets its own SpecId).
+    pub fn spec_true(&mut self, ty: Id) -> Id {
+        let id = self.id();
+        put(&mut self.globals, 48, &[ty, id]);
+        id
+    }
     pub fn c_null(&mut self, ty: Id) -> Id {
         self.constant(op::CONSTANT_NULL, ty, &[])
     }

@@ -1,6 +1,7 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v1** (2026-11-26; v0 2026-11-25). v1 takes the host's
+Status: **v1** (2026-11-26; v0 2026-11-25; v1 amended the same day:
+immediate samplers in set 1 by specialization constant, change 8). v1 takes the host's
 proposals (`docs/vulkan-host.md` section 6). Owner of the translator side:
 `crates/victory-shader/src/vk/`. Owner of the host side: the Vulkan host
 (branch `worktree-agent-a5b010d38d592dbd0`). Change this file first, then
@@ -54,8 +55,7 @@ memory model. Every module passes `spirv-val --target-env vulkan1.3
 
 | Dwords | Content |
 |---|---|
-| 0–1 | `memory_map`: device address (u64) of the memory map block (section 3) |
-| 2–3 | reserved, 0 |
+| 0–3 | reserved, 0 (v0 had the memory map's address here; v1 reads the map from a uniform buffer, section 3) |
 | 4–31 | user data of the first stage: compute, vertex or mesh program (user-data dword k at push dword 4 + k; k < 28) |
 | 32–63 | user data of the pixel program (user-data dword k at push dword 32 + k; k < 32) |
 
@@ -91,7 +91,7 @@ in root descriptors, V#s, tables, vertex/index views) are translated by
 one subtract and add over the host's imports of title memory:
 
 ```
-struct MemoryMap {            // at push dwords 0-1 (device address), 16-byte aligned, read-only
+struct MemoryMap {            // uniform buffer, set 3 binding 0 (std140; offsets as written)
     u64 zero;                 // device address of >= 256 bytes of zeros (never written)
     u64 sink;                 // device address of >= 256 writable bytes nobody reads (dropped stores)
     u32 count;                // ranges in use, 1..=64
@@ -106,13 +106,22 @@ struct MemoryMap {            // at push dwords 0-1 (device address), 16-byte al
 ```
 
 `device = range.device_base + (title - range.title_start)` for the range
-with `title - title_start < title_size` (unsigned). With `count == 1`
-(the host's title window: `title_start` 0, `device_base` the window) the
-translator does exactly that, one compare and add; otherwise a binary
-search over the sorted ranges (6 steps). An address in no range reads
+with `title - title_start < title_size` (unsigned). **Specialization
+constant 0** (bool, default true) says the map has one range (the host's
+title window: `title_start` 0, `device_base` the window): the translator
+then does exactly that with `range[0]`, one compare and add. A host that
+writes several ranges sets it false at pipeline creation; the module then
+does a binary search over the sorted ranges (6 steps). (`count` is read
+only then.) An address in no range reads
 zeros from `zero` and writes into `sink`; so does any access that is out
 of bounds of its V# (section 4). The map must stay valid and unchanged
 while any submitted work can read it; a new map is a new block.
+
+The map is a **uniform buffer at set 3, binding 0** (a set of its own, so
+the host binds it once per submission), read with uniform loads.
+Measured (NVIDIA 620.73, b7a7fb5ba5934a89): the same module reading the
+map through a pointer from push constants compiled ~35x slower (8.8 s
+against 0.26 s).
 
 Translation happens once per distinct base (a V#'s base, a table
 address, a root address): every access then only adds its offset.
@@ -152,12 +161,16 @@ the shader.
 |---|---|---|---|
 | 0 | 0 | `SAMPLED_IMAGE[1 << 20]` | image views, indexed by a T#'s slot |
 | 0 | 1 | `STORAGE_IMAGE[1 << 20]` | storage views of UAV textures, indexed by the same slot |
-| 1 | 0 | `SAMPLER[4096]` | heap samplers, indexed by an S#'s slot |
-| 2 | 0 / 1 | `SAMPLER[n]`, immutable | immediate samplers of the compute/vertex/mesh (0) or pixel (1) program |
+| 1 | 0 | `SAMPLER[4096]` | heap samplers, indexed by an S#'s slot; immediate samplers in slots the host reserves |
+| 3 | 0 | `UNIFORM_BUFFER` | the memory map (section 3) |
 
-Sets 0 and 1 are global (all stages, update-after-bind, partially
-bound); set 2 is per pipeline (embedded immutable samplers under
-`VK_EXT_descriptor_buffer`). The array sizes are fixed (descriptor
+Sets 0, 1 and 3 are global (all stages; 0 and 1 update-after-bind,
+partially bound), so every stage of every pipeline has the same layout.
+Set 2 is unused.
+
+Specialization constants: **0** (bool, default true) the memory map has
+one range (section 3); **100 + n** (u32, default 0) the sampler-heap slot
+of immediate sampler n (section 5.3). The array sizes are fixed (descriptor
 buffers need them at layout creation); the host never hands out a slot
 past them.
 
@@ -201,11 +214,12 @@ stays as the console's). At most 4,096 heap samplers.
 
 Immediate samplers (root signature static samplers, whose four words the
 console code builds from constants): the translator lists their words
-(`VkShader::samplers`, position n) and reads them from **set 2, element n
-of binding 0** (compute, vertex and mesh programs) **or binding 1** (pixel
-programs): per-pipeline arrays of immutable samplers the host builds from
-the words (`StaticSampler::from_words`, already in `emit/sampler.rs`). A
-stage with no immediate sampler declares nothing in set 2.
+(`VkShader::samplers`, position n) and reads immediate sampler n from
+**set 1 binding 0 at the index specialization constant `100 + n`**
+(u32, default 0) gives. The host puts each distinct immediate sampler
+(`StaticSampler::from_words`, already in `emit/sampler.rs`) into a slot of
+the sampler heap it reserves for them, and sets the constants per stage
+at pipeline creation.
 
 ## 6. Stage interface
 
@@ -235,7 +249,11 @@ stage with no immediate sampler declares nothing in set 2.
 - **Compute.** `LocalSize` from the console's thread-group size; thread
   and group ids from `LocalInvocationId` / `WorkgroupId`.
 - **Mesh.** `VK_EXT_mesh_shader`, `OutputVertices`/`OutputPrimitivesEXT`
-  the console's maxima, triangles. Dispatched as `vkCmdDrawMeshTasksEXT(x,
+  the console's maxima, triangles. The module sets the output counts to
+  the maxima at its start and culls every primitive
+  (`CullPrimitiveEXT`) until the console code exports it (the console's
+  `GS_ALLOC_REQ` counts are not used). Thread n writes vertex n and
+  primitive n (`LocalInvocationIndex`). Dispatched as `vkCmdDrawMeshTasksEXT(x,
   1, 1)` with the title's group count.
 
 ## 7. Waves
@@ -257,7 +275,7 @@ pub struct VkShader {
     pub stage: HwStage,
     pub spirv: Vec<u32>,
     pub user_data: Vec<emit::UserData>,  // push dword (stage window + index) <- root slot/dword
-    pub samplers: Vec<[u32; 4]>,         // immediate samplers, set 2 binding 0/1 element n
+    pub samplers: Vec<[u32; 4]>,         // immediate sampler n: set 1 binding 0 at spec constant 100 + n
     pub interface: Vec<Interface>,       // semantics and locations (information only)
     pub local_size: [u32; 3],            // compute / mesh
     pub approximate: Vec<&'static str>,  // wave64 operations taken per half

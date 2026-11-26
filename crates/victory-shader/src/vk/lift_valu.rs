@@ -1051,20 +1051,21 @@ impl Lift<'_> {
                 Ok(())
             }
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
+                // bits of the mask below this lane's console lane
                 let m = self.usrc(inst, v, 0)?;
                 let acc = self.usrc(inst, v, 1)?;
-                let x = if name == "v_mbcnt_lo_u32_b32" {
-                    let lane = self.lane();
-                    let below = self.mask_bits(lane);
-                    let t = self.spv(op::BITWISE_AND, Ty::U32, &[m, below]);
-                    let c = self.spv(op::BIT_COUNT, Ty::U32, &[t]);
-                    self.spv(op::I_ADD, Ty::U32, &[c, acc])
+                let lane = self.console_lane();
+                let k32 = self.k32(32);
+                let n = if name == "v_mbcnt_lo_u32_b32" {
+                    self.gl(glsl::U_MIN, Ty::U32, &[lane, k32])
                 } else {
-                    if self.wave64 {
-                        self.approx("v_mbcnt_hi in a wave64 program (one host subgroup per console wave half)");
-                    }
-                    acc
+                    let l = self.gl(glsl::U_MAX, Ty::U32, &[lane, k32]);
+                    self.spv(op::I_SUB, Ty::U32, &[l, k32])
                 };
+                let below = self.mask_bits(n);
+                let t = self.spv(op::BITWISE_AND, Ty::U32, &[m, below]);
+                let c = self.spv(op::BIT_COUNT, Ty::U32, &[t]);
+                let x = self.spv(op::I_ADD, Ty::U32, &[c, acc]);
                 f(self, x)
             }
             "v_readfirstlane_b32" => {
