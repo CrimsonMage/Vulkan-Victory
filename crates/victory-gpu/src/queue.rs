@@ -2,7 +2,7 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -382,12 +382,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// A present plane, 72 bytes, as the title fills them (title+0x248232d,
-/// presented at title+0x24824c1: up to two, 0x48 apart): frame token, the
-/// plane's resources, per resource the rectangle of it shown (left, top,
-/// right, bottom texels), where the plane goes on the screen (left, top,
-/// right, bottom as fractions of it; the title passes 0, 0, 1, 1), then a
-/// word from the title's plane record and words it leaves zero.
+/// A present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`), 72 bytes, the
+/// planes 0x48 apart (as the title fills them, and as XCL reads other
+/// titles'): frame token, the plane's resources, per resource the
+/// rectangle of it shown (left, top, right, bottom texels), where the plane
+/// goes on the screen (left, top, right, bottom as fractions of it; the
+/// title passes 0, 0, 1, 1), then its colour space and flags. The first
+/// resource of each plane is shown; later planes go over earlier ones with
+/// premultiplied alpha.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
@@ -399,6 +401,23 @@ pub(crate) struct Plane {
     rest: [u32; 7],
 }
 const _: () = assert!(size_of::<Plane>() == 0x48);
+/// The console's display composes up to this many planes.
+const MOST_PLANES: u32 = 8;
+
+/// The `count` planes the title passes at `planes` (up to [`MOST_PLANES`]);
+/// a change of their number is logged.
+fn given_planes<'a>(count: u32, planes: *const Plane) -> &'a [Plane] {
+    if planes.is_null() {
+        return &[];
+    }
+    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+    if LAST.swap(count, Ordering::Relaxed) != count {
+        tracing::info!(planes = count, shown = count.min(MOST_PLANES), "PresentX: the number of planes changed");
+    }
+    // SAFETY: the title passes `count` plane descriptions.
+    unsafe { std::slice::from_raw_parts(planes, count.min(MOST_PLANES) as usize) }
+}
+
 /// The planes as the Vulkan backend shows them.
 #[cfg(windows)]
 fn shown(given: &[Plane]) -> Vec<crate::vulkan::Shown> {
@@ -645,12 +664,7 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if crate::vulkan::on() {
-        let given: &[Plane] = if plane_parameters.is_null() {
-            &[]
-        } else {
-            // SAFETY: the title passes `planes` plane descriptions.
-            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
-        };
+        let given = given_planes(planes, plane_parameters);
         let size = given
             .iter()
             .filter(|p| p.count > 0 && !p.resources.is_null())
@@ -666,12 +680,7 @@ extern "system" fn present(
         // A state the host texture is not left in: what it was in comes
         // back, and goes back after.
         const COPY_SOURCE: u32 = 0x800;
-        let given: &[Plane] = if plane_parameters.is_null() {
-            &[]
-        } else {
-            // SAFETY: the title passes `planes` plane descriptions.
-            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
-        };
+        let given = given_planes(planes, plane_parameters);
         log_planes(frame, given);
         let mut shown: Vec<(This, crate::host::Shown)> = Vec::new();
         for plane in given {
