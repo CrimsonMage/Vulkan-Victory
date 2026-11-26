@@ -34,8 +34,15 @@ use victory_gpu::mapstat::Site;
 
 use crate::{HleModule, hle_export};
 
+mod fillers;
 mod hooks;
+mod places;
+use fillers::*;
 pub use hooks::{XMemAlloc, XMemFree, XMemSetAllocationHooks};
+#[cfg(feature = "diagnostics")]
+pub(crate) use places::check_aliases;
+use places::describe;
+pub(crate) use places::{target_memory, target_pages};
 
 const MIB: usize = 1 << 20;
 
@@ -299,6 +306,10 @@ const PAGE: usize = 64 << 10;
 
 struct Section {
     handle: HANDLE,
+    /// Never reused, unlike the section's address: the keys of its pages
+    /// ([`Slice::key`]) name it alone, so that no entry of a section gone
+    /// applies to a new one at the same address.
+    id: usize,
     /// The title's bytes in it (a canary page of unified memory may follow).
     bytes: usize,
     /// One view of all the title's bytes, for victory's own writes into
@@ -320,7 +331,8 @@ unsafe impl Sync for Section {}
 
 impl Section {
     fn new(handle: HANDLE, bytes: usize) -> Section {
-        Section { handle, bytes, whole: AtomicUsize::new(0) }
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        Section { handle, id: NEXT.fetch_add(1, Ordering::Relaxed), bytes, whole: AtomicUsize::new(0) }
     }
 
     /// The address of the view of all the title's bytes, mapping it the
@@ -392,9 +404,10 @@ struct Slice {
 }
 
 impl Slice {
-    /// The key in `Physical::shown` of the page `k` pages after this one.
+    /// The key in `Physical::shown` of the page `k` pages after this one:
+    /// its section's id and its index there.
     fn key(&self, k: usize) -> (usize, usize) {
-        (Arc::as_ptr(&self.section) as usize, self.index + k)
+        (self.section.id, self.index + k)
     }
 }
 
@@ -411,12 +424,20 @@ struct Physical {
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
     /// Filler pages by their key ([`Slice::key`]): pages of zeros the title
-    /// shows at many places (in the unused parts of its tiled resources),
-    /// shown there by stand-ins with no view ([`fill`]).
+    /// shows over and over (in the unused parts of its tiled resources),
+    /// shown there by stand-ins with no view ([`fill`]). Forgotten when the
+    /// page is freed or shown nowhere any more.
     fillers: HashMap<(usize, usize), Slice>,
-    /// Pages found holding data when a request showed them at several
-    /// places: views, as any page.
+    /// Pages found holding data when a request repeated them: views, as
+    /// any page. Forgotten as fillers are.
     not_fillers: std::collections::HashSet<(usize, usize)>,
+    /// Pages a DirectStorage request is writing now, and how many requests
+    /// ([`Target`]): never made filler pages meanwhile (fresh pages are
+    /// zeros until the request lands).
+    targeted: HashMap<(usize, usize), usize>,
+    /// Pages a change under way took away from somewhere
+    /// ([`forget_unshown`]).
+    unshown: Vec<(usize, usize)>,
     /// The pages of GPU views of the pool, by address: the page shown
     /// there ([`Slice::key`]); no view shows them ([`map_alias`]).
     aliased: HashMap<usize, (usize, usize)>,
@@ -547,6 +568,9 @@ const UNIFIED_SECTION: usize = 8192;
 const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
+/// What xmem noted about a freed page goes with it: whether it is a filler
+/// page, and where it shows (no write through victory's views can reach
+/// it any more, so none is told anywhere).
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
     if pages.is_null() {
         return 0;
@@ -554,7 +578,13 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) }) else {
+            continue;
+        };
+        let key = slice.key(0);
+        physical.fillers.remove(&key);
+        physical.not_fillers.remove(&key);
+        physical.shown.remove(&key);
     }
     1
 }
@@ -767,42 +797,6 @@ fn push_page(runs: &mut Vec<Run>, at: usize, slice: Slice) {
     runs.push(Run { at, bytes: PAGE, slice, repeat: false });
 }
 
-/// Places at which a page shows, from which it may be a filler page.
-const FILLER_PLACES: usize = 8;
-
-/// Pages a request shows at more than one place, or that show at
-/// [`FILLER_PLACES`] places with this request, are filler candidates: one
-/// that holds only zeros becomes a filler page, shown by stand-ins
-/// ([`fill`]) rather than a view per place.
-fn note_fillers(physical: &mut Physical, slices: &[Slice]) {
-    let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
-    for slice in slices {
-        *seen.entry(slice.key(0)).or_default() += 1;
-    }
-    for slice in slices {
-        let key = slice.key(0);
-        let Some(&here) = seen.get(&key) else {
-            continue;
-        };
-        let places = here + physical.shown.get(&key).map_or(0, Vec::len);
-        if (here < 2 && places < FILLER_PLACES) || physical.fillers.contains_key(&key) || physical.not_fillers.contains(&key) {
-            continue;
-        }
-        seen.remove(&key);
-        if zero(slice) {
-            tracing::info!(page = slice.index, "xmem: a page of zeros the title shows at many places: shown there by stand-ins, not views");
-            physical.fillers.insert(key, slice.clone());
-        } else {
-            physical.not_fillers.insert(key);
-        }
-    }
-}
-
-/// Whether the page holds only zeros.
-fn zero(slice: &Slice) -> bool {
-    View::map(slice, 1).is_some_and(|mut v| v.bytes().iter().all(|&b| b == 0))
-}
-
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -830,10 +824,10 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, site: Site) ->
             };
             slices.push(slice);
         }
-        note_fillers(&mut physical, &slices);
         for (k, slice) in slices.into_iter().enumerate() {
             push_page(&mut runs, base + k * PAGE, slice);
         }
+        note_fillers(&mut physical, &runs);
     }
     // Until the pages are mapped again: `show` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
@@ -868,12 +862,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     // SAFETY: as above.
     let page = |i: usize| if pages.is_null() { 0 } else { unsafe { *pages.add(i) } };
-    // A page this call shows at several addresses may be a filler page.
-    {
-        let mut physical = physical();
-        let slices: Vec<Slice> = (0..n).filter_map(|i| physical.pages.get(&page(i)).cloned()).collect();
-        note_fillers(&mut physical, &slices);
-    }
     let mut i = 0;
     while i < n {
         let unmapping = page(i) == 0;
@@ -1037,6 +1025,7 @@ fn show(physical: &mut Physical, base: usize, len: usize, runs: &[Run], site: Si
                 (lo..hi).step_by(PAGE).all(|p| map(physical, p, PAGE, slice.clone(), site))
             };
             if !ok {
+                forget_unshown(physical);
                 return false;
             }
             changed = true;
@@ -1045,6 +1034,7 @@ fn show(physical: &mut Physical, base: usize, len: usize, runs: &[Run], site: Si
     if !changed {
         victory_gpu::mapstat::kept(site);
     }
+    forget_unshown(physical);
     true
 }
 
@@ -1094,6 +1084,10 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
     if at + size > end {
         again(physical, end, at + size);
     }
+    // Looked at once the change is done ([`forget_unshown`]): the same
+    // page may be shown elsewhere by it.
+    let pages = if m.fill { 1 } else { size.div_ceil(PAGE) };
+    physical.unshown.extend((0..pages).map(|k| m.slice.key(k)));
 }
 
 /// The host's flag that joins adjacent placeholders (not in windows-sys).
@@ -1195,119 +1189,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Sit
     true
 }
 
-/// Shows the filler page `slice` at every page of `[base, base + len)`,
-/// which must be free placeholders, by a stand-in: zeroed memory of ours,
-/// read-only, with no view (the title reads its filler pages and never
-/// writes them; a write is let through and counted, `on_fault`). False if
-/// the host refuses.
-fn fill(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Site) -> bool {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
-    // SAFETY: private memory in place of the placeholder just made.
-    let ok = placeholder(base, len)
-        && unsafe {
-            VirtualAlloc2(
-                GetCurrentProcess(),
-                base as *const c_void,
-                len,
-                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-                PAGE_READONLY,
-                std::ptr::null_mut(),
-                0,
-            )
-        } as usize
-            == base;
-    if !ok {
-        tracing::warn!(address = format_args!("{base:#x}"), len, error = %std::io::Error::last_os_error(), "a stand-in for a filler page failed; views instead");
-        return false;
-    }
-    victory_gpu::mapstat::filled(site, len);
-    fill_ranges().insert(base, len);
-    physical.views.insert(base, Mapped { len, slice, fill: true });
-    true
-}
-
-/// Filler pages found written (`check_fillers`), to be shown by views from
-/// the next mapping on.
-static DIRTY: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-
-/// Every 10 s (the views line): a filler page that no longer holds only
-/// zeros was written after all, and its stand-ins show what it held
-/// before. Said aloud, and its stand-ins become views at the next mapping
-/// change. Never waits for the page table (the line comes from wherever).
-fn check_fillers() {
-    let fillers: Vec<Slice> = match PHYSICAL.try_lock() {
-        Ok(physical) => physical.fillers.values().cloned().collect(),
-        Err(_) => return,
-    };
-    for slice in fillers {
-        if !zero(&slice) {
-            tracing::warn!(page = slice.index, "xmem: a filler page was written; its stand-ins become views");
-            DIRTY.lock().unwrap_or_else(|e| e.into_inner()).push(slice.key(0));
-        }
-    }
-}
-
-/// Stand-ins of filler pages found written become views. With the change
-/// lock held.
-fn unfill_dirty(physical: &mut Physical) {
-    let dirty = std::mem::take(&mut *DIRTY.lock().unwrap_or_else(|e| e.into_inner()));
-    for key in dirty {
-        unfill(physical, key);
-    }
-}
-
-/// The filler page `key` is one no longer: its stand-ins become views.
-/// With the change lock held.
-fn unfill(physical: &mut Physical, key: (usize, usize)) {
-    if physical.fillers.remove(&key).is_none() {
-        return;
-    }
-    physical.not_fillers.insert(key);
-    let stand_ins: Vec<usize> = physical.views.iter().filter(|(_, m)| m.fill && m.slice.key(0) == key).map(|(&at, _)| at).collect();
-    for at in stand_ins {
-        let Some(m) = physical.views.get(&at).cloned() else {
-            continue;
-        };
-        unmap_view(physical, at, at, at + m.len, Site::Remnant);
-        for p in (at..at + m.len).step_by(PAGE) {
-            map(physical, p, PAGE, m.slice.clone(), Site::Remnant);
-        }
-    }
-}
-
-/// Before victory writes into pages (DirectStorage): a filler page among
-/// them is one no longer, and its stand-ins become views first.
-fn unfill_written(runs: &[(Slice, usize)]) {
-    let mut physical = physical();
-    let keys: Vec<(usize, usize)> = runs
-        .iter()
-        .flat_map(|(slice, n)| (0..*n).map(|k| slice.key(k)))
-        .filter(|key| physical.fillers.contains_key(key))
-        .collect();
-    if keys.is_empty() {
-        return;
-    }
-    let _changing = victory_gpu::title_memory_remapping();
-    for key in keys {
-        tracing::warn!(page = key.1, "xmem: DirectStorage writes a filler page; its stand-ins become views");
-        unfill(&mut physical, key);
-    }
-}
-
-/// Stand-ins by address, and their bytes, for the fault handler (which
-/// must not wait for the page table).
-fn fill_ranges() -> std::sync::RwLockWriteGuard<'static, BTreeMap<usize, usize>> {
-    FILL_RANGES.write().unwrap_or_else(|e| e.into_inner())
-}
-
-static FILL_RANGES: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
-
 /// Installs [`on_fault`] once, ahead of the crash reporter's handler.
 fn install_fault_handler() {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         victory_gpu::mapstat::on_tick(check_fillers);
+        victory_loader::describe_title_memory_with(describe);
         // SAFETY: the handler touches only its own state and protections.
         unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
     });

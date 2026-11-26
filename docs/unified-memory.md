@@ -701,15 +701,20 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   wineserver's load. `xmem` maps a run of consecutive pages as one view,
   leaves a view that already shows what the title asks, writes
   DirectStorage page destinations through one view per section kept for
-  good, and shows a *filler page* (a page of zeros the title maps at many
-  places, as in the unused parts of tiled resources) by stand-ins: zeroed
-  read-only memory of its own, no view. A filler page DirectStorage writes,
-  or found written at the 10 s check, has its stand-ins turned into views
-  (a warning says so). W should be 0 (a title write into a stand-in does
+  good, and shows a *filler page* (a page of zeros the title repeats at
+  consecutive addresses in one call, as in the unused parts of tiled
+  resources) by stand-ins: zeroed read-only memory of its own, no view.
+  A page merely shown at many places is not one: fresh pages are zeros
+  until data comes in through one of their places, which a stand-in would
+  never show (vk17/vk35). A filler page under a DirectStorage request has
+  its stand-ins turned into views before the bytes come, and a page a
+  request is writing never becomes one; one found written at the 10 s
+  check has its stand-ins turned into views (a warning says so). Fillers
+  are forgotten when freed or shown nowhere. W should be 0 (a title write into a stand-in does
   not reach the page's other places). T counts title threads that touched
   a page while its view was away for a change and waited instead of
-  faulting. F must be 0. The first filler found logs `xmem: a page of
-  zeros the title shows at many places`.
+  faulting. F must be 0. Each filler found logs `xmem: a page of
+  zeros the title repeats`.
 - The gate line (`… fps, … ms/frame …; card memory …`) gives the result.
 - Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms, idle
   I; S submissions/frame (U untimed); list calls written down by title

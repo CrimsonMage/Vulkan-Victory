@@ -500,3 +500,76 @@ fn filler_pages_are_shown_by_stand_ins() {
     assert_eq!(XMemMapPhysicalPages(a, 7, std::ptr::null()), a);
     assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
 }
+
+/// Whether xmem holds the page as a filler page.
+fn is_filler(page: usize) -> bool {
+    let physical = physical();
+    let key = physical.pages.get(&page).expect("known page").key(0);
+    physical.fillers.contains_key(&key)
+}
+
+/// A fresh page shown at many places, one at a time or twice in one
+/// scatter, is zeros because nothing has filled it yet: it stays a view
+/// at each place, so that what comes into it later shows everywhere
+/// (runs vk17 and vk35 read zeros through stand-ins of such pages).
+#[test]
+fn pages_shown_at_many_places_stay_views() {
+    let pages = allocate(1);
+    let a = XMemVirtualAlloc(std::ptr::null_mut(), 20 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+    assert!(!a.is_null());
+    let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+    for k in (0..18).step_by(2) {
+        assert_eq!(XMemMapPhysicalPages(at(k), 1, pages.as_ptr()), at(k));
+    }
+    let addresses = [at(1), at(5)];
+    assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, [pages[0]; 2].as_ptr()), 1);
+    assert!(!is_filler(pages[0]));
+    assert!(physical().views.range(a as usize..at(20) as usize).all(|(_, m)| !m.fill));
+    // Written through one place, read through all the others.
+    // SAFETY: mapped read-write.
+    unsafe { at(16).cast::<u8>().write(6) };
+    for k in [0, 1, 5, 14] {
+        // SAFETY: mapped.
+        assert_eq!(unsafe { at(k).cast::<u8>().read() }, 6);
+    }
+    assert_eq!(XMemMapPhysicalPages(a, 20, std::ptr::null()), a);
+    assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+}
+
+/// A filler page is forgotten once nothing shows it, or once freed; and
+/// while a DirectStorage request writes a page, it is never taken for one.
+#[test]
+fn fillers_are_forgotten_and_never_targeted() {
+    let pages = allocate(1);
+    let a = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+    assert!(!a.is_null());
+    let list = [pages[0]; 4];
+    assert_eq!(XMemMapPhysicalPages(a, 4, list.as_ptr()), a);
+    assert!(is_filler(pages[0]));
+    let said = describe(a as usize);
+    assert!(said.as_deref().is_some_and(|d| d.contains("stand-in for a filler page")), "{said:?}");
+    assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+    assert!(!is_filler(pages[0]), "shown nowhere");
+    // Targeted by a request: views, though zeros and repeated.
+    let target = target_pages(&pages, 0, 16);
+    assert_eq!(XMemMapPhysicalPages(a, 4, list.as_ptr()), a);
+    assert!(!is_filler(pages[0]));
+    assert_eq!(views_at(a, 4), vec![1, 1, 1, 1]);
+    drop(target);
+    assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+    // A filler page under a memory destination becomes views before the
+    // bytes come.
+    assert_eq!(XMemMapPhysicalPages(a, 4, list.as_ptr()), a);
+    assert!(is_filler(pages[0]));
+    let target = target_memory(a as usize + 8, 8);
+    assert!(!is_filler(pages[0]));
+    assert_eq!(views_at(a, 4), vec![1, 1, 1, 1]);
+    drop(target);
+    assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+    // Freed: forgotten.
+    assert_eq!(XMemMapPhysicalPages(a, 4, list.as_ptr()), a);
+    let key = physical().pages.get(&pages[0]).expect("known page").key(0);
+    assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    assert!(!physical().fillers.contains_key(&key));
+    assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+}

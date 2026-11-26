@@ -994,6 +994,9 @@ vk19 or vk19b):
      `check_fillers` (every 10 s) and the next mapping change. vk17's
      mapstat line showed "title writes into stand-ins 0" before the
      crash, so this is not shown.
+     Later (kiss.md, 2026-11-26): it was. The writes came through views
+     of the same pages, not the stand-ins: ~1,348 fresh pages were made
+     fillers at every startup, and 39-216 of them were found written.
 - Next diagnostic: at a crash, report which xmem kind holds `rcx`'s page
   (view, stand-in, section, region).
 

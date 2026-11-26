@@ -142,6 +142,20 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: the zeros in streamed resources (vk17, vk35: `m_PageMap`
+  0, a vtable 0) traced to xmem's filler pages. Every run made ~1,348
+  fresh pages "fillers" at startup (zeros, shown at 8+ places counting
+  the GPU views, or twice in a scatter) and showed them by ~2,165
+  single-page stand-ins; data then came in through a view of the same
+  page and the stand-ins kept showing zeros (39-216 "filler page was
+  written" per run, found only at the 10 s check). Now only a page the
+  title repeats at consecutive addresses in one call can be a filler;
+  never one a DirectStorage request is writing (a filler under a request,
+  memory or page destination, becomes views first); fillers are forgotten
+  when freed or shown nowhere; section keys are ids, never reused.
+  Diagnostics builds compare each memory destination with every other
+  place showing its pages; access-violation reports dump 64 bytes at each
+  register into title memory, with xmem's view of it. Built, not yet run.
 - 2026-11-26: wave64 compute exact on the translator side (branch
   `worktree-agent-a08b3058c5f4bb083`). Found in CS_Tree_BatchCull (and the
   other BatchCull programs with wave prefix sums): `s_mov_b32 exec_lo, 0` /
