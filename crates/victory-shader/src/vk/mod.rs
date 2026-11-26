@@ -169,7 +169,7 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
     tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     let ir_insts = f.count();
     let (local_size, mesh) = match &native.io {
-        crate::native::StageIo::Cs(cs) => (cs.threads, (0, 0)),
+        crate::native::StageIo::Cs(_) => ([lift::Lift::host_threads(&native), 1, 1], (0, 0)),
         crate::native::StageIo::Ms(ms) => ([ms.threads, 1, 1], (ms.max_vertices, ms.max_primitives)),
         _ => ([1, 1, 1], (0, 0)),
     };
@@ -213,10 +213,13 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
     })
 }
 
-/// Iterations after which a loop gives up: low enough that a loop which
-/// gives up cannot cause a GPU timeout by itself.
+/// Loop iterations (all loops of an invocation together) after which the
+/// invocation gives up: low enough that the programs that give up cannot
+/// make a GPU timeout by themselves (a culling dispatch of thousands of
+/// waves whose loops each ran to 2^16 took a large part of the ~2 s
+/// limit), far above what a loop of the title runs.
 fn loop_limit(_stage: HwStage) -> u32 {
-    1 << 16
+    1 << 14
 }
 
 /// FNV-1a of the container: the program's id in the guard buffer.

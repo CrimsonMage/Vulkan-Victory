@@ -1,26 +1,41 @@
-//! Whole-wave values of a console wave64 run as two host subgroups, for
-//! thread groups of one console wave (33 to 64 threads): the halves
-//! exchange one word through workgroup memory between barriers (the group
-//! is the wave, so every invocation reaches every exchange as long as the
-//! scalar values agree, which the exchanges make them do). Masks read as
-//! numbers, `any` of a mask, `v_readlane` and `v_readfirstlane` are then
-//! exact. Larger groups keep the per-half forms.
+//! Whole-wave values of a console wave64 run as two host subgroups
+//! (compute groups, and mesh groups of more than 32 threads), and the
+//! console's thread numbering on the host: the halves exchange
+//! one word (emit_xchg.rs: group barriers in a group of one console wave,
+//! counters per pair in larger groups). Every invocation reaches every
+//! exchange as long as the scalar values agree, which the exchanges make
+//! them do. Masks read as numbers, `any` of a mask, `v_readlane` and
+//! `v_readfirstlane` are then exact.
 
 use super::*;
 
 impl Lift<'_> {
-    /// Whether the halves exchange (set by `Lift::new`).
-    pub(super) fn one_wave(native: &NativeProgram) -> bool {
-        let StageIo::Cs(cs) = &native.io else { return false };
-        let threads = cs.threads.iter().product::<u32>();
-        native.wave64 && threads > 32 && threads <= 64
+    /// Whether the halves exchange (set by `Lift::new`): a wave64 compute
+    /// or mesh group with an upper half.
+    pub(super) fn paired_halves(native: &NativeProgram) -> bool {
+        native.wave64 && Self::host_threads(native) > 32
     }
 
     /// Both halves' value of a word uniform within each half: (lower
     /// half's, upper half's).
     pub(super) fn exchange(&mut self, own: V) -> (V, V) {
         let pair = self.emit(Op::Xchg, Ty::vec(S::U32, 2), vec![own]);
+        self.lds_dirty = false;
         (self.extract(pair, 0), self.extract(pair, 1))
+    }
+
+    /// Before an LDS access: the halves meet when either may have made
+    /// another since they last did. The console's wave runs its LDS
+    /// accesses in program order across all 64 lanes (a lane initialises a
+    /// counter, the wave adds to it, a lane reads the total); two host
+    /// subgroups are not ordered without it.
+    pub(super) fn lds_meet(&mut self) {
+        if !self.xwave || !self.lds_dirty {
+            return;
+        }
+        self.close();
+        let z = self.k32(0);
+        self.exchange(z);
     }
 
     /// The two dwords of a wave64 mask: exchanged once per block (masks
@@ -112,6 +127,135 @@ impl Lift<'_> {
         let k32 = self.k32(32);
         let upper = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[l, k32]);
         Some(self.spv(op::SELECT, Ty::U32, &[upper, hi, lo]))
+    }
+
+    /// Lane-mask registers `code`, `code + 1` as this invocation's bit. In
+    /// a wave64 whose dwords were written apart (`s_mov_b32 exec_lo, 0`,
+    /// `s_mov_b32 exec_hi, -1` in a prefix sum) each half takes its own
+    /// dword.
+    pub(super) fn mask_reg(&mut self, inst: &Inst, code: u8) -> Res<V> {
+        let lo = self.val(inst, Reg::S(code))?;
+        let hi = match inst.read(Reg::S(code + 1)) {
+            Some(h) if self.wave64 => self.value(h, inst.machine.offset)?,
+            _ => return Ok(self.mask_of(lo)),
+        };
+        Ok(self.mask_pair(lo, hi))
+    }
+
+    /// A 64-bit lane mask from its two dwords: one mask, or the dword of
+    /// this invocation's half.
+    pub(super) fn mask_pair(&mut self, lo: R, hi: R) -> V {
+        if let (R::M(a, _), R::M(b, _)) = (lo, hi)
+            && a == b
+        {
+            return a;
+        }
+        let l = self.mask_of(lo);
+        let Some(up) = self.upper_half() else { return l };
+        let h = self.mask_of(hi);
+        if l == h {
+            return l;
+        }
+        self.spv(op::SELECT, Ty::BOOL, &[up, h, l])
+    }
+
+    /// Whether this invocation is in the upper half of its console wave64
+    /// (compute and mesh, whose waves are pairs of host subgroups); none
+    /// where a host subgroup stands for a whole wave.
+    pub(super) fn upper_half(&mut self) -> Option<V> {
+        if !self.wave64 || !matches!(self.native.stage, HwStage::Cs | HwStage::Ms) {
+            return None;
+        }
+        let h = self.half_index();
+        let z = self.k32(0);
+        Some(self.global_bin(op::I_NOT_EQUAL, Ty::BOOL, h, z))
+    }
+
+    /// Threads in a compute or mesh group as the program declares it (0 for
+    /// other stages).
+    pub(super) fn group_threads(native: &NativeProgram) -> u32 {
+        match &native.io {
+            StageIo::Cs(cs) => cs.threads.iter().product(),
+            StageIo::Ms(ms) => ms.threads,
+            _ => 0,
+        }
+    }
+
+    /// Invocations of the host's group: a compute group is whole console
+    /// waves, as the console's hardware runs it (the lanes past the group
+    /// exist, inactive), so whole-wave code (`s_or_saveexec -1` and DPP
+    /// steps) finds its identity in them instead of a missing lane, and a
+    /// wave64 always has its upper half. One dimension: thread ids come
+    /// from the console thread index.
+    pub(crate) fn host_threads(native: &NativeProgram) -> u32 {
+        let n = Self::group_threads(native);
+        match &native.io {
+            StageIo::Cs(_) => n.max(1).next_multiple_of(if native.wave64 { 64 } else { 32 }),
+            _ => n,
+        }
+    }
+
+    /// This invocation's thread index in its group as the console counts
+    /// it: the host subgroups in order are the console waves (or their
+    /// halves), so a thread's id, its lane and its wave agree whichever
+    /// invocations the host puts in a subgroup. Groups of whole subgroups;
+    /// others keep `LocalInvocationIndex`.
+    pub(super) fn console_thread(&mut self) -> V {
+        let n = Self::host_threads(self.native);
+        if n == 0 || !n.is_multiple_of(32) {
+            return self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32);
+        }
+        let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+        let k5 = self.k32(5);
+        let base = self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, sg, k5);
+        let lane = self.lane();
+        self.global_bin(op::BITWISE_OR, Ty::U32, base, lane)
+    }
+
+    /// Whether this invocation is a thread of the console's group (not a
+    /// lane that fills its last wave): EXEC at the start. None when every
+    /// invocation is.
+    pub(super) fn in_group(&mut self) -> Option<V> {
+        let n = Self::group_threads(self.native);
+        if n == Self::host_threads(self.native) {
+            return None;
+        }
+        let t = self.console_thread();
+        let k = self.k32(n);
+        Some(self.global_bin(op::U_LESS_THAN, Ty::BOOL, t, k))
+    }
+
+    /// Component `c` of the thread id in the group, from the console's
+    /// thread index.
+    pub(super) fn thread_id(&mut self, c: u8) -> V {
+        let StageIo::Cs(cs) = &self.native.io else {
+            return self.f.global(Op::Builtin(Builtin::LocalInvocationId(c)), Ty::U32);
+        };
+        let [x, y, z] = cs.threads.map(|d| d.max(1));
+        let (div, modulo) = match c {
+            0 => (1, x),
+            1 => (x, y),
+            _ => (x * y, z),
+        };
+        if modulo == 1 {
+            return self.k32(0);
+        }
+        let t = self.console_thread();
+        let q = if div == 1 {
+            t
+        } else {
+            let k = self.k32(div);
+            self.global_bin(op::U_DIV, Ty::U32, t, k)
+        };
+        let k = self.k32(modulo);
+        self.global_bin(op::U_MOD, Ty::U32, q, k)
+    }
+
+    /// 0 for the lower half of a console wave64, 1 for the upper.
+    pub(super) fn half_index(&mut self) -> V {
+        let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+        let one = self.k32(1);
+        self.global_bin(op::BITWISE_AND, Ty::U32, sg, one)
     }
 
     /// The first set bit of a 64-bit value (-1 for none).

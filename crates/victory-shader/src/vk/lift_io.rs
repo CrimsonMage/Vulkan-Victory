@@ -27,7 +27,7 @@ impl Lift<'_> {
                 self.global_bin(op::I_SUB, Ty::U32, i, b)
             }
             Input::PrimitiveId => u(self, Builtin::PrimitiveId),
-            Input::ThreadIdInGroup(c) => u(self, Builtin::LocalInvocationId(c)),
+            Input::ThreadIdInGroup(c) => self.thread_id(c),
             Input::GroupId(c) => u(self, Builtin::WorkgroupId(c)),
             Input::Position(c) => self.f.global(Op::Builtin(Builtin::FragCoord(c)), Ty::F32),
             Input::FrontFace => {
@@ -80,7 +80,7 @@ impl Lift<'_> {
                     let h = self.f.global(Op::Builtin(Builtin::Helper), Ty::BOOL);
                     self.global_node(Op::Spv(op::LOGICAL_NOT), Ty::BOOL, vec![h])
                 } else {
-                    self.kb(true)
+                    self.in_group().unwrap_or_else(|| self.kb(true))
                 };
                 R::M(b, half)
             }
@@ -134,7 +134,7 @@ impl Lift<'_> {
 
     /// Mesh: vertex and primitive n are written by thread n of the group.
     fn mesh_index(&mut self) -> Option<V> {
-        (self.native.stage == HwStage::Ms).then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32))
+        (self.native.stage == HwStage::Ms).then(|| self.console_thread())
     }
 
     /// The channels of an export as outputs of a slot.

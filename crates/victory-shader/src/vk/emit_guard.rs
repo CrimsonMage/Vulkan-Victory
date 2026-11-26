@@ -1,28 +1,35 @@
-//! The loop guard: every loop counts its iterations and gives up after
-//! `Stage::loop_limit` of them, so a loop that never exits (a
-//! mistranslation, or memory that reads zeros) cannot hang the GPU. A loop
-//! that gives up leaves through its merge and returns; it first counts
-//! itself in the host's guard buffer (push dwords 2-3: its device address,
-//! 0 for none): dword 0 += 1, dword 1 = the program's guard id.
+//! The loop guard: every invocation counts the iterations of all its loops
+//! and gives up after `Stage::loop_limit` of them, so a loop that never
+//! exits (a mistranslation, or memory that reads zeros), or nested loops
+//! that multiply, cannot hang the GPU. A loop that gives up leaves through
+//! its merge and returns; it first counts itself in the host's guard buffer
+//! (push dwords 2-3: its device address, 0 for none): dword 0 += 1, dword 1
+//! = the program's guard id.
 
 use super::*;
 
 impl Emit<'_> {
-    /// The iteration count at a loop header (`pre`: the block before it).
-    pub(super) fn loop_counter(&mut self, pre: Id, cont: Id) {
-        let u = self.t.u32_;
-        let (z, next) = (self.c32(0), self.m.id());
-        let count = self.m.op(op::PHI, u, &[z, pre, next, cont]);
-        self.counters.insert(cont, (count, next));
+    /// The invocation's iteration count so far: a private `u32`, 0 at start.
+    fn spent(&mut self) -> Id {
+        if self.spent_var == 0 {
+            let u = self.t.u32_;
+            let p = self.m.t_ptr(en::SC_PRIVATE, u);
+            let z = self.c32(0);
+            self.spent_var = self.m.variable_init(p, en::SC_PRIVATE, z);
+            self.interface.push(self.spent_var);
+        }
+        self.spent_var
     }
 
-    /// At the continue target: the next count; past the limit the loop
+    /// At the continue target: one more iteration; past the limit the loop
     /// leaves through its merge.
     pub(super) fn guard_back(&mut self, cont: Id, header: Id, merge: Id) {
-        let (count, next) = self.counters[&cont];
+        let var = self.spent();
         let (u, b) = (self.t.u32_, self.t.bool_);
         let one = self.c32(1);
-        self.m.op_to(op::I_ADD, u, next, &[count, one]);
+        let count = self.m.op(op::LOAD, u, &[var]);
+        let next = self.m.op(op::I_ADD, u, &[count, one]);
+        self.m.op_void(op::STORE, &[var, next]);
         let lim = self.c32(self.st.loop_limit);
         let over = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[next, lim]);
         self.merge_preds.entry(merge).or_default().push(cont);

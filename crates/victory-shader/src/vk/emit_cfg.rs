@@ -79,7 +79,6 @@ impl Emit<'_> {
             self.set_id(ph, id);
         }
         self.cphi.insert(x, cids);
-        self.loop_counter(pre, cont);
         self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
         let body = self.m.id();
         self.branch_to(body);

@@ -145,6 +145,10 @@ impl Lift<'_> {
                 r?;
             }
         }
+        // values exchanged at the end of a source stay there; the halves may
+        // arrive from different LDS accesses
+        self.words.clear();
+        self.lds_dirty = b != 0;
         let n = p.blocks[b].insts.len();
         let branch = matches!(p.blocks[b].exit, Exit::Branch { .. });
         for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -157,20 +161,36 @@ impl Lift<'_> {
         self.close();
         let term = self.terminator(b)?;
         let body = std::mem::take(&mut self.cur);
-        self.done[b] = Some(tir::Block { phis: self.all_phis[b].clone(), preds: p.blocks[b].preds.clone(), body, term });
+        let mut phis = self.all_phis[b].clone();
+        let mut seen = HashSet::new();
+        phis.retain(|x| seen.insert(*x));
+        self.done[b] = Some(tir::Block { phis, preds: p.blocks[b].preds.clone(), body, term });
         Ok(())
     }
 
     /// Phis: lane masks and SCC as booleans, data as f32 when every value
-    /// known so far is f32 (back edges convert), else u32.
+    /// known so far is f32 (back edges convert), else u32. The two dwords of
+    /// a wave64 lane mask share one phi (each half's bit).
     pub(super) fn block_phis(&mut self, b: usize) {
-        let mut phis = Vec::new();
         let p = self.p;
-        for phi in &p.blocks[b].phis {
-            let mask = matches!(phi.reg, Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1)
-                || phi.reg == Reg::Scc;
-            let known: Vec<R> = phi.args.iter().filter_map(|a| self.vals.get(a).copied()).collect();
-            let mask = mask || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
+        let kinds: Vec<(bool, Half)> = p.blocks[b].phis.iter().map(|phi| self.phi_kind(phi)).collect();
+        let mut pairs = Vec::new();
+        for (j, phi) in p.blocks[b].phis.iter().enumerate() {
+            if let (Reg::S(c), (true, Half::Hi)) = (phi.reg, kinds[j])
+                && self.wave64
+                && c > 0
+                && let Some(i) = p.blocks[b].phis.iter().position(|q| q.reg == Reg::S(c - 1))
+                && kinds[i] == (true, Half::Lo)
+            {
+                pairs.push((i, j));
+            }
+        }
+        let mut nodes = vec![u32::MAX; kinds.len()];
+        for (j, phi) in p.blocks[b].phis.iter().enumerate() {
+            if pairs.iter().any(|&(_, h)| h == j) {
+                continue;
+            }
+            let (mask, half) = kinds[j];
             let ty = if mask {
                 Ty::BOOL
             } else if self.floaty.get(&phi.value).copied().unwrap_or(0) > 0 {
@@ -179,11 +199,7 @@ impl Lift<'_> {
                 Ty::U32
             };
             let x = self.f.push(Node { op: Op::Phi, ty, args: vec![u32::MAX; phi.args.len()], imm: Vec::new() });
-            phis.push(x);
-            let half = match phi.reg {
-                Reg::S(c) if self.wave64 && (c == ir::VCC + 1 || c == ir::EXEC + 1) => Half::Hi,
-                _ => Half::Lo,
-            };
+            nodes[j] = x;
             let r = match (phi.reg == Reg::Scc, mask) {
                 (true, _) => R::B(x),
                 (false, true) => R::M(x, half),
@@ -191,7 +207,27 @@ impl Lift<'_> {
             };
             self.vals.insert(phi.value, r);
         }
-        self.all_phis[b] = phis;
+        for &(i, j) in &pairs {
+            nodes[j] = nodes[i];
+            self.vals.insert(p.blocks[b].phis[j].value, R::M(nodes[i], Half::Hi));
+        }
+        self.all_phis[b] = nodes;
+        self.mask_pairs.insert(b, pairs);
+    }
+
+    /// Whether a phi is a lane mask (or SCC), and which dword of a mask.
+    fn phi_kind(&self, phi: &ir::Phi) -> (bool, Half) {
+        let wide = |c: u8| c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1;
+        let known: Vec<R> = phi.args.iter().filter_map(|a| self.vals.get(a).copied()).collect();
+        let mask = matches!(phi.reg, Reg::S(c) if wide(c))
+            || phi.reg == Reg::Scc
+            || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
+        let hi = match phi.reg {
+            Reg::S(c) if self.wave64 && (c == ir::VCC + 1 || c == ir::EXEC + 1) => true,
+            Reg::S(_) => self.wave64 && !known.is_empty() && known.iter().all(|r| matches!(r, R::M(_, Half::Hi))),
+            _ => false,
+        };
+        (mask, if hi { Half::Hi } else { Half::Lo })
     }
 
     /// A block's terminator, after the values its edges give lifted targets.
@@ -271,10 +307,20 @@ impl Lift<'_> {
     /// their types where the current list is.
     pub(super) fn edge_k(&mut self, from: usize, to: usize, k: usize) -> Res<()> {
         let p = self.p;
+        let pairs = self.mask_pairs.get(&to).cloned().unwrap_or_default();
         for (j, phi) in p.blocks[to].phis.iter().enumerate() {
+            if pairs.iter().any(|&(_, h)| h == j) {
+                continue;
+            }
             let node = self.all_phis[to][j];
             let ty = self.f.ty(node);
-            let x = match self.value(phi.args[k], p.blocks[from].offset) {
+            let off = p.blocks[from].offset;
+            let hi = pairs.iter().find(|&&(l, _)| l == j).map(|&(_, h)| self.value(p.blocks[to].phis[h].args[k], off));
+            let x = match self.value(phi.args[k], off) {
+                Ok(lo) if hi.is_some() => match hi {
+                    Some(Ok(hi)) => self.mask_pair(lo, hi),
+                    _ => self.mask_of(lo),
+                },
                 Ok(r) => match ty {
                     Ty::BOOL if phi.reg == Reg::Scc => self.scc_of(r),
                     Ty::BOOL => self.mask_of(r),
@@ -304,8 +350,7 @@ impl Lift<'_> {
             }
             "s_cbranch_vccz" | "s_cbranch_vccnz" | "s_cbranch_execz" | "s_cbranch_execnz" => {
                 let reg = if name.contains("vcc") { ir::VCC } else { ir::EXEC };
-                let r = self.val(inst, Reg::S(reg))?;
-                let m = self.mask_of(r);
+                let m = self.mask_reg(inst, reg)?;
                 let a = self.any(m);
                 if name.ends_with('z') && !name.ends_with("nz") { self.spv(op::LOGICAL_NOT, Ty::BOOL, &[a]) } else { a }
             }
@@ -325,6 +370,7 @@ impl Lift<'_> {
             Fields::Sopp { .. } => match name {
                 "s_barrier" => {
                     self.close();
+                    self.lds_dirty = false;
                     self.emit(Op::Barrier, Ty::VOID, vec![]);
                     Ok(())
                 }
@@ -363,10 +409,12 @@ impl Lift<'_> {
                     self.need(inst);
                     return self.ds_cross(inst, name);
                 }
+                self.lds_meet();
                 let g = self.guard(inst)?;
                 self.guarded = g;
                 let r = self.ds(inst, name);
                 self.guarded = false;
+                self.lds_dirty = self.xwave;
                 r
             }
             Fields::Image { .. } => {
