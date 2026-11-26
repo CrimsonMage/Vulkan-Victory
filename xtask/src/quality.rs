@@ -31,6 +31,9 @@ pub const COGNITIVE: Limit = Limit {
     plan: 15,
     mandatory: 25,
 };
+/// Cyclomatic complexity only warns (owner's decision, 2026-11-26): flat
+/// lookup tables score high on it while being the simplest code; cognitive
+/// complexity is the mandatory gate. `mandatory` is kept for the report.
 pub const CYCLOMATIC: Limit = Limit {
     plan: 10,
     mandatory: 20,
@@ -284,14 +287,14 @@ pub fn check(files: &[FileStats], baseline: &Baseline) -> Vec<Finding> {
             let cyc = allowance.map(|a| a.cyclomatic);
             let levels = [
                 grade(f.cognitive, COGNITIVE, cog),
-                grade(f.cyclomatic, CYCLOMATIC, cyc),
+                grade(f.cyclomatic, CYCLOMATIC, cyc).map(|_| Level::Plan),
             ];
             let Some(level) = levels.into_iter().flatten().max() else {
                 continue;
             };
             let notes: Vec<_> = [
                 describe("cognitive", f.cognitive, COGNITIVE, cog),
-                describe("cyclomatic", f.cyclomatic, CYCLOMATIC, cyc),
+                warn_only("cyclomatic", f.cyclomatic, CYCLOMATIC),
             ]
             .into_iter()
             .filter(|n| !n.is_empty())
@@ -309,7 +312,16 @@ pub fn check(files: &[FileStats], baseline: &Baseline) -> Vec<Finding> {
 }
 
 fn is_mandatory(f: &FnScore) -> bool {
-    f.cognitive > COGNITIVE.mandatory || f.cyclomatic > CYCLOMATIC.mandatory
+    f.cognitive > COGNITIVE.mandatory
+}
+
+/// A score that only ever warns.
+fn warn_only(what: &str, value: u32, limit: Limit) -> String {
+    if value > limit.plan {
+        format!("{what} {value} > {} (warning)", limit.plan)
+    } else {
+        String::new()
+    }
 }
 
 /// A first baseline: every current offender over a mandatory limit.

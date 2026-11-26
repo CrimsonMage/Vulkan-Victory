@@ -82,9 +82,9 @@ comparing. If something seems to need that, it is in the wrong class.
 - Every change passes the gate before it lands.
 - Code shape (`cargo xtask quality`, run by the pre-commit hook): a file
   over 1,000 lines plans a split, over 1,500 must split; per function,
-  cognitive complexity (SonarSource) over 15 / 25 and cyclomatic over
-  10 / 20 mean plan / must simplify. New code stays under the second
-  number. Today's offenders are listed in `xtask/quality-baseline.toml` and
+  cognitive complexity (SonarSource) over 15 plans and over 25 must
+  simplify; cyclomatic over 10 only warns (flat lookup tables score high on
+  it). New code stays under the mandatory numbers. Today's offenders are listed in `xtask/quality-baseline.toml` and
   may only shrink; `cargo xtask quality --update-baseline` lowers them as
   code is split.
 
@@ -277,7 +277,7 @@ driver errors and no new crash, and the captures look no worse.
   memory, mutable formats. After parity: delete ~37k translator lines
   (emit/, hlsl/, resource.rs, structure.rs, bvh.rs) and ~15k host lines.
   Code-shape limits (user): files 1,000 plan / 1,500 mandatory; cognitive
-  15/25, cyclomatic 10/20 per function; `cargo xtask quality` + baseline.
+  15/25 per function (cyclomatic >10 warns only); `cargo xtask quality` + baseline.
 - 2026-11-26: real NVIDIA compile times (native Vulkan, cache off, 68
   compute modules by size): new SPIR-V path (pre-OpPhi) p50 25 ms, p90
   538, max 1,043; old path (dxil-spirv) p50 84, p90 414, max 2,447. The

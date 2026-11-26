@@ -33,9 +33,6 @@
 [functions."apps/victory/src/inspect.rs"]
 "run" = { cognitive = 27, cyclomatic = 18 }
 
-[functions."apps/victory/src/run.rs"]
-"run" = { cognitive = 10, cyclomatic = 23 }
-
 [functions."apps/victory/src/shader.rs"]
 "run" = { cognitive = 81, cyclomatic = 27 }
 
@@ -71,7 +68,6 @@
 "State::op_text" = { cognitive = 26, cyclomatic = 14 }
 "State::prepare_for" = { cognitive = 28, cyclomatic = 20 }
 "State::slots_text" = { cognitive = 38, cyclomatic = 30 }
-"State::table_entry" = { cognitive = 22, cyclomatic = 22 }
 "State::tables" = { cognitive = 114, cyclomatic = 61 }
 "readable" = { cognitive = 27, cyclomatic = 19 }
 
@@ -87,20 +83,13 @@
 [functions."crates/victory-gpu/src/list.rs"]
 "copy_texture_region" = { cognitive = 32, cyclomatic = 23 }
 
-[functions."crates/victory-gpu/src/list/thin.rs"]
-"translate" = { cognitive = 20, cyclomatic = 25 }
-
 [functions."crates/victory-gpu/src/memory.rs"]
 "ready" = { cognitive = 39, cyclomatic = 25 }
 
 [functions."crates/victory-gpu/src/memory/cache.rs"]
 "Memory::cache_plan" = { cognitive = 173, cyclomatic = 77 }
 
-[functions."crates/victory-gpu/src/pipeline/catalog.rs"]
-"decode" = { cognitive = 7, cyclomatic = 28 }
-
 [functions."crates/victory-gpu/src/pipeline/host.rs"]
-"GraphicsState::decode" = { cognitive = 6, cyclomatic = 63 }
 "HostPipeline::new" = { cognitive = 62, cyclomatic = 44 }
 
 [functions."crates/victory-gpu/src/pipeline/make.rs"]
@@ -115,37 +104,20 @@
 "hosted" = { cognitive = 52, cyclomatic = 36 }
 "let_go_idle" = { cognitive = 28, cyclomatic = 20 }
 
-[functions."crates/victory-gpu/src/shader_cache.rs"]
-"decode" = { cognitive = 5, cyclomatic = 47 }
-
 [functions."crates/victory-gpu/src/texture.rs"]
 "Staging::refresh_now" = { cognitive = 38, cyclomatic = 25 }
 
 [functions."crates/victory-gpu/src/vulkan.rs"]
 "Engine::pump" = { cognitive = 79, cyclomatic = 21 }
 
-[functions."crates/victory-gpu/src/warp_tests.rs"]
-"bare_cost::Rig::new" = { cognitive = 2, cyclomatic = 22 }
-
 [functions."crates/victory-gpu/src/watch.rs"]
 "guard" = { cognitive = 29, cyclomatic = 20 }
 
-[functions."crates/victory-hle/src/modules/dstorage.rs"]
-"execute" = { cognitive = 24, cyclomatic = 21 }
-
 [functions."crates/victory-hle/src/modules/xmem.rs"]
-"XMemVirtualAlloc" = { cognitive = 25, cyclomatic = 23 }
-"on_fault" = { cognitive = 25, cyclomatic = 25 }
 "show" = { cognitive = 35, cyclomatic = 24 }
 
 [functions."crates/victory-loader/src/console_insn.rs"]
 "emulate" = { cognitive = 43, cyclomatic = 31 }
-
-[functions."crates/victory-loader/src/console_insn_decode.rs"]
-"decode" = { cognitive = 21, cyclomatic = 42 }
-
-[functions."crates/victory-loader/src/prepare.rs"]
-"prepare" = { cognitive = 11, cyclomatic = 23 }
 
 [functions."crates/victory-shader/src/emit/bitcode.rs"]
 "Module::write" = { cognitive = 61, cyclomatic = 62 }
@@ -162,16 +134,11 @@
 
 [functions."crates/victory-shader/src/emit/host.rs"]
 "Host::dispatch" = { cognitive = 43, cyclomatic = 54 }
-"Host::draw" = { cognitive = 21, cyclomatic = 35 }
-
-[functions."crates/victory-shader/src/emit/intersect.rs"]
-"Lower::bvh" = { cognitive = 23, cyclomatic = 33 }
 
 [functions."crates/victory-shader/src/emit/intersect_tests.rs"]
 "scene" = { cognitive = 47, cyclomatic = 19 }
 
 [functions."crates/victory-shader/src/emit/lower.rs"]
-"Lower::buffer_placed" = { cognitive = 18, cyclomatic = 27 }
 "Lower::buffer_view" = { cognitive = 159, cyclomatic = 153 }
 "Lower::compare" = { cognitive = 40, cyclomatic = 66 }
 "Lower::descriptor_data" = { cognitive = 110, cyclomatic = 73 }
@@ -180,13 +147,9 @@
 "Lower::export" = { cognitive = 81, cyclomatic = 57 }
 "Lower::fill_phis" = { cognitive = 42, cyclomatic = 34 }
 "Lower::find_sections" = { cognitive = 27, cyclomatic = 15 }
-"Lower::flat" = { cognitive = 18, cyclomatic = 26 }
-"Lower::handle" = { cognitive = 13, cyclomatic = 24 }
 "Lower::image" = { cognitive = 268, cyclomatic = 175 }
-"Lower::inst" = { cognitive = 21, cyclomatic = 44 }
 "Lower::integer" = { cognitive = 77, cyclomatic = 114 }
 "Lower::interp" = { cognitive = 59, cyclomatic = 52 }
-"Lower::memory_flat" = { cognitive = 21, cyclomatic = 41 }
 "Lower::new" = { cognitive = 87, cyclomatic = 60 }
 "Lower::packed16" = { cognitive = 55, cyclomatic = 35 }
 "Lower::placed" = { cognitive = 46, cyclomatic = 49 }
@@ -203,7 +166,6 @@
 
 [functions."crates/victory-shader/src/emit/mod.rs"]
 "emit_forms" = { cognitive = 51, cyclomatic = 30 }
-"signature" = { cognitive = 12, cyclomatic = 40 }
 
 [functions."crates/victory-shader/src/emit/own_bits.rs"]
 "Ctx::new" = { cognitive = 30, cyclomatic = 13 }
@@ -226,12 +188,7 @@
 "Instruction::fields" = { cognitive = 57, cyclomatic = 51 }
 "Instruction::valu" = { cognitive = 62, cyclomatic = 38 }
 
-[functions."crates/victory-shader/src/gfx10/mod.rs"]
-"instruction" = { cognitive = 12, cyclomatic = 27 }
-"name" = { cognitive = 3, cyclomatic = 23 }
-
 [functions."crates/victory-shader/src/gfx10/sp3.rs"]
-"const_name" = { cognitive = 1, cyclomatic = 21 }
 "operands" = { cognitive = 69, cyclomatic = 53 }
 "valu" = { cognitive = 87, cyclomatic = 48 }
 
@@ -247,12 +204,7 @@
 "L::export" = { cognitive = 37, cyclomatic = 26 }
 "L::export_stores" = { cognitive = 49, cyclomatic = 36 }
 "L::finish" = { cognitive = 58, cyclomatic = 41 }
-"L::flat" = { cognitive = 25, cyclomatic = 29 }
-"L::handle" = { cognitive = 20, cyclomatic = 28 }
 "L::image" = { cognitive = 198, cyclomatic = 155 }
-"L::inst" = { cognitive = 13, cyclomatic = 29 }
-"L::int16" = { cognitive = 13, cyclomatic = 24 }
-"L::integer" = { cognitive = 1, cyclomatic = 162 }
 "L::interp" = { cognitive = 43, cyclomatic = 49 }
 "L::run" = { cognitive = 28, cyclomatic = 26 }
 "L::smem" = { cognitive = 26, cyclomatic = 38 }
@@ -274,14 +226,10 @@
 "unspill" = { cognitive = 119, cyclomatic = 67 }
 "without_skips" = { cognitive = 86, cyclomatic = 51 }
 
-[functions."crates/victory-shader/src/native.rs"]
-"programs" = { cognitive = 17, cyclomatic = 39 }
-
 [functions."crates/victory-shader/src/resource.rs"]
 "Tracer::carried" = { cognitive = 28, cyclomatic = 19 }
 "Tracer::lane_copies" = { cognitive = 28, cyclomatic = 21 }
 "Tracer::lane_phi" = { cognitive = 26, cyclomatic = 20 }
-"Tracer::picked" = { cognitive = 10, cyclomatic = 22 }
 "Tracer::propagate_copies" = { cognitive = 38, cyclomatic = 15 }
 "Tracer::waterfall" = { cognitive = 54, cyclomatic = 47 }
 "track" = { cognitive = 44, cyclomatic = 36 }
@@ -292,11 +240,9 @@
 [functions."crates/victory-shader/src/structure.rs"]
 "Lanes::check_joins" = { cognitive = 31, cyclomatic = 18 }
 "Lanes::masks_in_order" = { cognitive = 29, cyclomatic = 14 }
-"Lanes::sop" = { cognitive = 14, cyclomatic = 30 }
 "Lanes::step" = { cognitive = 72, cyclomatic = 47 }
 
 [functions."crates/victory-shader/src/vk/emit.rs"]
-"Emit::builtin" = { cognitive = 18, cyclomatic = 29 }
 "Emit::close" = { cognitive = 33, cyclomatic = 16 }
 "Emit::emit_node" = { cognitive = 55, cyclomatic = 45 }
 "Emit::image" = { cognitive = 144, cyclomatic = 56 }
@@ -305,37 +251,22 @@
 [functions."crates/victory-shader/src/vk/lift.rs"]
 "Lift::buffer" = { cognitive = 29, cyclomatic = 34 }
 "Lift::ds" = { cognitive = 48, cyclomatic = 44 }
-"Lift::flat" = { cognitive = 22, cyclomatic = 28 }
 "Lift::fold" = { cognitive = 78, cyclomatic = 74 }
-"Lift::input" = { cognitive = 22, cyclomatic = 25 }
-"Lift::inst" = { cognitive = 6, cyclomatic = 22 }
 "Lift::run" = { cognitive = 75, cyclomatic = 44 }
 "Lift::salu_arith" = { cognitive = 38, cyclomatic = 46 }
 "Lift::smem" = { cognitive = 32, cyclomatic = 19 }
 "Lift::sop" = { cognitive = 114, cyclomatic = 102 }
 "Lift::typed_load" = { cognitive = 37, cyclomatic = 18 }
 "float_uses" = { cognitive = 85, cyclomatic = 27 }
-"tformat" = { cognitive = 1, cyclomatic = 40 }
 
 [functions."crates/victory-shader/src/vk/lift_image.rs"]
 "Lift::image" = { cognitive = 146, cyclomatic = 100 }
 
 [functions."crates/victory-shader/src/vk/lift_valu.rs"]
-"Lift::compare" = { cognitive = 11, cyclomatic = 37 }
-"Lift::dpp" = { cognitive = 25, cyclomatic = 35 }
 "Lift::valu_op" = { cognitive = 209, cyclomatic = 317 }
 
 [functions."crates/victory-shader/src/vk/mod.rs"]
 "translate" = { cognitive = 27, cyclomatic = 27 }
 
-[functions."crates/victory-vk/src/gfx10.rs"]
-"from_dxgi" = { cognitive = 1, cyclomatic = 69 }
-
 [functions."crates/victory-vk/src/host.rs"]
 "Host::create" = { cognitive = 39, cyclomatic = 52 }
-
-[functions."crates/victory-vk/src/present.rs"]
-"clear_frames" = { cognitive = 25, cyclomatic = 30 }
-
-[functions."crates/victory-vk/src/probe.rs"]
-"steps" = { cognitive = 23, cyclomatic = 41 }
