@@ -49,10 +49,23 @@ fn at_names() -> &'static Mutex<Vec<String>> {
 /// there, it is recorded now (the caller is outside rendering when this
 /// returns true: it ends its pass first when `wants` says so).
 pub(super) fn wants(name: &str) -> bool {
-    cfg!(feature = "diagnostics")
-        && from().is_some_and(|f| super::present::FRAME.load(Ordering::Relaxed) >= f)
-        && lock(at_names()).iter().any(|n| n == name)
+    if !cfg!(feature = "diagnostics") {
+        return false;
+    }
+    let Some(f) = from() else { return false };
+    let frame = super::present::FRAME.load(Ordering::Relaxed);
+    if frame == f {
+        let mut order = lock(&ORDER);
+        if !order.iter().any(|n| n == name) {
+            order.push(name.to_string());
+        }
+    }
+    frame >= f && lock(at_names()).iter().any(|n| n == name)
 }
+
+/// The programs of the first dumped frame in the order they were first
+/// used (told with the dump: which names `VICTORY_VK_DUMP_AT` can take).
+static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// # Safety
 /// Recording into `cmd`, outside rendering.
@@ -180,6 +193,10 @@ pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
         tracing::info!(frame, at = format_args!("{:#x}", img.key.address), width = img.extent.width, height = img.extent.height, min = lo, max = hi, not_zero = some, "Vulkan: a depth image's values at the dump");
     }
     tell_depth_uses();
+    let order = std::mem::take(&mut *lock(&ORDER));
+    for (n, part) in order.chunks(40).enumerate() {
+        tracing::info!(part = n, programs = %part.join(" "), "Vulkan: the programs of the first dumped frame, in the order of their first use");
+    }
     tracing::info!(frame, images = p.items.len(), label = %p.label, "Vulkan: the card-written images dumped beside the frame");
     // SAFETY: the queue is idle and nothing else names the buffer.
     unsafe { p.held.destroy(&b.host) };
