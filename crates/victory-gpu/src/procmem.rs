@@ -58,6 +58,25 @@ pub(crate) fn start() {
     });
 }
 
+/// This process's resident memory and its peak in bytes, as Linux counts
+/// them (`VmRSS`, `VmHWM` of `/proc/<pid>/status` through Wine's `Z:`);
+/// `None` where that cannot be read.
+pub(crate) fn resident() -> Option<(u64, u64)> {
+    static PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let pid = (*PID.get_or_init(unix_pid))?;
+    let status = std::fs::read_to_string(format!(r"Z:\proc\{pid}\status")).ok()?;
+    let kb = |field: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v << 10)
+    };
+    Some((kb("VmRSS:")?, kb("VmHWM:")?))
+}
+
+
 /// This process's Linux pid: the one whose maps show the middle page of
 /// three we reserve, committed read-only, as a mapping of its own (its
 /// neighbours are reserved, no access, so Linux keeps it apart). The

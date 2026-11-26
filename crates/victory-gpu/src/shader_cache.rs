@@ -1,9 +1,12 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the translator
-//! that translated it (its source fingerprint and settings, see `build`), so
-//! a changed translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's hash (BLAKE3 of its bytes) and by
+//! the translator that translated it (its source fingerprint and settings,
+//! see `build`), so a changed translator never serves an old translation.
+//! Keyed by the hash, not the bytes, so that the pipeline bake finds a
+//! translation from a pipeline's description alone, without the title's
+//! container ([`by_hash`]). Entries go through `victory-pipeline`'s
+//! content-addressed cache, which writes them atomically; an entry that
+//! does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -63,7 +66,7 @@ fn build() -> [u8; 32] {
         }
     });
     let mut h = blake3::Hasher::new();
-    h.update(b"victory shader cache key 2\0");
+    h.update(b"victory shader cache key 3\0");
     if let Some(exe) = exe {
         h.update(exe);
     }
@@ -86,6 +89,38 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+/// The translation of the container whose BLAKE3 is `hash`, if the cache
+/// holds one for this translator; nothing is translated.
+pub(crate) fn by_hash(hash: &[u8; 32]) -> Option<HostShader> {
+    let shader = std::fs::read(entry(CACHE.get()?, &build(), hash)).ok().and_then(|b| decode(&b))?;
+    HITS.fetch_add(1, Ordering::Relaxed);
+    Some(shader)
+}
+
+/// Whether the cache holds a translation of the container whose BLAKE3 is
+/// `hash` (a look at the file only).
+pub(crate) fn has(hash: &[u8; 32]) -> bool {
+    CACHE.get().is_some_and(|cache| entry(cache, &build(), hash).is_file())
+}
+
+/// Where `cache` keeps the translation by `build` of the container whose
+/// BLAKE3 is `hash`.
+fn entry(cache: &Cache, build: &[u8; 32], hash: &[u8; 32]) -> PathBuf {
+    let converter = Translate {
+        translate: |_: &[u8]| Err::<HostShader, String>(String::new()),
+        container: &[],
+        ran: AtomicBool::new(false),
+    };
+    let input = [&build[..], hash].concat();
+    cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input))
+}
+
+/// What makes a translation: [`build`] (for the pipeline bake's record of
+/// what it baked with).
+pub(crate) fn translator() -> [u8; 32] {
+    build()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
@@ -97,14 +132,16 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
-struct Translate<F> {
+/// The cache entry's converter: the build and the container's hash in,
+/// the encoded translation of `container` out. `ran` tells a miss from a
+/// hit.
+struct Translate<'a, F> {
     translate: F,
+    container: &'a [u8],
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<'_, F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -112,9 +149,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         // The build fingerprint in the input does the versioning.
         1
     }
-    fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(self.container).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -125,9 +162,10 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let input = [&build[..], blake3::hash(container).as_bytes()].concat();
     let converter = Translate {
         translate,
+        container,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
@@ -400,6 +438,11 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+
+        // Found by the container's hash alone (the pipeline bake's way).
+        let at = entry(&cache, &build, blake3::hash(container).as_bytes());
+        assert_eq!(std::fs::read(at).ok().and_then(|b| decode(&b)), Some(shader()));
+        assert!(!entry(&cache, &build, blake3::hash(b"other").as_bytes()).is_file());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

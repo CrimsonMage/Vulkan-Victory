@@ -168,11 +168,20 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
+    let pick = |hash: &blake3::Hash| all || wanted.contains(&hash.to_hex()[..16]);
+    warm_matching(&paths, &pick, &asked, jobs.unwrap_or(4))
+}
+
+/// Translates into the shader cache every container under `paths` whose
+/// BLAKE3 `pick` takes (once each), on `threads` threads; `asked` says
+/// how many were asked for, in the closing line.
+pub fn warm_matching(paths: &[PathBuf], pick: &(dyn Fn(&blake3::Hash) -> bool + Sync), asked: &str, threads: usize) -> Result<()> {
+    let threads = threads.max(1);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 4];
-    for root in &paths {
+    for root in paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
@@ -189,8 +198,8 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             let Some(bytes) = job.bytes() else {
                                 continue;
                             };
-                            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            let full = blake3::hash(&bytes);
+                            if !pick(&full) || !lock(&done).insert(*full.as_bytes()) {
                                 continue;
                             }
                             let n = counts[3].fetch_add(1, Ordering::Relaxed) + 1;
@@ -210,7 +219,6 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
-    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
     println!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads",
         translated + there + failed,

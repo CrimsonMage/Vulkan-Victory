@@ -1,5 +1,5 @@
 //! Compiled host pipelines kept on disk, and the title pipelines worth
-//! starting early (decision 0007, "Pipeline cache").
+//! baking (decision 0007, "Pipeline cache").
 //!
 //! 1. Every host pipeline goes into the host's pipeline library, named by
 //!    a hash of all that its host description holds (the translated
@@ -7,10 +7,9 @@
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
 //!    an entry whose description differs, so neither is ever used.
-//! 2. The title pipelines a run drew or dispatched with are listed by a key
-//!    known when the title creates them (their shader containers and
-//!    graphics state); the next run hands those to the workers at
-//!    creation, during loading.
+//! 2. The title pipelines a run drew or dispatched with are listed, with
+//!    their descriptions, in the pipeline catalog beside it
+//!    (`super::catalog`), which the bake makes them from (`super::bake`).
 //!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
@@ -45,7 +44,6 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below).
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -55,13 +53,18 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the catalog in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder of the library and the catalog, if one is set.
+pub(crate) fn dir() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
-/// started at creation, since the start.
+/// queued at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
@@ -401,9 +404,6 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
-const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -571,7 +571,7 @@ fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
     }
 }
 
-/// Writes the library and the early list if pipelines were added since the
+/// Writes the library and the catalog if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -590,9 +590,9 @@ pub(crate) fn save(now: bool) {
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
+    // added: the library on disk is then what it was, and only the
+    // catalog is written (a title pipeline first drawn with wrote all
+    // 1,352 MB of the library again: run 60's second save).
     let bytes = {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -602,9 +602,6 @@ pub(crate) fn save(now: bool) {
             store(library, name, pso);
         }
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
-        }
         if added == 0 {
             0
         } else {
@@ -621,7 +618,6 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = super::lock(&USED).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -637,15 +633,15 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = library_written.and_then(|()| super::catalog::save(dir));
     match written {
-        Ok(()) => tracing::info!(
+        Ok(_) if bytes == 0 => {}
+        Ok(catalog) => tracing::info!(
             bytes,
-            early = used.len(),
+            catalog,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
+            queued_at_creation = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -680,42 +676,10 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
-}
-
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-static USED_CHANGED: AtomicBool = AtomicBool::new(false);
-
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = super::lock(&USED);
-    if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
-    }
-    used
-}
-
-/// Whether the title pipeline with `key` was requested in this or an earlier run.
-pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
-}
-
-/// A draw or dispatch requested the title pipeline with `key`.
-pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]
