@@ -57,7 +57,7 @@ pub(crate) fn on() -> bool {
         let asked = std::env::var("VICTORY_GPU").unwrap_or_default();
         let on = asked.trim().eq_ignore_ascii_case("vulkan");
         if on {
-            tracing::info!("VICTORY_GPU=vulkan: the Vulkan backend runs (milestone M2a: queues, fences, memory, present; no draws yet)");
+            tracing::info!("VICTORY_GPU=vulkan: the Vulkan backend runs (milestone M2b: draws, dispatches, card images, descriptors, planes)");
         }
         on
     })
