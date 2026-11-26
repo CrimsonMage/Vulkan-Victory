@@ -39,6 +39,8 @@ impl Default for HostPolicy {
             // Window, message and shell APIs: the host's desktop window
             // stands in for the console's single core window.
             "ext-ms-win-rtcore-ntuser-*",
+            // The console's `minuserx.dll` (see `modules::twins`).
+            "user32.dll",
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
@@ -65,13 +67,7 @@ impl HostPolicy {
     }
 
     pub fn allows(&self, dll: &str) -> bool {
-        let dll = dll.to_ascii_lowercase();
-        self.allow
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => dll.starts_with(prefix),
-                None => dll == *pattern,
-            })
+        crate::registry::matches(&self.allow, dll)
     }
 
     pub(crate) fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Option<usize> {

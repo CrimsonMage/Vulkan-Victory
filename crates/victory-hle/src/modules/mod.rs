@@ -14,6 +14,7 @@ pub mod ffx;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
+pub mod kernelx;
 pub mod lifecycle;
 pub mod media;
 pub mod net;
@@ -37,6 +38,7 @@ use crate::HleModule;
 pub(crate) fn all() -> Vec<HleModule> {
     vec![
         kernel::module(),
+        kernelx::module(),
         xgameruntime::module(),
         gameinput::module(),
         d3d12x::module(),
@@ -55,30 +57,39 @@ pub(crate) fn all() -> Vec<HleModule> {
     ]
 }
 
-/// The PC DLLs a console DLL is under another name, in lookup order: an
+/// The DLLs a console DLL is under another name, in lookup order: an
 /// import of it is looked up under each (ours first, then the host's).
 /// `kernelx.dll` is kernel32, kernelbase and advapi32 in one, with the XMem
-/// API and app-state notifications; the legacy and app-model DLLs are parts
-/// of the same.
+/// API and app-state notifications (its own exports are in [`kernelx`]);
+/// the legacy and app-model DLLs are parts of the same. `minuserx.dll` is
+/// the PC's user32; the runtime's other names are ours.
 pub(crate) fn twins(dll: &str) -> &'static [&'static str] {
-    const CONSOLE: [&str; 4] = [
-        "kernelx.dll",
-        "kernel32legacy.dll",
-        "advapi32legacy.dll",
-        "minappmodelx.dll",
+    const TWINS: &[(&[&str], &[&str])] = &[
+        (
+            &[
+                "kernelx.dll",
+                "kernel32legacy.dll",
+                "advapi32legacy.dll",
+                "minappmodelx.dll",
+            ],
+            &[
+                "kernel32.dll",
+                "kernelbase.dll",
+                "advapi32.dll",
+                "xmem.dll",
+                "api-ms-win-core-psm-appnotify-l1-1-0.dll",
+            ],
+        ),
+        (&["minuserx.dll"], &["user32.dll"]),
+        (
+            &["xgameplatform.dll", "xgameruntime*"],
+            &["xgameruntime.dll"],
+        ),
     ];
-    const PC: &[&str] = &[
-        "kernel32.dll",
-        "kernelbase.dll",
-        "advapi32.dll",
-        "xmem.dll",
-        "api-ms-win-core-psm-appnotify-l1-1-0.dll",
-    ];
-    if CONSOLE.iter().any(|c| c.eq_ignore_ascii_case(dll)) {
-        PC
-    } else {
-        &[]
-    }
+    TWINS
+        .iter()
+        .find(|(console, _)| crate::registry::matches(console, dll))
+        .map_or(&[], |(_, pc)| pc)
 }
 
 /// Single exports of title DLLs we replace, the DLL itself staying the

@@ -34,6 +34,9 @@ use victory_gpu::mapstat::Site;
 
 use crate::{HleModule, hle_export};
 
+mod hooks;
+pub use hooks::{XMemAlloc, XMemFree, XMemSetAllocationHooks};
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -255,64 +258,6 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
     Layout::from_size_align(size.checked_add(align)?, align).ok()
-}
-
-type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-type FreeRoutine = extern "system" fn(*mut c_void, u64);
-
-/// The allocation and free routines the title's exe exports as
-/// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
-/// `XMemFree` call them, for the title's own calls and its middleware's;
-/// the `…Default` exports do not.
-fn hooks() -> [usize; 2] {
-    static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let at = match AT.get() {
-        Some(&at) => at,
-        // Looked up once the title is mapped, which is before it runs.
-        None => match crate::runtime::main_image() {
-            Some(base) => *AT.get_or_init(|| {
-                use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-                // SAFETY: a mapped image and a NUL-terminated name.
-                let at = unsafe {
-                    GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
-                }
-                .map_or(0, |f| f as usize);
-                tracing::info!(found = at != 0, "xmem allocation hooks");
-                at
-            }),
-            None => 0,
-        },
-    };
-    if at == 0 {
-        return [0; 2];
-    }
-    // SAFETY: the export is two routine pointers.
-    unsafe { (at as *const [usize; 2]).read() }
-}
-
-/// The title's general allocator, for middleware too: its hook if it has
-/// one, else [`XMemAllocDefault`].
-pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
-        0 => XMemAllocDefault(size, attributes),
-        hook => {
-            // SAFETY: the title's own routine of this type.
-            let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
-        }
-    }
-}
-
-/// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
-    match hooks()[1] {
-        0 => XMemFreeDefault(address, attributes),
-        hook => {
-            // SAFETY: the title's own routine of this type.
-            let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
-            free(address, attributes)
-        }
-    }
 }
 
 /// The system allocator behind [`XMemAlloc`].
@@ -1659,6 +1604,7 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
+            hle_export!(XMemSetAllocationHooks),
             hle_export!(XMemAllocDefault),
             hle_export!(XMemFreeDefault),
             hle_export!(XMemIsToolsMemAvailable),
@@ -1712,6 +1658,26 @@ pub mod memory {
         ok
     }
 
+    /// The console's `VirtualAlloc` flags of graphics and title memory
+    /// (`MEM_GRAPHICS`, `MEM_TITLE`), which the host refuses.
+    const CONSOLE_KINDS: u32 = 0x1000_0000 | 0x4000_0000;
+    /// The console's GPU access bits of a protection (`PAGE_GRAPHICS_*`).
+    const GRAPHICS_PROTECTION: u32 = 0x7_f800;
+
+    /// The title's `VirtualAlloc`: with console flags it goes the XMem way
+    /// (`XMemVirtualAlloc` strips them and places the memory as title
+    /// memory); anything else is the host's, unchanged.
+    #[allow(non_snake_case)]
+    pub extern "system" fn VirtualAlloc(at: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+        if kind & CONSOLE_KINDS == 0 && protect & GRAPHICS_PROTECTION == 0 {
+            // SAFETY: the title's own arguments.
+            return unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(at, size, kind, protect) };
+        }
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| tracing::info!(kind, protect, "VirtualAlloc with console flags: the XMem way"));
+        super::XMemVirtualAlloc(at, size, kind & !CONSOLE_KINDS, 0, protect)
+    }
+
     /// Victory's frees of title memory (`XMemFreeDefault`) go the same way.
     pub(crate) fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
         VirtualFree(address, size, kind)
@@ -1748,7 +1714,7 @@ pub mod memory {
         HleModule {
             name: "memory",
             dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-            exports: vec![hle_export!(VirtualFree)],
+            exports: vec![hle_export!(VirtualAlloc), hle_export!(VirtualFree)],
         }
     }
 }

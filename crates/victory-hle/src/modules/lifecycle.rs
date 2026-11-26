@@ -44,8 +44,7 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     if registration.is_null() {
         return ERROR_INVALID_PARAMETER;
     }
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let id = registration_id();
     routines().push((id, routine, context as usize));
     // SAFETY: checked non-null; the title passes room for its registration.
     unsafe { registration.write(id) };
@@ -55,6 +54,28 @@ pub extern "system" fn RegisterAppStateChangeNotification(
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
     routines().retain(|&(id, ..)| id != registration);
 }
+
+fn registration_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// kernelx: a title here is never constrained (its resources never cut
+/// back while another app is in front), so the routine is never called.
+pub extern "system" fn RegisterAppConstrainedChangeNotification(
+    routine: Option<Routine>,
+    _context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    if routine.is_none() || registration.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: checked non-null; the title passes room for its registration.
+    unsafe { registration.write(registration_id()) };
+    0
+}
+
+pub extern "system" fn UnregisterAppConstrainedChangeNotification(_registration: usize) {}
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
@@ -306,10 +327,13 @@ pub(crate) fn module() -> HleModule {
         dlls: &[
             "api-ms-win-core-psm-appnotify-*",
             "ext-ms-win-rtcore-ntuser-window-*",
+            "user32.dll",
         ],
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
+            hle_export!(RegisterAppConstrainedChangeNotification),
+            hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
         ],

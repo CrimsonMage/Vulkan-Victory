@@ -114,10 +114,7 @@ mod tests {
             Some(Provenance::Host)
         );
         // Console-only DLLs never pass through.
-        assert_eq!(
-            r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
-            None
-        );
+        assert_eq!(r.classify("xmem.dll", &name("Sleep")), None);
     }
 
     #[test]
@@ -133,7 +130,22 @@ mod tests {
         );
         assert_eq!(kernelx("Sleep"), Some(Provenance::Host));
         assert_eq!(kernelx("RegOpenKeyExW"), Some(Provenance::Hle));
+        assert_eq!(kernelx("GetConsoleType"), Some(Provenance::Hle));
+        assert_eq!(kernelx("VirtualAlloc"), Some(Provenance::Hle));
         assert_eq!(kernelx("NotAnExport"), None);
+        // Other names of PC DLLs and of the runtime.
+        assert_eq!(
+            r.classify("minuserx.dll", &name("CreateWindowExW")),
+            Some(Provenance::Hle)
+        );
+        assert_eq!(
+            r.classify("minuserx.dll", &name("PeekMessageW")),
+            Some(Provenance::Host)
+        );
+        assert_eq!(
+            r.classify("xgameplatform.dll", &name("QueryApiImpl")),
+            Some(Provenance::Hle)
+        );
         // No pass-through, no host twin.
         let strict = HleResolver::new(HostPolicy::none());
         assert_eq!(strict.classify("kernelx.dll", &name("Sleep")), None);
