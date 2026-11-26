@@ -10,6 +10,7 @@
 
 pub mod emit;
 pub mod graph;
+pub mod ifconv;
 pub mod lift;
 pub mod pack16;
 pub mod semantics;
@@ -160,6 +161,7 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
     }
     let (mut f, iface) = lift.run()?;
     tir::fold_branches(&mut f);
+    ifconv::if_convert(&mut f);
     tir::dce(&mut f);
     tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     let ir_insts = f.count();
