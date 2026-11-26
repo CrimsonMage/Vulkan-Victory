@@ -44,8 +44,12 @@ Vulkan 1.3 with:
   NVIDIA; the translator assumes `subgroupSize` = 32 and full subgroups,
   `VK_EXT_subgroup_size_control` `requiredSubgroupSize` 32 if available).
 - `VK_EXT_mesh_shader` for mesh programs, `VK_KHR_fragment_shader_barycentric`
-  only if a pixel program reads per-vertex attributes (`v_interp_mov`), and
-  `shaderDemoteToHelperInvocation`.
+  (`fragmentShaderBarycentric`) for pixel programs that read an
+  attribute per vertex (`v_interp_mov` of P10/P20, interpolation with
+  computed weights) or barycentrics as numbers: such an attribute is a
+  `PerVertexKHR` input at its semantic's location and every read of it
+  weighs its three vertices with `BaryCoordKHR`/`BaryCoordNoPerspKHR`
+  (P0 + i (P1 - P0) + j (P2 - P0)); and `shaderDemoteToHelperInvocation`.
 
 SPIR-V 1.6 (Vulkan 1.3), `PhysicalStorageBuffer64` addressing, GLSL450
 memory model. Every module passes `spirv-val --target-env vulkan1.3
