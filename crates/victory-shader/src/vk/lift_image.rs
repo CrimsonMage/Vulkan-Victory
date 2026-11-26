@@ -28,7 +28,7 @@ impl Lift<'_> {
             return Err(unsupported(off, "an image access with tfe or lwe"));
         }
         if name.starts_with("image_bvh") {
-            return self.bvh_miss(inst, &data);
+            return self.bvh(inst, name);
         }
         let Operand::Vector { reg: dreg, .. } = data else { return Err(unsupported(off, name)) };
         let (sdim, arrayed, ms, coords) = dim_class(dim);
@@ -450,16 +450,54 @@ impl Lift<'_> {
         self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, 3), &out)
     }
 
-    /// The ray/node test misses every node (as `VICTORY_BVH_MISS`): a box
-    /// node returns no child (all lanes 0xFFFFFFFF), a triangle a miss.
-    pub(super) fn bvh_miss(&mut self, inst: &Inst, data: &Operand) -> Res<()> {
-        self.approx("ray/node tests miss every node (no BVH yet)");
-        let Operand::Vector { reg, dwords } = *data else {
-            return Err(unsupported(inst.machine.offset, "a BVH test"));
-        };
-        let all = self.k32(u32::MAX);
-        for k in 0..dwords.max(4) {
-            self.def(inst, Reg::V(reg + k), R::D(all));
+    /// `image_bvh_intersect_ray` / `image_bvh64_intersect_ray`: the node
+    /// the pointer names (`((T# base 40 bits) << 8) + (pointer >> 3) * 64`,
+    /// 128 bytes of title memory in one range, else the zero block) tested
+    /// by `Helper::BvhRay`. Operands: the pointer (one or two dwords), the
+    /// ray's extent, origin, direction and inverse direction.
+    pub(super) fn bvh(&mut self, inst: &Inst, name: &'static str) -> Res<()> {
+        let off = inst.machine.offset;
+        let Fields::Image { data, addr, rsrc, a16, d16, .. } = inst.fields.clone() else { unreachable!() };
+        let Operand::Vector { reg, .. } = data else { return Err(unsupported(off, name)) };
+        let wide = name.starts_with("image_bvh64");
+        let mut x = Vec::new();
+        for o in &addr {
+            let Operand::Vector { reg: r, dwords } = *o else { return Err(unsupported(off, name)) };
+            for k in 0..dwords {
+                let v = self.val(inst, Reg::V(r + k))?;
+                let v = self.data(v);
+                x.push(self.u32v(v));
+            }
+        }
+        if a16 || d16 || x.len() != if wide { 12 } else { 11 } {
+            return Err(unsupported(off, "a ray/node test with 16-bit operands"));
+        }
+        let ptr = if wide { self.u64_of(x[0], x[1]) } else { self.spv(op::U_CONVERT, Ty::U64, &[x[0]]) };
+        let ray: Vec<V> = x[if wide { 2 } else { 1 }..].iter().map(|&v| self.f32v(v)).collect();
+        let w: Vec<V> = (0..2).map(|k| self.opnd_dw(inst, &rsrc, k, false).map(|v| self.u32v(v))).collect::<Res<_>>()?;
+        let kff = self.k32(0xFF);
+        let hi = self.spv(op::BITWISE_AND, Ty::U32, &[w[1], kff]);
+        let base = self.u64_of(w[0], hi);
+        let k8 = self.k32(8);
+        let base = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U64, &[base, k8]);
+        let k3 = self.k32(3);
+        let node = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U64, &[ptr, k3]);
+        let k6 = self.k32(6);
+        let node = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U64, &[node, k6]);
+        let node = self.spv(op::I_ADD, Ty::U64, &[base, node]);
+        let k128 = self.k32(128);
+        let dev = self.emit(Op::Call(Helper::TranslateRange), Ty::U64, vec![node, k128]);
+        let lo = self.spv(op::U_CONVERT, Ty::U32, &[ptr]);
+        let k7 = self.k32(7);
+        let kind = self.spv(op::BITWISE_AND, Ty::U32, &[lo, k7]);
+        let k31 = self.k32(31);
+        let sort = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[w[1], k31]);
+        let mut args = vec![dev, kind, sort];
+        args.extend(ray);
+        let r = self.emit(Op::Call(Helper::BvhRay), Ty::vec(S::U32, 4), args);
+        for k in 0..4u8 {
+            let c = self.extract(r, u32::from(k));
+            self.def(inst, Reg::V(reg + k), R::D(c));
         }
         Ok(())
     }

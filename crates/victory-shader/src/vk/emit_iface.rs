@@ -480,6 +480,10 @@ impl Emit<'_> {
             let (_, fid) = helpers.remove(k);
             self.write_typed_shape(fid);
         }
+        if let Some(k) = helpers.iter().position(|h| h.0 == Helper::BvhRay) {
+            let (_, fid) = helpers.remove(k);
+            self.write_bvh(fid);
+        }
         if helpers.is_empty() {
             return;
         }
