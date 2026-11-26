@@ -262,6 +262,13 @@ pub struct Caps {
     /// Unbound sparse pages read zeros (and drop writes).
     pub non_resident_strict: bool,
     pub timestamp_period: f32,
+    /// `VK_EXT_robustness2` `nullDescriptor`: null descriptors of any type.
+    pub null_descriptor: bool,
+}
+
+/// Whether null descriptors of any type are on (`VK_EXT_robustness2`).
+fn null_descriptor(extension: bool, rob2: &vk::PhysicalDeviceRobustness2FeaturesEXT) -> bool {
+    extension && rob2.null_descriptor == vk::TRUE
 }
 
 impl Caps {
@@ -748,6 +755,7 @@ impl Host {
             sparse_address_space_size: props.limits.sparse_address_space_size,
             non_resident_strict: props.sparse_properties.residency_non_resident_strict == vk::TRUE,
             timestamp_period: props.limits.timestamp_period,
+            null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
             extensions,
             features,
             core,

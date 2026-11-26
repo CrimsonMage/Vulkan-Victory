@@ -176,6 +176,9 @@ pub struct Recording {
 #[derive(Default)]
 pub struct Trail {
     pub notes: VecDeque<String>,
+    /// Beside each note: the descriptor table addresses its draw or
+    /// dispatch was given (empty for others).
+    pub tables: VecDeque<Vec<u32>>,
     pub earlier: u64,
 }
 
@@ -183,11 +186,17 @@ impl Trail {
     pub const MOST: usize = 64;
 
     pub fn push(&mut self, note: String) {
+        self.push_with(note, Vec::new());
+    }
+
+    pub fn push_with(&mut self, note: String, tables: Vec<u32>) {
         if self.notes.len() == Self::MOST {
             self.notes.pop_front();
+            self.tables.pop_front();
             self.earlier += 1;
         }
         self.notes.push_back(note);
+        self.tables.push_back(tables);
     }
 }
 

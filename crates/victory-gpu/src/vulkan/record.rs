@@ -165,6 +165,8 @@ pub(crate) struct Rec {
     /// the guard id of the compute stage last bound for a dispatch.
     noted: This,
     guard_id: u32,
+    /// Diagnostics: the descriptor table addresses of the last push.
+    last_tables: Vec<u32>,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -209,6 +211,7 @@ impl Default for Rec {
             last_layout: String::new(),
             noted: std::ptr::null(),
             guard_id: 0,
+            last_tables: Vec::new(),
             console: console::State::default(),
         }
     }
@@ -579,6 +582,15 @@ impl Rec {
         self.last_push = words;
         self.pushed = true;
         if cfg!(feature = "diagnostics") {
+            self.last_tables = stages
+                .iter()
+                .flat_map(|s| s.user_data.iter())
+                .filter(|u| matches!(u.root, RootType::Table) && (u.index as usize) < 64)
+                .map(|u| words[u.index as usize])
+                .filter(|&w| w != 0)
+                .collect();
+            self.last_tables.sort_unstable();
+            self.last_tables.dedup();
             self.last_user = stages
                 .iter()
                 .flat_map(|s| s.user_data.iter().map(|u| format!("{}<-{}.{}{:?}", u.index, u.slot, u.dword, u.root)))
@@ -792,9 +804,17 @@ impl Rec {
             skipped(false);
             return;
         };
+        // A dispatch of no groups draws nothing (it ran one group before);
+        // counts stay within the device's mesh limits.
+        let l = super::stages::limits(b);
+        let [x, y, z] = [x.min(l.mesh_groups[0]), y.min(l.mesh_groups[1]), z.min(l.mesh_groups[2])];
+        if x == 0 || y == 0 || z == 0 || u64::from(x) * u64::from(y) * u64::from(z) > u64::from(l.mesh_groups_total) {
+            skipped(false);
+            return;
+        }
         if let Some(cmd) = self.prepare_draw(b, true) {
             // SAFETY: rendering open, a mesh pipeline bound.
-            unsafe { mesh.cmd_draw_mesh_tasks(cmd, x.max(1), y.max(1), z.max(1)) };
+            unsafe { mesh.cmd_draw_mesh_tasks(cmd, x, y, z) };
             self.drawn(&format!("mesh {x}x{y}x{z}"));
         }
     }

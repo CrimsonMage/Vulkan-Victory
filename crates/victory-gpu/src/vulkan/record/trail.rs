@@ -65,7 +65,7 @@ impl Rec {
                 .unwrap_or_default();
             format!("{} [{names}]", what())
         };
-        r.trail.push(note);
+        r.trail.push_with(note, self.last_tables.clone());
     }
 
     /// Diagnostics: the first [`CULLS_LOGGED`] dispatches of each pipeline
