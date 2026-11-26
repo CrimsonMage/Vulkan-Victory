@@ -1,6 +1,7 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **draft v0** (2026-11-25). Owner of the translator side:
+Status: **v1** (2026-11-26; v0 2026-11-25). v1 takes the host's
+proposals (`docs/vulkan-host.md` section 6). Owner of the translator side:
 `crates/victory-shader/src/vk/`. Owner of the host side: the Vulkan host
 (branch `worktree-agent-a5b010d38d592dbd0`). Change this file first, then
 both sides; every change bumps `ABI_VERSION` (below) and the shader cache
@@ -23,7 +24,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 0`
+`ABI_VERSION = 1`
 
 ## 1. Vulkan requirements
 
@@ -87,33 +88,34 @@ rewrites the table loads, `spill.rs`).
 
 Title GPU addresses (the console's virtual addresses: what the title puts
 in root descriptors, V#s, tables, vertex/index views) are translated by
-one subtract and add over a small set of host imports of title memory:
+one subtract and add over the host's imports of title memory:
 
 ```
-struct MemoryMap {            // at push dwords 0-1, 16-byte aligned, read-only for shaders
+struct MemoryMap {            // at push dwords 0-1 (device address), 16-byte aligned, read-only
     u64 zero;                 // device address of >= 256 bytes of zeros (never written)
     u64 sink;                 // device address of >= 256 writable bytes nobody reads (dropped stores)
-    u32 count;                // ranges in use, <= 4
+    u32 count;                // ranges in use, 1..=64
     u32 pad[3];
     struct {
         u64 title_start;      // first title address of the range
         u64 title_size;       // bytes
         u64 device_base;      // device address that title_start maps to
         u64 pad;
-    } range[4];
+    } range[64];              // sorted by title_start, disjoint
 };
 ```
 
 `device = range.device_base + (title - range.title_start)` for the range
-with `title - title_start < title_size` (unsigned). The translator checks
-the ranges in order (unrolled, `count` read at run time). An address in
-no range reads zeros from `zero` and writes into `sink`; so does any
-access that is out of bounds (section 4). The map must stay valid and
-unchanged while any submitted work can read it; a new map is a new block.
+with `title - title_start < title_size` (unsigned). With `count == 1`
+(the host's title window: `title_start` 0, `device_base` the window) the
+translator does exactly that, one compare and add; otherwise a binary
+search over the sorted ranges (6 steps). An address in no range reads
+zeros from `zero` and writes into `sink`; so does any access that is out
+of bounds of its V# (section 4). The map must stay valid and unchanged
+while any submitted work can read it; a new map is a new block.
 
-Translation happens once per distinct base (a V#'s base, a table address,
-a root address): CSE keeps it out of loops; every access then only adds
-its offset.
+Translation happens once per distinct base (a V#'s base, a table
+address, a root address): every access then only adds its offset.
 
 ## 4. Buffers: V# (4 dwords)
 
@@ -144,13 +146,20 @@ the shader.
 
 ## 5. Images and samplers
 
-### 5.1 Descriptor set 0 (global, all stages, update-after-bind, partially bound)
+### 5.1 Descriptor sets
 
-| Binding | Type | Content |
-|---|---|---|
-| 0 | `SAMPLED_IMAGE[]` | image views, indexed by a T#'s slot |
-| 1 | `STORAGE_IMAGE[]` | storage views of UAV textures, indexed by the same slot |
-| 2 | `SAMPLER[]` | samplers, indexed by an S#'s slot |
+| Set | Binding | Type | Content |
+|---|---|---|---|
+| 0 | 0 | `SAMPLED_IMAGE[1 << 20]` | image views, indexed by a T#'s slot |
+| 0 | 1 | `STORAGE_IMAGE[1 << 20]` | storage views of UAV textures, indexed by the same slot |
+| 1 | 0 | `SAMPLER[4096]` | heap samplers, indexed by an S#'s slot |
+| 2 | 0 / 1 | `SAMPLER[n]`, immutable | immediate samplers of the compute/vertex/mesh (0) or pixel (1) program |
+
+Sets 0 and 1 are global (all stages, update-after-bind, partially
+bound); set 2 is per pipeline (embedded immutable samplers under
+`VK_EXT_descriptor_buffer`). The array sizes are fixed (descriptor
+buffers need them at layout creation); the host never hands out a slot
+past them.
 
 The translator declares several variables on bindings 0 and 1, one per
 image type it uses (1D, 2D, 3D, cube, arrays, multisampled; float or
@@ -187,12 +196,12 @@ slot to another keeps its slot.
 
 Heap samplers: real RDNA2 S# fields (WORD0–2 as Leonida's
 `encode(const Sampler&)`); **WORD3 BORDER_COLOR_PTR[11:0] is the slot**
-into set 0 binding 2 (the host owns border colours; BORDER_COLOR_TYPE
+into set 1 binding 0 (the host owns border colours; BORDER_COLOR_TYPE
 stays as the console's). At most 4,096 heap samplers.
 
 Immediate samplers (root signature static samplers, whose four words the
 console code builds from constants): the translator lists their words
-(`VkShader::samplers`, position n) and reads them from **set 1, element n
+(`VkShader::samplers`, position n) and reads them from **set 2, element n
 of binding 0** (compute, vertex and mesh programs) **or binding 1** (pixel
 programs): per-pipeline arrays of immutable samplers the host builds from
 the words (`StaticSampler::from_words`, already in `emit/sampler.rs`). A
@@ -200,21 +209,25 @@ stage with no immediate sampler declares nothing in set 1.
 
 ## 6. Stage interface
 
+- **Locations are fixed per semantic, pack-wide.** Every vertex/mesh
+  output and pixel input with semantic (name, index) has the location
+  `vk::SEMANTIC_LOCATIONS` gives it, found offline from the whole pack:
+  37 distinct semantics, at most 23 in one program, coloured so that no
+  two semantics one program uses share a location: 27 locations
+  (0..26). A semantic outside the table takes location 31. Each
+  semantic is a vec4 at its location, components as the console
+  signature's mask columns. No module is rewritten per vertex/pixel pair;
+  a pixel input no vertex output writes reads an undefined value.
 - **Vertex.** No vertex input bindings: the title's code fetches its
   vertices with buffer loads. `gl_VertexIndex` is the console's vertex id
   (index + base vertex), `gl_InstanceIndex - gl_BaseInstance` its instance
-  id. `exp pos0` is `gl_Position`; `exp param<n>` an output at
-  `Location = n` (vec4 of 32-bit, float or the signature's integer type).
-- **Pixel.** Inputs at the location of the attribute the console reads
-  (`v_interp_*` attribute index), with the interpolation the barycentrics
-  say (perspective/linear × center/centroid/sample). Because the console
-  driver links the pixel program's attributes to the vertex program's
-  parameters by semantic at pipeline creation, so does the host: each
-  module lists its interface (`VkShader::interface`: semantic name, index,
-  location, the word offset of the `Location` literal), and
-  `victory_shader::vk::link(vertex, pixel)` rewrites the pixel module's
-  locations to the vertex module's for the same semantic (a pixel input no
-  vertex output names reads 0 from a location past both). `exp mrt<n>` is
+  id. `exp pos0` is `gl_Position`; `exp param<n>` writes the outputs of
+  signature row n at their semantics' locations (32-bit float; integer
+  values travel as float bits). Outputs carry no interpolation
+  decorations.
+- **Pixel.** Inputs at their semantics' locations with the interpolation
+  the barycentrics say (perspective/linear × center/centroid/sample,
+  flat for `v_interp_mov` P0). `exp mrt<n>` is
   `Location = n` with the type of the console signature's `SV_Target<n>`
   (float, uint or int vec4); depth, stencil export and sample mask as
   `FragDepth`, `FragStencilRefEXT`, `SampleMask`. A lane killed by the
@@ -244,8 +257,8 @@ pub struct VkShader {
     pub stage: HwStage,
     pub spirv: Vec<u32>,
     pub user_data: Vec<emit::UserData>,  // push dword (stage window + index) <- root slot/dword
-    pub samplers: Vec<[u32; 4]>,         // immediate samplers, set 1 binding 0 element n
-    pub interface: Vec<Interface>,       // vertex outputs / pixel inputs and outputs
+    pub samplers: Vec<[u32; 4]>,         // immediate samplers, set 2 binding 0/1 element n
+    pub interface: Vec<Interface>,       // semantics and locations (information only)
     pub local_size: [u32; 3],            // compute / mesh
     pub approximate: Vec<&'static str>,  // wave64 operations taken per half
 }
@@ -261,4 +274,6 @@ pub struct VkShader {
   `VICTORY_BVH_MISS` does today.
 - Whether graphics stages should share one user-data window (the layouts
   in the pack put the same root parameter at the same index in every
-  stage; v0 keeps one window per stage).
+  stage; v1 keeps one window per stage).
+- Heaps below 4 GiB: the host checks it at heap creation (section 2,
+  `Table`).
