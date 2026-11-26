@@ -14,6 +14,9 @@ use victory_shader::vk::UserData;
 use victory_shader::vk::{Interface, VkShader};
 use victory_shader::{HwStage, RootType};
 
+/// The file encoding's version: bump it when `encode`/`decode` change.
+/// (The key used to hash this whole file, so any edit here, even one that
+/// left the encoding alone, threw every kept translation away.)
 const MAGIC: &[u8; 8] = b"vkstage2";
 
 fn dir() -> Option<&'static PathBuf> {
@@ -44,7 +47,6 @@ fn key() -> &'static str {
         h.update(&victory_shader::translation_fingerprint());
         h.update(&victory_shader::vk::ABI_VERSION.to_le_bytes());
         h.update(&victory_shader::vk::semantics::SEMANTICS_VERSION.to_le_bytes());
-        h.update(include_bytes!("stage_cache.rs"));
         h.finalize().to_hex()[..16].to_string()
     })
 }
