@@ -20,6 +20,7 @@ const CAP_STENCIL_EXPORT: u32 = 5013;
 const CAP_FRAGMENT_BARYCENTRIC: u32 = 5284;
 const CAP_MESH_SHADING: u32 = 5283;
 const CAP_STORAGE_IMAGE_MULTISAMPLE: u32 = 27;
+const CAP_INT64_IMAGE: u32 = 5016;
 
 /// The device limits the check compares with.
 #[derive(Clone, Debug, Default)]
@@ -44,6 +45,8 @@ pub struct Limits {
     pub stencil_export: bool,
     pub barycentric: bool,
     pub storage_image_multisample: bool,
+    /// `shaderImageInt64Atomics` (ABI v5: 64-bit image atomics).
+    pub image_int64_atomics: bool,
 }
 
 impl Limits {
@@ -80,6 +83,7 @@ impl Limits {
             barycentric: host.caps.has(ash::khr::fragment_shader_barycentric::NAME),
             storage_image_multisample: host.caps.core.shader_storage_image_multisample
                 == vk::TRUE,
+            image_int64_atomics: host.caps.image_int64_atomics,
         }
     }
 
@@ -112,6 +116,7 @@ impl Limits {
             (CAP_FRAGMENT_BARYCENTRIC, self.barycentric, "per-vertex attributes without VK_KHR_fragment_shader_barycentric"),
             (CAP_MESH_SHADING, self.mesh, "a mesh program without mesh shaders"),
             (CAP_STORAGE_IMAGE_MULTISAMPLE, self.storage_image_multisample, "multisampled storage images without the feature"),
+            (CAP_INT64_IMAGE, self.image_int64_atomics, "64-bit image atomics without shaderImageInt64Atomics"),
         ];
         needs
             .iter()

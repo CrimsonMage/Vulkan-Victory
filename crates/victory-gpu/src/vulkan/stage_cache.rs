@@ -17,7 +17,7 @@ use victory_shader::{HwStage, RootType};
 /// The file encoding's version: bump it when `encode`/`decode` change.
 /// (The key used to hash this whole file, so any edit here, even one that
 /// left the encoding alone, threw every kept translation away.)
-const MAGIC: &[u8; 8] = b"vkstage3";
+const MAGIC: &[u8; 8] = b"vkstage4";
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();

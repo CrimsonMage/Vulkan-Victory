@@ -142,6 +142,18 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: 64-bit image atomics (ABI v5). The 679 alpha prepass
+  pixel programs do one `image_atomic_umax` on a two-dword texel (depth
+  high, payload low); it ran on the low dword only. Now a u64 atomic on an
+  R64_UINT view of the same image (set 0 binding 3 at the T#'s slot, a
+  third 2^20 array like the cube binding: 4 MiB of descriptors at
+  NVIDIA's 4 bytes); every other program keeps the two-channel views.
+  Chosen over a "64-bit texel" T# bit with a split/join typed path: only
+  the atomic touches the new binding, the typed load/store path stays as
+  it is, and no compact second index is needed at that descriptor size.
+  A device without `shaderImageInt64Atomics` refuses those modules with
+  the reason (no low-dword fallback: it was wrong output anyway).
+
 - 2026-11-26: the black world: the host refused the world's and the
   characters' mesh programs (`MS_VS_Transform*`, `MS_VS_PedTransform*`)
   before compiling, their output memory over NVIDIA's 32 KiB. Their maxima

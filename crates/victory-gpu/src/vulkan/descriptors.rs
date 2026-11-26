@@ -46,6 +46,8 @@ pub(crate) struct Heaps {
     storage_at: u64,
     /// Set 0 binding 2: 2D-array views of cube images (ABI v2).
     cube_at: u64,
+    /// Set 0 binding 3: R64_UINT storage views of two-dword images (ABI v5).
+    wide_at: u64,
     sampler_at: u64,
     map_at: u64,
     map_stride: u64,
@@ -53,8 +55,8 @@ pub(crate) struct Heaps {
     maps: Buffer,
     zero_sink: Buffer,
     state: Mutex<State>,
-    /// Slot 0's descriptor bytes: sampled, storage, cube, sampler.
-    nulls: OnceLock<[Vec<u8>; 4]>,
+    /// Slot 0's descriptor bytes: sampled, storage, cube, sampler, wide.
+    nulls: OnceLock<[Vec<u8>; 5]>,
 }
 
 // SAFETY: the mapped pointers are written at distinct slots, under the
@@ -82,6 +84,31 @@ struct State {
 /// Views made, samplers made, view writes that found no image.
 pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// The R64_UINT storage view of a storage view of a two-dword format
+/// (R32G32 UINT, SINT or SFLOAT: one compatibility class with R64_UINT, the
+/// image is made MUTABLE_FORMAT), for 64-bit image atomics (ABI v5); `None`
+/// on a device without `shaderImageInt64Atomics` or R64_UINT storage atomics.
+fn wide_view(b: &Backend, image: &Image, key: ViewKey) -> Option<vk::ImageView> {
+    let two_dwords = matches!(key.format, vk::Format::R32G32_UINT | vk::Format::R32G32_SINT | vk::Format::R32G32_SFLOAT);
+    if !(two_dwords && b.host.caps.image_int64_atomics && r64_atomics(b)) {
+        return None;
+    }
+    let identity = [vk::ComponentSwizzle::IDENTITY; 4];
+    image.view(b, ViewKey { format: vk::Format::R64_UINT, components: identity, ..key })
+}
+
+/// Whether R64_UINT storage images take atomics (optimal tiling).
+fn r64_atomics(b: &Backend) -> bool {
+    static R64: OnceLock<bool> = OnceLock::new();
+    *R64.get_or_init(|| {
+        // SAFETY: a plain query.
+        let p = unsafe { b.host.instance.get_physical_device_format_properties(b.host.physical, vk::Format::R64_UINT) };
+        let has = p.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC);
+        tracing::info!(r64_uint_storage_atomics = has, int64_image_atomics = b.host.caps.image_int64_atomics, "Vulkan: 64-bit image atomics");
+        has
+    })
+}
+
 /// The image bindings of set 0.
 #[derive(Clone, Copy)]
 enum Binding {
@@ -89,6 +116,8 @@ enum Binding {
     Storage,
     /// 2D-array views of cube images (ABI v2).
     Cube,
+    /// R64_UINT storage views of two-dword images (ABI v5).
+    Wide,
 }
 
 pub(crate) fn heaps(b: &'static Backend) -> Option<&'static Heaps> {
@@ -110,11 +139,12 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
     let props = victory_vk::descriptors::properties(&b.host).ok_or_else(|| anyhow::anyhow!("no descriptor buffer properties"))?;
     let align = props.descriptor_buffer_offset_alignment.max(1);
     // SAFETY: live layouts.
-    let (sampled_at, storage_at, cube_at, sampler_at) = unsafe {
+    let (sampled_at, storage_at, cube_at, wide_at, sampler_at) = unsafe {
         (
             db.get_descriptor_set_layout_binding_offset(layout.sets[0], 0),
             db.get_descriptor_set_layout_binding_offset(layout.sets[0], 1),
             db.get_descriptor_set_layout_binding_offset(layout.sets[0], 2),
+            db.get_descriptor_set_layout_binding_offset(layout.sets[0], 3),
             db.get_descriptor_set_layout_binding_offset(layout.sets[1], 0),
         )
     };
@@ -150,6 +180,7 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
         sampled_at,
         storage_at,
         cube_at,
+        wide_at,
         sampler_at,
         map_at,
         map_stride,
@@ -232,15 +263,17 @@ impl Heaps {
                     .subresource_range(range),
                 None,
             )?;
-            // Slot 0 is the null image on bindings 0, 1 and 2 (ABI v2).
+            // Slot 0 is the null image on bindings 0-3 (ABI v5; the wide
+            // binding takes only null descriptors and R64_UINT views).
             self.write_image(b, 0, view, Binding::Sampled);
             self.write_image(b, 0, view, Binding::Storage);
             self.write_image(b, 0, array, Binding::Cube);
+            self.write_image(b, 0, view, Binding::Wide);
             // Null descriptors fit every image type a shader declares (a 2D
             // view of one texel does not fit a 3D, cube or arrayed
             // variable: vk42's Illegal Instruction Parameter).
             if b.host.caps.null_descriptor {
-                for binding in [Binding::Sampled, Binding::Storage, Binding::Cube] {
+                for binding in [Binding::Sampled, Binding::Storage, Binding::Cube, Binding::Wide] {
                     self.write_null(b, binding);
                 }
             }
@@ -257,7 +290,7 @@ impl Heaps {
         Ok(())
     }
 
-    /// Slot 0's descriptors copied into every other slot of bindings 0-2
+    /// Slot 0's descriptors copied into every other slot of bindings 0-3
     /// and of the samplers.
     fn fill_null(&self) {
         let take = |base: *mut u8, at: u64, size: usize| -> Vec<u8> {
@@ -269,6 +302,7 @@ impl Heaps {
             take(self.resource.mapped, self.storage_at, self.sizes[1]),
             take(self.resource.mapped, self.cube_at, self.sizes[0]),
             take(self.sampler.mapped, self.sampler_at, self.sizes[2]),
+            take(self.resource.mapped, self.wide_at, self.sizes[1]),
         ];
         let spread = |base: *mut u8, at: u64, bytes: &[u8], slots: u32| {
             for slot in 1..slots as usize {
@@ -280,16 +314,17 @@ impl Heaps {
         spread(self.resource.mapped, self.storage_at, &nulls[1], IMAGE_SLOTS);
         spread(self.resource.mapped, self.cube_at, &nulls[2], IMAGE_SLOTS);
         spread(self.sampler.mapped, self.sampler_at, &nulls[3], stages::SAMPLER_SLOTS);
+        spread(self.resource.mapped, self.wide_at, &nulls[4], IMAGE_SLOTS);
         let _ = self.nulls.set(nulls);
     }
 
-    /// `slot` back to the null image on bindings 0, 1 and 2.
+    /// `slot` back to the null image on bindings 0-3.
     fn null_slot(&self, slot: u32) {
         let Some(n) = self.nulls.get() else { return };
         if slot == 0 {
             return;
         }
-        for (bytes, at) in [(&n[0], self.sampled_at), (&n[1], self.storage_at), (&n[2], self.cube_at)] {
+        for (bytes, at) in [(&n[0], self.sampled_at), (&n[1], self.storage_at), (&n[2], self.cube_at), (&n[4], self.wide_at)] {
             // SAFETY: the slot lies inside the mapped set-0 range.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.resource.mapped.add(at as usize + slot as usize * bytes.len()), bytes.len()) };
         }
@@ -299,10 +334,10 @@ impl Heaps {
     fn write_null(&self, b: &Backend, binding: Binding) {
         let Some(db) = b.host.descriptor_buffer.as_ref() else { return };
         let (ty, data, at, size) = match binding {
-            Binding::Storage => (
+            Binding::Storage | Binding::Wide => (
                 vk::DescriptorType::STORAGE_IMAGE,
                 vk::DescriptorDataEXT { p_storage_image: std::ptr::null() },
-                self.storage_at,
+                if matches!(binding, Binding::Wide) { self.wide_at } else { self.storage_at },
                 self.sizes[1],
             ),
             Binding::Sampled | Binding::Cube => (
@@ -325,10 +360,10 @@ impl Heaps {
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL);
         let (ty, data, at, size) = match binding {
-            Binding::Storage => (
+            Binding::Storage | Binding::Wide => (
                 vk::DescriptorType::STORAGE_IMAGE,
                 vk::DescriptorDataEXT { p_storage_image: &info },
-                self.storage_at,
+                if matches!(binding, Binding::Wide) { self.wide_at } else { self.storage_at },
                 self.sizes[1],
             ),
             Binding::Sampled | Binding::Cube => (
@@ -394,6 +429,9 @@ impl Heaps {
         self.write_image(b, slot, sampled, Binding::Sampled);
         if let Some(st) = storage {
             self.write_image(b, slot, st, Binding::Storage);
+            if let Some(wide) = wide_view(b, image, key) {
+                self.write_image(b, slot, wide, Binding::Wide);
+            }
         }
         if matches!(key.kind, vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY)
             && let Some(array) = image.view(b, ViewKey { kind: vk::ImageViewType::TYPE_2D_ARRAY, storage: false, ..key })

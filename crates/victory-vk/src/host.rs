@@ -83,6 +83,11 @@ pub const EXTENSIONS: &[Extension] = &[
         "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
     ),
     ext(
+        ext::shader_image_atomic_int64::NAME,
+        Need::Wanted,
+        "64-bit image atomics (the alpha prepass programs' image_atomic_umax on two-dword texels; without it those programs are refused)",
+    ),
+    ext(
         MAINTENANCE8,
         Need::Wanted,
         "samples with a texel offset that is not a constant (image_sample_*_o under a guard)",
@@ -269,6 +274,9 @@ pub struct Caps {
     pub timestamp_period: f32,
     /// `VK_EXT_robustness2` `nullDescriptor`: null descriptors of any type.
     pub null_descriptor: bool,
+    /// `shaderImageInt64Atomics` (VK_EXT_shader_image_atomic_int64): 64-bit
+    /// image atomics on R64_UINT storage views (ABI v5 section 5.1).
+    pub image_int64_atomics: bool,
 }
 
 /// Whether null descriptors of any type are on (`VK_EXT_robustness2`).
@@ -547,6 +555,7 @@ impl Host {
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut m8 = Maintenance8::default();
+        let mut int64_image = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -586,11 +595,14 @@ impl Host {
             f2 = chain_features(f2, on(khr::fragment_shader_barycentric::NAME), &mut bary);
             f2 = chain_features(f2, on(ext::conditional_rendering::NAME), &mut conditional);
             f2 = chain_features(f2, on(MAINTENANCE8), &mut m8);
+            f2 = chain_features(f2, on(ext::shader_image_atomic_int64::NAME), &mut int64_image);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
         let null = std::ptr::null_mut();
         m8.p_next = null;
+        int64_image.p_next = null;
+        int64_image.sparse_image_int64_atomics = vk::FALSE;
         v11.p_next = null;
         v12.p_next = null;
         v13.p_next = null;
@@ -731,6 +743,7 @@ impl Host {
             info = chain_device(info, has(khr::fragment_shader_barycentric::NAME), &mut bary);
             info = chain_device(info, has(ext::conditional_rendering::NAME), &mut conditional);
             info = chain_device(info, has(MAINTENANCE8), &mut m8);
+            info = chain_device(info, has(ext::shader_image_atomic_int64::NAME), &mut int64_image);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 
@@ -789,6 +802,7 @@ impl Host {
             non_resident_strict: props.sparse_properties.residency_non_resident_strict == vk::TRUE,
             timestamp_period: props.limits.timestamp_period,
             null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
+            image_int64_atomics: int64_image.shader_image_int64_atomics == vk::TRUE,
             extensions,
             features,
             core,

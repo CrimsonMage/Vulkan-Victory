@@ -30,7 +30,7 @@ pub use report::{Report, report};
 pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// (row, channel) -> (location, component) for the user-semantic rows of
 /// a signature part (`locs`: each row's location, from the registry).
