@@ -607,4 +607,6 @@ mod guard;
 mod xchg;
 #[path = "emit_typed.rs"]
 mod typed;
+#[path = "emit_bvh.rs"]
+mod bvh;
 

@@ -357,7 +357,14 @@ Known gaps (the program translates; the result differs from the console):
 
 - Position exports past the first (`exp pos1..3`: clip and cull
   distances) are dropped.
-- Ray/node tests (`image_bvh*_intersect_ray`) miss every node.
+- Ray/node tests (`image_bvh*_intersect_ray`) run in software
+  (`Helper::BvhRay`, one function per module): the node is read from
+  title memory at `(T# base << 8) + (pointer >> 3) * 64` through the map
+  (128 bytes in one range, else the zero block); slab tests and the
+  sorting network for box16/box32 nodes, the watertight triangle test,
+  as the D3D12 path's tested reference did. Triangles always return the
+  barycentric form (T# dword 3 bit 24; the title sets it). Not checked
+  on the card yet.
 - Typed buffer stores through a V#'s format are written as 32-bit
   channels.
 - Wave64 compute and mesh programs run each console wave as two host
@@ -387,9 +394,6 @@ Open points:
 - Typed buffer formats decoded in the shader: which formats (the title's
   `buffer_load_format_*` / `tbuffer_*` set) is measured as the backend
   grows.
-- Ray-tracing node tests (`image_bvh*_intersect_ray`): the BVH base is a
-  title address in a buffer-like T#; v0 misses every node, as
-  `VICTORY_BVH_MISS` does today.
 - Whether graphics stages should share one user-data window (the layouts
   in the pack put the same root parameter at the same index in every
   stage; v1 keeps one window per stage).

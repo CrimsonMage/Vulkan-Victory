@@ -96,6 +96,10 @@ pub enum Helper {
     Typed,
     /// (V# FORMAT u32) -> the shape `Typed` decodes (a table lookup).
     TypedShape,
+    /// (node device address u64, kind u32, sort u32, extent, origin xyz,
+    /// direction xyz, inverse direction xyz) -> uvec4: the ray/node test
+    /// of `image_bvh*_intersect_ray` (emit_bvh.rs).
+    BvhRay,
 }
 
 /// Image access kinds.
