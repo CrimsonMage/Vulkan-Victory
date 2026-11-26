@@ -189,4 +189,35 @@ impl Emit<'_> {
         let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, idx]);
         self.m.op(op::LOAD, u, &[ptr])
     }
+
+    /// Each half stores its word in its slot; a group barrier; both slots;
+    /// a group barrier (the slots are written again by the next exchange).
+    pub(super) fn xchg(&mut self, own: Id) -> Id {
+        let u = self.t.u32_;
+        if self.xchg_var == 0 {
+            let arr = self.m.t_array(u, 2);
+            let p = self.m.t_ptr(en::SC_WORKGROUP, arr);
+            self.xchg_var = self.m.variable(p, en::SC_WORKGROUP);
+            self.interface.push(self.xchg_var);
+        }
+        let half = {
+            let sg = self.builtin(Builtin::SubgroupId);
+            let one = self.c32(1);
+            self.m.op(op::BITWISE_AND, u, &[sg, one])
+        };
+        let p = self.m.t_ptr(en::SC_WORKGROUP, u);
+        let mine = self.m.op(op::ACCESS_CHAIN, p, &[self.xchg_var, half]);
+        self.m.op_void(op::STORE, &[mine, own]);
+        let wg = self.c32(en::SCOPE_WORKGROUP);
+        let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
+        self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
+        let (k0, k1) = (self.c32(0), self.c32(1));
+        let p0 = self.m.op(op::ACCESS_CHAIN, p, &[self.xchg_var, k0]);
+        let p1 = self.m.op(op::ACCESS_CHAIN, p, &[self.xchg_var, k1]);
+        let lo = self.m.op(op::LOAD, u, &[p0]);
+        let hi = self.m.op(op::LOAD, u, &[p1]);
+        self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
+        let v2 = self.m.t_vec(u, 2);
+        self.m.op(op::COMPOSITE_CONSTRUCT, v2, &[lo, hi])
+    }
 }

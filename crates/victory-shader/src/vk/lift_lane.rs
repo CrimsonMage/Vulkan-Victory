@@ -276,11 +276,15 @@ impl Lift<'_> {
         let src = *v.src.first().ok_or(unsupported(off, name))?;
         let x = self.opnd(inst, &src)?;
         let x = self.u32v(x);
-        let shuffled = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, from]);
+        let shuffled = self.shuffle_live(x, from);
         // an inactive source lane (fi clear) or an invalid one reads 0
         let mut ok = valid.unwrap_or_else(|| self.kb(true));
         if !fi && self.f.as_const(a_exec) != Some(1) {
+            // a lane that is not there counts as active (it gave its own value)
             let sa = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::BOOL, vec![a_exec, from]);
+            let live = self.lane_live(from);
+            let nl = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[live]);
+            let sa = self.spv(op::LOGICAL_OR, Ty::BOOL, &[sa, nl]);
             ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[ok, sa]);
         }
         let z = self.k32(0);

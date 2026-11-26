@@ -213,13 +213,10 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
     })
 }
 
-/// Iterations after which a loop gives up: pixel and vertex programs run
-/// far more invocations than compute ones, so they get less.
-fn loop_limit(stage: HwStage) -> u32 {
-    match stage {
-        HwStage::Cs => 1 << 18,
-        _ => 1 << 16,
-    }
+/// Iterations after which a loop gives up: low enough that a loop which
+/// gives up cannot cause a GPU timeout by itself.
+fn loop_limit(_stage: HwStage) -> u32 {
+    1 << 16
 }
 
 /// FNV-1a of the container: the program's id in the guard buffer.

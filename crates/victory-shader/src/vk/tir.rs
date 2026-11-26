@@ -199,6 +199,9 @@ pub enum Op {
     Demote,
     /// `s_barrier`.
     Barrier,
+    /// The two halves of a console wave64 (a group of one wave) exchange a
+    /// word uniform in each half: uvec2 (lower half's, upper half's).
+    Xchg,
     /// A block or guard phi: args in predecessor order (guards: inner, outer).
     Phi,
     /// Dynamic index into a function-local array of the args (v_movrel).

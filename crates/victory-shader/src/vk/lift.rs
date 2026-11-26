@@ -204,6 +204,11 @@ pub struct Lift<'a> {
     cur: Vec<Item>,
     cse: HashMap<Node, V>,
     open: Option<Open>,
+    /// A console wave64 in a group of one wave: the halves exchange
+    /// whole-wave values (lift_wave.rs).
+    xwave: bool,
+    /// The exchanged dwords of masks, per block.
+    words: HashMap<V, (V, V)>,
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
@@ -289,6 +294,8 @@ impl<'a> Lift<'a> {
             cur: Vec::new(),
             cse: HashMap::new(),
             open: None,
+            xwave: Self::one_wave(native),
+            words: HashMap::new(),
             guarded: false,
             sel: None,
             undo: Vec::new(),
@@ -487,19 +494,24 @@ impl<'a> Lift<'a> {
         if self.f.as_const(b).is_some() {
             return b;
         }
+        if let Some(a) = self.wave_any(b) {
+            return a;
+        }
         self.emit(Op::Wave(op::GROUP_NON_UNIFORM_ANY, u32::MAX), Ty::BOOL, vec![b])
     }
 
     fn data(&mut self, r: R) -> V {
         match r {
             R::D(v) => v,
-            R::M(b, Half::Lo) => self.ballot(b),
-            R::M(_, Half::Hi) => {
-                self.approx("a wave64 mask's high half read as a number");
-                self.k32(0)
-            }
+            R::M(b, half) => self.mask_word(b, half),
             R::B(b) => self.u32v(b),
         }
+    }
+
+    /// A wave64 program whose halves do not exchange (more than one
+    /// console wave per group): cross-half values are per half.
+    fn wave64_halves(&self) -> bool {
+        self.wave64 && !self.xwave
     }
 
     fn approx(&mut self, what: &'static str) {
@@ -913,6 +925,8 @@ mod valu;
 mod vops;
 #[path = "lift_flow.rs"]
 mod flow;
+#[path = "lift_wave.rs"]
+mod wave;
 #[path = "lift_fold.rs"]
 mod fold;
 #[path = "lift_lane.rs"]

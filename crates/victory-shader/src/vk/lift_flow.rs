@@ -127,6 +127,7 @@ impl Lift<'_> {
     pub(super) fn lift_block(&mut self, b: usize) -> Res<()> {
         let p = self.p;
         self.cur = Vec::new();
+        self.words.clear();
         // loads are not shared across blocks
         self.epoch += 1;
         self.block_phis(b);

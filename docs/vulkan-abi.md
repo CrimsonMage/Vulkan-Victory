@@ -71,8 +71,8 @@ A compute program may use dwords 4–63 (k < 60).
 
 ### 2.1 The loop guard
 
-Every loop counts its iterations and gives up after 2^18 of them (compute)
-or 2^16 (vertex, mesh, pixel): it leaves and the invocation returns, so a
+Every loop counts its iterations and gives up after 2^16 of them: it
+leaves and the invocation returns, so a
 loop that never exits (a mistranslation, or memory that reads zeros) cannot
 hang the GPU. Before returning, when push dwords 2–3 hold an address, the
 invocation adds 1 to **dword 0** of the guard buffer (`OpAtomicIAdd`,
@@ -350,10 +350,15 @@ Known gaps (the program translates; the result differs from the console):
 - Ray/node tests (`image_bvh*_intersect_ray`) miss every node.
 - Typed buffer stores through a V#'s format are written as 32-bit
   channels.
-- Wave64 programs run as two host subgroups: a 64-bit mask read as a
-  number (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, the high half), and
-  `v_readlane`/`v_writelane` of a lane in the other half, are taken per
-  half (`VkShader::approximate` lists them).
+- Wave64 programs run as two host subgroups. In a compute group of one
+  console wave (33 to 64 threads) the halves exchange whole-wave values
+  through a workgroup `u32[2]` between two group barriers: 64-bit masks
+  read as numbers (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, `v_mbcnt_hi`, the
+  high half), `any` of a mask (`s_cbranch_execz`, SCC of mask logic),
+  `v_readlane`, `v_readfirstlane` and `v_writelane` are exact. In larger
+  groups (mesh programs, compute groups of several waves) and for a mask
+  read inside a lane guard they are taken per half (`VkShader::approximate`
+  lists them).
 - Cube samples with derivatives or offsets read the faces as a 2D array:
   no filtering across face edges.
 

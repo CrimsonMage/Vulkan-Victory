@@ -167,6 +167,8 @@ pub struct Emit<'a> {
     counters: HashMap<Id, (Id, Id)>,
     /// The guard function (0: no loop gave up a way to it yet).
     guard_fn: Id,
+    /// The halves' exchange slots: workgroup `u32[2]` (0: none yet).
+    xchg_var: Id,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -238,6 +240,7 @@ impl<'a> Emit<'a> {
             if_merge: Vec::new(),
             counters: HashMap::new(),
             guard_fn: 0,
+            xchg_var: 0,
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -345,6 +348,7 @@ impl<'a> Emit<'a> {
                 self.m.op_void(op::DEMOTE_TO_HELPER_INVOCATION, &[]);
                 0
             }
+            Op::Xchg => self.xchg(args[0]),
             Op::Barrier => {
                 let wg = self.c32(en::SCOPE_WORKGROUP);
                 let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
