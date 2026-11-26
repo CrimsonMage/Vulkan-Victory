@@ -57,6 +57,7 @@ mod primitive;
 pub mod query;
 #[cfg(windows)]
 mod quality;
+mod procmem;
 #[cfg(windows)]
 mod release;
 pub mod queue;
@@ -76,6 +77,8 @@ mod shadow;
 mod tiles;
 #[cfg(windows)]
 mod unified;
+#[cfg(windows)]
+mod vulkan;
 mod unified_map;
 #[cfg(windows)]
 mod unified_probe;

@@ -9,12 +9,14 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+victory-core.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+victory-vk.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

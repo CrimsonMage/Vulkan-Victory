@@ -344,6 +344,13 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     #[cfg(windows)]
+    if crate::vulkan::on() {
+        // SAFETY: the title passes `count` lists.
+        let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::vulkan::execute(this, lists);
+        return;
+    }
+    #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -410,6 +417,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::signal(this, fence, value);
+        return S_OK;
+    }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -434,6 +446,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::wait(this, fence, value);
+        return S_OK;
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -595,6 +612,24 @@ extern "system" fn present(
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
+    }
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        let given: &[Plane] = if plane_parameters.is_null() {
+            &[]
+        } else {
+            // SAFETY: the title passes `planes` plane descriptions.
+            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
+        };
+        let size = given
+            .iter()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .filter_map(|p| crate::resource::texture_memory(unsafe { *p.resources }))
+            .map(|(_, desc)| desc.extent())
+            .max_by_key(|&(w, h)| u64::from(w) * u64::from(h));
+        crate::vulkan::present(frame, size);
+        return S_OK;
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {

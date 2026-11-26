@@ -220,10 +220,10 @@ struct Mode {
 const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// if set, else the PC's own screen, as a console reports the television it
+/// is plugged into (a Series X on a 1080p set lists a 1080p mode). Never
+/// more than 3840x2160. Reporting 4K by default made the title allocate
+/// ~3 GB of 4K render targets on an 8 GB card, which spilled over the bus.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -233,7 +233,17 @@ fn display_size() -> (u32, u32) {
         });
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+            _ => {
+                use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+                // SAFETY: plain queries with no arguments to uphold.
+                let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+                match (u32::try_from(w), u32::try_from(h)) {
+                    (Ok(w), Ok(h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => {
+                        (w.min(3840), h.min(2160))
+                    }
+                    _ => (1920, 1080),
+                }
+            }
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size

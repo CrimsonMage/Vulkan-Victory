@@ -573,6 +573,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    if crate::vulkan::on() {
+        return crate::vulkan::title_memory_written(at, len);
+    }
     // An announced write: host textures over it detile again.
     crate::unified::written(at, len);
     let mode = page_writes();

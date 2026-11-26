@@ -74,6 +74,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -247,6 +256,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -642,6 +661,7 @@ dependencies = [
  "victory-loader",
  "victory-pe",
  "victory-shader",
+ "victory-vk",
  "walkdir",
 ]
 
@@ -677,9 +697,11 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
+ "victory-vk",
  "windows",
  "windows-sys",
  "zlib-rs",
@@ -692,6 +714,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
@@ -741,6 +764,15 @@ dependencies = [
  "windows",
  "windows-sys",
  "zlib-rs",
+]
+
+[[package]]
+name = "victory-vk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "windows-sys",
 ]
 
 [[package]]
@@ -893,6 +925,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "proc-macro2",
+ "serde",
+ "syn 2.0.119",
+ "toml",
  "walkdir",
 ]
 

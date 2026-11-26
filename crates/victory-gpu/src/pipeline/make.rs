@@ -1,31 +1,34 @@
 //! Host pipelines are made by workers, not by the threads that record the
 //! title's lists. Translating a shader and the host driver's compile take
-//! from milliseconds to seconds each (structurisation of the biggest
-//! compute programs ~0.4 s, some driver compiles 3.4 s), and the title's
-//! first world frame wants over 1,200 new pipelines (decision 0007,
-//! "Pipelines made off the title's threads").
+//! from milliseconds to seconds each (0.5 to 10 s of the NVIDIA compiler
+//! for the biggest translated programs), and the world wants 2,000 to
+//! 3,000 pipelines (decision 0007, "Pipelines made off the title's
+//! threads").
 //!
-//! One queue, two priorities:
+//! One queue, three priorities:
 //!
 //! - **For draws**: a draw or dispatch found its pipeline not made. These
 //!   go first, on any worker.
-//! - **Early**: pipelines an earlier run drew with, queued when the title
-//!   creates them (during loading). Only [`EARLY_WORKERS`] of the workers
-//!   take these, and only while no pipeline for a draw is queued, so the
-//!   others are free the moment a draw needs one; early work goes on in
-//!   the background, a few at a time, through loading and into the world.
+//! - **Created**: the title created a pipeline an earlier run used (the
+//!   catalog, `super::catalog`): it creates them while it loads, ahead of
+//!   use.
+//! - **Bake**: the catalog's pipelines the title has not created yet, in
+//!   the order an earlier run first used them (`super::bake`). Made to
+//!   fill the caches (the library, vkd3d-proton's and the driver's) and
+//!   let go: the title's creation then loads it from them.
 //!
-//! Workers run below the title's threads and the list workers (those that
-//! take early work lower still), so a compile takes only the processors
-//! they leave.
+//! The last two are background work: only [`BACKGROUND_WORKERS`] of the
+//! workers take it (all of them in the standalone bake), at the lowest
+//! priority, and only while no pipeline for a draw is queued; their
+//! compiles in flight stay under a memory ceiling ([`reserve`]).
 //!
-//! A draw whose pipeline is not made is dropped (a brief pop-in), never
-//! waited for beyond [`WAIT_BUDGET`] per frame: a list worker that waits
-//! stalls its list, the submission waits for the list, and the frame with
-//! it. With half a second per frame (as before), the world's start ran at
-//! 300 to 400 ms a frame while the list workers took about 1% of the
-//! process's samples each: standing still, not short of processors (the
-//! frame line's "waited for pipelines" shows how long).
+//! A draw whose pipeline is not made waits for it, up to [`WAIT_PER_FRAME`]
+//! a frame over all threads together ([`wait`]); only then is it dropped.
+//! A wait holds the list, the submission and the title's progress on the
+//! card: bounded so that the title's own watchdog (about 30 s without
+//! progress) never fires. Dropping after 3 ms instead (efa4886) skipped
+//! one-off and temporal passes (the exposure chain) and left the world
+//! black.
 //!
 //! No lock of ours is held across a compile: the queue's lock is taken to
 //! queue and to take a pipeline only, a made pipeline is handed out before
@@ -33,12 +36,13 @@
 //! (`library::pipeline`).
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
+use super::bake;
 use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -62,16 +66,29 @@ unsafe impl Sync for Pending {}
 /// What the thread making a pipeline is doing it for ([`MAKING_NS`]).
 const ON_FRAME_THREAD: u8 = 0;
 const FOR_DRAWS: u8 = 1;
-const FOR_EARLY: u8 = 2;
+const FOR_CREATED: u8 = 2;
+const FOR_BAKE: u8 = 3;
 
 thread_local! {
     static MAKING_FOR: Cell<u8> = const { Cell::new(ON_FRAME_THREAD) };
 }
 
 /// Since the last frame line, per [`ON_FRAME_THREAD`], [`FOR_DRAWS`],
-/// [`FOR_EARLY`]: nanoseconds making pipelines (translation, library load
-/// or driver compile) and pipelines made.
-static MAKING_NS: [[AtomicU64; 2]; 3] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 3];
+/// [`FOR_CREATED`], [`FOR_BAKE`]: nanoseconds making pipelines
+/// (translation, library load or driver compile) and pipelines made.
+static MAKING_NS: [[AtomicU64; 2]; 4] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 4];
+
+/// Counts a pipeline made by this thread since `began`.
+fn count_making(began: Instant) {
+    let sums = &MAKING_NS[usize::from(MAKING_FOR.with(Cell::get))];
+    sums[0].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    sums[1].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether this thread is making a pipeline as background work.
+fn in_background() -> bool {
+    matches!(MAKING_FOR.with(Cell::get), FOR_CREATED | FOR_BAKE)
+}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -80,7 +97,13 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             shaders,
             graphics,
@@ -94,33 +117,58 @@ impl Pending {
     fn make(&self) {
         let began = Instant::now();
         let mut ran = false;
+        // Translated first (or taken from the cache): the compile's memory
+        // is reckoned from the code's size. Background work waits for room
+        // before it takes the pipeline, so that a draw's worker that wants
+        // the same pipeline never waits behind that.
+        let room = || reserve(estimate(self.shaders.iter().filter_map(|s| s.translated())));
+        let mut early = (in_background() && self.made.get().is_none()).then(room);
         self.made.get_or_init(|| {
             ran = true;
-            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            let room = early.take().unwrap_or_else(room);
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            drop(room);
+            if made.is_some() {
+                super::catalog::note_made(&self.key, &bake::stamp());
+            }
+            made
         });
         if ran {
-            let sums = &MAKING_NS[usize::from(MAKING_FOR.with(Cell::get))];
-            sums[0].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            sums[1].fetch_add(1, Ordering::Relaxed);
+            count_making(began);
         }
         let (lock, done) = &DONE;
         let _held = super::lock(lock);
         done.notify_all();
+    }
+
+    /// What the catalog keeps of it (`super::catalog::Desc`).
+    fn desc(&self) -> Option<super::catalog::Desc> {
+        if self.shaders.is_empty() {
+            return None;
+        }
+        Some(super::catalog::Desc {
+            shaders: self
+                .shaders
+                .iter()
+                .map(|s| (s.stage, s.full, s.name.clone()))
+                .collect(),
+            graphics: self.graphics.as_ref().map(|g| g.encode()),
+        })
     }
 }
 
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads together, for a
-/// pipeline a draw wants that a worker is making or is about to: enough
-/// for one loaded from the library or the driver's cache, so that menus
-/// and one-off passes whose pipelines are quick to make are not lost; a
-/// draw whose pipeline takes longer is dropped. (Half a second, as before,
-/// held the frame for as long whenever pipelines were being made.)
-const WAIT_BUDGET: Duration = Duration::from_millis(3);
+/// Waiting allowed per title frame, over all threads together, for the
+/// pipelines its draws want: a draw whose pipeline is not made by then is
+/// dropped. A frame that does not end gets this much again only after
+/// [`WAIT_REST`] without waiting, so the card makes progress at least a
+/// third of the time.
+const WAIT_PER_FRAME: Duration = Duration::from_secs(2);
+const WAIT_REST: Duration = Duration::from_secs(1);
 
-/// Pipelines queued or being made, not made yet.
+/// Pipelines of the title queued or being made, not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// Since the last frame line: nanoseconds and times frame threads waited
@@ -129,23 +177,17 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 static WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static DROPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// The host pipeline, made now or within the frame's waiting
+/// ([`WAIT_PER_FRAME`]); queues it first for draws.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    // A still-pending pipeline was requested by the title too. Prewarm it
-    // on the next launch, even if this run never got to use it.
+    // The first use this run: listed in the catalog (with when), so the
+    // next launch bakes it in this order.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+        super::catalog::note_used(&p.key, crate::frame::current(), || p.desc());
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        // Only when a worker is on it or will be at once: one far down the
-        // queue cannot be made within the budget.
-        if p.queue_state.load(Ordering::Relaxed) == MAKING
-            || NOW_QUEUED.load(Ordering::Relaxed) <= THREADS[0].load(Ordering::Relaxed) as u64
-        {
-            wait(p, crate::frame::current());
-        }
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
 }
@@ -162,82 +204,172 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
-/// At the title's creation of a pipeline: queues it as early work if an
-/// earlier run drew with it (during loading, so the world's first frames
-/// find it).
-pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+/// The title's pipelines an earlier run used, by key, as the title created
+/// them: the bake makes one of these as the title's own (kept) rather than
+/// a copy of its own (let go).
+static CREATED: Mutex<Option<HashMap<String, Weak<Pending>>>> = Mutex::new(None);
+
+/// At the title's creation of a pipeline: queued at once, ahead of the
+/// bake, if an earlier run used it (the title creates them while it loads,
+/// ahead of use). Others are made at their first draw, if any comes: the
+/// title creates tens of thousands it never draws with.
+pub(crate) fn created(p: &Arc<Pending>) {
+    if p.shaders.is_empty() || !super::catalog::known(&p.key) {
+        return;
     }
+    // `VICTORY_GPU=vulkan`: the stages go to the Vulkan backend's stage
+    // workers instead (no DXIL translation).
+    if crate::vulkan::on() {
+        crate::vulkan::pipeline_created(&p.shaders);
+        return;
+    }
+    super::lock(&CREATED)
+        .get_or_insert_with(HashMap::new)
+        .insert(p.key.clone(), Arc::downgrade(p));
+    super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+    start(p, CREATED_EARLY);
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// The title's own pipeline with `key`, if it created one ([`created`]).
+pub(crate) fn title_pipeline(key: &str) -> Option<Arc<Pending>> {
+    super::lock(&CREATED).as_ref()?.get(key)?.upgrade()
+}
+
+/// Makes the title's pipeline `p` for the bake (on a worker taking
+/// background work); whether it has a host pipeline.
+pub(crate) fn make_for_bake(p: &Arc<Pending>) -> bool {
+    now(p)
+}
+
+/// Waits for `p` while frame `frame` has waiting left ([`WAIT_PER_FRAME`]).
 fn wait(p: &Pending, frame: u64) {
-    let budget = WAIT_BUDGET;
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
-    let left = {
-        let mut spent = super::lock(&SPENT);
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
+    // The frame the waiting belongs to, and when its waiting ends.
+    static WINDOW: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    let deadline = {
+        let mut window = super::lock(&WINDOW);
+        let now = Instant::now();
+        let fresh = window.0 != frame || window.1.is_none_or(|end| now >= end + WAIT_REST);
+        if fresh {
+            *window = (frame, Some(now + WAIT_PER_FRAME));
         }
-        let left = budget.saturating_sub(spent.1);
-        spent.1 += left;
-        left
+        window.1.unwrap_or(now)
     };
-    if left.is_zero() {
+    if Instant::now() >= deadline {
         return;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = deadline.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
-    let waited = started.elapsed();
-    WAITED[0].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+    WAITED[0].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     WAITED[1].fetch_add(1, Ordering::Relaxed);
-    let waited = waited.min(left);
-    {
-        let mut spent = super::lock(&SPENT);
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            spent.1 = spent.1.saturating_sub(left - waited);
+}
+
+/// The memory a compile of `translated` may take in the host driver's
+/// compiler, reckoned from the code's size: 48 MiB plus 512 bytes a byte
+/// of DXIL (the biggest translated programs, 600 to 800 KiB, take some
+/// hundreds of MB in the NVIDIA compiler).
+pub(crate) fn estimate<'a>(translated: impl Iterator<Item = &'a super::Translated>) -> u64 {
+    (48 << 20)
+        + translated
+            .map(|t| t.host.dxil.len() as u64 * 512)
+            .sum::<u64>()
+}
+
+/// Memory reckoned for the compiles in flight ([`estimate`]), the most at
+/// once, and the ceiling background work keeps under: [`IN_GAME_CEILING`],
+/// or [`STANDALONE_CEILING`] in the standalone bake.
+static RESERVED: Mutex<u64> = Mutex::new(0);
+static ROOM: Condvar = Condvar::new();
+pub(crate) static RESERVED_PEAK: AtomicU64 = AtomicU64::new(0);
+const IN_GAME_CEILING: u64 = 1 << 30;
+const STANDALONE_CEILING: u64 = 3 << 30;
+
+pub(crate) fn ceiling() -> u64 {
+    if bake::is_standalone() {
+        STANDALONE_CEILING
+    } else {
+        IN_GAME_CEILING
+    }
+}
+
+/// Memory reckoned for one compile in flight, given back when dropped.
+pub(crate) struct Reservation(u64);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = super::lock(&RESERVED);
+        *reserved = reserved.saturating_sub(self.0);
+        ROOM.notify_all();
+    }
+}
+
+/// Reckons `bytes` for a compile about to start. Background work waits
+/// until it fits under the [`ceiling`] (or nothing else is in flight); a
+/// compile a draw waits for never waits here, though it counts.
+pub(crate) fn reserve(bytes: u64) -> Reservation {
+    let mut reserved = super::lock(&RESERVED);
+    if in_background() {
+        let ceiling = ceiling();
+        while *reserved > 0 && *reserved + bytes > ceiling {
+            reserved = ROOM.wait(reserved).unwrap_or_else(|e| e.into_inner());
         }
     }
+    *reserved += bytes;
+    RESERVED_PEAK.fetch_max(*reserved, Ordering::Relaxed);
+    Reservation(bytes)
+}
+
+/// The memory reckoned for the compiles in flight now.
+pub(crate) fn reserved() -> u64 {
+    *super::lock(&RESERVED)
 }
 
 const NOT_QUEUED: u8 = 0;
-const EARLY: u8 = 1;
+const CREATED_EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
-struct Queue {
-    early: VecDeque<Arc<Pending>>,
-    requested: VecDeque<Arc<Pending>>,
-    /// Pipelines queued early and not promoted or taken yet (`early` also
-    /// holds promoted ones, passed over when they come up).
-    early_queued: usize,
+/// A worker's next job.
+enum Job {
+    /// A title pipeline; whether it is background work.
+    Title(Arc<Pending>, bool),
+    /// A catalog pipeline the bake makes.
+    Bake(Arc<bake::Job>),
 }
 
-/// Mirrors of the queue's lengths for draws and early, read without the
-/// lock (the frame line, [`ready`]).
+struct Queue {
+    created: VecDeque<Arc<Pending>>,
+    requested: VecDeque<Arc<Pending>>,
+    bake: VecDeque<Arc<bake::Job>>,
+    /// Pipelines queued at creation and not promoted or taken yet
+    /// (`created` also holds promoted ones, passed over when they come up).
+    created_queued: usize,
+}
+
+/// Mirrors of the queue's lengths for draws, created and bake, read
+/// without the lock (the frame line).
 static NOW_QUEUED: AtomicU64 = AtomicU64::new(0);
-static EARLY_QUEUED: AtomicU64 = AtomicU64::new(0);
+static CREATED_QUEUED: AtomicU64 = AtomicU64::new(0);
+static BAKE_QUEUED: AtomicU64 = AtomicU64::new(0);
 
 impl Queue {
     const fn new() -> Self {
         Self {
-            early: VecDeque::new(),
+            created: VecDeque::new(),
             requested: VecDeque::new(),
-            early_queued: 0,
+            bake: VecDeque::new(),
+            created_queued: 0,
         }
     }
 
@@ -250,52 +382,57 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
-            if prev == EARLY {
-                self.early_queued -= 1;
+            if prev == CREATED_EARLY {
+                self.created_queued -= 1;
             }
             self.requested.push_back(p.clone());
         } else {
-            self.early_queued += 1;
-            self.early.push_back(p.clone());
+            self.created_queued += 1;
+            self.created.push_back(p.clone());
         }
         self.publish();
         Some(prev == NOT_QUEUED)
     }
 
-    /// The next pipeline to make, and whether it is early work: those for
-    /// draws first; early ones only for a worker that takes them, and only
-    /// when none is queued for a draw.
-    fn pop(&mut self, takes_early: bool) -> Option<(Arc<Pending>, bool)> {
+    /// The next job: pipelines for draws first; background work (created,
+    /// then bake) only for a worker that takes it, and only when none is
+    /// queued for a draw.
+    fn pop(&mut self, background: bool) -> Option<Job> {
         let job = if let Some(p) = self.requested.pop_front() {
-            (p, false)
-        } else if takes_early {
-            // An early entry can have been promoted and claimed already.
-            let p = std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
-            self.early_queued -= 1;
-            (p, true)
-        } else {
+            Job::Title(p, false)
+        } else if !background {
             return None;
+        } else if let Some(p) = std::iter::from_fn(|| self.created.pop_front())
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == CREATED_EARLY)
+        {
+            // (An entry can have been promoted and claimed already.)
+            self.created_queued -= 1;
+            Job::Title(p, true)
+        } else {
+            Job::Bake(self.bake.pop_front()?)
         };
-        job.0.queue_state.store(MAKING, Ordering::Relaxed);
+        if let Job::Title(p, _) = &job {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+        }
         self.publish();
         Some(job)
     }
 
     fn publish(&self) {
         NOW_QUEUED.store(self.requested.len() as u64, Ordering::Relaxed);
-        EARLY_QUEUED.store(self.early_queued as u64, Ordering::Relaxed);
+        CREATED_QUEUED.store(self.created_queued as u64, Ordering::Relaxed);
+        BAKE_QUEUED.store(self.bake.len() as u64, Ordering::Relaxed);
     }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 /// Waited on by the workers that take only pipelines for draws, and by
-/// those that take early ones too.
+/// those that take background work too.
 static FOR_DRAWS_ONLY: Condvar = Condvar::new();
 static FOR_ANY: Condvar = Condvar::new();
 
-/// Start or promote work for a draw without waiting behind the entire early
-/// list. Queue changes and worker claims happen under the same lock.
+/// Queues or promotes `p`. Queue changes and worker claims happen under
+/// the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
@@ -309,10 +446,13 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = super::lock(&QUEUE);
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
         }
         // One waiting worker of each kind may take a pipeline for a draw;
-        // only the early kind takes early work.
+        // only the background kind takes the rest.
         if priority == REQUESTED {
             FOR_DRAWS_ONLY.notify_one();
         }
@@ -320,77 +460,142 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next(takes_early: bool) -> (Arc<Pending>, bool) {
-    let available = if takes_early { &FOR_ANY } else { &FOR_DRAWS_ONLY };
+/// Queues the bake's jobs, in order, behind everything else.
+pub(crate) fn queue_bake(jobs: Vec<Arc<bake::Job>>) -> bool {
+    if !workers() {
+        return false;
+    }
+    let mut queue = super::lock(&QUEUE);
+    queue.bake.extend(jobs);
+    queue.publish();
+    FOR_ANY.notify_all();
+    true
+}
+
+fn next(background: bool) -> Job {
+    let available = if background {
+        &FOR_ANY
+    } else {
+        &FOR_DRAWS_ONLY
+    };
     let mut queue = super::lock(&QUEUE);
     loop {
-        if let Some(job) = queue.pop(takes_early) {
+        if let Some(job) = queue.pop(background) {
             return job;
         }
         queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Workers that take early work too (the others only pipelines for draws).
-const EARLY_WORKERS: usize = 3;
+/// Workers that take background work in the game (the others only
+/// pipelines for draws).
+const BACKGROUND_WORKERS: usize = 4;
 
-/// The workers started, and of them those that take early work.
+/// The workers started, those that take background work, and those
+/// making a pipeline now (and the most at once).
 static THREADS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+pub(crate) static BUSY: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static BUSY_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// The workers started, and of them those that take background work.
+pub(crate) fn threads() -> (usize, usize) {
+    (
+        THREADS[0].load(Ordering::Relaxed),
+        THREADS[1].load(Ordering::Relaxed),
+    )
+}
 
 /// Runs the calling worker below the title's threads and the list workers;
-/// the workers that take early work lower still.
-fn set_priority(early: bool) {
+/// those that take background work lower still. In the standalone bake,
+/// at normal priority.
+fn set_priority(background: bool) {
     use windows::Win32::System::Threading::*;
-    let level = if early { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+    if bake::is_standalone() {
+        return;
+    }
+    let level = if background {
+        THREAD_PRIORITY_LOWEST
+    } else {
+        THREAD_PRIORITY_BELOW_NORMAL
+    };
     // SAFETY: a plain call on our own thread.
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), level);
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use;
-/// [`EARLY_WORKERS`] of them (at most all but one) take early work.
+/// Starts the workers on first use: in the game half the logical
+/// processors, 2 to 8, [`BACKGROUND_WORKERS`] of them (at most all but
+/// one) taking background work; in the standalone bake its job count, all
+/// taking everything.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        let early = EARLY_WORKERS.min(workers - 1);
+        let (workers, background) = match bake::standalone_jobs() {
+            Some(jobs) => (jobs.max(1), jobs.max(1)),
+            None => {
+                let workers =
+                    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+                (workers, BACKGROUND_WORKERS.min(workers - 1))
+            }
+        };
         for i in 0..workers {
-            let takes_early = i < early;
+            let takes_background = i < background;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
                     super::compile_thread();
                     // Once: a thread's nice value raised again needs a
                     // limit Linux does not grant by default.
-                    set_priority(takes_early);
+                    set_priority(takes_background);
                     loop {
-                        let (p, early) = next(takes_early);
-                        MAKING_FOR.with(|m| m.set(if early { FOR_EARLY } else { FOR_DRAWS }));
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
+                        let job = next(takes_background);
+                        let busy = BUSY.fetch_add(1, Ordering::Relaxed) + 1;
+                        BUSY_PEAK.fetch_max(busy, Ordering::Relaxed);
+                        match job {
+                            Job::Title(p, background) => {
+                                MAKING_FOR.with(|m| {
+                                    m.set(if background { FOR_CREATED } else { FOR_DRAWS })
+                                });
+                                p.make();
+                                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                                    drained();
+                                } else {
+                                    super::library::save(false);
+                                }
+                            }
+                            Job::Bake(job) => {
+                                MAKING_FOR.with(|m| m.set(FOR_BAKE));
+                                let began = Instant::now();
+                                if bake::run(&job) {
+                                    count_making(began);
+                                }
+                                super::library::save(false);
+                            }
                         }
+                        BUSY.fetch_sub(1, Ordering::Relaxed);
                     }
                 });
             match spawned {
                 Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
                 Ok(_) => {
                     THREADS[0].fetch_add(1, Ordering::Relaxed);
-                    if takes_early {
+                    if takes_background {
                         THREADS[1].fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
         }
         let started = THREADS.each_ref().map(|t| t.load(Ordering::Relaxed));
-        tracing::info!(workers = started[0], early = started[1], "pipeline workers started");
+        tracing::info!(
+            workers = started[0],
+            background = started[1],
+            "pipeline workers started"
+        );
         if started[0] > 0 && started[1] == 0 {
-            // No worker would take early work: what is queued so is made
-            // when a draw asks for it.
-            tracing::warn!("no pipeline worker takes early work");
+            // No worker would take background work: what is queued so is
+            // made when a draw asks for it.
+            tracing::warn!("no pipeline worker takes background work");
         }
         started[0] > 0
     })
@@ -415,15 +620,15 @@ pub(crate) fn made_with(local_array_bytes: u32) {
     }
 }
 
-/// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// The workers ran out of the title's pipelines: logged after a batch of
+/// 10 or more, and the cache saved (at most every 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
+            queued_at_creation = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -447,25 +652,30 @@ pub(crate) fn frame_text(frames: f64) -> String {
         now.saturating_sub(seen.swap(now, Ordering::Relaxed))
     };
     let (made, loaded) = (since(&MADE, &SEEN[0]), since(&LOADED, &SEEN[1]));
+    let part = |i: u8| making[usize::from(i)];
     format!(
-        "pipelines: {} being made ({} queued for draws, {} queued early; {} workers, {} take early work); \
-         making ms/frame summed (n/frame): for draws {:.1} ({:.2}), early {:.1} ({:.2}), on frame threads {:.1} ({:.2}); \
+        "pipelines: {} being made ({} queued for draws, {} queued at creation, {} to bake; {} workers, {} take background work; {}); \
+         making ms/frame summed (n/frame): for draws {:.1} ({:.2}), at creation {:.1} ({:.2}), bake {:.1} ({:.2}), on frame threads {:.1} ({:.2}); \
          {made} compiled by the driver and {loaded} loaded from the library since the last line; \
          frame threads waited for pipelines {waited_ms:.1} ms/frame ({waits:.2} waits), for pipeline locks {:.2} ms/frame ({:.2}); \
          workers waited for pipeline locks {:.2} ms/frame ({:.2}); \
-         draws and dispatches dropped without a host pipeline: {being_made:.1}/frame still being made, {refused:.1}/frame with none; \
+         draws and dispatches dropped without a host pipeline: {being_made:.1}/frame still being made (after waiting), {refused:.1}/frame with none; \
          made with per-lane arrays (local memory): {} pipelines, the largest {} bytes a lane",
         WAITING.load(Ordering::Relaxed),
         NOW_QUEUED.load(Ordering::Relaxed),
-        EARLY_QUEUED.load(Ordering::Relaxed),
+        CREATED_QUEUED.load(Ordering::Relaxed),
+        BAKE_QUEUED.load(Ordering::Relaxed),
         THREADS[0].load(Ordering::Relaxed),
         THREADS[1].load(Ordering::Relaxed),
-        making[usize::from(FOR_DRAWS)].0,
-        making[usize::from(FOR_DRAWS)].1,
-        making[usize::from(FOR_EARLY)].0,
-        making[usize::from(FOR_EARLY)].1,
-        making[usize::from(ON_FRAME_THREAD)].0,
-        making[usize::from(ON_FRAME_THREAD)].1,
+        bake::summary(),
+        part(FOR_DRAWS).0,
+        part(FOR_DRAWS).1,
+        part(FOR_CREATED).0,
+        part(FOR_CREATED).1,
+        part(FOR_BAKE).0,
+        part(FOR_BAKE).1,
+        part(ON_FRAME_THREAD).0,
+        part(ON_FRAME_THREAD).1,
         frame_locks.0,
         frame_locks.1,
         worker_locks.0,
@@ -479,12 +689,12 @@ pub(crate) fn frame_text(frames: f64) -> String {
 mod tests {
     use super::*;
 
-    /// A first use queues the pipeline and, within the budget, gets the
-    /// worker's answer (here: no host pipeline for no shaders).
+    /// A first use queues the pipeline and gets the worker's answer (here:
+    /// no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        let _ = ready(&p);
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
@@ -494,57 +704,75 @@ mod tests {
     }
 
     #[test]
-    fn pending_pipeline_is_recorded_for_the_next_launch() {
-        let mut p = Pending::new(Vec::new(), None);
-        p.key = "pending-pipeline-test".to_owned();
-        // Simulate a worker that has taken the job but cannot finish it yet.
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        let p = Arc::new(p);
-
-        assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
-        assert!(p.made.get().is_none());
-        assert!(super::super::library::wanted_early(&p.key));
-    }
-
-    #[test]
-    fn draws_promote_early_pipelines_without_claiming_them_twice() {
+    fn draws_promote_created_pipelines_without_claiming_them_twice() {
         let earlier = Arc::new(Pending::new(Vec::new(), None));
         let promoted = Arc::new(Pending::new(Vec::new(), None));
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
+        assert_eq!(queue.push(&earlier, CREATED_EARLY), Some(true));
+        assert_eq!(queue.push(&promoted, CREATED_EARLY), Some(true));
         assert_eq!(queue.push(&requested, REQUESTED), Some(true));
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert_eq!(queue.early_queued, 1);
+        assert_eq!(queue.created_queued, 1);
 
-        let (p, early) = queue.pop(true).unwrap();
-        assert!(Arc::ptr_eq(&p, &requested) && !early);
-        let (p, early) = queue.pop(true).unwrap();
-        assert!(Arc::ptr_eq(&p, &promoted) && !early);
+        let pop = |q: &mut Queue| match q.pop(true) {
+            Some(Job::Title(p, background)) => Some((p, background)),
+            _ => None,
+        };
+        let (p, background) = pop(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &requested) && !background);
+        let (p, background) = pop(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &promoted) && !background);
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        let (p, early) = queue.pop(true).unwrap();
-        assert!(Arc::ptr_eq(&p, &earlier) && early);
+        let (p, background) = pop(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &earlier) && background);
         assert!(queue.pop(true).is_none());
-        assert_eq!(queue.early_queued, 0);
+        assert_eq!(queue.created_queued, 0);
     }
 
-    /// A worker that takes only pipelines for draws leaves early work to
-    /// the others, and early work waits while one for a draw is queued.
+    /// A worker that takes only pipelines for draws leaves background work
+    /// to the others, and background work waits while one for a draw is
+    /// queued; the bake comes after pipelines the title created.
     #[test]
-    fn early_work_goes_to_its_workers_after_draws() {
-        let early = Arc::new(Pending::new(Vec::new(), None));
+    fn background_work_goes_to_its_workers_after_draws() {
+        let created = Arc::new(Pending::new(Vec::new(), None));
         let drawn = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
-        queue.push(&early, EARLY);
-        assert!(queue.pop(false).is_none(), "a worker for draws took early work");
+        queue.bake.push_back(Arc::new(bake::Job::test()));
+        queue.push(&created, CREATED_EARLY);
+        assert!(
+            queue.pop(false).is_none(),
+            "a worker for draws took background work"
+        );
         queue.push(&drawn, REQUESTED);
-        let (p, is_early) = queue.pop(true).unwrap();
-        assert!(Arc::ptr_eq(&p, &drawn) && !is_early, "early work went before a draw's");
-        let (p, is_early) = queue.pop(true).unwrap();
-        assert!(Arc::ptr_eq(&p, &early) && is_early);
+        assert!(matches!(queue.pop(true), Some(Job::Title(p, false)) if Arc::ptr_eq(&p, &drawn)));
+        assert!(matches!(queue.pop(true), Some(Job::Title(p, true)) if Arc::ptr_eq(&p, &created)));
+        assert!(matches!(queue.pop(true), Some(Job::Bake(_))));
+        assert!(queue.pop(true).is_none());
+    }
+
+    /// Background compiles keep under the ceiling; one alone always runs.
+    #[test]
+    fn background_compiles_keep_under_the_ceiling() {
+        MAKING_FOR.with(|m| m.set(FOR_BAKE));
+        let first = reserve(ceiling() * 2);
+        assert!(
+            reserved() >= ceiling() * 2,
+            "one compile alone runs whatever its size"
+        );
+        let waiter = std::thread::spawn(|| {
+            MAKING_FOR.with(|m| m.set(FOR_BAKE));
+            let _r = reserve(1 << 20);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "a second compile went past the ceiling"
+        );
+        drop(first);
+        waiter.join().unwrap();
+        MAKING_FOR.with(|m| m.set(ON_FRAME_THREAD));
     }
 }

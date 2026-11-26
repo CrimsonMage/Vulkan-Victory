@@ -167,6 +167,9 @@ pub(crate) fn region_len(base: usize) -> Option<u64> {
 /// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
 /// of 64 KiB), with a committed canary page of its own right after it.
 pub fn title_region(at: usize, len: usize) {
+    if crate::vulkan::on() {
+        return crate::vulkan::title_region(at, len);
+    }
     REGIONS.write().unwrap_or_else(|e| e.into_inner()).insert(at, (len as u64, false));
     let old = units().regions.insert(at, Unit { len: len as u64, state: State::Untried });
     if let Some(old) = old {
@@ -177,6 +180,9 @@ pub fn title_region(at: usize, len: usize) {
 /// `xmem` made a section for physical pages, `len` bytes of the title's
 /// and a canary page after them.
 pub fn title_section(handle: usize, len: u64) {
+    if crate::vulkan::on() {
+        return crate::vulkan::title_section(handle, len);
+    }
     units().sections.insert(handle, Unit { len, state: State::Untried });
 }
 
@@ -184,6 +190,9 @@ pub fn title_section(handle: usize, len: u64) {
 /// its heap lives on in the buffers placed in it until those go, as for a
 /// region the title frees ([`released`]).
 pub fn title_section_gone(handle: usize) {
+    if crate::vulkan::on() {
+        return crate::vulkan::title_section_gone(handle);
+    }
     let gone = {
         let mut u = units();
         u.chunks.retain(|(home, _), _| *home != Home::Section(handle));

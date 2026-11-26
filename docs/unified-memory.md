@@ -859,14 +859,34 @@ victory holds for title memory follows it.
   memory another one covers; sharing card pages by title address would
   save about … MB`. The large targets of the 13:53 log (15 of 16 MB or
   more) do not overlap.
-- **Process memory** (`release.rs`, every 30 s, Linux view through `Z:`,
-  of the process under `/proc` that maps victory's executable over its own
-  code; `/proc/self` named another process in run p8):
-  `process memory (Linux): resident … MB in … mappings; title addresses:
-  anonymous …, shared …; host addresses: anonymous …, shared …; NVIDIA
-  driver mappings …; files …; of ours in the PC's memory: …; largest …`.
-  Run p7 had 21.6 GB resident against about 14 GB before; this line says
-  where.
+- **Process memory** (`procmem.rs`, every 10 s on a thread of its own).
+  Linux's smaps through `Z:` (opened by wineserver, so `/proc/self` is
+  wineserver's: our pid is the process whose maps show a read-only page
+  of ours between two reserved ones as a mapping of its own; the old
+  lookup by the executable's name never found it, since Wine reads images
+  that are not page-aligned into anonymous memory), joined per mapping
+  with a `VirtualQuery` walk (committed Windows memory against what only
+  Linux knows) and our counters:
+  `process memory: resident … MB by Linux's count (… the system says …),
+  unique … MB, swapped … MB; … mappings, read in … ms | title memory
+  (below 1 TiB): regions committed …, pool section views …, reserved only
+  …; opened as heaps …; resident: regions …, section views …, the
+  sections … unique with victory's own views of them (… resident there);
+  swapped … | Windows private memory above (victory, vkd3d-proton, Wine's
+  DLLs): committed …, resident …; victory's heap live … (textures,
+  streaming, shaders, recording, descriptors, directory, title blocks,
+  other, small blocks); the rest about … (vkd3d-proton, Wine, heap slack)
+  | images …, section views above …; resident: images …, files mapped …
+  (largest three) | NVIDIA driver mappings … | Unix side only (driver,
+  Vulkan, Wine's Unix half): anonymous …, libraries and files … | of ours
+  in driver memory: staging …, spare staging …, buffers pooled …; host
+  lists kept idle …, lists of ours for copies spare …`. "Resident by
+  Linux's count" counts a section page once per view (the title's CPU
+  view and victory's whole view); "unique" counts it once. Victory's
+  heap is counted by `victory_core::heap::Counting`, the global allocator
+  of the diagnostics build: allocations of 4 KiB or more carry the owner
+  their thread named (`heap::enter`), smaller ones are "small blocks";
+  per-thread counters, no shared atomics.
 
 ## 14. Descriptors by directory (per-call binding)
 

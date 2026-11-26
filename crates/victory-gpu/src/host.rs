@@ -56,7 +56,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
-    adapter: Option<IDXGIAdapter3>,
+    pub(crate) adapter: Option<IDXGIAdapter3>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -365,6 +365,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
+    // `VICTORY_GPU=vulkan`: no D3D12 device at all (`crate::vulkan`).
+    if crate::vulkan::on() {
+        return None;
+    }
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -3376,6 +3380,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // The Vulkan backend's pool view: through its pages' homes.
+    if crate::vulkan::on() {
+        // SAFETY: the caller's buffer of `len` bytes.
+        let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+        if let Some(done) = crate::vulkan::read(src as u64, out) {
+            return done;
+        }
+    }
     // The GPU view of the pool: through its pages (`crate::memory`).
     if crate::memory::gpu_view(src as u64, len as u64) {
         return crate::memory::read(src as u64, dst, len, false);
@@ -3873,7 +3885,7 @@ impl Host {
 
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
-fn title_window() -> Option<HWND> {
+pub(crate) fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         // SAFETY: a window handle from the enumeration; `found` is ours.
@@ -4189,7 +4201,7 @@ pub(crate) fn transition(
 }
 
 /// A window of the given client size, owned by its own message thread.
-fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
+pub(crate) fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("victory-window".into())

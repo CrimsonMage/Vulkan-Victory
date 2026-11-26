@@ -93,6 +93,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         // may be behind them: the flights ahead of it land, which sets it
         // (all of them if no signal of it is in the line).
         #[cfg(windows)]
+        if crate::vulkan::on() {
+            drop(waiters);
+            return if crate::vulkan::wait_for_fence(this, value) { S_OK } else { E_NOTIMPL };
+        }
+        #[cfg(windows)]
         {
             drop(waiters);
             let t = std::time::Instant::now();

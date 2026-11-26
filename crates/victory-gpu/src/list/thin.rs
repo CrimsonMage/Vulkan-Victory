@@ -125,7 +125,10 @@ impl Front {
         let fresh = if workers() == 0 {
             Vec::new()
         } else {
-            held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256))
+            held(&WORDS).pop().unwrap_or_else(|| {
+                let _owner = victory_core::heap::enter(victory_core::heap::Owner::Recording);
+                Vec::with_capacity(CHUNK + 256)
+            })
         };
         let words = std::mem::replace(&mut self.words, fresh);
         let schedule = {
@@ -231,6 +234,7 @@ fn start(threads: usize) {
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_on_fast_cores("victory-list");
+            victory_core::heap::enter_for_thread(victory_core::heap::Owner::Recording);
             loop {
                 let stream = {
                     let mut ready = held(&READY);

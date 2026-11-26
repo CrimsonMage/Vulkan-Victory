@@ -36,6 +36,14 @@ the twin; it implements only what is truly console-only.
   More is better (the title's own cap is 30; see workstream 10 for 60).
 - **Low memory**: as little card memory and system memory as the content
   needs, not a mirror of everything.
+- **Process memory (the PC's RAM)**: the baseline is a Series S, where the
+  title has about 8 GB for everything, CPU and GPU. The title's own memory
+  (~7.2 GB, all opened as heaps and so resident) is its budget; what is
+  ours (victory, Wine, vkd3d-proton, the driver) comes on top. Target:
+  the whole process at **≤ ~12 GB first, then toward ~10 GB**, read as the
+  `unique` figure of the `process memory:` line (each page once; Linux's
+  resident count, which `top` shows, counts a section page at each view
+  that maps it). Last full run: ~16.7 GB resident, ~9.5 GB of it ours.
 - **Iterate**: measure (`frame time:` line, card/PC memory), cut the
   biggest cost, repeat.
 - **Content is streamed on demand and then stays put**: the title loads it
@@ -72,6 +80,13 @@ comparing. If something seems to need that, it is in the wrong class.
 - Linux runs exactly the Windows build under stock Proton, with app-local
   DLLs only: a current vkd3d-proton, `d3dcompiler_47`, DXC.
 - Every change passes the gate before it lands.
+- Code shape (`cargo xtask quality`, run by the pre-commit hook): a file
+  over 1,000 lines plans a split, over 1,500 must split; per function,
+  cognitive complexity (SonarSource) over 15 plans and over 25 must
+  simplify; cyclomatic over 10 only warns (flat lookup tables score high on
+  it). New code stays under the mandatory numbers. Today's offenders are listed in `xtask/quality-baseline.toml` and
+  may only shrink; `cargo xtask quality --update-baseline` lowers them as
+  code is split.
 
 ## Gate
 
@@ -118,6 +133,8 @@ driver errors and no new crash, and the captures look no worse.
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 24 | Thin recording (after VIctory-7900XTX `VICTORY_THIN`, GPL-3.0): the title's threads only write list calls down (`list/thin.rs`), a worker per fast core translates them, `ExecuteCommandLists` waits for its lists; first uploads of title-filled textures on a copy queue of their own, detiled by its workers, slots show a 1x1 grey fallback until the queue's fence (`texture/ahead.rs`, after their `VICTORY_UPLOAD_AHEAD`/`VICTORY_SHOW_AFTER`) | subagent | built, not yet run |
 | 25 | Card page cache for the pool (`memory/cache.rs`): each physical pool page a list names gets one copy in 64 MiB blocks of card memory (a directory copy per block, every alias's entry names it), taken in at first naming or announced change (DirectStorage, file reads, CPU title copies, page mappings), shader writes copied back after each list word by word against a twin (only changed words, never over CPU writes), heap-picked writes held off the cache, LRU eviction by frame inside 90% of memcap's ceiling (idle texture copies let go first for room), naming lock-free once per view and list and off while the cache has no block; frame line `pool page cache: …` | subagent | p21: never opened (gated on the falling system budget), naming cost ~900 ms/frame of workers; fixed, built, not yet run |
+| 26 | Process memory: `process memory:` line every 10 s (Linux's smaps joined with a `VirtualQuery` walk and our counters; victory's heap by owner through a counting allocator in the diagnostics build); DirectStorage worker buffers kept up to 1 MiB (was 8 MiB × 3 × 28 workers), texture read buffers up to 16 MiB per thread (was the largest texture) | subagent | built, not yet run |
+| 27 | Pipelines like a PC game: a catalog of every pipeline a run drew with (shaders by hash, graphics state, frame of first use; dropped after 5 unused launches) beside the library; baked as the title starts (4 workers, lowest priority, compiles in flight under 1 GiB, made to fill the caches and let go) or before it (`victory bake [--title] [--jobs]`, its own device, half the CPUs, 3 GiB); the title's creation of a catalog pipeline jumps the queue; a draw waits for its pipeline up to 2 s a frame, then drops; a repeat bake skips what was made with the same translator, driver and layer; translated-shader cache keyed by the container's hash; progress lines `compiling shaders: k of n, ETA` | subagent | built, not yet run |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
@@ -232,6 +249,54 @@ driver errors and no new crash, and the captures look no worse.
   stops the game on any NVIDIA Xid.
 - 2026-11-25: the title's ray-tracing builder stays off: 3 of its 53 programs
   don't translate (wave64 first-lane reads); being fixed.
+- 2026-11-25: the world had rendered black since run p25: draws whose
+  pipeline was not made were dropped (3 ms budget), skipping one-off and
+  temporal passes (exposure). Never dropping stalled the title, whose own
+  watchdog crashed it ~30 s on. Answer: bake used pipelines (first-use
+  order, light: <=4 threads in game, ~1 GB RAM, released after caching),
+  before launch (`victory bake`) and at start; a bounded wait at draws.
+- 2026-11-25: DECISION (user): Vulkan direct. Translator rewritten to
+  emit SPIR-V (buffer device address for raw title addresses, descriptor
+  buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
+  until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: KISS audit of the kept "console side" (partly true):
+  KISS as is: gfx10 decoder (sp3.rs aside), native.rs, io.rs, spill.rs,
+  wave SSA + lift, frame.rs, fence.rs (once its Signal pumps Vulkan),
+  xmem's console API, dstorage.rs, d3d12x.rs. Not KISS: the vk/emit.rs
+  placement (Ramsey one-iteration loops at every merge -> 220 nested
+  constructs, 156 s compiles; replace with post-dominator selection
+  merges, ~300-400 lines), the per-loop iteration cap and seven VK_*
+  switches; host plumbing still carrying D3D12 machinery (list.rs ~1,600
+  D3D12 lines, memory.rs/unified/views/shadow/gather/descriptor-host/
+  memory-cache -> ~0 under Vulkan, indirect.rs windows), duplicated
+  mechanisms (held line in queue.rs and vulkan.rs; two card-page caches;
+  dominators thrice), serial timeline (all queues one after another),
+  leaks (descriptor mirror pending, Vulkan images never freed, map not
+  pruned on unmap). Vulkan plane 0 black: one VkImage per address+shape
+  means views of the same memory get separate images; fix: one image per
+  memory, mutable formats. After parity: delete ~37k translator lines
+  (emit/, hlsl/, resource.rs, structure.rs, bvh.rs) and ~15k host lines.
+  Code-shape limits (user): files 1,000 plan / 1,500 mandatory; cognitive
+  15/25 per function (cyclomatic >10 warns only); `cargo xtask quality` + baseline.
+- 2026-11-26: real NVIDIA compile times (native Vulkan, cache off, 68
+  compute modules by size): new SPIR-V path (pre-OpPhi) p50 25 ms, p90
+  538, max 1,043; old path (dxil-spirv) p50 84, p90 414, max 2,447. The
+  bake's 7.7 s a pipeline was mostly our re-translation and vkd3d's
+  DXIL->SPIR-V conversion, not NVIDIA. Vulkan M2a under Proton (run vk1):
+  device, present, sparse pool view and imports work, the title reached
+  frame 256, then the device was lost (present waits timed out, then
+  vkQueueBindSparse: device lost); being fixed before M2b.
+- 2026-11-26: the D3D12 bake measured the real problem: 2,024 used
+  pipelines took 1,110 s on 14 threads (~7.7 s of NVIDIA compile each,
+  4.3 CPU-hours, 6 GB peak). Bake stopped (user): the translator is the
+  cause. Focus: the KISS SPIR-V translator, target <=0.1 s a pipeline.
+  `victory vkprobe` under Proton: 11/11 (host-pointer imports with device
+  addresses, coherent section aliases, descriptor buffer, descriptor heap
+  in title memory, pipeline libraries: fast link 0.004 ms). Imported host
+  memory cannot back a sparse buffer, so: a 64-range map over imports for
+  CPU-written memory; the pool's GPU view as a sparse buffer of card pages
+  bound per page-mapping call and filled on announced writes (console's
+  own design). Display mode now the PC's screen (was 4K).
 - 2026-11-25: runs p21-p28. Pipeline waits (500 ms a frame) removed:
   menus ~26 fps. The physical-vs-DXGI card gap (~2.2 GB) was NVIDIA local
   memory for per-lane code-constant tables (up to 21 KB a lane x 55k
@@ -277,3 +342,36 @@ driver errors and no new crash, and the captures look no worse.
   which ended a device loss every ~15 min there). Not taken: their async
   submit thread and joined parts, relay, compares, card steps (mirroring
   machinery this tree deleted).
+- 2026-11-25: process memory (workstream 26). Linux counts a page at each
+  address that maps it: the pool's sections are mapped by the title's CPU
+  view and by victory's whole view of each section (its own writes), so
+  the 16.7 GB resident of the last full run may count up to the
+  sections' 4.4 GB twice. The new line gives both counts; the target is
+  read on the unique one. Title memory opened as heaps is pinned, so
+  resident whole, used or not. Not done, and why: the 1.8 GB of
+  "textures the title fills" are the card's memory, not the PC's
+  (staging is freed after each upload, ~30 MB alive); pool pages cannot
+  be discarded once on the card, since the title's CPU view reads the
+  same pages, textures let go for room are detiled again from them (7.4
+  GB let go by idle eviction in that run), the card page cache refills
+  from them and the GPU reads uncached pages in place;
+  translated shaders kept for pipelines (`pipeline.rs`) are counted
+  (owner "shaders") but left to the pipeline work.
+- 2026-11-25: pipelines baked like a PC game's shader compile (workstream
+  26): only pipelines earlier runs drew with (about 3,000; the title
+  creates tens of thousands), in first-use order, from the pipeline
+  catalog; the title's own data gives the shader containers
+  (`shaders.rpf`) but not the pipelines (which shaders pair, what state):
+  the title builds those in code at run time, and only the AMD upscaler
+  deserializes ready pipelines (ACO code, untranslatable). Draws wait up
+  to 2 s a frame for a pipeline (dropping after 3 ms, efa4886, left the
+  world black). `CS_DefragHeap_ComputeRelocations`,
+  `CS_AlphTransmissionPrefilterMip` and `CS_Visibility` are refused
+  (E_INVALIDARG) because their translations declare `WaveSize(64)`,
+  which vkd3d-proton refuses on a card of 32-lane waves: wave64 programs
+  that share LDS within the console wave inside lane branches (a read
+  and a write in one branch region, e.g. one lane updating a counter the
+  next loop pass of the whole wave reads) cannot be split into two host
+  waves ordered by group barriers. Needs the translator to order the two
+  halves of a console wave without the group (pair meetings in
+  wave-uniform code); not yet done.
