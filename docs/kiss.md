@@ -232,6 +232,15 @@ driver errors and no new crash, and the captures look no worse.
   stops the game on any NVIDIA Xid.
 - 2026-11-25: the title's ray-tracing builder stays off: 3 of its 53 programs
   don't translate (wave64 first-lane reads); being fixed.
+- 2026-11-25: runs p21-p28. Pipeline waits (500 ms a frame) removed:
+  menus ~26 fps. The physical-vs-DXGI card gap (~2.2 GB) was NVIDIA local
+  memory for per-lane code-constant tables (up to 21 KB a lane x 55k
+  lanes); tables trimmed to data only: p28 ran the full 5 minutes, the
+  game's card memory peaked at 4.8 GB (was 6.4-7.2, watchdog kills).
+  World ~95 ms/frame with ~1,300 draws a frame still dropped for
+  pipelines being made (largest compile several seconds each; ~1,100
+  queued after 5 min) and GPU busy ~90 ms. Next: one access path per
+  buffer access (offline: -59% code), then GPU time.
 - 2026-11-25: run p20 (thin recording on 8 workers, pool by directory,
   texture copy queue, builder translating): 294 ms/frame (~3.3 fps, from
   ~560); title threads 1 ms in our layer; windows 0 MB; GPU busy 84 ms;
