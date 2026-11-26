@@ -43,125 +43,142 @@ const CAP_STORAGE_IMAGE_MULTISAMPLE: u32 = 27;
 /// Reads `words` (a module the translator made). Unknown instructions are
 /// skipped; a malformed module gives what was read up to the fault.
 pub fn usage(words: &[u32]) -> Usage {
-    use std::collections::HashMap;
-    let mut u = Usage::default();
-    // Type sizes (bytes), constants, pointers (storage class, pointee).
-    let mut size: HashMap<u32, u64> = HashMap::new();
-    let mut array_len: HashMap<u32, (u32, u64)> = HashMap::new(); // array -> (element, length)
-    let mut constant: HashMap<u32, u64> = HashMap::new();
-    let mut pointer: HashMap<u32, (u32, u32)> = HashMap::new();
-    let mut builtin: HashMap<u32, u32> = HashMap::new();
-    let mut per_primitive: std::collections::HashSet<u32> = Default::default();
-    let mut location: HashMap<u32, u32> = HashMap::new();
-    let mut variables: Vec<(u32, u32, u32)> = Vec::new(); // (id, pointer type, storage)
-    let mut struct_builtin: std::collections::HashSet<u32> = Default::default();
-    let mut entry = false;
+    let mut p = Parse::default();
     let mut at = 5;
     while at < words.len() {
         let count = (words[at] >> 16) as usize;
-        let op = words[at] & 0xffff;
         if count == 0 || at + count > words.len() {
             break;
         }
-        let w = &words[at + 1..at + count];
-        let arg = |i: usize| w.get(i).copied().unwrap_or(0);
-        match op {
-            17 => u.capabilities.push(arg(0)),
-            15 if !entry => {
-                entry = true;
-                u.model = arg(0);
-            }
-            16 => match arg(1) {
-                17 => u.local_size = [arg(2), arg(3), arg(4)],
-                26 => u.out_vertices = arg(2),
-                5270 => u.out_primitives = arg(2),
-                _ => {}
-            },
-            71 => match arg(1) {
-                11 => {
-                    builtin.insert(arg(0), arg(2));
-                }
-                30 => {
-                    location.insert(arg(0), arg(2));
-                }
-                5271 => {
-                    per_primitive.insert(arg(0));
-                }
-                _ => {}
-            },
-            72 if arg(2) == 11 => {
-                struct_builtin.insert(arg(0));
-            }
-            20 => {
-                size.insert(arg(0), 4);
-            }
-            21 | 22 => {
-                size.insert(arg(0), u64::from(arg(1) / 8));
-            }
-            23 | 24 => {
-                let s = size.get(&arg(1)).copied().unwrap_or(4) * u64::from(arg(2));
-                size.insert(arg(0), s);
-            }
-            28 => {
-                let len = constant.get(&arg(2)).copied().unwrap_or(1);
-                let s = size.get(&arg(1)).copied().unwrap_or(4) * len;
-                size.insert(arg(0), s);
-                array_len.insert(arg(0), (arg(1), len));
-            }
-            30 => {
-                let s = w[1..].iter().map(|m| size.get(m).copied().unwrap_or(4)).sum();
-                size.insert(arg(0), s);
-            }
-            32 => {
-                pointer.insert(arg(0), (arg(1), arg(2)));
-            }
-            43 => {
-                constant.insert(arg(1), u64::from(arg(2)));
-            }
-            59 => variables.push((arg(1), arg(0), arg(2))),
-            _ => {}
-        }
+        p.instruction(words[at] & 0xffff, &words[at + 1..at + count]);
         at += count;
     }
-    let mut locations = 0u32;
-    for (id, ptr, storage) in variables {
-        let Some(&(_, pointee)) = pointer.get(&ptr) else {
-            continue;
-        };
-        match storage {
-            4 => u.workgroup_bytes += size.get(&pointee).copied().unwrap_or(0),
-            3 => {
-                let user = location.contains_key(&id);
-                if user {
-                    locations += 1;
-                }
-                if u.model != MODEL_MESH {
-                    continue;
-                }
-                // Per-vertex or per-primitive arrays: one element each.
-                let element = match array_len.get(&pointee) {
-                    Some(&(e, _)) => e,
-                    None => pointee,
-                };
-                let bytes = if user {
-                    16
-                } else {
-                    size.get(&element).copied().unwrap_or(0)
-                };
-                let prim = per_primitive.contains(&id)
-                    || matches!(builtin.get(&id), Some(5296 | 5299 | 7 | 9 | 10))
-                    || per_primitive.contains(&element);
-                if prim {
-                    u.per_primitive_bytes += bytes;
-                } else {
-                    u.per_vertex_bytes += bytes;
-                }
+    p.finish()
+}
+
+/// What the parse keeps of a module: type sizes, array shapes, constants,
+/// pointers, decorations and variables.
+#[derive(Default)]
+struct Parse {
+    u: Usage,
+    entry: bool,
+    size: HashMap<u32, u64>,
+    /// Array -> (element, length).
+    array_len: HashMap<u32, (u32, u64)>,
+    constant: HashMap<u32, u64>,
+    /// Pointer type -> (storage class, pointee).
+    pointer: HashMap<u32, (u32, u32)>,
+    builtin: HashMap<u32, u32>,
+    per_primitive: HashSet<u32>,
+    location: HashMap<u32, u32>,
+    /// (id, pointer type, storage class).
+    variables: Vec<(u32, u32, u32)>,
+}
+
+use std::collections::{HashMap, HashSet};
+
+impl Parse {
+    fn size_of(&self, id: u32) -> u64 {
+        self.size.get(&id).copied().unwrap_or(4)
+    }
+
+    fn instruction(&mut self, op: u32, w: &[u32]) {
+        let arg = |i: usize| w.get(i).copied().unwrap_or(0);
+        match op {
+            17 => self.u.capabilities.push(arg(0)),
+            15 if !self.entry => {
+                self.entry = true;
+                self.u.model = arg(0);
+            }
+            16 => self.execution_mode(arg(1), w),
+            71 => self.decorate(arg(0), arg(1), arg(2)),
+            20..=32 => self.type_of(op, w),
+            43 => {
+                self.constant.insert(arg(1), u64::from(arg(2)));
+            }
+            59 => self.variables.push((arg(1), arg(0), arg(2))),
+            _ => {}
+        }
+    }
+
+    fn execution_mode(&mut self, mode: u32, w: &[u32]) {
+        let arg = |i: usize| w.get(i).copied().unwrap_or(0);
+        match mode {
+            17 => self.u.local_size = [arg(2), arg(3), arg(4)],
+            26 => self.u.out_vertices = arg(2),
+            5270 => self.u.out_primitives = arg(2),
+            _ => {}
+        }
+    }
+
+    fn decorate(&mut self, id: u32, decoration: u32, value: u32) {
+        match decoration {
+            11 => {
+                self.builtin.insert(id, value);
+            }
+            30 => {
+                self.location.insert(id, value);
+            }
+            5271 => {
+                self.per_primitive.insert(id);
             }
             _ => {}
         }
     }
-    u.out_locations = locations;
-    u
+
+    fn type_of(&mut self, op: u32, w: &[u32]) {
+        let arg = |i: usize| w.get(i).copied().unwrap_or(0);
+        let bytes = match op {
+            20 => 4,
+            21 | 22 => u64::from(arg(1) / 8),
+            23 | 24 => self.size_of(arg(1)) * u64::from(arg(2)),
+            28 => {
+                let len = self.constant.get(&arg(2)).copied().unwrap_or(1);
+                self.array_len.insert(arg(0), (arg(1), len));
+                self.size_of(arg(1)) * len
+            }
+            30 => w[1..].iter().map(|&m| self.size_of(m)).sum(),
+            32 => {
+                self.pointer.insert(arg(0), (arg(1), arg(2)));
+                return;
+            }
+            _ => return,
+        };
+        self.size.insert(arg(0), bytes);
+    }
+
+    fn finish(mut self) -> Usage {
+        for (id, ptr, storage) in std::mem::take(&mut self.variables) {
+            let Some(&(_, pointee)) = self.pointer.get(&ptr) else { continue };
+            match storage {
+                4 => self.u.workgroup_bytes += self.size.get(&pointee).copied().unwrap_or(0),
+                3 => self.output(id, pointee),
+                _ => {}
+            }
+        }
+        self.u
+    }
+
+    /// An output variable: counted as a location; for mesh programs, its
+    /// bytes per vertex or per primitive.
+    fn output(&mut self, id: u32, pointee: u32) {
+        let user = self.location.contains_key(&id);
+        self.u.out_locations += u32::from(user);
+        if self.u.model != MODEL_MESH {
+            return;
+        }
+        // Per-vertex or per-primitive arrays: one element each.
+        let element = self.array_len.get(&pointee).map_or(pointee, |&(e, _)| e);
+        let bytes = if user { 16 } else { self.size.get(&element).copied().unwrap_or(0) };
+        let prim = self.per_primitive.contains(&id)
+            || matches!(self.builtin.get(&id), Some(5296 | 5299 | 7 | 9 | 10))
+            || self.per_primitive.contains(&element);
+        if prim {
+            self.u.per_primitive_bytes += bytes;
+        } else {
+            self.u.per_vertex_bytes += bytes;
+        }
+    }
 }
 
 /// The device limits the check compares with.
@@ -238,81 +255,66 @@ impl Usage {
 
     /// Why the device cannot take this module, if it cannot.
     pub fn refused(&self, l: &Limits) -> Option<String> {
-        let has = |c: u32| self.capabilities.contains(&c);
-        if has(CAP_STENCIL_EXPORT) && !l.stencil_export {
-            return Some("stencil export without VK_EXT_shader_stencil_export".into());
+        self.capability_refused(l).or_else(|| match self.model {
+            MODEL_COMPUTE => self.compute_refused(l),
+            MODEL_MESH => self.mesh_refused(l),
+            MODEL_VERTEX if self.out_locations * 4 > l.vertex_components => Some(format!(
+                "vertex output components {} over the device's {}",
+                self.out_locations * 4,
+                l.vertex_components
+            )),
+            _ => None,
+        })
+    }
+
+    fn capability_refused(&self, l: &Limits) -> Option<String> {
+        let needs = [
+            (CAP_STENCIL_EXPORT, l.stencil_export, "stencil export without VK_EXT_shader_stencil_export"),
+            (CAP_FRAGMENT_BARYCENTRIC, l.barycentric, "per-vertex attributes without VK_KHR_fragment_shader_barycentric"),
+            (CAP_MESH_SHADING, l.mesh, "a mesh program without mesh shaders"),
+            (CAP_STORAGE_IMAGE_MULTISAMPLE, l.storage_image_multisample, "multisampled storage images without the feature"),
+        ];
+        needs
+            .iter()
+            .find(|(cap, has, _)| !has && self.capabilities.contains(cap))
+            .map(|(_, _, why)| (*why).to_owned())
+    }
+
+    fn invocations(&self) -> u64 {
+        self.local_size.iter().map(|&v| u64::from(v.max(1))).product()
+    }
+
+    fn group_over(&self, size: [u32; 3]) -> bool {
+        (0..3).any(|i| self.local_size[i] > size[i])
+    }
+
+    fn compute_refused(&self, l: &Limits) -> Option<String> {
+        if self.invocations() > u64::from(l.compute_invocations) || self.group_over(l.compute_size) {
+            return Some(format!("compute group {:?} over the device's {} invocations", self.local_size, l.compute_invocations));
         }
-        if has(CAP_FRAGMENT_BARYCENTRIC) && !l.barycentric {
-            return Some("per-vertex attributes without VK_KHR_fragment_shader_barycentric".into());
+        (self.workgroup_bytes > u64::from(l.compute_shared))
+            .then(|| format!("compute shared memory {} bytes over the device's {}", self.workgroup_bytes, l.compute_shared))
+    }
+
+    fn mesh_refused(&self, l: &Limits) -> Option<String> {
+        if self.invocations() > u64::from(l.mesh_invocations) || self.group_over(l.mesh_size) {
+            return Some(format!("mesh group {:?} over the device's {} invocations", self.local_size, l.mesh_invocations));
         }
-        if has(CAP_MESH_SHADING) && !l.mesh {
-            return Some("a mesh program without mesh shaders".into());
+        if self.out_vertices > l.mesh_vertices || self.out_primitives > l.mesh_primitives {
+            return Some(format!(
+                "mesh outputs {} vertices / {} primitives over the device's {} / {}",
+                self.out_vertices, self.out_primitives, l.mesh_vertices, l.mesh_primitives
+            ));
         }
-        if has(CAP_STORAGE_IMAGE_MULTISAMPLE) && !l.storage_image_multisample {
-            return Some("multisampled storage images without the feature".into());
+        if self.workgroup_bytes > u64::from(l.mesh_shared) {
+            return Some(format!("mesh shared memory {} bytes over the device's {}", self.workgroup_bytes, l.mesh_shared));
         }
-        let n: u64 = self.local_size.iter().map(|&v| u64::from(v.max(1))).product();
-        let over = |size: [u32; 3]| (0..3).any(|i| self.local_size[i] > size[i]);
-        match self.model {
-            MODEL_COMPUTE => {
-                if n > u64::from(l.compute_invocations) || over(l.compute_size) {
-                    return Some(format!(
-                        "compute group {:?} over the device's {} invocations",
-                        self.local_size, l.compute_invocations
-                    ));
-                }
-                if self.workgroup_bytes > u64::from(l.compute_shared) {
-                    return Some(format!(
-                        "compute shared memory {} bytes over the device's {}",
-                        self.workgroup_bytes, l.compute_shared
-                    ));
-                }
-            }
-            MODEL_MESH => {
-                if n > u64::from(l.mesh_invocations) || over(l.mesh_size) {
-                    return Some(format!(
-                        "mesh group {:?} over the device's {} invocations",
-                        self.local_size, l.mesh_invocations
-                    ));
-                }
-                if self.out_vertices > l.mesh_vertices || self.out_primitives > l.mesh_primitives
-                {
-                    return Some(format!(
-                        "mesh outputs {} vertices / {} primitives over the device's {} / {}",
-                        self.out_vertices, self.out_primitives, l.mesh_vertices, l.mesh_primitives
-                    ));
-                }
-                if self.workgroup_bytes > u64::from(l.mesh_shared) {
-                    return Some(format!(
-                        "mesh shared memory {} bytes over the device's {}",
-                        self.workgroup_bytes, l.mesh_shared
-                    ));
-                }
-                let out = self.mesh_output_bytes(l);
-                if out > u64::from(l.mesh_output_memory) {
-                    return Some(format!(
-                        "mesh output memory {out} bytes over the device's {}",
-                        l.mesh_output_memory
-                    ));
-                }
-                if self.out_locations * 4 > l.mesh_components {
-                    return Some(format!(
-                        "mesh output components {} over the device's {}",
-                        self.out_locations * 4,
-                        l.mesh_components
-                    ));
-                }
-            }
-            MODEL_VERTEX if self.out_locations * 4 > l.vertex_components => {
-                return Some(format!(
-                    "vertex output components {} over the device's {}",
-                    self.out_locations * 4,
-                    l.vertex_components
-                ));
-            }
-            _ => {}
+        let out = self.mesh_output_bytes(l);
+        if out > u64::from(l.mesh_output_memory) {
+            return Some(format!("mesh output memory {out} bytes over the device's {}", l.mesh_output_memory));
         }
-        None
+        (self.out_locations * 4 > l.mesh_components)
+            .then(|| format!("mesh output components {} over the device's {}", self.out_locations * 4, l.mesh_components))
     }
 }
 

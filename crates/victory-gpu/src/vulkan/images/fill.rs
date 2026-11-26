@@ -66,96 +66,65 @@ pub(crate) fn flush(b: &Backend) {
         let mut guard = registry();
         let Some(r) = guard.as_mut() else { return };
         let completed = b.timeline.completed(&b.host);
-        // Staging and images the card is done with.
-        let mut i = 0;
-        while i < r.staging.len() {
-            if r.staging[i].0 <= completed {
-                let (_, buf) = r.staging.swap_remove(i);
-                // SAFETY: the card has passed its last use.
-                unsafe { buf.destroy(&b.host) };
-            } else {
-                i += 1;
-            }
-        }
-        let mut done = Vec::new();
-        let mut i = 0;
-        while i < r.dropped.len() {
-            if r.dropped[i].0 <= completed && Arc::strong_count(&r.dropped[i].1) == 1 {
-                done.push(r.dropped.swap_remove(i).1);
-            } else {
-                i += 1;
-            }
-        }
-        for img in &done {
-            if let Some((memory, at, size, _)) = lock(&PLACES).remove(&img.id) {
-                let mut users = lock(&USERS);
-                let n = users.entry((memory, at)).or_insert(1);
-                *n -= 1;
-                if *n == 0 {
-                    users.remove(&(memory, at));
-                    release(b, &mut r.blocks, memory, at, size);
-                }
-            }
-        }
+        free_staging(b, r, completed);
+        let done = finished(b, r, completed);
         (std::mem::take(&mut r.pending), done)
     };
     for img in done {
-        // SAFETY: nothing uses it any more.
-        unsafe {
-            for (_, v) in lock(&img.views).drain(..) {
-                b.host.device.destroy_image_view(v, None);
-            }
-            b.host.device.destroy_image(img.image, None);
+        destroy(b, &img);
+    }
+    if !pending.is_empty() {
+        set_up(b, &pending);
+    }
+}
+
+/// Staging buffers the card is done with go.
+fn free_staging(b: &Backend, r: &mut super::Registry, completed: u64) {
+    let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut r.staging).into_iter().partition(|(v, _)| *v <= completed);
+    r.staging = kept;
+    for (_, buf) in done {
+        // SAFETY: the card has passed its last use.
+        unsafe { buf.destroy(&b.host) };
+    }
+}
+
+/// Dropped images the card is done with and nothing holds; their card
+/// memory goes with the last image bound to it.
+fn finished(b: &Backend, r: &mut super::Registry, completed: u64) -> Vec<Arc<Image>> {
+    let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut r.dropped)
+        .into_iter()
+        .partition(|(v, i)| *v <= completed && Arc::strong_count(i) == 1);
+    r.dropped = kept;
+    let done: Vec<Arc<Image>> = done.into_iter().map(|(_, i)| i).collect();
+    for img in &done {
+        let Some((memory, at, size, _)) = lock(&PLACES).remove(&img.id) else { continue };
+        let mut users = lock(&USERS);
+        let n = users.entry((memory, at)).or_insert(1);
+        *n -= 1;
+        if *n == 0 {
+            users.remove(&(memory, at));
+            release(b, &mut r.blocks, memory, at, size);
         }
     }
-    if pending.is_empty() {
-        return;
+    done
+}
+
+fn destroy(b: &Backend, img: &Image) {
+    // SAFETY: nothing uses it any more.
+    unsafe {
+        for (_, v) in lock(&img.views).drain(..) {
+            b.host.device.destroy_image_view(v, None);
+        }
+        b.host.device.destroy_image(img.image, None);
     }
-    // One staging buffer and one submission for everything queued: new
-    // images into GENERAL (cleared), then the fills.
-    let mut jobs = Vec::new();
-    let mut total = 0u64;
-    for img in &pending {
-        img.pending.store(false, Ordering::Relaxed);
-        if img.card_written() {
-            continue;
-        }
-        match plan(img) {
-            Ok(subs) => {
-                let start = total;
-                total += subs.iter().map(|s| s.bytes.next_multiple_of(16)).sum::<u64>();
-                jobs.push((img.clone(), subs, start));
-            }
-            Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
-        }
-    }
-    let staging = if total > 0 {
-        match Buffer::new(&b.host, total, vk::BufferUsageFlags::TRANSFER_SRC, Place::Upload) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                once_warn(format!("Vulkan: no staging buffer of {} MiB: {e:#}", total >> 20));
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut copies: Vec<(vk::Image, Vec<vk::BufferImageCopy>)> = Vec::new();
-    if let Some(st) = &staging {
-        // SAFETY: the staging buffer is mapped and `total` bytes long.
-        let linear = unsafe { std::slice::from_raw_parts_mut(st.mapped, total as usize) };
-        for (img, subs, start) in &jobs {
-            match detile(b, img, subs, &mut linear[*start as usize..], *start) {
-                Ok(regions) => {
-                    img.written[3].fetch_add(1, Ordering::Relaxed);
-                    STATS[1].fetch_add(1, Ordering::Relaxed);
-                    STATS[2].fetch_add(subs.iter().map(|s| s.bytes).sum::<u64>(), Ordering::Relaxed);
-                    copies.push((img.image, regions));
-                }
-                Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
-            }
-        }
-    }
+}
+
+/// One staging buffer and one submission for everything queued: new
+/// images into GENERAL (cleared), then the fills.
+fn set_up(b: &Backend, pending: &[Arc<Image>]) {
+    let (jobs, total) = plan_all(pending);
+    let staging = staging_buffer(b, total);
+    let copies = staging.as_ref().map(|st| detile_all(b, st, &jobs, total)).unwrap_or_default();
     let fresh: Vec<(vk::Image, vk::ImageAspectFlags, bool)> = pending
         .iter()
         .filter(|i| i.fresh.swap(false, Ordering::Relaxed))
@@ -164,35 +133,7 @@ pub(crate) fn flush(b: &Backend) {
     let buffer = staging.as_ref().map(|s| s.buffer);
     let value = b.timeline.record(&b.host, |d, cmd| {
         // SAFETY: recording into the timeline's one-shot buffer.
-        unsafe {
-            for &(image, aspect, clear) in &fresh {
-                let range = vk::ImageSubresourceRange {
-                    aspect_mask: aspect,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                };
-                to_general(d, cmd, image, range, vk::ImageLayout::UNDEFINED);
-                if !clear {
-                    continue;
-                }
-                if aspect == vk::ImageAspectFlags::COLOR {
-                    d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
-                } else {
-                    d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue::default(), &[range]);
-                }
-            }
-            full_barrier(d, cmd);
-            if let Some(buffer) = buffer {
-                for (image, regions) in &copies {
-                    if !regions.is_empty() {
-                        d.cmd_copy_buffer_to_image(cmd, buffer, *image, vk::ImageLayout::GENERAL, regions);
-                    }
-                }
-                full_barrier(d, cmd);
-            }
-        }
+        unsafe { record_set_up(d, cmd, &fresh, buffer, &copies) }
     });
     match (value, staging) {
         (Ok(v), Some(st)) => {
@@ -209,6 +150,104 @@ pub(crate) fn flush(b: &Backend) {
             }
         }
         _ => {}
+    }
+}
+
+/// The fills to do: (image, subresources, offset in staging), and the bytes.
+fn plan_all(pending: &[Arc<Image>]) -> (Vec<(Arc<Image>, Vec<Sub>, u64)>, u64) {
+    let mut jobs = Vec::new();
+    let mut total = 0u64;
+    for img in pending {
+        img.pending.store(false, Ordering::Relaxed);
+        if img.card_written() {
+            continue;
+        }
+        match plan(img) {
+            Ok(subs) => {
+                let start = total;
+                total += subs.iter().map(|s| s.bytes.next_multiple_of(16)).sum::<u64>();
+                jobs.push((img.clone(), subs, start));
+            }
+            Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
+        }
+    }
+    (jobs, total)
+}
+
+fn staging_buffer(b: &Backend, total: u64) -> Option<Buffer> {
+    if total == 0 {
+        return None;
+    }
+    Buffer::new(&b.host, total, vk::BufferUsageFlags::TRANSFER_SRC, Place::Upload)
+        .map_err(|e| once_warn(format!("Vulkan: no staging buffer of {} MiB: {e:#}", total >> 20)))
+        .ok()
+}
+
+/// Detiles every job into the staging buffer; the copies to record.
+fn detile_all(b: &Backend, st: &Buffer, jobs: &[(Arc<Image>, Vec<Sub>, u64)], total: u64) -> Vec<(vk::Image, Vec<vk::BufferImageCopy>)> {
+    // SAFETY: the staging buffer is mapped and `total` bytes long.
+    let linear = unsafe { std::slice::from_raw_parts_mut(st.mapped, total as usize) };
+    let mut copies = Vec::new();
+    for (img, subs, start) in jobs {
+        match detile(b, img, subs, &mut linear[*start as usize..], *start) {
+            Ok(regions) => {
+                img.written[3].fetch_add(1, Ordering::Relaxed);
+                STATS[1].fetch_add(1, Ordering::Relaxed);
+                STATS[2].fetch_add(subs.iter().map(|s| s.bytes).sum::<u64>(), Ordering::Relaxed);
+                copies.push((img.image, regions));
+            }
+            Err(e) => once_warn(format!("Vulkan: a texture is not filled: {e:#}")),
+        }
+    }
+    copies
+}
+
+/// # Safety
+/// Recording into `cmd`.
+unsafe fn record_set_up(
+    d: &victory_vk::ash::Device,
+    cmd: vk::CommandBuffer,
+    fresh: &[(vk::Image, vk::ImageAspectFlags, bool)],
+    buffer: Option<vk::Buffer>,
+    copies: &[(vk::Image, Vec<vk::BufferImageCopy>)],
+) {
+    // SAFETY: as the caller says.
+    unsafe {
+        for &(image, aspect, clear) in fresh {
+            set_up_image(d, cmd, image, aspect, clear);
+        }
+        full_barrier(d, cmd);
+        let Some(buffer) = buffer else { return };
+        for (image, regions) in copies.iter().filter(|(_, r)| !r.is_empty()) {
+            d.cmd_copy_buffer_to_image(cmd, buffer, *image, vk::ImageLayout::GENERAL, regions);
+        }
+        full_barrier(d, cmd);
+    }
+}
+
+/// A new image into GENERAL, cleared unless it shares another's memory.
+///
+/// # Safety
+/// Recording into `cmd`.
+unsafe fn set_up_image(d: &victory_vk::ash::Device, cmd: vk::CommandBuffer, image: vk::Image, aspect: vk::ImageAspectFlags, clear: bool) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_mip_level: 0,
+        level_count: vk::REMAINING_MIP_LEVELS,
+        base_array_layer: 0,
+        layer_count: vk::REMAINING_ARRAY_LAYERS,
+    };
+    // SAFETY: as the caller says.
+    unsafe {
+        to_general(d, cmd, image, range, vk::ImageLayout::UNDEFINED);
+        if !clear {
+            return;
+        }
+        if aspect == vk::ImageAspectFlags::COLOR {
+            d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+        } else {
+            d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue::default(), &[range]);
+        }
     }
 }
 

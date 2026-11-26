@@ -928,7 +928,15 @@ pub(crate) fn heap_created(start: u64, size: u64, kind: u32, visible: bool, plac
     } else {
         tracing::warn!(start = format_args!("{start:#x}"), kb = size >> 10, kind, placed, "Vulkan: a shader-visible descriptor heap above 4 GiB: tables (32-bit addresses) cannot reach it");
     }
-    touch(start);
+    // The whole heap, whatever is committed or mapped where now: every
+    // piece of it is imported (it may lie across several views).
+    let mut m = match backend() {
+        Some(b) => memory(b),
+        None => return,
+    };
+    for at in (start..start + size).step_by(1 << 20).chain([start + size - 1]) {
+        m.want(at);
+    }
 }
 
 impl Memory {
@@ -951,15 +959,20 @@ impl Memory {
         if self.pools.iter().any(|p| p.contains(at)) {
             return false;
         }
-        if let Some((&v, &(len, ..))) = self.views.range(..=at as usize).next_back()
+        // A big view of a section is in the map once its section is
+        // imported (pool pages bring that); otherwise the view itself is
+        // imported below, as loose memory (the title's heaps sit in such
+        // views: vk15's tables, 18 MB into a placed heap, never reached).
+        if let Some((&v, &(len, section, _))) = self.views.range(..=at as usize).next_back()
             && at < (v + len) as u64
+            && self.sections.get(&section).is_some_and(|s| s.import.is_some())
         {
             return false;
         }
         // Loose memory: the run of committed read-write pages around it.
         let Some((base, len)) = committed_run(at) else {
-            if self.warned < 24 {
-                self.warned += 1;
+            static UNKNOWN: AtomicU64 = AtomicU64::new(0);
+            if UNKNOWN.fetch_add(1, Ordering::Relaxed) < 24 {
                 tracing::warn!(at = format_args!("{at:#x}"), "Vulkan: an address the card reads is in no title memory the host knows");
             }
             return false;
