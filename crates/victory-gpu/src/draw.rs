@@ -797,20 +797,12 @@ impl State {
             thread_local! {
                 static ADDRESSES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
             }
+            self.root_views_named(list, roots, compute);
             return ADDRESSES.with_borrow_mut(|addresses| {
                 addresses.clear();
-                crate::frametime::add(crate::frametime::Sum::RootDirectory, roots.len() as u64);
-                for &(slot, writes) in roots {
+                for &(slot, _) in roots {
                     if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                        crate::memory::reach(address, ROOT_VIEW_REACH);
                         addresses.push(address);
-                        // Over the page pool: named for the card's page
-                        // cache (what is written, by `root_memory_writes`).
-                        if !writes && crate::memory::covers(address) {
-                            // (As far as the cache takes a root view in;
-                            // `reach` above demanded its pages.)
-                            crate::memory::named_root(list, address, 128 << 10, false);
-                        }
                     }
                 }
                 crate::memory::ready(list, heap, Some((addresses, &[], false)))
@@ -1377,19 +1369,17 @@ impl State {
         let made = std::mem::take(&mut self.made);
         for stage in &p.stages {
             let t = stage.translated();
-            let memory = if t.host.root_memory.is_empty() {
-                None
-            } else {
-                let Some(ready) = self.memory_ready(list, compute, false, false, &t.host.root_memory) else {
-                    self.made = made;
-                    return false;
-                };
+            // The memory run is the heap's, as the whole binding found it
+            // (`memory_base`), and that binding made the list's copies
+            // ready: only the new root views' pages are seen to, without a
+            // lock once seen.
+            if !t.host.root_memory.is_empty() {
+                self.root_views_named(list, &t.host.root_memory, compute);
                 if t.stores {
                     self.root_memory_writes(list, &t.host.root_memory, compute);
                 }
-                Some(ready)
-            };
-            self.user_data(list, stage, &made, memory.as_ref(), compute);
+            }
+            self.user_data(list, stage, &made, None, compute);
         }
         self.made = made;
         let read = if compute {
@@ -1497,6 +1487,24 @@ impl State {
             self.root_pools.push((compute, u.slot, index));
         }
         true
+    }
+
+    /// The root views a shader reads by directory
+    /// (`HostShader::root_memory`): their pages given directory entries
+    /// (`memory::reach`, no lock once seen to) and, over the page pool,
+    /// named for the card's page cache (what is written, by
+    /// [`State::root_memory_writes`]).
+    fn root_views_named(&self, list: &HostList, roots: &[(u8, bool)], compute: bool) {
+        crate::frametime::add(crate::frametime::Sum::RootDirectory, roots.len() as u64);
+        for &(slot, writes) in roots {
+            if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
+                crate::memory::reach(address, ROOT_VIEW_REACH);
+                if !writes && crate::memory::covers(address) {
+                    // (As far as the cache takes a root view in.)
+                    crate::memory::named_root(list, address, 128 << 10, false);
+                }
+            }
+        }
     }
 
     /// What a shader writes through root views it reads by directory
