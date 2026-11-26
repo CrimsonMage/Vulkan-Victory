@@ -347,6 +347,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // What the title's threads wrote down into them is translated first.
+        crate::list::join(lists);
         if !this.is_null() {
             submit_cut(this, lists);
             return;

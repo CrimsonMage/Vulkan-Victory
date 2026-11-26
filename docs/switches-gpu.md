@@ -22,6 +22,7 @@ The relay (`VICTORY_RELAY`) was ON by default (stage 2), and with it
 | `VICTORY_TEXTURE_QUALITY` | `medium` under 10 GB of card memory, else `high` | `high`, `medium`, `low`: host copies of textures the title fills leave out 0, 1 or 2 of their largest levels (`quality.rs`) |
 | `VICTORY_D3D12_DEBUG` | off | D3D12 debug layer (diagnostics builds) |
 | `VICTORY_PC_DXC` | SDK dxc | test-only: dxc.exe for pipeline tests |
+| `VICTORY_LIST_WORKERS` | fast physical cores, 2-16 (8 on an i7-14700) | workers that translate the list calls the title's threads write down (`list/thin.rs`); `0` translates each call at once on the title's thread, through the same stream (for A/B and bisecting only; to delete once the gate is passed) |
 
 ## Not done (still read; left for the memory rework or a later pass)
 

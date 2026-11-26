@@ -76,6 +76,12 @@ pub(crate) fn has_table<const N: usize>(this: This, table: &'static Table<N>) ->
     !this.is_null() && unsafe { (*this).functions } == table.0.as_ptr()
 }
 
+/// The references `this` has now (one of our objects).
+pub(crate) fn references(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects.
+    unsafe { &*this }.refs.load(Ordering::Acquire)
+}
+
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1

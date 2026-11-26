@@ -3059,8 +3059,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
+                && !crate::texture::sample(list, *resource as This, t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                // Its first upload is on the copy queue: the slot shows the
+                // fallback, and the list names nothing of it.
+                return;
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
