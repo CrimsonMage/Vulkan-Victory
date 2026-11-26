@@ -9,11 +9,15 @@
 //!   packs (`victory bake` in the app finds them; [`translate`]), exactly
 //!   as the game would translate them; old keys' files with a current
 //!   twin are deleted afterwards.
-//! - Stages compile smallest first, on half the logical processors with at
-//!   most a million SPIR-V words compiling at once. Stages over
-//!   `stages::SLOW_WORDS` go to the slow lane, one at a time; when only
-//!   slow-lane compiles are left and the oldest has run [`GIVE_UP`], the
-//!   bake ends without them (listed with their time so far).
+//! - Stages compile smallest first, stages known to be slow last, on half
+//!   the logical processors with at most a million SPIR-V words compiling
+//!   at once. A compile that runs a minute turns slow (`slow.rs`): a new
+//!   bake thread takes its place. When only slow compiles are left and the
+//!   oldest has run [`GIVE_UP`], the bake ends without them (listed with
+//!   their time so far, and written down slow for the next bake and the
+//!   game).
+//! - The game's background bake leaves stages known to be slow alone while
+//!   the title's own stages wait.
 //! - Progress every 5 s with an ETA, and what is compiling when nothing
 //!   finished since; the pipeline cache saved and the pipeline index
 //!   rewritten every 60 s and at the end.
@@ -36,6 +40,7 @@ use std::time::{Duration, Instant};
 use victory_shader::HwStage;
 use victory_vk::ash::vk;
 
+use super::slow::{self, Owner};
 use super::{Backend, backend, stage_cache, stages};
 
 /// A compile at most this long found the stage in a cache.
@@ -108,8 +113,6 @@ struct Shared {
     names: BTreeMap<String, String>,
     queue: Mutex<VecDeque<(String, PathBuf)>>,
     rows: Mutex<Vec<Row>>,
-    /// Compiling now: hash -> (name, words, since).
-    busy: Mutex<BTreeMap<String, (String, usize, Instant)>>,
     total: usize,
 }
 
@@ -123,41 +126,52 @@ fn prepare(b: &Backend) -> (Shared, Vec<Row>) {
     for (hash, file) in stage_cache::all() {
         let name = names.get(&hash).cloned().unwrap_or_default();
         match before.get(&hash) {
-            Some(line) => done.push(row_before(hash, name, line)),
-            None => left.push((std::fs::metadata(&file).map_or(0, |m| m.len()), hash, file)),
+            Some(line) if !slow::is_slow(line) => done.push(row_before(hash, name, line)),
+            // Slow before: compiled again, last.
+            Some(_) => left.push((true, std::fs::metadata(&file).map_or(0, |m| m.len()), hash, file)),
+            None => left.push((false, std::fs::metadata(&file).map_or(0, |m| m.len()), hash, file)),
         }
     }
     left.sort();
     let total = left.len();
-    let queue = Mutex::new(left.into_iter().map(|(_, h, f)| (h, f)).collect());
-    (Shared { device, names, queue, rows: Mutex::new(Vec::new()), busy: Mutex::new(BTreeMap::new()), total }, done)
+    let queue = Mutex::new(left.into_iter().map(|(_, _, h, f)| (h, f)).collect());
+    (Shared { device, names, queue, rows: Mutex::new(Vec::new()), total }, done)
 }
 
-/// Compiles the translation in `file` as the game would; its row.
-fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, busy: &Mutex<BTreeMap<String, (String, usize, Instant)>>) -> Row {
+/// Compiles the translation in `file` as the game would; its row, and
+/// whether it turned slow (its thread was replaced: it ends).
+fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, owner: Owner) -> (Row, bool) {
     let Some(vs) = stage_cache::read_file(file) else {
-        return Row { hash: hash.into(), name, kind: "?", words: 0, slow: false, status: Status::Failed("unreadable translation".into()) };
+        return (Row { hash: hash.into(), name, kind: "?", words: 0, slow: false, status: Status::Failed("unreadable translation".into()) }, false);
     };
     let words = vs.spirv.len();
-    let slow = words > stages::SLOW_WORDS;
-    let row = |status| Row { hash: hash.into(), name: name.clone(), kind: kind_of(vs.stage), words, slow, status };
+    let known = stages::known_slow(b, hash, words);
+    if known && owner == Owner::Background {
+        // The title's own stages first.
+        while stages::waiting() > 0 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let row = |status, slow| Row { hash: hash.into(), name: name.clone(), kind: kind_of(vs.stage), words, slow, status };
     if let Some(why) = stages::limits(b).refuses(&victory_vk::limits::usage(&vs.spirv)) {
-        return row(Status::Refused(format!("over the device: {why}")));
+        return (row(Status::Refused(format!("over the device: {why}")), false), false);
     }
     let d = &b.host.device;
     // SAFETY: the translator's words, a SPIR-V module.
     let module = match unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vs.spirv), None) } {
         Ok(m) => m,
-        Err(e) => return row(Status::Failed(format!("vkCreateShaderModule: {e}"))),
+        Err(e) => return (row(Status::Failed(format!("vkCreateShaderModule: {e}")), false), false),
     };
-    let lane = slow.then(|| stages::slow_lane(words, hash));
-    let flight = (!slow).then(|| stages::Flight::take(words as u64));
-    lock(busy).insert(hash.to_string(), (name.clone(), words, Instant::now()));
+    if known {
+        slow::lane();
+    }
+    let flight = (!known).then(|| stages::Flight::take(words as u64));
+    let running = slow::compiling(hash, &name, &vs.spirv, owner, known);
     let t = Instant::now();
     let made = stages::compile(b, vs.stage, module, &vs.samplers, None);
     let ms = t.elapsed().as_millis() as u64;
-    lock(busy).remove(hash);
-    drop((flight, lane));
+    let turned = running.finish() && !known;
+    drop(flight);
     // SAFETY: ours, used by nothing (the caches keep what was compiled).
     unsafe {
         if let Ok(p) = &made {
@@ -165,21 +179,27 @@ fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, busy: &Mutex<BTr
         }
         d.destroy_shader_module(module, None);
     }
-    match made {
-        Ok(_) if ms <= HIT_MS => row(Status::Cached(ms)),
-        Ok(_) => row(Status::Compiled(ms)),
-        Err(e) => row(Status::Failed(format!("{e:#}"))),
-    }
+    let slow = known || turned;
+    let status = match made {
+        Ok(_) if ms <= HIT_MS => Status::Cached(ms),
+        Ok(_) => Status::Compiled(ms),
+        Err(e) => Status::Failed(format!("{e:#}")),
+    };
+    (row(status, slow), turned)
 }
 
-/// One bake thread: stages from the queue until it is empty.
-fn work(b: &'static Backend, s: &Shared, priority: i32) {
+/// One bake thread: stages from the queue until it is empty, or until a
+/// compile of its turned slow (a new thread took its place).
+fn work(b: &'static Backend, s: &Shared, priority: i32, owner: Owner) {
     set_priority(priority);
     loop {
         let Some((hash, file)) = lock(&s.queue).pop_front() else { return };
-        let row = bake_one(b, &hash, &file, s.names.get(&hash).cloned().unwrap_or_default(), &s.busy);
+        let (row, turned) = bake_one(b, &hash, &file, s.names.get(&hash).cloned().unwrap_or_default(), owner);
         stage_cache::mark_baked(&s.device, &hash, &outcome(&row));
         lock(&s.rows).push(row);
+        if turned {
+            return;
+        }
     }
 }
 
@@ -226,11 +246,14 @@ pub(super) fn run(jobs: Option<usize>, index: Option<PathBuf>) -> anyhow::Result
     println!("bake: {} stages to compile (smallest first), {} done by earlier bakes, {jobs} threads", shared.total, before.len());
     for _ in 0..jobs {
         let s = shared.clone();
-        std::thread::spawn(move || work(b, &s, 0));
+        std::thread::spawn(move || work(b, &s, 0, Owner::Bake));
     }
     let path = index.or_else(|| crate::pipeline::cache_dir().map(|d| d.with_file_name("pipeline-index.md"))).unwrap_or_else(|| "pipeline-index.md".into());
     let started = Instant::now();
     watch(b, &shared, &before, &path, started);
+    if let Some(dir) = crate::pipeline::cache_dir() {
+        println!("bake: slow stages' SPIR-V (diagnostics builds) in {}", dir.with_file_name("slow-stages").display());
+    }
     stages::save_cache(b);
     let rows = all_rows(&shared, &before);
     std::fs::write(&path, index_text(&rows))?;
@@ -243,41 +266,50 @@ pub(super) fn run(jobs: Option<usize>, index: Option<PathBuf>) -> anyhow::Result
 fn all_rows(s: &Shared, before: &[Row]) -> Vec<Row> {
     let mut rows: Vec<Row> = before.to_vec();
     rows.extend(lock(&s.rows).iter().cloned());
-    for (hash, (name, words, since)) in lock(&s.busy).iter() {
-        rows.push(Row { hash: hash.clone(), name: name.clone(), kind: "", words: *words, slow: *words > stages::SLOW_WORDS, status: Status::GaveUp(since.elapsed().as_secs()) });
+    for (hash, busy) in lock(&slow::BUSY).iter() {
+        rows.push(Row { hash: hash.clone(), name: busy.name.clone(), kind: "", words: busy.words, slow: busy.slow, status: Status::GaveUp(busy.since.elapsed().as_secs()) });
     }
     rows.sort_by(|a, c| a.hash.cmp(&c.hash));
     rows
 }
 
-/// Whether the bake is over: every stage done, or only slow-lane compiles
-/// left and the oldest has run past [`GIVE_UP`].
+/// Whether the bake is over: every stage done, or only slow compiles left
+/// and the oldest has run past [`GIVE_UP`].
 fn over(s: &Shared) -> bool {
-    let done = lock(&s.rows).len();
-    if done >= s.total {
+    if lock(&s.rows).len() >= s.total {
         return true;
     }
-    let busy = lock(&s.busy);
-    lock(&s.queue).is_empty()
-        && !busy.is_empty()
-        && busy.values().all(|(_, w, _)| *w > stages::SLOW_WORDS)
-        && busy.values().any(|(_, _, t)| t.elapsed() >= GIVE_UP)
-        && done + busy.len() >= s.total
+    let busy = lock(&slow::BUSY);
+    lock(&s.queue).is_empty() && !busy.is_empty() && busy.values().all(|c| c.slow) && busy.values().any(|c| c.since.elapsed() >= GIVE_UP)
 }
 
-/// Progress every 5 s (with what is compiling when nothing finished); the
-/// pipeline cache and the index every 60 s; returns when the bake is over.
-fn watch(b: &Backend, s: &Shared, before: &[Row], path: &Path, started: Instant) {
+/// Once a second, compiles past a minute turn slow and a bake thread takes
+/// each one's place; progress every 5 s (with what is compiling when
+/// nothing finished); the pipeline cache and the index every 60 s;
+/// returns when the bake is over.
+fn watch(b: &'static Backend, s: &Arc<Shared>, before: &[Row], path: &Path, started: Instant) {
     let (mut saved, mut last) = (Instant::now(), 0usize);
+    let mut tick = 0u64;
     while !over(s) {
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(1));
+        slow::watch(b, &|owner| {
+            if owner == Owner::Bake {
+                let s = s.clone();
+                std::thread::spawn(move || work(b, &s, 0, Owner::Bake));
+            }
+        });
+        tick += 1;
+        if !tick.is_multiple_of(5) {
+            continue;
+        }
         let n = lock(&s.rows).len();
         let secs = started.elapsed().as_secs_f64();
         let eta = if n == 0 { 0.0 } else { secs / n as f64 * s.total.saturating_sub(n) as f64 };
         println!("bake: {n} of {} ({:.0}%), {secs:.0} s so far, ETA {eta:.0} s", s.total, 100.0 * n as f64 / s.total.max(1) as f64);
         if n == last {
-            for (hash, (name, words, since)) in lock(&s.busy).iter() {
-                println!("bake:   compiling {} {name} ({words} words) for {} s", &hash[..16], since.elapsed().as_secs());
+            for (hash, c) in lock(&slow::BUSY).iter() {
+                let lane = if c.slow { " (slow)" } else { "" };
+                println!("bake:   compiling {} {} ({} words) for {} s{lane}", short(hash), c.name, c.words, c.since.elapsed().as_secs());
             }
         }
         last = n;
@@ -297,7 +329,7 @@ pub(super) fn in_background(b: &'static Backend) {
         let _ = std::thread::Builder::new().name("victory-vk-bake".into()).spawn(move || {
             let (shared, before) = prepare(b);
             tracing::info!(left = shared.total, baked_before = before.len(), "Vulkan: background bake of the stage cache");
-            work(b, &shared, -2);
+            work(b, &shared, -2, Owner::Background);
             tracing::info!(baked = lock(&shared.rows).len(), "Vulkan: background bake done");
         });
     });

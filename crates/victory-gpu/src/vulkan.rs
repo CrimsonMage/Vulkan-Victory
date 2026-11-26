@@ -34,6 +34,7 @@ use victory_vk::timeline::Timeline;
 
 mod bound;
 mod baking;
+mod slow;
 mod budget;
 mod compose;
 mod descriptors;
