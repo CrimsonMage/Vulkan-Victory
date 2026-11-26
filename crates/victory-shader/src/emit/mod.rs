@@ -25,18 +25,24 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root views** (root CBVs, SRVs and UAVs) are read through the
+//!   directory of title memory ([`MEMORY_RUN_POOL`]) at the address the
+//!   title sets, which the host puts in user data like a root constant
+//!   (`RootType::Descriptor`, dwords 0 and 1: [`HostShader::root_memory`]);
+//!   nothing else is bound for them. Compute programs note pages found
+//!   without a copy for the host. Programs with a spilled user-data table,
+//!   and programs with an access the directory's way cannot lower (typed,
+//!   d16), keep root descriptors `b<i>` / `t<i>` / `u<i>` in
+//!   [`ROOT_CBV_SPACE`], `i` the title's root parameter index
+//!   ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
+//!   [`HostShader::root_uavs`]), which the host binds per draw.
 //! * **Vertex fetch** (added 2026-11-23). The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
 //!   instruction, so the translation reads raw bytes and converts them
 //!   itself. Their descriptors are built around a root SRV (stride 1, no
-//!   record limit): the host binds the root SRV `t<slot>` above with the
-//!   address the title sets, nothing more. The vertex index, the stride
+//!   record limit), read by directory as above. The vertex index, the stride
 //!   and the attribute offset are the shader's own arithmetic on data in
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads

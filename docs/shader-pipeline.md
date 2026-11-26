@@ -56,8 +56,23 @@ Windows-only test tools (D3D12 device, `dxil.dll`).
   (`USER_VIEW_ADDRESS`, `USER_VIEW_BIAS`), the per-slot stride table
   (`SLOT_STRIDES`) or title memory by directory (`MEMORY_RUN_POOL`: the
   directory, the pool table and the copies in a run of view-heap slots);
-  see the constants in `emit/shader.rs` and the module
-  notes of `emit/mod.rs` for the binding contract.
+  a buffer view picked at a computed offset and read only as numbers
+  takes its address and bytes from the slot's pool table entry. See the
+  constants in `emit/shader.rs` and the module notes of `emit/mod.rs` for
+  the binding contract.
+- **Descriptors as the console reads them.** The title's descriptor
+  records are victory's own (`victory-gpu/src/descriptor.rs`), and the host
+  heap keeps the title heap's order, so a T# or S# the code loads from a
+  table or the heap is `ResourceDescriptorHeap[i]` /
+  `SamplerDescriptorHeap[i]` at the slot the address gives: no lookup.
+  A buffer view (V#) over memory the directory reaches has a null host
+  view and a pool table entry the host writes when the title writes the
+  descriptor; the shader reads the entry and the bytes by directory.
+  Root views are read by directory at the address in user data
+  (`HostShader::root_memory`). Per draw the host binds root constants,
+  the heaps and the pipeline; a program whose root views the directory's
+  way cannot read is translated again with host-bound root views
+  (`with_root_windows`, logged as a fallback).
 - **Loops** get an iteration limit (128 pixel, 256 vertex/mesh, 4,096
   compute; `Lower::count_iteration`) so data the host lacks cannot hang
   the GPU.

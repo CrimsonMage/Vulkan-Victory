@@ -840,3 +840,56 @@ victory holds for title memory follows it.
   driver mappings …; files …; of ours in the PC's memory: …; largest …`.
   Run p7 had 21.6 GB resident against about 14 GB before; this line says
   where.
+
+## 14. Descriptors by directory (per-call binding)
+
+The console's GPU reads a descriptor where the title put it, when the
+draw runs; the CPU does nothing per draw. Victory's records are its own
+(`descriptor.rs`: a tag and a view number) and the host heap keeps the
+title heap's order, so texture and sampler slots were already read in
+place (`ResourceDescriptorHeap[i]`, SM 6.6): no hash, no lookup. What the
+host still did per draw and dispatch was buffer memory: a host view made
+for each buffer view a table holds, constant buffers not on 256 bytes
+copied into fresh tables, every root view resolved into a one-view table
+over its host buffer, every host copy brought up to date. The frame of
+2026-11-25 (Series S, thin recording) spent 0.55 ms per draw and 48 µs
+per bound dispatch there.
+
+- **Root views by directory.** The translated shader takes a root view's
+  title address from user data (the root argument's two dwords,
+  `RootType::Descriptor`) and reads and writes the bytes through the
+  directory (`emit/lower.rs` `direct_root`, `buffer_direct`; `smem`).
+  Compute programs note pages found without a copy (a store only on a
+  miss). No root parameter, no view, no copy found per draw. The host
+  puts the address in user data, sees to the pages (`memory::reach`: a
+  bit per page, no lock once seen; 16 MiB from the address) and declares
+  what is written. Programs with a spilled user-data table and programs
+  with a typed or d16 access through a root view keep host-bound root
+  views (`with_root_windows`; `root views bound by the host per draw ...
+  (fallback)` warns per shader). Offline: all 9,724 programs with root
+  views in the pack read them by directory (46 compute, 8,658 mesh, 1,020
+  vertex; the title's root views are all SRVs).
+- **Root views are user data.** Setting a root view no longer forces a
+  whole binding: draws, mesh draws and dispatches whose pipeline changed
+  only root constants and such root views set their user data again and
+  nothing else (`draw.rs` `constants_only`).
+- **Buffer views made when written.** A raw, structured or constant
+  buffer view whose memory the directory reaches (page reservations, and
+  regions that opened: `unified::region_holds`) is made when the title
+  writes the descriptor: a null host view and its pool table entry
+  (address, bytes). A draw that reads it through a table checks the
+  record and the entry (`HostHeap::by_directory`, no lock) and only
+  declares what it writes. Typed views and memory in neither keep the
+  per-call path.
+- **Regions in the directory.** A region page's entry names a copy per
+  256 MiB chunk of the region's heap (`memory.rs` `Copy::Chunk`), so root
+  views and buffer views over regions (constants, streams) are read by
+  address, every byte at home; a freed region's entries read zeros
+  (`memory::region_released`).
+- **Table entries once per list.** A texture or sampler slot read again
+  from the same record with nothing recorded since that prepares
+  differently (the list's epoch) is skipped (`draw.rs` `table_entry`).
+- Frame line: `table buffer views read by directory N/frame, made by the
+  host per call M/frame; root views read by directory R/frame`. M should
+  stay small (typed views, loose memory); a fallback warning names each
+  shader whose root views the host binds.
