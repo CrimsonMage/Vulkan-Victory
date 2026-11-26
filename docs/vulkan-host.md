@@ -613,6 +613,116 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
   - Regions freed while imported are not covered, because nothing
     imports regions yet.
 
+### M2b handoff (2026-11-26)
+
+Branch `worktree-agent-a5b010d38d592dbd0`, at f61b493 when this note was
+written. It holds integrate 30cd6a5 and the translator's ABI v1
+(`worktree-agent-a34d12784adf81093` at 0614732, merged as 76c4e7d).
+
+**Done.**
+
+- **M2a.** Queues, timeline fences, title memory, the pool's GPU view and
+  present (see "M2a as built"). Run clean for 300 s.
+- **Step 1: stages compiled once** (`victory-gpu/src/vulkan/stages.rs`).
+  - At the title's creation of a catalog pipeline, each new container goes
+    to 4 stage workers: `victory_shader::vk::translate`, then a shader
+    module, then a part.
+  - A part is a pre-rasterisation part (vertex or mesh) or a fragment part
+    (pixel), with `RETAIN_LINK_TIME_OPTIMIZATION`, or a compute pipeline.
+    All of them use the one pipeline layout.
+  - The layout is set 0 images (2^20 sampled, 2^20 storage), set 1
+    samplers (4,096), set 2 empty, set 3 the map UBO, and 256 bytes of push
+    constants, all as descriptor buffers.
+  - Specialisation: constant 0 is false (the map has several ranges).
+    Constant 100+n is the slot of immediate sampler n, from the top 256
+    slots of set 1 (`IMMEDIATE`, `IMMEDIATE_FIRST`).
+  - Stats go into a 10 s line (`Vulkan: stages translated once and
+    compiled once`).
+  - The map's binding is defined in one place (`MAP_SET`, `map_binding`).
+- **Encoders.** `victory-vk/src/gfx10.rs` writes T#, S# and V# with the
+  host's words (T# WORD7 slot/integer/storage, S# WORD3 slot), holds the
+  GFX10 format table, and maps DXGI formats to Vulkan. It is unit-tested.
+- **Map block.** `victory-vk/src/map.rs` writes the ABI v1 block: 64
+  sorted ranges, zero and sink addresses. `vulkan.rs` `Memory::rebuild_map`
+  keeps `MemoryMap` current: the pool view plus big section views. Regions
+  are not imported yet.
+
+**Next, in order.**
+
+1. **(a) Descriptors.** In `descriptor.rs` `record(handle, view)`, under
+   `crate::vulkan::on()`, write the encoded descriptor into the slot
+   instead of victory's record:
+   - `View::Constant` → `gfx10::Buffer::raw`;
+   - buffer SRV/UAV and `Placed` buffers → V#: raw, structured (stride)
+     or typed (format plus `gfx10::format_of`);
+   - texture views → T#, with a slot from a vulkan-side table keyed by
+     `View`.
+
+   The SRV/UAV description words are D3D12's: format, dimension, 4×3-bit
+   component mapping, then the union. `descriptor/host.rs` already parses
+   them, for reference.
+   - **Slots** are freed when the resource is released (`descriptor::forget`)
+     or its memory is released (`vulkan::title_memory_released`), and only
+     reused after the timeline passes the last submission that may read
+     them.
+   - **Descriptor bytes** go into a set-0 descriptor buffer (upload memory,
+     `layout.set_bytes[0]` = 8 MiB) at `binding offset + slot × size`
+     (`vkGetDescriptorEXT`).
+   - **Samplers:** `View::Sampler` (D3D12_SAMPLER_DESC) and
+     `View::ConsoleSampler` → `gfx10::Sampler`, deduplicated into set 1.
+     Also write the `IMMEDIATE` samplers into their slots. Their words are
+     S# words: decode as in Leonida's `vulkan_sampler`.
+   - **Keep the records** victory's other code reads, for RTV/DSV (separate
+     non-shader heaps, unchanged).
+2. **(b) Card images.**
+   - One image per title texture or render target. Reuse
+     `resource::texture_layout` and the `texture.rs` detile code to fill
+     a staging buffer, then `vkCmdCopyBufferToImage` on the timeline. Do
+     it at the announced points `texture.rs` already uses.
+   - Linear textures copy straight from the map's buffers.
+   - Track layouts: `GENERAL` for written ones; attachment and read-only
+     otherwise.
+   - Views per T#.
+3. **(c) Draw recording.**
+   - Under Vulkan, turn `thin` recording on (`list.rs`: `thin` is
+     `host().is_some()` today). Replay each stream into a command buffer
+     per part (`vulkan.rs` `Part` gets `cmds`; `Engine::pump` already
+     submits per part).
+   - **Pipelines:** the 4 parts (vertex input; pre-raster from
+     `stages`; fragment from `stages`; output per format set) are
+     fast-linked, cached per tuple, and optimised-linked in the background.
+   - **Push constants:** the user data from `VkShader::user_data`. Root
+     constants as given, root descriptors as title addresses, tables and
+     heaps as the low 32 bits of their title address.
+   - **Bind once per command buffer:** the set 0/1/3 descriptor buffers,
+     with a map UBO per map generation.
+   - **Index and indirect buffers:** title address → `MemoryMap::range_of`
+     → its buffer (pool view sparse buffer, section import) plus offset.
+   - **Dynamic rendering** on RTV/DSV records → image views. Also clears,
+     sync2 barriers, copies, dispatch and draw, and indirect execution
+     bounded as `indirect.rs` does.
+   - **Regions** must be imported (`Imported::new`) before shaders read
+     them, then added to the map. Commit their pages first, as
+     `unified.rs` `place` does.
+4. **(d) Plane composition.** In `vulkan::present`, blit or draw each
+   plane's image (step b) into the swapchain image. The first plane goes
+   as is; later ones premultiplied-alpha over it, which needs a small
+   graphics pass, unlike a blit.
+
+**Open issues.**
+
+- **Translator coverage** at 0614732 (the translator's numbers): 1,249 of
+  1,527 used programs translate, and 134 of 175 used mesh programs. The
+  census of step 1 (ABI 0) listed the failure classes: mesh, f16 high
+  half, a16/tfe/lwe, swappc, d16.
+- **Immediate samplers** past 256 distinct share the last slot (logged).
+- **Unbound pool pages** read zeros (`residencyNonResidentStrict` is true
+  on this card). Evicted pages stay zeros until announced again.
+- **`CopyPageMappingsBatchX`** binds at once, possibly ahead of
+  submissions its queue still holds.
+- **Stage workers** compile with no `VkPipelineCache` yet. Load and save
+  one per `pipelineCacheUUID` in the run's cache folder.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
