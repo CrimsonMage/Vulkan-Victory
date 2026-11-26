@@ -11,6 +11,7 @@
 pub mod emit;
 pub mod graph;
 pub mod ifconv;
+pub mod interp;
 pub mod lift;
 pub mod pack16;
 pub mod report;
@@ -153,30 +154,12 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
 /// take their locations from `semantics`.
 pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShader, ShaderError> {
     let (c, native) = native(container)?;
-    let p = crate::spill::build(&native)?;
-    // The branches that only skip code when no lane is left for it go: the
-    // skipped vector code is guarded by EXEC anyway, and without them the
-    // wave's graph is the structured program.
-    let p = crate::ir::without_skips(&p, true).unwrap_or(p);
-    let io = io::raise(&p, &native)?;
+    let (f, iface) = thread_ir_of(&c, &native)?;
+    let ir_insts = f.count();
     let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let ps = native.stage == HwStage::Ps;
     let rows = if ps { &isg } else { &osg };
-    let iface_elems = elements(rows);
-    let mut lift = lift::Lift::new(&p, &native, &io);
-    lift.mesh_stride = mesh_stride(&c, &native);
-    lift.halves = pack16::halves(&native.io, &iface_elems);
-    lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
-    if native.stage == HwStage::Vs {
-        lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
-    }
-    let (mut f, iface) = lift.run()?;
-    tir::fold_branches(&mut f);
-    ifconv::if_convert(&mut f);
-    tir::dce(&mut f);
-    tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
-    let ir_insts = f.count();
     let (local_size, mesh) = match &native.io {
         crate::native::StageIo::Cs(_) => ([lift::Lift::host_threads(&native), 1, 1], (0, 0)),
         crate::native::StageIo::Ms(ms) => ([ms.threads, 1, 1], (ms.max_vertices, ms.max_primitives)),
@@ -249,6 +232,40 @@ fn emit_mesh_fitting(f: &tir::Func, iface: &lift::Interface, st: emit::Stage) ->
         }
     }
     Ok((e, 1))
+}
+
+/// A container's thread program (the IR [`emit`] writes as SPIR-V), as the
+/// translation makes it: for [`interp`] and other offline checks.
+pub fn thread_ir(container: &[u8]) -> Result<(tir::Func, lift::Interface, NativeProgram), ShaderError> {
+    let (c, native) = native(container)?;
+    let (f, iface) = thread_ir_of(&c, &native)?;
+    Ok((f, iface, native))
+}
+
+fn thread_ir_of(c: &Container<'_>, native: &NativeProgram) -> Result<(tir::Func, lift::Interface), ShaderError> {
+    let p = crate::spill::build(native)?;
+    // The branches that only skip code when no lane is left for it go: the
+    // skipped vector code is guarded by EXEC anyway, and without them the
+    // wave's graph is the structured program.
+    let p = crate::ir::without_skips(&p, true).unwrap_or(p);
+    let io = io::raise(&p, native)?;
+    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let rows = if native.stage == HwStage::Ps { &isg } else { &osg };
+    let iface_elems = elements(rows);
+    let mut lift = lift::Lift::new(&p, native, &io);
+    lift.mesh_stride = mesh_stride(c, native);
+    lift.halves = pack16::halves(&native.io, &iface_elems);
+    lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
+    if native.stage == HwStage::Vs {
+        lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
+    }
+    let (mut f, iface) = lift.run()?;
+    tir::fold_branches(&mut f);
+    ifconv::if_convert(&mut f);
+    tir::dce(&mut f);
+    tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+    Ok((f, iface))
 }
 
 /// Loop iterations (all loops of an invocation together) after which the
