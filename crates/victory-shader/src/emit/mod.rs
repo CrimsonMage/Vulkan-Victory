@@ -95,7 +95,6 @@ pub mod host;
 mod lower;
 mod own_bits;
 mod rect;
-mod sampler;
 mod shader;
 mod threading;
 #[cfg(windows)]
@@ -111,7 +110,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
-pub use sampler::StaticSampler;
+pub use crate::sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -143,17 +142,7 @@ pub fn bvh_miss() -> bool {
 /// this instead of on the whole executable, so a rebuild that leaves the
 /// translator alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
-    out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
+    let mut out = crate::translation_fingerprint();
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&crate::hlsl::fingerprint());
