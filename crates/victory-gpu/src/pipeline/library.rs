@@ -539,14 +539,36 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    // A save holds the library alone for the seconds it takes to write it
+    // out: the pipeline is then stored by the next save, not waited on here
+    // (a draw may be waiting for it).
+    match library.saving.try_read() {
+        Ok(_stores) => store(library, &wide, &pso),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let _stores = e.into_inner();
+            store(library, &wide, &pso);
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            super::lock(&UNSTORED).push(Unstored(wide, pso.clone()));
+        }
     }
     Ok(pso)
+}
+
+/// Pipelines made while a save held the library, stored by the next save.
+struct Unstored(HSTRING, ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Unstored {}
+static UNSTORED: Mutex<Vec<Unstored>> = Mutex::new(Vec::new());
+
+/// Stores `pso` as `name` (with the library's store side held).
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs) is refused, which leaves the library as it was.
+    if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -574,6 +596,11 @@ pub(crate) fn save(now: bool) {
     let bytes = {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+        // Those made while the last save held the library.
+        let unstored = std::mem::take(&mut *super::lock(&UNSTORED));
+        for Unstored(name, pso) in &unstored {
+            store(library, name, pso);
+        }
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
@@ -594,7 +621,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used: Vec<String> = super::lock(&USED).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -664,7 +691,7 @@ static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut used = super::lock(&USED);
     if used.is_none() {
         let listed = DIR
             .get()

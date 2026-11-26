@@ -833,6 +833,7 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::dropped(self.pipeline as This);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -2214,6 +2215,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            crate::pipeline::dropped(self.pipeline as This);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -3061,6 +3063,7 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::dropped(self.pipeline as This);
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256

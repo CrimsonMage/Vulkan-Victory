@@ -114,10 +114,64 @@ pub(crate) fn names(shaders: &[Arc<Shader>]) -> String {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+thread_local! {
+    /// Whether this thread is one of the pipeline workers (`make`): their
+    /// waits for our pipeline locks are counted apart from the frame
+    /// threads' (list workers, the title's threads).
+    static COMPILE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Nanoseconds and times threads waited for a pipeline lock of ours held
+/// by another thread: frame threads, then pipeline workers.
+static LOCK_WAITS: [[std::sync::atomic::AtomicU64; 2]; 2] =
+    [const { [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)] }; 2];
+
+/// Marks this thread as a pipeline worker.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn compile_thread() {
+    COMPILE_THREAD.with(|c| c.set(true));
+}
+
+/// Whether this thread is a pipeline worker.
+pub(crate) fn on_compile_thread() -> bool {
+    COMPILE_THREAD.with(std::cell::Cell::get)
+}
+
+/// A thread waited for a pipeline lock from `since` until now.
+pub(crate) fn lock_waited(since: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let w = &LOCK_WAITS[usize::from(on_compile_thread())];
+    w[0].fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    w[1].fetch_add(1, Relaxed);
+}
+
+/// Takes one of the pipeline locks (queue, early list, containers,
+/// builder), counting the time a thread stood waiting for another holder.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let since = std::time::Instant::now();
+            let held = m.lock().unwrap_or_else(|e| e.into_inner());
+            lock_waited(since);
+            held
+        }
+    }
+}
+
+/// Per frame (of `frames`): ms and waits for pipeline locks by frame
+/// threads, then by pipeline workers.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn lock_waits(frames: f64) -> [(f64, f64); 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    LOCK_WAITS.each_ref().map(|w| (w[0].swap(0, Relaxed) as f64 / 1e6 / frames, w[1].swap(0, Relaxed) as f64 / frames))
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut shaders = lock(&SHADERS);
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
@@ -290,7 +344,7 @@ pub(crate) fn is_builder(this: This) -> bool {
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = lock(&BUILDER);
     if !b.off {
         b.off = true;
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
@@ -305,7 +359,7 @@ pub(crate) fn builder_runs() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = lock(&BUILDER);
     if b.off {
         return false;
     }
@@ -412,6 +466,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// A draw, mesh dispatch, dispatch or indirect execution with the title
+/// pipeline `this` is dropped because [`host_pipeline`] gave none: counted
+/// for the frame line, apart for pipelines still being made (a brief
+/// pop-in) and those that have none (untranslated, refused).
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) {
+    if !this.is_null() {
+        make::dropped(&pipeline(this).host);
+    }
+}
+
+/// The pipelines' part of the `frame time:` line (`make::frame_text`).
+#[cfg(windows)]
+pub(crate) fn frame_text(frames: f64) -> String {
+    make::frame_text(frames)
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
@@ -439,7 +510,7 @@ fn hand_out(
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
-        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut b = lock(&BUILDER);
         b.pipelines.push(host.clone());
         b.whole = false;
     }
