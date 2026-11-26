@@ -9,6 +9,7 @@
 //! device addresses over the host's imports of title memory.
 
 pub mod emit;
+pub mod graph;
 pub mod lift;
 pub mod pack16;
 pub mod spirv;
@@ -17,7 +18,6 @@ pub mod tir;
 use std::collections::HashMap;
 
 use crate::dxbc::{Container, FourCC};
-use crate::emit::UserData;
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io};
 
@@ -168,6 +168,19 @@ pub fn native(container: &[u8]) -> Result<(Container<'_>, NativeProgram), Shader
     Ok((c, native))
 }
 
+/// One dword of user data and the root parameter that fills it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserData {
+    /// Dword in the user-data buffer (the console's user-data index).
+    pub index: u32,
+    /// Root parameter index in the title's root signature.
+    pub slot: u8,
+    /// `Constants` or `Table` (the value: a constant, or a descriptor table's heap index).
+    pub root: RootType,
+    /// Dword within the parameter.
+    pub dword: u32,
+}
+
 /// Translates a console shader container to SPIR-V.
 pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     let (c, native) = native(container)?;
@@ -175,81 +188,99 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     // The branches that only skip code when no lane is left for it go: the
     // skipped vector code is guarded by EXEC anyway, and without them the
     // wave's graph is the structured program.
-    let p = if std::env::var_os("VK_SKIPS").is_some() { p } else { crate::ir::without_skips(&p, true).unwrap_or(p) };
+    let p = crate::ir::without_skips(&p, true).unwrap_or(p);
     let io = io::raise(&p, &native)?;
-    // A mesh group's id arrives multiplied by max(threads, vertices,
-    // primitives); the thread count is in PSV0 from runtime info version 2.
-    let mesh_stride = match &native.io {
-        crate::native::StageIo::Ms(ms) => {
-            let psv = c.part(FourCC::PSV0).map(|p| p.data);
-            let threads = psv
-                .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
-                .and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
-            threads.map_or(ms.threads, |t| t.max(ms.max_vertices).max(ms.max_primitives))
-        }
-        _ => 0,
-    };
     let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
-    let elems = |rows: &[SigRow]| -> Vec<pack16::Elem> {
-        rows.iter()
-            .filter(|r| r.reg < 32)
-            .map(|r| pack16::Elem {
-                row: r.reg as u8,
-                col: r.mask.trailing_zeros().min(3) as u8,
-                cols: r.mask.count_ones().max(1) as u8,
-                half: r.half,
-                user: r.sv == 0,
-            })
-            .collect()
-    };
-    let iface_elems = if native.stage == HwStage::Ps { elems(&isg) } else { elems(&osg) };
+    let ps = native.stage == HwStage::Ps;
+    let rows = if ps { &isg } else { &osg };
+    let iface_elems = elements(rows);
     let mut lift = lift::Lift::new(&p, &native, &io);
-    lift.mesh_stride = mesh_stride;
+    lift.mesh_stride = mesh_stride(&c, &native);
     lift.halves = pack16::halves(&native.io, &iface_elems);
     lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
     if native.stage == HwStage::Vs {
         lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
     }
     let (mut f, iface) = lift.run()?;
-    if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {
-        tir::dump(&f);
-    }
     tir::fold_branches(&mut f);
     tir::dce(&mut f);
     tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
-    if std::env::var("VK_DUMP").is_ok_and(|v| v == "1") {
-        tir::dump(&f);
-    }
     let ir_insts = f.count();
-    let mut out_types = HashMap::new();
-    if native.stage == HwStage::Ps {
-        for r in &osg {
-            if r.sv == 64 {
-                out_types.insert(r.reg as u16, match r.comp {
-                    1 | 4 => 1,
-                    2 | 5 => 2,
-                    _ => 0,
-                });
-            }
-        }
-    }
     let (local_size, mesh) = match &native.io {
         crate::native::StageIo::Cs(cs) => (cs.threads, (0, 0)),
         crate::native::StageIo::Ms(ms) => ([ms.threads, 1, 1], (ms.max_vertices, ms.max_primitives)),
         _ => ([1, 1, 1], (0, 0)),
     };
-    let loop_limit = match native.stage {
-        HwStage::Ps => 128,
-        HwStage::Cs => 4096,
-        _ => 256,
+    let out_types = if ps { pixel_out_types(&osg) } else { HashMap::new() };
+    let st = emit::Stage { stage: native.stage, local_size, out_types, locs: locations(rows), mesh, no_sel: Default::default() };
+    let e = emit_retrying(&f, &iface, st)?;
+    let mut interface = Vec::new();
+    if native.stage == HwStage::Vs {
+        interface = vertex_inputs(&isg, &e.vertex_inputs);
+    }
+    // the rest is information only: locations are fixed per semantic
+    interface.extend(rows.iter().filter(|r| r.sv == 0).map(|r| Interface {
+        semantic: r.name.clone(),
+        index: r.index,
+        location: semantic_location(&r.name, r.index),
+        input: ps,
+        word: None,
+    }));
+    Ok(VkShader {
+        stage: native.stage,
+        spirv: e.words,
+        user_data: user_data(&native),
+        samplers: iface.samplers.clone(),
+        interface,
+        local_size,
+        approximate: iface.approximate.clone(),
+        ir_insts,
+    })
+}
+
+/// A mesh group's id arrives multiplied by max(threads, vertices,
+/// primitives); the thread count is in PSV0 from runtime info version 2.
+fn mesh_stride(c: &Container<'_>, native: &NativeProgram) -> u32 {
+    let crate::native::StageIo::Ms(ms) = &native.io else { return 0 };
+    let psv = c.part(FourCC::PSV0).map(|p| p.data);
+    let threads =
+        psv.filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48)).and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
+    threads.map_or(ms.threads, |t| t.max(ms.max_vertices).max(ms.max_primitives))
+}
+
+/// The interface elements (registers below 32) for 16-bit packing.
+fn elements(rows: &[SigRow]) -> Vec<pack16::Elem> {
+    rows.iter()
+        .filter(|r| r.reg < 32)
+        .map(|r| pack16::Elem {
+            row: r.reg as u8,
+            col: r.mask.trailing_zeros().min(3) as u8,
+            cols: r.mask.count_ones().max(1) as u8,
+            half: r.half,
+            user: r.sv == 0,
+        })
+        .collect()
+}
+
+/// A pixel program's render target types: 0 float, 1 uint, 2 sint.
+fn pixel_out_types(osg: &[SigRow]) -> HashMap<u16, u8> {
+    let kind = |comp| match comp {
+        1 | 4 => 1,
+        2 | 5 => 2,
+        _ => 0,
     };
-    let locs = if native.stage == HwStage::Ps { locations(&isg) } else { locations(&osg) };
-    let mut st = emit::Stage { stage: native.stage, local_size, out_types, loop_limit, locs, mesh, no_sel: Default::default() };
-    // Joins as selections; a selection that a jump had to leave through a
-    // dispatch is a block construct in the next attempt (all of them, at worst).
-    let mut e = emit::Emit::new(&f, &iface, &st).run().map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
-    for round in 0.. {
+    osg.iter().filter(|r| r.sv == 64).map(|r| (r.reg as u16, kind(r.comp))).collect()
+}
+
+/// Joins as selections; a selection that a jump had to leave through a
+/// dispatch is a block construct in the next attempt (all of them, at worst).
+fn emit_retrying(f: &tir::Func, iface: &lift::Interface, mut st: emit::Stage) -> Result<emit::Emitted, ShaderError> {
+    let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
+    let g = graph::Graph::new(f).map_err(unsupported)?;
+    let run = |st: &emit::Stage| emit::Emit::new(f, &g, iface, st).run().map_err(unsupported);
+    let mut e = run(&st)?;
+    for round in 0..=8 {
         if e.bad_sel.is_empty() {
             break;
         }
@@ -258,9 +289,13 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         } else {
             st.no_sel.extend(e.bad_sel.iter().copied());
         }
-        e = emit::Emit::new(&f, &iface, &st).run().map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+        e = run(&st)?;
     }
-    // user data
+    Ok(e)
+}
+
+/// The push constants user data occupies, by root parameter.
+fn user_data(native: &NativeProgram) -> Vec<UserData> {
     let window = lift::push_window(native.stage);
     let mut user_data = Vec::new();
     for r in &native.layout {
@@ -271,42 +306,15 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
             user_data.push(UserData { index: window + u32::from(r.user_data) + d, slot: r.slot, root: r.root, dword: d });
         }
     }
-    // interface (information only: locations are fixed per semantic)
-    let mut interface = Vec::new();
-    // vertex attributes (a vertex program with a fetch shader): Location =
-    // the input-signature row; the host matches its input layout by semantic
-    if native.stage == HwStage::Vs {
-        for r in isg.iter().filter(|r| r.sv == 0 && r.reg < 32) {
-            if e.vertex_inputs.contains(&(r.reg as u8)) {
-                interface.push(Interface {
-                    semantic: r.name.clone(),
-                    index: r.index,
-                    location: r.reg as u8,
-                    input: true,
-                    word: None,
-                });
-            }
-        }
-    }
-    let rows = if native.stage == HwStage::Ps { &isg } else { &osg };
-    for r in rows.iter().filter(|r| r.sv == 0) {
-        interface.push(Interface {
-            semantic: r.name.clone(),
-            index: r.index,
-            location: semantic_location(&r.name, r.index),
-            input: native.stage == HwStage::Ps,
-            word: None,
-        });
-    }
-    Ok(VkShader {
-        stage: native.stage,
-        spirv: e.words,
-        user_data,
-        samplers: iface.samplers.clone(),
-        interface,
-        local_size,
-        approximate: iface.approximate.clone(),
-        ir_insts,
-    })
+    user_data
+}
+
+/// Vertex attributes (a vertex program with a fetch shader): Location =
+/// the input-signature row; the host matches its input layout by semantic.
+fn vertex_inputs(isg: &[SigRow], used: &[u8]) -> Vec<Interface> {
+    isg.iter()
+        .filter(|r| r.sv == 0 && r.reg < 32 && used.contains(&(r.reg as u8)))
+        .map(|r| Interface { semantic: r.name.clone(), index: r.index, location: r.reg as u8, input: true, word: None })
+        .collect()
 }
 

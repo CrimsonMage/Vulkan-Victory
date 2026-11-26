@@ -63,17 +63,7 @@ impl Lift<'_> {
         {
             return self.kf(0.0);
         }
-        static FORM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let form = FORM.get_or_init(|| std::env::var("VK_LEGACY").unwrap_or_default());
-        if form == "plain" {
-            return p;
-        }
         let z = self.kf(0.0);
-        if form == "nan" {
-            // differs only for a NaN operand times a non-zero one (0, not NaN)
-            let n = self.spv(op::IS_NAN, Ty::BOOL, &[p]);
-            return self.spv(op::SELECT, Ty::F32, &[n, z, p]);
-        }
         let az = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[a, z]);
         let bz = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[b, z]);
         let any = self.spv(op::LOGICAL_OR, Ty::BOOL, &[az, bz]);
@@ -853,7 +843,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => 0,
         "v_movrels_b32" | "v_movreld_b32" => 0,
         "v_swap_b32" => 0,
-        "v_interp_p1_f32" | "v_interp_p2_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16" => 1,
+        "v_interp_p1_f32" | "v_interp_p2_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16" | "v_interp_mov_f32" => 1,
         "v_add_f32" => 2,
         "v_sub_f32" => 2,
         "v_subrev_f32" => 2,
@@ -866,7 +856,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_min3_f32" | "v_max3_f32" => 3,
         "v_med3_f32" => 3,
         "v_rcp_f32" | "v_rcp_iflag_f32" | "v_rcp_legacy_f32" => 3,
-        "v_rsq_f32" | "v_sqrt_f32" | "v_exp_f32" | "v_log_f32" | "v_fract_f32" | "v_floor_f32" | "v_ceil_f32" => 4,
+        "v_rsq_f32" | "v_sqrt_f32" | "v_exp_f32" | "v_log_f32" | "v_fract_f32" | "v_floor_f32" | "v_ceil_f32" | "v_trunc_f32" | "v_rndne_f32" => 4,
         "v_sin_f32" | "v_cos_f32" => 4,
         "v_ldexp_f32" => 4,
         "v_frexp_mant_f32" | "v_frexp_exp_i32_f32" => 4,
@@ -874,7 +864,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => 5,
         "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_max_f16" | "v_min_f16" => 5,
         "v_fma_f16" | "v_mad_f16" | "v_fmac_f16" | "v_med3_f16" => 5,
-        "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_exp_f16" | "v_log_f16" | "v_sin_f16" | "v_cos_f16" => 5,
+        "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_exp_f16" | "v_log_f16" | "v_sin_f16" | "v_cos_f16" | "v_trunc_f16" | "v_floor_f16" | "v_ceil_f16" | "v_fract_f16" | "v_rndne_f16" => 5,
         "v_pk_fma_f16" | "v_pk_mul_f16" | "v_pk_add_f16" | "v_pk_max_f16" | "v_pk_min_f16" => 5,
         "v_lshrrev_b16" | "v_lshlrev_b16" | "v_ashrrev_i16" | "v_add_nc_u16" | "v_sub_nc_u16" | "v_mul_lo_u16" => 6,
         "v_cvt_f32_u32" | "v_cvt_f32_i32" => 7,
@@ -895,7 +885,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_not_b32" => 10,
         "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => 10,
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => 10,
-        "v_lshl_add_u32" | "v_add_lshl_u32" | "v_lshl_or_b32" | "v_and_or_b32" | "v_or3_b32" | "v_add3_u32" => 10,
+        "v_lshl_add_u32" | "v_add_lshl_u32" | "v_lshl_or_b32" | "v_and_or_b32" | "v_or3_b32" | "v_add3_u32" | "v_xad_u32" | "v_xor3_b32" => 10,
         "v_bfe_u32" | "v_bfe_i32" => 10,
         "v_bfi_b32" => 11,
         "v_bfm_b32" => 11,
@@ -908,7 +898,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_bfrev_b32" => 12,
         "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" => 12,
         "v_min3_u32" | "v_max3_u32" | "v_min3_i32" | "v_max3_i32" | "v_med3_u32" | "v_med3_i32" => 12,
-        "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" => 13,
+        "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => 13,
         "v_mad_u64_u32" | "v_mad_i64_i32" => 13,
         "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => 14,
         "v_readfirstlane_b32" => 14,

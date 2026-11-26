@@ -4,103 +4,104 @@ use super::*;
 
 impl Lift<'_> {
     pub(super) fn input(&mut self, reg: Reg, v: Value, offset: usize) -> Res<R> {
-        let stage = self.native.stage;
         if let Some(&(_, input)) = self.io.inputs.iter().find(|i| i.0 == v) {
-            let u = |l: &mut Self, b| l.f.global(Op::Builtin(b), Ty::U32);
-            let x = match input {
-                Input::VertexId => u(self, Builtin::VertexIndex),
-                // A vertex attribute the console's fetch shader loads: a
-                // vertex input at the location of its signature row.
-                Input::Attribute { row, channel } => {
-                    let ty = if self.vs_float.get(&row).copied().unwrap_or(true) { Ty::F32 } else { Ty::U32 };
-                    self.f.global(Op::Input { loc: row, comp: channel, interp: Interp::Flat }, ty)
-                }
-                Input::InstanceId => {
-                    let i = u(self, Builtin::InstanceIndex);
-                    let b = u(self, Builtin::BaseInstance);
-                    self.global_bin(op::I_SUB, Ty::U32, i, b)
-                }
-                Input::PrimitiveId => u(self, Builtin::PrimitiveId),
-                Input::ThreadIdInGroup(c) => u(self, Builtin::LocalInvocationId(c)),
-                Input::GroupId(c) => u(self, Builtin::WorkgroupId(c)),
-                Input::Position(c) => self.f.global(Op::Builtin(Builtin::FragCoord(c)), Ty::F32),
-                Input::FrontFace => {
-                    let b = self.f.global(Op::Builtin(Builtin::FrontFacing), Ty::BOOL);
-                    let (one, zero) = (self.k32(1), self.k32(0));
-                    self.global_node(Op::Spv(op::SELECT), Ty::U32, vec![b, one, zero])
-                }
-                Input::Ancillary => {
-                    // sample id in bits 8-11
-                    let s = u(self, Builtin::SampleId);
-                    let k = self.k32(8);
-                    self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, s, k)
-                }
-                Input::SampleCoverage => u(self, Builtin::SampleMaskIn),
-                Input::Barycentric { kind, index } => {
-                    // i and j: the weights of vertices 1 and 2
-                    use io::Barycentric as B;
-                    let (perspective, centroid, sample) = match kind {
-                        B::PerspectiveCenter => (true, false, false),
-                        B::PerspectiveCentroid => (true, true, false),
-                        B::PerspectiveSample => (true, false, true),
-                        B::LinearCenter => (false, false, false),
-                        B::LinearCentroid => (false, true, false),
-                        B::LinearSample => (false, false, true),
-                        B::PerspectivePullModel => return Err(unsupported(offset, "pull-model barycentrics")),
-                    };
-                    if index > 1 {
-                        return Err(unsupported(offset, "pull-model barycentrics"));
-                    }
-                    let b = Builtin::Bary { perspective, centroid, sample, comp: index + 1 };
-                    let x = self.f.global(Op::Builtin(b), Ty::F32);
-                    self.iface.per_vertex = true;
-                    x
-                }
-                Input::MeshGroup => {
-                    let g = u(self, Builtin::WorkgroupId(0));
-                    let k = self.k32(self.mesh_stride);
-                    self.global_bin(op::I_MUL, Ty::U32, g, k)
-                }
-                Input::MergedWaveInfo | Input::GroupInfo => {
-                    // the wave's index in the group in bits 24-27 (mesh)
-                    let w = self.console_wave();
-                    let k = self.k32(if input == Input::GroupInfo { 6 } else { 24 });
-                    self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, w, k)
-                }
-                _ => return Err(unsupported(offset, "a system input")),
-            };
-            return Ok(R::D(x));
+            return Ok(R::D(self.system_input(input, offset)?));
         }
+        Ok(self.register_input(reg))
+    }
+
+    /// An input the hardware loads (io.rs names it).
+    fn system_input(&mut self, input: Input, offset: usize) -> Res<V> {
+        let u = |l: &mut Self, b| l.f.global(Op::Builtin(b), Ty::U32);
+        Ok(match input {
+            Input::VertexId => u(self, Builtin::VertexIndex),
+            // A vertex attribute the console's fetch shader loads: a
+            // vertex input at the location of its signature row.
+            Input::Attribute { row, channel } => {
+                let ty = if self.vs_float.get(&row).copied().unwrap_or(true) { Ty::F32 } else { Ty::U32 };
+                self.f.global(Op::Input { loc: row, comp: channel, interp: Interp::Flat }, ty)
+            }
+            Input::InstanceId => {
+                let i = u(self, Builtin::InstanceIndex);
+                let b = u(self, Builtin::BaseInstance);
+                self.global_bin(op::I_SUB, Ty::U32, i, b)
+            }
+            Input::PrimitiveId => u(self, Builtin::PrimitiveId),
+            Input::ThreadIdInGroup(c) => u(self, Builtin::LocalInvocationId(c)),
+            Input::GroupId(c) => u(self, Builtin::WorkgroupId(c)),
+            Input::Position(c) => self.f.global(Op::Builtin(Builtin::FragCoord(c)), Ty::F32),
+            Input::FrontFace => {
+                let b = self.f.global(Op::Builtin(Builtin::FrontFacing), Ty::BOOL);
+                let (one, zero) = (self.k32(1), self.k32(0));
+                self.global_node(Op::Spv(op::SELECT), Ty::U32, vec![b, one, zero])
+            }
+            Input::Ancillary => {
+                // sample id in bits 8-11
+                let s = u(self, Builtin::SampleId);
+                let k = self.k32(8);
+                self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, s, k)
+            }
+            Input::SampleCoverage => u(self, Builtin::SampleMaskIn),
+            Input::Barycentric { kind, index } => self.bary_input(kind, index, offset)?,
+            Input::MeshGroup => {
+                let g = u(self, Builtin::WorkgroupId(0));
+                let k = self.k32(self.mesh_stride);
+                self.global_bin(op::I_MUL, Ty::U32, g, k)
+            }
+            Input::MergedWaveInfo | Input::GroupInfo => {
+                // the wave's index in the group in bits 24-27 (mesh)
+                let w = self.console_wave();
+                let k = self.k32(if input == Input::GroupInfo { 6 } else { 24 });
+                self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, w, k)
+            }
+            _ => return Err(unsupported(offset, "a system input")),
+        })
+    }
+
+    /// i and j, the weights of vertices 1 and 2, read as numbers.
+    fn bary_input(&mut self, kind: io::Barycentric, index: u8, offset: usize) -> Res<V> {
+        let (perspective, centroid, sample) = bary_mode(kind).ok_or(unsupported(offset, "pull-model barycentrics"))?;
+        if index > 1 {
+            return Err(unsupported(offset, "pull-model barycentrics"));
+        }
+        let b = Builtin::Bary { perspective, centroid, sample, comp: index + 1 };
+        self.iface.per_vertex = true;
+        Ok(self.f.global(Op::Builtin(b), Ty::F32))
+    }
+
+    /// A register read before any write: EXEC, user data, or undefined.
+    fn register_input(&mut self, reg: Reg) -> R {
+        let stage = self.native.stage;
         match reg {
             Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 => {
                 let half = if c == ir::EXEC { Half::Lo } else { Half::Hi };
+                // pixels: the live lanes (helpers join at s_wqm)
                 let b = if stage == HwStage::Ps {
                     let h = self.f.global(Op::Builtin(Builtin::Helper), Ty::BOOL);
                     self.global_node(Op::Spv(op::LOGICAL_NOT), Ty::BOOL, vec![h])
                 } else {
                     self.kb(true)
                 };
-                Ok(R::M(b, half))
+                R::M(b, half)
             }
-            Reg::S(c) => {
-                // user data
-                let base = match stage {
-                    HwStage::Ms | HwStage::Gs | HwStage::Es | HwStage::Hs | HwStage::Ls => 8,
-                    _ => 0,
-                };
-                let users = match &self.native.io {
-                    StageIo::Cs(cs) => u32::from(cs.user_sgprs()),
-                    _ => 32,
-                };
-                let c = u32::from(c);
-                if c >= base && c - base < users && c - base < 60 {
-                    let k = push_window(stage) + (c - base);
-                    return Ok(R::D(self.f.global(Op::Push(k), Ty::U32)));
-                }
-                Ok(R::D(self.f.konst(Ty::U32, 0)))
-            }
-            _ => Ok(R::D(self.f.global(Op::Undef, Ty::U32))),
+            Reg::S(c) => R::D(self.user_data(u32::from(c))),
+            _ => R::D(self.f.global(Op::Undef, Ty::U32)),
         }
+    }
+
+    /// User SGPR `c` (merged stages have 8 system SGPRs first): its push
+    /// constant, or 0 past the user data.
+    fn user_data(&mut self, c: u32) -> V {
+        let stage = self.native.stage;
+        let base = if matches!(stage, HwStage::Ms | HwStage::Gs | HwStage::Es | HwStage::Hs | HwStage::Ls) { 8 } else { 0 };
+        let users = match &self.native.io {
+            StageIo::Cs(cs) => u32::from(cs.user_sgprs()),
+            _ => 32,
+        };
+        if c >= base && c - base < users && c - base < 60 {
+            return self.f.global(Op::Push(push_window(stage) + (c - base)), Ty::U32);
+        }
+        self.f.konst(Ty::U32, 0)
     }
 
     pub(super) fn export(&mut self, inst: &Inst) -> Res<()> {
@@ -122,70 +123,76 @@ impl Lift<'_> {
                 self.approx("clip and cull distances (pos1+ exports) left out");
                 return Ok(());
             }
-            Target::Param { row, .. } => u16::from(row),
+            Target::Param { .. } => return self.export_param(&e, off),
             Target::Null | Target::Unread => return Ok(()),
-            Target::Depth => {
-                self.iface.depth = true;
-                // channel 0 depth, 1 stencil, 2 sample mask
-                for (c, v) in e.values.iter().enumerate() {
-                    if let Some(v) = v {
-                        let r = self.value(*v, off)?;
-                        let x = self.data(r);
-                        let slot = match c {
-                            0 => OUT_DEPTH,
-                            1 => OUT_STENCIL,
-                            2 => OUT_SAMPLE_MASK,
-                            _ => continue,
-                        };
-                        self.emit(Op::Output { slot, comp: 0 }, Ty::VOID, vec![x]);
-                        self.note_output(slot, 0);
-                    }
-                }
-                return Ok(());
-            }
+            Target::Depth => return self.export_depth(&e, off),
             Target::Primitive => OUT_PRIMITIVE,
             Target::PrimitiveParam { .. } => return Err(unsupported(off, "a per-primitive output")),
         };
-        // mesh: vertex and primitive n are written by thread n of the group
-        let index = (self.native.stage == HwStage::Ms)
-            .then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32));
-        let slot = match e.target {
-            Target::Param { usage: crate::native::Usage::Other(0), .. } if self.native.stage == HwStage::Ms => {
-                u16::from(self.unnamed_row.ok_or(unsupported(off, "a mesh parameter without a row"))?)
-            }
-            _ => slot,
-        };
-        // 16-bit outputs: each dword carries two halves, each a column of a row
-        if matches!(e.target, Target::Param { .. }) && self.halves.keys().any(|k| u16::from(k.0) == slot) {
-            for (c, v) in e.values.iter().enumerate() {
-                let Some(v) = v else { continue };
-                let r = self.value(*v, off)?;
-                let x = self.data(r);
-                let x = self.u32v(x);
-                for high in [false, true] {
-                    let Some(&(row, col)) = self.halves.get(&(slot as u8, 2 * c as u8 + u8::from(high))) else {
-                        continue;
-                    };
-                    let f = self.half_f32(x, high);
-                    let mut args = vec![f];
-                    args.extend(index);
-                    self.emit(Op::Output { slot: u16::from(row), comp: col }, Ty::VOID, args);
-                    self.note_output(u16::from(row), col);
-                }
-            }
-            return Ok(());
-        }
+        self.export_values(&e, slot, off)
+    }
+
+    /// Mesh: vertex and primitive n are written by thread n of the group.
+    fn mesh_index(&mut self) -> Option<V> {
+        (self.native.stage == HwStage::Ms).then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32))
+    }
+
+    /// The channels of an export as outputs of a slot.
+    fn export_values(&mut self, e: &io::Export, slot: u16, off: usize) -> Res<()> {
+        let index = self.mesh_index();
         for (c, v) in e.values.iter().enumerate() {
-            if let Some(v) = v {
-                let r = self.value(*v, off)?;
-                let x = self.data(r);
-                let mut args = vec![x];
+            let Some(v) = v else { continue };
+            let r = self.value(*v, off)?;
+            let x = self.data(r);
+            let mut args = vec![x];
+            args.extend(index);
+            self.emit(Op::Output { slot, comp: c as u8 }, Ty::VOID, args);
+            self.note_output(slot, c as u8);
+            if slot == OUT_PRIMITIVE {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Depth, stencil and sample mask (channels 0-2).
+    fn export_depth(&mut self, e: &io::Export, off: usize) -> Res<()> {
+        self.iface.depth = true;
+        for (c, slot) in [OUT_DEPTH, OUT_STENCIL, OUT_SAMPLE_MASK].into_iter().enumerate() {
+            let Some(v) = e.values[c] else { continue };
+            let r = self.value(v, off)?;
+            let x = self.data(r);
+            self.emit(Op::Output { slot, comp: 0 }, Ty::VOID, vec![x]);
+            self.note_output(slot, 0);
+        }
+        Ok(())
+    }
+
+    /// A parameter: its row (the mesh's unnamed entry has the free row);
+    /// 16-bit rows carry two halves per dword, each a column of a row.
+    fn export_param(&mut self, e: &io::Export, off: usize) -> Res<()> {
+        let Target::Param { usage, row } = e.target else { unreachable!() };
+        let slot = if usage == crate::native::Usage::Other(0) && self.native.stage == HwStage::Ms {
+            self.unnamed_row.ok_or(unsupported(off, "a mesh parameter without a row"))?
+        } else {
+            row
+        };
+        if !self.halves.keys().any(|k| k.0 == slot) {
+            return self.export_values(e, u16::from(slot), off);
+        }
+        let index = self.mesh_index();
+        for (c, v) in e.values.iter().enumerate() {
+            let Some(v) = v else { continue };
+            let r = self.value(*v, off)?;
+            let x = self.data(r);
+            let x = self.u32v(x);
+            for high in [false, true] {
+                let Some(&(row, col)) = self.halves.get(&(slot, 2 * c as u8 + u8::from(high))) else { continue };
+                let f = self.half_f32(x, high);
+                let mut args = vec![f];
                 args.extend(index);
-                self.emit(Op::Output { slot, comp: c as u8 }, Ty::VOID, args);
-                self.note_output(slot, c as u8);
-                if slot == OUT_PRIMITIVE {
-                    break;
-                }
+                self.emit(Op::Output { slot: u16::from(row), comp: col }, Ty::VOID, args);
+                self.note_output(u16::from(row), col);
             }
         }
         Ok(())
@@ -210,16 +217,8 @@ impl Lift<'_> {
         };
         let (attr, mode) = match interp {
             io::Interp::Interpolated { attribute, barycentric, .. } => {
-                use io::Barycentric as B;
-                let (perspective, centroid, sample) = match barycentric {
-                    B::PerspectiveCenter => (true, false, false),
-                    B::PerspectiveCentroid => (true, true, false),
-                    B::PerspectiveSample => (true, false, true),
-                    B::LinearCenter => (false, false, false),
-                    B::LinearCentroid => (false, true, false),
-                    B::LinearSample => (false, false, true),
-                    B::PerspectivePullModel => return Err(unsupported(off, "pull-model interpolation")),
-                };
+                let (perspective, centroid, sample) =
+                    bary_mode(*barycentric).ok_or(unsupported(off, "pull-model interpolation"))?;
                 (*attribute, Interp::Smooth { perspective, centroid, sample })
             }
             io::Interp::Vertex { attribute, vertex: 2 } if !self.per_vertex.contains(&attribute.row) => {
@@ -290,16 +289,8 @@ impl Lift<'_> {
         let p20 = self.spv(op::F_SUB, Ty::F32, &[p2, p0]);
         let x = match *interp {
             io::Interp::Interpolated { barycentric, .. } => {
-                use io::Barycentric as B;
-                let (perspective, centroid, sample) = match barycentric {
-                    B::PerspectiveCenter => (true, false, false),
-                    B::PerspectiveCentroid => (true, true, false),
-                    B::PerspectiveSample => (true, false, true),
-                    B::LinearCenter => (false, false, false),
-                    B::LinearCentroid => (false, true, false),
-                    B::LinearSample => (false, false, true),
-                    B::PerspectivePullModel => return Err(unsupported(off, "pull-model interpolation")),
-                };
+                let (perspective, centroid, sample) =
+                    bary_mode(barycentric).ok_or(unsupported(off, "pull-model interpolation"))?;
                 let b = |l: &mut Self, comp| {
                     l.f.global(Op::Builtin(Builtin::Bary { perspective, centroid, sample, comp }), Ty::F32)
                 };
@@ -339,4 +330,19 @@ impl Lift<'_> {
         self.def(inst, Reg::V(reg), R::D(x));
         Ok(())
     }
+}
+
+/// (perspective, centroid, sample) of a barycentric kind; none for the pull
+/// model.
+pub(super) fn bary_mode(kind: io::Barycentric) -> Option<(bool, bool, bool)> {
+    use io::Barycentric as B;
+    Some(match kind {
+        B::PerspectiveCenter => (true, false, false),
+        B::PerspectiveCentroid => (true, true, false),
+        B::PerspectiveSample => (true, false, true),
+        B::LinearCenter => (false, false, false),
+        B::LinearCentroid => (false, true, false),
+        B::LinearSample => (false, false, true),
+        B::PerspectivePullModel => return None,
+    })
 }

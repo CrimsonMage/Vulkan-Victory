@@ -78,45 +78,11 @@ fn packed_half(layout: &Layout, a: u8, h: u8) -> Option<(u8, u8)> {
 /// (row, half) -> (row, column) for the 16-bit rows of a stage's
 /// interface: vertex/mesh outputs or pixel inputs. Rows absent are 32-bit.
 pub fn halves(io: &StageIo, elements: &[Elem]) -> HashMap<(u8, u8), (u8, u8)> {
-    let free_rows = |taken: &dyn Fn(u8) -> bool| {
-        let mut free: Vec<u8> = elements.iter().filter(|e| e.half && e.user).map(|e| e.row).filter(|&r| !taken(r)).collect();
-        free.sort_unstable();
-        free.dedup();
-        free
+    let rows = match io {
+        StageIo::Vs { outputs, .. } | StageIo::Ms(crate::native::MeshIo { outputs, .. }) => output_rows(outputs, elements),
+        StageIo::Ps { inputs, .. } => input_rows(inputs, elements),
+        _ => Vec::new(),
     };
-    // (row, pack2, second row)
-    let mut rows: Vec<(u8, bool, Option<u8>)> = Vec::new();
-    match io {
-        StageIo::Vs { outputs, .. } | StageIo::Ms(crate::native::MeshIo { outputs, .. }) => {
-            let per_vertex: Vec<_> = outputs.iter().filter(|o| o.param & 0x80 == 0).collect();
-            let mut free = free_rows(&|r| per_vertex.iter().any(|o| o.row == r));
-            let mut fp16: Vec<_> = per_vertex.iter().filter(|o| o.fp16).collect();
-            fp16.sort_by_key(|o| o.row);
-            for o in fp16 {
-                let b = o.pack2.then(|| free.iter().position(|&r| r > o.row)).flatten().map(|i| free.remove(i));
-                rows.push((o.row, o.pack2, b));
-            }
-        }
-        StageIo::Ps { inputs, .. } => {
-            let packed: Vec<_> = inputs.iter().filter(|i| i.fp16 && i.pack2).collect();
-            let mut free = free_rows(&|r| {
-                inputs.iter().any(|i| i.row == r) || packed.iter().any(|i| i.row2 != i.row && i.row2 == r)
-            });
-            let mut missing: Vec<_> = packed.iter().filter(|i| i.row2 == i.row).collect();
-            missing.sort_by_key(|i| i.row);
-            let mut partners = HashMap::new();
-            for i in missing {
-                if let Some(k) = free.iter().position(|&r| r > i.row) {
-                    partners.insert(i.row, free.remove(k));
-                }
-            }
-            for i in inputs.iter().filter(|i| i.fp16) {
-                let b = if i.row2 != i.row { Some(i.row2) } else { partners.get(&i.row).copied() };
-                rows.push((i.row, i.pack2, if i.pack2 { b } else { None }));
-            }
-        }
-        _ => {}
-    }
     let packs: Vec<(u8, Option<u8>)> = rows.iter().filter(|r| r.1).map(|r| (r.0, r.2)).collect();
     let layout = packed_layout(elements, &packs);
     let mut out = HashMap::new();
@@ -129,6 +95,54 @@ pub fn halves(io: &StageIo, elements: &[Elem]) -> HashMap<(u8, u8), (u8, u8)> {
         }
     }
     out
+}
+
+/// The 16-bit user rows of `elements` that `taken` leaves free, in order.
+fn free_rows(elements: &[Elem], taken: &dyn Fn(u8) -> bool) -> Vec<u8> {
+    let mut free: Vec<u8> = elements.iter().filter(|e| e.half && e.user).map(|e| e.row).filter(|&r| !taken(r)).collect();
+    free.sort_unstable();
+    free.dedup();
+    free
+}
+
+/// Vertex/mesh 16-bit rows: (row, two per dword, second row). A packed row's
+/// partner is the next free 16-bit row.
+fn output_rows(outputs: &[crate::native::VsOutput], elements: &[Elem]) -> Vec<(u8, bool, Option<u8>)> {
+    let per_vertex: Vec<_> = outputs.iter().filter(|o| o.param & 0x80 == 0).collect();
+    let mut free = free_rows(elements, &|r| per_vertex.iter().any(|o| o.row == r));
+    let mut fp16: Vec<_> = per_vertex.iter().filter(|o| o.fp16).collect();
+    fp16.sort_by_key(|o| o.row);
+    let mut rows = Vec::new();
+    for o in fp16 {
+        let b = o.pack2.then(|| free.iter().position(|&r| r > o.row)).flatten().map(|i| free.remove(i));
+        rows.push((o.row, o.pack2, b));
+    }
+    rows
+}
+
+/// Pixel 16-bit rows; a packed row the metadata names no partner for takes
+/// the next free one.
+fn input_rows(inputs: &[crate::native::PsInput], elements: &[Elem]) -> Vec<(u8, bool, Option<u8>)> {
+    let packed: Vec<_> = inputs.iter().filter(|i| i.fp16 && i.pack2).collect();
+    let mut free = free_rows(elements, &|r| {
+        inputs.iter().any(|i| i.row == r) || packed.iter().any(|i| i.row2 != i.row && i.row2 == r)
+    });
+    let mut missing: Vec<_> = packed.iter().filter(|i| i.row2 == i.row).collect();
+    missing.sort_by_key(|i| i.row);
+    let mut partners = HashMap::new();
+    for i in missing {
+        if let Some(k) = free.iter().position(|&r| r > i.row) {
+            partners.insert(i.row, free.remove(k));
+        }
+    }
+    inputs
+        .iter()
+        .filter(|i| i.fp16)
+        .map(|i| {
+            let b = if i.row2 != i.row { Some(i.row2) } else { partners.get(&i.row).copied() };
+            (i.row, i.pack2, if i.pack2 { b } else { None })
+        })
+        .collect()
 }
 
 /// The row a mesh parameter entry names: the 2020 compiler leaves a mesh

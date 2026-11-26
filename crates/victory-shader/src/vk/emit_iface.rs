@@ -38,12 +38,6 @@ impl Emit<'_> {
         self.map
     }
 
-    /// Experiment: no binary search code (one range only).
-    pub(super) fn no_search() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("VK_SEARCH").is_ok_and(|v| v == "0"))
-    }
-
     /// The memory map: a uniform buffer, set 3 binding 0 (read with uniform
     /// loads; NVIDIA compiled a pointer-loaded map ~35x slower).
     pub(super) fn map_ptr(&mut self) -> Id {
@@ -74,23 +68,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn builtin(&mut self, b: Builtin) -> Id {
-        let (bi, comps, sty): (u32, u32, Id) = match b {
-            Builtin::VertexIndex => (en::BI_VERTEX_INDEX, 1, self.t.u32_),
-            Builtin::InstanceIndex => (en::BI_INSTANCE_INDEX, 1, self.t.u32_),
-            Builtin::BaseInstance => (en::BI_BASE_INSTANCE, 1, self.t.u32_),
-            Builtin::FragCoord(_) => (en::BI_FRAG_COORD, 4, self.t.f32_),
-            Builtin::FrontFacing => (en::BI_FRONT_FACING, 1, self.t.bool_),
-            Builtin::SampleId => (en::BI_SAMPLE_ID, 1, self.t.u32_),
-            Builtin::SampleMaskIn => (en::BI_SAMPLE_MASK, 1, self.t.u32_),
-            Builtin::Helper => (en::BI_HELPER_INVOCATION, 1, self.t.bool_),
-            Builtin::WorkgroupId(_) => (en::BI_WORKGROUP_ID, 3, self.t.u32_),
-            Builtin::LocalInvocationId(_) => (en::BI_LOCAL_INVOCATION_ID, 3, self.t.u32_),
-            Builtin::LocalInvocationIndex => (en::BI_LOCAL_INVOCATION_INDEX, 1, self.t.u32_),
-            Builtin::SubgroupId => (en::BI_SUBGROUP_ID, 1, self.t.u32_),
-            Builtin::SubgroupLocalId => (en::BI_SUBGROUP_LOCAL_INVOCATION_ID, 1, self.t.u32_),
-            Builtin::PrimitiveId => (en::BI_PRIMITIVE_ID, 1, self.t.u32_),
-            Builtin::Bary { perspective, .. } => (if perspective { en::BI_BARY_COORD_KHR } else { 5287 }, 3, self.t.f32_),
-        };
+        let (bi, comps, sty) = self.builtin_kind(b);
         let key = match b {
             Builtin::FragCoord(_) => Builtin::FragCoord(0),
             Builtin::WorkgroupId(_) => Builtin::WorkgroupId(0),
@@ -98,44 +76,13 @@ impl Emit<'_> {
             Builtin::Bary { perspective, centroid, sample, .. } => Builtin::Bary { perspective, centroid, sample, comp: 0 },
             x => x,
         };
-        let var = if let Some(&v) = self.builtins.get(&key) {
-            v
-        } else {
-            let ty = if b == Builtin::SampleMaskIn {
-                let arr = self.m.t_array(sty, 1);
-                arr
-            } else {
-                self.m.t_vec(sty, comps)
-            };
-            let p = self.m.t_ptr(en::SC_INPUT, ty);
-            let v = self.m.variable(p, en::SC_INPUT);
-            self.m.decorate(v, en::DEC_BUILTIN, &[bi]);
-            if self.frag && sty != self.t.f32_ && sty != self.t.bool_ && b != Builtin::Helper {
-                self.m.decorate(v, en::DEC_FLAT, &[]);
+        let var = match self.builtins.get(&key) {
+            Some(&v) => v,
+            None => {
+                let v = self.builtin_var(b, bi, comps, sty);
+                self.builtins.insert(key, v);
+                v
             }
-            if let Builtin::Bary { centroid, sample, .. } = b {
-                self.m.extension("SPV_KHR_fragment_shader_barycentric");
-                self.m.capability(en::CAP_FRAGMENT_BARYCENTRIC_KHR);
-                if centroid {
-                    self.m.decorate(v, en::DEC_CENTROID, &[]);
-                }
-                if sample {
-                    self.m.capability(en::CAP_SAMPLE_RATE_SHADING);
-                    self.m.decorate(v, en::DEC_SAMPLE, &[]);
-                }
-            }
-            if b == Builtin::BaseInstance {
-                self.m.capability(4427); // DrawParameters
-            }
-            if b == Builtin::SampleId {
-                self.m.capability(en::CAP_SAMPLE_RATE_SHADING);
-            }
-            if matches!(b, Builtin::SubgroupLocalId | Builtin::SubgroupId) {
-                self.m.capability(en::CAP_GROUP_NON_UNIFORM);
-            }
-            self.interface.push(v);
-            self.builtins.insert(key, v);
-            v
         };
         let comp = match b {
             Builtin::FragCoord(c) | Builtin::WorkgroupId(c) | Builtin::LocalInvocationId(c) => Some(u32::from(c)),
@@ -155,6 +102,59 @@ impl Emit<'_> {
                 self.m.op(op::LOAD, ty, &[var])
             }
         }
+    }
+
+    /// A built-in's SPIR-V code, components and scalar type.
+    fn builtin_kind(&self, b: Builtin) -> (u32, u32, Id) {
+        let (u, f, bo) = (self.t.u32_, self.t.f32_, self.t.bool_);
+        match b {
+            Builtin::VertexIndex => (en::BI_VERTEX_INDEX, 1, u),
+            Builtin::InstanceIndex => (en::BI_INSTANCE_INDEX, 1, u),
+            Builtin::BaseInstance => (en::BI_BASE_INSTANCE, 1, u),
+            Builtin::FragCoord(_) => (en::BI_FRAG_COORD, 4, f),
+            Builtin::FrontFacing => (en::BI_FRONT_FACING, 1, bo),
+            Builtin::SampleId => (en::BI_SAMPLE_ID, 1, u),
+            Builtin::SampleMaskIn => (en::BI_SAMPLE_MASK, 1, u),
+            Builtin::Helper => (en::BI_HELPER_INVOCATION, 1, bo),
+            Builtin::WorkgroupId(_) => (en::BI_WORKGROUP_ID, 3, u),
+            Builtin::LocalInvocationId(_) => (en::BI_LOCAL_INVOCATION_ID, 3, u),
+            Builtin::LocalInvocationIndex => (en::BI_LOCAL_INVOCATION_INDEX, 1, u),
+            Builtin::SubgroupId => (en::BI_SUBGROUP_ID, 1, u),
+            Builtin::SubgroupLocalId => (en::BI_SUBGROUP_LOCAL_INVOCATION_ID, 1, u),
+            Builtin::PrimitiveId => (en::BI_PRIMITIVE_ID, 1, u),
+            Builtin::Bary { perspective: true, .. } => (en::BI_BARY_COORD_KHR, 3, f),
+            Builtin::Bary { .. } => (5287, 3, f),
+        }
+    }
+
+    /// The input variable of a built-in, with its decorations and capabilities.
+    fn builtin_var(&mut self, b: Builtin, bi: u32, comps: u32, sty: Id) -> Id {
+        let ty = if b == Builtin::SampleMaskIn { self.m.t_array(sty, 1) } else { self.m.t_vec(sty, comps) };
+        let p = self.m.t_ptr(en::SC_INPUT, ty);
+        let v = self.m.variable(p, en::SC_INPUT);
+        self.m.decorate(v, en::DEC_BUILTIN, &[bi]);
+        if self.frag && sty != self.t.f32_ && sty != self.t.bool_ && b != Builtin::Helper {
+            self.m.decorate(v, en::DEC_FLAT, &[]);
+        }
+        if let Builtin::Bary { centroid, sample, .. } = b {
+            self.m.extension("SPV_KHR_fragment_shader_barycentric");
+            self.m.capability(en::CAP_FRAGMENT_BARYCENTRIC_KHR);
+            if centroid {
+                self.m.decorate(v, en::DEC_CENTROID, &[]);
+            }
+            if sample {
+                self.m.capability(en::CAP_SAMPLE_RATE_SHADING);
+                self.m.decorate(v, en::DEC_SAMPLE, &[]);
+            }
+        }
+        match b {
+            Builtin::BaseInstance => self.m.capability(4427), // DrawParameters
+            Builtin::SampleId => self.m.capability(en::CAP_SAMPLE_RATE_SHADING),
+            Builtin::SubgroupLocalId | Builtin::SubgroupId => self.m.capability(en::CAP_GROUP_NON_UNIFORM),
+            _ => {}
+        }
+        self.interface.push(v);
+        v
     }
 
     pub(super) fn input(&mut self, row: u8, chan: u8, interp: Interp, ty: Ty) -> Id {
@@ -463,6 +463,8 @@ impl Emit<'_> {
     /// Writes the helper functions' bodies (after main).
     pub(super) fn write_helpers(&mut self) {
         let mut helpers: Vec<(Helper, Id)> = self.helpers.iter().map(|(h, i)| (*h, *i)).collect();
+        // in the order they were declared, so output is reproducible
+        helpers.sort_by_key(|h| h.1);
         if let Some(k) = helpers.iter().position(|h| h.0 == Helper::Typed) {
             let (_, fid) = helpers.remove(k);
             self.write_typed(fid);
@@ -479,7 +481,7 @@ impl Emit<'_> {
             let range = h == Helper::TranslateRange;
             let (ret, params): (Id, Vec<Id>) = if range { (q, vec![q, u]) } else { (q, vec![q]) };
             let fty = self.m.global_fn_type(ret, &params);
-            self.m.op_to(op::FUNCTION, ret, fid, &[helper_control("map"), fty]);
+            self.m.op_to(op::FUNCTION, ret, fid, &[0, fty]);
             let ps: Vec<Id> = params
                 .iter()
                 .map(|&t| {
@@ -513,12 +515,6 @@ impl Emit<'_> {
                 let dev = e.m.op(op::I_ADD, q, &[base, d]);
                 (e.m.op(op::SELECT, q, &[hit, dev, zero]), lim)
             };
-            if Self::no_search() {
-                let r0 = through(self, z);
-                self.m.op_void(254, &[r0.0]);
-                self.m.op_void(op::FUNCTION_END, &[]);
-                continue;
-            }
             let (lf, ls, lm) = (self.m.id(), self.m.id(), self.m.id());
             self.m.op_void(op::SELECTION_MERGE, &[lm, 0]);
             self.m.op_void(op::BRANCH_CONDITIONAL, &[one_range, lf, ls]);
@@ -553,11 +549,92 @@ impl Emit<'_> {
 
     /// The typed-buffer decoder: a switch over the GFX10 FORMAT codes the
     /// title's views use; others read one 32-bit channel.
+    /// A 2_10_10_10 unorm element (x in the low bits) as four float bits.
+    fn typed_packed(&mut self, addr: Id) -> Vec<Id> {
+        let (u, f) = (self.t.u32_, self.t.f32_);
+        let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
+        let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+        let w = self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4]);
+        let mut at = 0;
+        let mut ch = Vec::new();
+        for width in [10u32, 10, 10, 2] {
+            let (o, wv) = (self.c32(at), self.c32(width));
+            at += width;
+            let r = self.m.op(op::BIT_FIELD_U_EXTRACT, u, &[w, o, wv]);
+            let fl = self.m.op(op::CONVERT_U_TO_F, f, &[r]);
+            let k = self.m.c_f32((1.0 / ((1u64 << width) - 1) as f32).to_bits());
+            let m = self.m.op(op::F_MUL, f, &[fl, k]);
+            ch.push(self.m.op(op::BITCAST, u, &[m]));
+        }
+        ch
+    }
+
+    /// The channels of an element of `comps` x `bits` (num: 0 float, 1
+    /// unorm, 2 snorm, 3 uint, 4 sint), missing ones 0 and alpha 1.
+    fn typed_channels(&mut self, addr: Id, comps: u32, bits: u32, num: u32) -> Vec<Id> {
+        let st = match bits {
+            32 => S::U32,
+            16 => S::U16,
+            _ => S::U8,
+        };
+        let et = self.scalar(st);
+        let lt = self.m.t_vec(et, comps);
+        let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, lt);
+        let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+        let v = self.m.op(op::LOAD, lt, &[ptr, en::MEM_ALIGNED, (bits / 8).max(1)]);
+        let mut ch = Vec::new();
+        for c in 0..comps {
+            let e = if comps == 1 { v } else { self.m.op(op::COMPOSITE_EXTRACT, et, &[v, c]) };
+            ch.push(self.typed_channel(e, bits, num));
+        }
+        let (z, one_i, one_f) = (self.c32(0), self.c32(1), self.m.c_u32(1.0f32.to_bits()));
+        while ch.len() < 4 {
+            ch.push(match (ch.len(), num >= 3) {
+                (3, true) => one_i,
+                (3, false) => one_f,
+                _ => z,
+            });
+        }
+        ch
+    }
+
+    /// One channel's value as 32 bits.
+    fn typed_channel(&mut self, e: Id, bits: u32, num: u32) -> Id {
+        let (u, f) = (self.t.u32_, self.t.f32_);
+        match (bits, num) {
+            (32, _) => e,
+            (16, 0) => {
+                let h = self.scalar(S::F16);
+                let hf = self.m.op(op::BITCAST, h, &[e]);
+                let fl = self.m.op(op::F_CONVERT, f, &[hf]);
+                self.m.op(op::BITCAST, u, &[fl])
+            }
+            (_, 1) => {
+                let i = self.m.op(op::U_CONVERT, u, &[e]);
+                let fl = self.m.op(op::CONVERT_U_TO_F, f, &[i]);
+                let k = self.m.c_f32((1.0 / ((1u64 << bits) - 1) as f32).to_bits());
+                let m = self.m.op(op::F_MUL, f, &[fl, k]);
+                self.m.op(op::BITCAST, u, &[m])
+            }
+            (_, 2) => {
+                let i = self.m.op(op::S_CONVERT, u, &[e]);
+                let fl = self.m.op(op::CONVERT_S_TO_F, f, &[i]);
+                let k = self.m.c_f32((1.0 / ((1u64 << (bits - 1)) - 1) as f32).to_bits());
+                let m = self.m.op(op::F_MUL, f, &[fl, k]);
+                let lo = self.m.c_f32((-1.0f32).to_bits());
+                let c = self.m.ext(glsl::N_MAX, f, &[m, lo]);
+                self.m.op(op::BITCAST, u, &[c])
+            }
+            (_, 3) => self.m.op(op::U_CONVERT, u, &[e]),
+            _ => self.m.op(op::S_CONVERT, u, &[e]),
+        }
+    }
+
     pub(super) fn write_typed(&mut self, fid: Id) {
-        let (u, q, f) = (self.t.u32_, self.t.u64_, self.t.f32_);
+        let (u, q) = (self.t.u32_, self.t.u64_);
         let v4 = self.m.t_vec(u, 4);
         let fty = self.m.global_fn_type(v4, &[q, u]);
-        self.m.op_to(op::FUNCTION, v4, fid, &[helper_control("typed"), fty]);
+        self.m.op_to(op::FUNCTION, v4, fid, &[0, fty]);
         let (addr, fmt) = (self.m.id(), self.m.id());
         self.m.op_to(55, q, addr, &[]);
         self.m.op_to(55, u, fmt, &[]);
@@ -615,79 +692,11 @@ impl Emit<'_> {
         self.m.op_void(op::SELECTION_MERGE, &[merge, 0]);
         self.m.op_void(251, &sw); // OpSwitch
         let one_f = self.m.c_u32(1.0f32.to_bits());
-        let one_i = self.c32(1);
         let z = self.c32(0);
         let mut incoming = Vec::new();
         for (i, &(_, comps, bits, num)) in table.iter().enumerate() {
             self.m.label(labels[i]);
-            let mut ch = Vec::new();
-            if bits == 0 {
-                let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
-                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
-                let w = self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4]);
-                let mut at = 0;
-                for width in [10u32, 10, 10, 2] {
-                    let (o, wv) = (self.c32(at), self.c32(width));
-                    at += width;
-                    let r = self.m.op(op::BIT_FIELD_U_EXTRACT, u, &[w, o, wv]);
-                    let fl = self.m.op(op::CONVERT_U_TO_F, f, &[r]);
-                    let k = self.m.c_f32((1.0 / ((1u64 << width) - 1) as f32).to_bits());
-                    let m = self.m.op(op::F_MUL, f, &[fl, k]);
-                    ch.push(self.m.op(op::BITCAST, u, &[m]));
-                }
-            } else {
-                let st = match bits {
-                    32 => S::U32,
-                    16 => S::U16,
-                    _ => S::U8,
-                };
-                let et = self.scalar(st);
-                let lt = self.m.t_vec(et, comps);
-                let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, lt);
-                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
-                let v = self.m.op(op::LOAD, lt, &[ptr, en::MEM_ALIGNED, (bits / 8).max(1)]);
-                for c in 0..comps {
-                    let e = if comps == 1 { v } else { self.m.op(op::COMPOSITE_EXTRACT, et, &[v, c]) };
-                    let x = match (bits, num) {
-                        (32, _) => e,
-                        (16, 0) => {
-                            let h = self.scalar(S::F16);
-                            let hf = self.m.op(op::BITCAST, h, &[e]);
-                            let fl = self.m.op(op::F_CONVERT, f, &[hf]);
-                            self.m.op(op::BITCAST, u, &[fl])
-                        }
-                        (_, 1) => {
-                            let i = self.m.op(op::U_CONVERT, u, &[e]);
-                            let fl = self.m.op(op::CONVERT_U_TO_F, f, &[i]);
-                            let k = self.m.c_f32((1.0 / ((1u64 << bits) - 1) as f32).to_bits());
-                            let m = self.m.op(op::F_MUL, f, &[fl, k]);
-                            self.m.op(op::BITCAST, u, &[m])
-                        }
-                        (_, 2) => {
-                            let i = self.m.op(op::S_CONVERT, u, &[e]);
-                            let fl = self.m.op(op::CONVERT_S_TO_F, f, &[i]);
-                            let k = self.m.c_f32((1.0 / ((1u64 << (bits - 1)) - 1) as f32).to_bits());
-                            let m = self.m.op(op::F_MUL, f, &[fl, k]);
-                            let lo = self.m.c_f32((-1.0f32).to_bits());
-                            let c = self.m.ext(glsl::N_MAX, f, &[m, lo]);
-                            self.m.op(op::BITCAST, u, &[c])
-                        }
-                        (_, 3) => self.m.op(op::U_CONVERT, u, &[e]),
-                        _ => self.m.op(op::S_CONVERT, u, &[e]),
-                    };
-                    ch.push(x);
-                }
-                while ch.len() < 4 {
-                    let alpha = ch.len() == 3;
-                    ch.push(if !alpha {
-                        z
-                    } else if num >= 3 {
-                        one_i
-                    } else {
-                        one_f
-                    });
-                }
-            }
+            let ch = if bits == 0 { self.typed_packed(addr) } else { self.typed_channels(addr, comps, bits, num) };
             let r = self.m.op(op::COMPOSITE_CONSTRUCT, v4, &ch);
             incoming.push((r, labels[i]));
             self.m.op_void(op::BRANCH, &[merge]);

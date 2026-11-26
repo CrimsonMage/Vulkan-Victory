@@ -520,19 +520,27 @@ impl<'a> Lift<'a> {
             }
         }
         if o == op::BITCAST && n.args.len() == 1 {
-            let src = self.f.node(n.args[0]).clone();
-            if self.f.ty(n.args[0]) == ty {
-                return Some(n.args[0]);
-            }
-            if let Op::Const(bits) = src.op
-                && ty.n == 1
-                && self.f.ty(n.args[0]).n == 1
-            {
-                return Some(self.f.konst(ty, bits));
-            }
-            if src.op == Op::Spv(op::BITCAST) && self.f.ty(src.args[0]) == ty {
-                return Some(src.args[0]);
-            }
+            return self.fold_bitcast(n);
+        }
+        None
+    }
+
+    /// A bitcast of a value of the same type, of a scalar constant, or of a
+    /// bitcast back.
+    fn fold_bitcast(&mut self, n: &Node) -> Option<V> {
+        let ty = n.ty;
+        let src = self.f.node(n.args[0]).clone();
+        if self.f.ty(n.args[0]) == ty {
+            return Some(n.args[0]);
+        }
+        if let Op::Const(bits) = src.op
+            && ty.n == 1
+            && self.f.ty(n.args[0]).n == 1
+        {
+            return Some(self.f.konst(ty, bits));
+        }
+        if src.op == Op::Spv(op::BITCAST) && self.f.ty(src.args[0]) == ty {
+            return Some(src.args[0]);
         }
         None
     }

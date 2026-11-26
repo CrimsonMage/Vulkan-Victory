@@ -487,93 +487,108 @@ mod tests {
 /// (or its negation) goes one way. The console's uniform state machines
 /// test the same scalar conditions over and over.
 pub fn fold_branches(f: &mut Func) {
-    use super::spirv::op;
-    let n = f.blocks.len();
     for _round in 0..4 {
-        // predecessors as the terminators now say (block preds stay as the
-        // phis index them)
-        let succ = |b: &Block| -> Vec<usize> {
-            match b.term {
-                Term::Jump(t) => vec![t],
-                Term::Branch(_, t, e) => vec![t, e],
-                Term::Return => vec![],
-            }
-        };
-        let mut preds = vec![Vec::new(); n];
-        for (b, blk) in f.blocks.iter().enumerate() {
-            for s in succ(blk) {
-                preds[s].push(b);
-            }
-        }
-        // reverse postorder: a block with one way in sees its predecessor's
-        // facts and the edge's; others start with none
-        let mut order = Vec::new();
-        let mut mark = vec![false; n];
-        let mut st = vec![(0usize, 0usize)];
-        mark[0] = true;
-        while let Some(&mut (b, ref mut k)) = st.last_mut() {
-            let ss = succ(&f.blocks[b]);
-            if *k < ss.len() {
-                let x = ss[*k];
-                *k += 1;
-                if !mark[x] {
-                    mark[x] = true;
-                    st.push((x, 0));
-                }
-            } else {
-                order.push(b);
-                st.pop();
-            }
-        }
-        order.reverse();
-        let mut facts: Vec<Option<std::rc::Rc<Vec<(V, bool)>>>> = vec![None; n];
+        let preds = term_preds(f);
+        let order = term_rpo(f);
+        let mut facts: Vec<Option<std::rc::Rc<Vec<(V, bool)>>>> = vec![None; f.blocks.len()];
         let mut changed = false;
-        let strip = |f: &Func, c: V| {
-            let mut c = c;
-            let mut neg = false;
-            while let Op::Spv(op::LOGICAL_NOT) = f.nodes[c as usize].op {
-                c = f.nodes[c as usize].args[0];
-                neg = !neg;
-            }
-            (c, neg)
-        };
         for &b in &order {
             let mine = facts[b].clone().unwrap_or_default();
-            if let Term::Branch(c, t, e) = f.blocks[b].term {
-                let (c0, neg) = strip(f, c);
-                let k = match f.nodes[c0 as usize].op {
-                    Op::Const(k) => Some(k != 0),
-                    _ => mine.iter().rev().find(|x| x.0 == c0).map(|x| x.1),
-                };
-                if t == e {
-                    f.blocks[b].term = Term::Jump(t);
-                    changed = true;
-                } else if let Some(v) = k {
-                    f.blocks[b].term = Term::Jump(if v != neg { t } else { e });
-                    changed = true;
+            changed |= fold_term(f, b, &mine);
+            for (s, fact) in edge_facts(f, b) {
+                if preds[s].len() == 1 && facts[s].is_none() {
+                    let mut fs = (*mine).clone();
+                    fs.extend(fact);
+                    facts[s] = Some(std::rc::Rc::new(fs));
                 }
-            }
-            match f.blocks[b].term {
-                Term::Jump(t) => {
-                    if preds[t].len() == 1 && facts[t].is_none() {
-                        facts[t] = Some(mine.clone());
-                    }
-                }
-                Term::Branch(c, t, e) => {
-                    let (c0, neg) = strip(f, c);
-                    for (s, v) in [(t, !neg), (e, neg)] {
-                        if preds[s].len() == 1 && facts[s].is_none() {
-                            let mut fs = (*mine).clone();
-                            fs.push((c0, v));
-                            facts[s] = Some(std::rc::Rc::new(fs));
-                        }
-                    }
-                }
-                Term::Return => {}
             }
         }
         if !changed {
             break;
         }
+    }
+}
+
+pub fn term_succ(b: &Block) -> Vec<usize> {
+    match b.term {
+        Term::Jump(t) => vec![t],
+        Term::Branch(_, t, e) => vec![t, e],
+        Term::Return => vec![],
+    }
+}
+
+/// Predecessors as the terminators now say (block preds stay as the phis
+/// index them).
+fn term_preds(f: &Func) -> Vec<Vec<usize>> {
+    let mut preds = vec![Vec::new(); f.blocks.len()];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for s in term_succ(blk) {
+            preds[s].push(b);
+        }
+    }
+    preds
+}
+
+/// Reverse postorder from the entry by the terminators.
+pub fn term_rpo(f: &Func) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut mark = vec![false; f.blocks.len()];
+    let mut st = vec![(0usize, 0usize)];
+    mark[0] = true;
+    while let Some(&mut (b, ref mut k)) = st.last_mut() {
+        let ss = term_succ(&f.blocks[b]);
+        if *k < ss.len() {
+            let x = ss[*k];
+            *k += 1;
+            if !std::mem::replace(&mut mark[x], true) {
+                st.push((x, 0));
+            }
+        } else {
+            order.push(b);
+            st.pop();
+        }
+    }
+    order.reverse();
+    order
+}
+
+/// A condition without its negations: (value, negated).
+fn strip_not(f: &Func, c: V) -> (V, bool) {
+    use super::spirv::op;
+    let mut c = c;
+    let mut neg = false;
+    while let Op::Spv(op::LOGICAL_NOT) = f.nodes[c as usize].op {
+        c = f.nodes[c as usize].args[0];
+        neg = !neg;
+    }
+    (c, neg)
+}
+
+/// Folds `b`'s branch if its condition is known; whether it did.
+fn fold_term(f: &mut Func, b: usize, facts: &[(V, bool)]) -> bool {
+    let Term::Branch(c, t, e) = f.blocks[b].term else { return false };
+    let (c0, neg) = strip_not(f, c);
+    let known = match f.nodes[c0 as usize].op {
+        Op::Const(k) => Some(k != 0),
+        _ => facts.iter().rev().find(|x| x.0 == c0).map(|x| x.1),
+    };
+    let to = match known {
+        _ if t == e => t,
+        Some(v) => if v != neg { t } else { e },
+        None => return false,
+    };
+    f.blocks[b].term = Term::Jump(to);
+    true
+}
+
+/// The successors of `b` with the fact each edge adds.
+fn edge_facts(f: &Func, b: usize) -> Vec<(usize, Option<(V, bool)>)> {
+    match f.blocks[b].term {
+        Term::Jump(t) => vec![(t, None)],
+        Term::Branch(c, t, e) => {
+            let (c0, neg) = strip_not(f, c);
+            vec![(t, Some((c0, !neg))), (e, Some((c0, neg)))]
+        }
+        Term::Return => vec![],
     }
 }

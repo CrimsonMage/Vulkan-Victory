@@ -181,14 +181,44 @@ impl Lift<'_> {
 
     pub(super) fn buffer(&mut self, inst: &Inst, name: &'static str) -> Res<()> {
         let off = inst.machine.offset;
-        let Fields::Buffer { data, addr, rsrc, soffset, offset, offen, idxen, format, lds, tfe, .. } = inst.fields.clone()
-        else {
-            unreachable!()
-        };
+        let Fields::Buffer { data, rsrc, format, lds, tfe, .. } = inst.fields.clone() else { unreachable!() };
         if lds || tfe {
             return Err(unsupported(off, "a buffer access to LDS or with tfe"));
         }
         let vs = self.vsharp(inst, &rsrc)?;
+        let o = self.buffer_offset(inst, &vs)?;
+        let Some(src @ Operand::Vector { reg, dwords }) = data else {
+            return Err(unsupported(off, name));
+        };
+        if name.contains("_atomic_") {
+            return self.buffer_atomic(inst, name, &vs, o, &src, reg);
+        }
+        let load = name.contains("_load_");
+        let (size, kind) = self.buffer_kind(name, format, load, u32::from(dwords), off)?;
+        if let Kind::VFormat(ch, d16) = kind {
+            return self.buffer_vformat(inst, &vs, o, reg, ch, d16);
+        }
+        let a = self.buffer_addr(&vs, o, size, !load);
+        if load {
+            let kind = match kind {
+                Kind::Dwords(n) if self.floats(inst, (0..n).map(|k| Reg::V(reg + k as u8))) => Kind::Floats(n),
+                k => k,
+            };
+            let vals = self.load_kind(a, kind)?;
+            for (i, v) in vals.into_iter().enumerate() {
+                self.def(inst, Reg::V(reg + i as u8), R::D(v));
+            }
+        } else {
+            let vals: Vec<V> = (0..dwords).map(|i| self.opnd_dw(inst, &src, i, false)).collect::<Res<_>>()?;
+            self.store_kind(a, kind, &vals)?;
+        }
+        Ok(())
+    }
+
+    /// A buffer access's byte offset: soffset + offset, plus index x stride
+    /// (idxen) and the vector offset (offen).
+    fn buffer_offset(&mut self, inst: &Inst, vs: &VSharp) -> Res<V> {
+        let Fields::Buffer { addr, soffset, offset, offen, idxen, .. } = inst.fields.clone() else { unreachable!() };
         let so = self.opnd(inst, &soffset)?;
         let so = self.u32v(so);
         let ko = self.k32(u32::from(offset));
@@ -206,96 +236,79 @@ impl Lift<'_> {
             let vo = self.u32v(vo);
             o = self.spv(op::I_ADD, Ty::U32, &[o, vo]);
         }
-        let Some(Operand::Vector { reg, dwords }) = data else {
-            return Err(unsupported(off, name));
-        };
-        let n = u32::from(dwords);
-        if name.contains("_atomic_") {
-            let glc = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let opc = atomic_op(name).ok_or(unsupported(off, name))?;
-            let a = self.buffer_addr(&vs, o, 4, true);
-            let x = self.opnd_dw(inst, &data.unwrap(), 0, false)?;
-            let x = self.u32v(x);
-            let mut args = vec![a, x];
-            if name.contains("cmpswap") {
-                let c = self.opnd_dw(inst, &data.unwrap(), 1, false)?;
-                let c = self.u32v(c);
-                args.push(c);
-            }
-            let r = self.emit(Op::Atomic(opc), Ty::U32, args);
-            if glc {
-                self.def(inst, Reg::V(reg), R::D(r));
-            }
-            return Ok(());
+        Ok(o)
+    }
+
+    /// A buffer atomic; the old value returns with glc.
+    fn buffer_atomic(&mut self, inst: &Inst, name: &'static str, vs: &VSharp, o: V, src: &Operand, reg: u8) -> Res<()> {
+        let off = inst.machine.offset;
+        let glc = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+        let opc = atomic_op(name).ok_or(unsupported(off, name))?;
+        let a = self.buffer_addr(vs, o, 4, true);
+        let x = self.opnd_dw(inst, src, 0, false)?;
+        let x = self.u32v(x);
+        let mut args = vec![a, x];
+        if name.contains("cmpswap") {
+            let c = self.opnd_dw(inst, src, 1, false)?;
+            let c = self.u32v(c);
+            args.push(c);
         }
-        // element size and conversion
-        let fmt: Option<u8> = format;
-        let load = name.contains("_load_");
-        let (size, kind) = if name.contains("_format_") {
-            let ch = name.rsplit('_').next().unwrap().len() as u32; // x, xy, xyz, xyzw
-            let d16 = name.contains("_d16_");
-            match fmt {
-                Some(f) => {
-                    let Some((bytes, kind)) = tformat(f) else {
-                        if std::env::var_os("VK_FMT").is_some() {
-                            eprintln!("typed buffer format {f} ({name})");
-                        }
-                        return Err(unsupported(off, "a typed buffer format"));
-                    };
-                    (bytes, Kind::T(kind, ch, d16))
-                }
-                None if load => (0, Kind::VFormat(ch, d16)),
-                None => {
-                    // stores through a V# format: 32-bit channels
-                    self.approx("a typed buffer store written as 32-bit channels");
-                    if d16 {
-                        (4 * ch, Kind::Halves(ch))
-                    } else {
-                        (4 * ch, Kind::Dwords(ch))
-                    }
-                }
-            }
-        } else if name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_byte") {
+        let r = self.emit(Op::Atomic(opc), Ty::U32, args);
+        if glc {
+            self.def(inst, Reg::V(reg), R::D(r));
+        }
+        Ok(())
+    }
+
+    /// Element size and conversion of a buffer access.
+    fn buffer_kind(&mut self, name: &str, format: Option<u8>, load: bool, n: u32, off: usize) -> Res<(u32, Kind)> {
+        if name.contains("_format_") {
+            return self.buffer_format_kind(name, format, load, off);
+        }
+        let ends = |a: &str, b: &str, c: &str| name.ends_with(a) || name.ends_with(b) || name.ends_with(c);
+        Ok(if ends("_ubyte", "_sbyte", "_byte") {
             (1, Kind::Byte(name.ends_with("_sbyte")))
-        } else if name.ends_with("_ushort") || name.ends_with("_sshort") || name.ends_with("_short") {
+        } else if ends("_ushort", "_sshort", "_short") {
             (2, Kind::Short(name.ends_with("_sshort")))
         } else if name.contains("_d16") {
             return Err(unsupported(off, "a d16 buffer access"));
         } else {
             (4 * n, Kind::Dwords(n))
-        };
-        if let Kind::VFormat(ch, d16) = kind {
-            // the format from the V#, decoded by a helper; bounds by the stride
-            let four = self.k32(4);
-            let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
-            let a = self.buffer_addr_dyn(&vs, o, bytes, false);
-            let k12 = self.k32(12);
-            let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[vs.w3, k12]);
-            let k7f = self.k32(0x7F);
-            let f = self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
-            let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, f]);
-            let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
-            let vals = if d16 { self.pack_d16(&vals) } else { vals };
-            for (i, v) in vals.into_iter().enumerate() {
-                self.def(inst, Reg::V(reg + i as u8), R::D(v));
+        })
+    }
+
+    /// A formatted access: the instruction's format (tbuffer), or the V#'s.
+    fn buffer_format_kind(&mut self, name: &str, format: Option<u8>, load: bool, off: usize) -> Res<(u32, Kind)> {
+        let ch = name.rsplit('_').next().unwrap().len() as u32; // x, xy, xyz, xyzw
+        let d16 = name.contains("_d16_");
+        Ok(match format {
+            Some(f) => {
+                let (bytes, kind) = tformat(f).ok_or(unsupported(off, "a typed buffer format"))?;
+                (bytes, Kind::T(kind, ch, d16))
             }
-            return Ok(());
-        }
-        if load {
-            let a = self.buffer_addr(&vs, o, size, false);
-            let kind = match kind {
-                Kind::Dwords(n) if self.floats(inst, (0..n).map(|k| Reg::V(reg + k as u8))) => Kind::Floats(n),
-                k => k,
-            };
-            let vals = self.load_kind(a, kind)?;
-            for (i, v) in vals.into_iter().enumerate() {
-                self.def(inst, Reg::V(reg + i as u8), R::D(v));
+            None if load => (0, Kind::VFormat(ch, d16)),
+            None => {
+                // stores through a V# format: 32-bit channels
+                self.approx("a typed buffer store written as 32-bit channels");
+                (4 * ch, if d16 { Kind::Halves(ch) } else { Kind::Dwords(ch) })
             }
-        } else {
-            let a = self.buffer_addr(&vs, o, size, true);
-            let vals: Vec<V> =
-                (0..n).map(|i| self.opnd_dw(inst, &data.unwrap(), i as u8, false)).collect::<Res<_>>()?;
-            self.store_kind(a, kind, &vals)?;
+        })
+    }
+
+    /// A load in the V#'s format, decoded by a helper; bounds by the stride.
+    fn buffer_vformat(&mut self, inst: &Inst, vs: &VSharp, o: V, reg: u8, ch: u32, d16: bool) -> Res<()> {
+        let four = self.k32(4);
+        let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
+        let a = self.buffer_addr_dyn(vs, o, bytes, false);
+        let k12 = self.k32(12);
+        let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[vs.w3, k12]);
+        let k7f = self.k32(0x7F);
+        let f = self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
+        let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, f]);
+        let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
+        let vals = if d16 { self.pack_d16(&vals) } else { vals };
+        for (i, v) in vals.into_iter().enumerate() {
+            self.def(inst, Reg::V(reg + i as u8), R::D(v));
         }
         Ok(())
     }
@@ -369,74 +382,61 @@ impl Lift<'_> {
         if t.bits == 0 {
             return self.packed_load(a, t, ch);
         }
-        let (comps, bits, num) = (t.comps, t.bits, t.num);
-        let mut out = Vec::new();
-        let raw: Vec<V> = match bits {
-            32 => {
-                let v = self.emit(Op::Load { align: 4 }, Ty::vec(S::U32, comps), vec![a]);
-                if comps == 1 { vec![v] } else { (0..u32::from(comps)).map(|i| self.extract(v, i)).collect() }
-            }
-            16 => {
-                let v = self.emit(Op::Load { align: 2 }, Ty::vec(S::U16, comps), vec![a]);
-                (0..u32::from(comps))
-                    .map(|i| {
-                        let e = if comps == 1 { v } else { self.extract(v, i) };
-                        self.spv(if num == Num::Sint || num == Num::Snorm { op::S_CONVERT } else { op::U_CONVERT }, Ty::U32, &[e])
-                    })
-                    .collect()
-            }
-            _ => {
-                let v = self.emit(Op::Load { align: 1 }, Ty::vec(S::U8, comps), vec![a]);
-                (0..u32::from(comps))
-                    .map(|i| {
-                        let e = if comps == 1 { v } else { self.extract(v, i) };
-                        self.spv(if num == Num::Sint || num == Num::Snorm { op::S_CONVERT } else { op::U_CONVERT }, Ty::U32, &[e])
-                    })
-                    .collect()
-            }
+        let comps = u32::from(t.comps);
+        let s = match t.bits {
+            32 => S::U32,
+            16 => S::U16,
+            _ => S::U8,
         };
+        let v = self.emit(Op::Load { align: u32::from(t.bits / 8).max(1) }, Ty::vec(s, t.comps), vec![a]);
+        let signed = matches!(t.num, Num::Sint | Num::Snorm);
+        let mut out = Vec::new();
         for c in 0..ch {
-            let x = if (c as usize) < raw.len() {
-                let r = raw[c as usize];
-                match num {
-                    Num::Uint | Num::Sint => r,
-                    Num::Float if bits == 32 => r,
-                    Num::Float => {
-                        // f16 bits to f32
-                        let h = self.spv(op::U_CONVERT, Ty::U16, &[r]);
-                        let hf = self.spv(op::BITCAST, Ty::F16, &[h]);
-                        let f = self.spv(op::F_CONVERT, Ty::F32, &[hf]);
-                        self.u32v(f)
-                    }
-                    Num::Unorm => {
-                        let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
-                        let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
-                        let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                        self.u32v(m)
-                    }
-                    Num::Snorm => {
-                        let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
-                        let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
-                        let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                        let lo = self.kf(-1.0);
-                        let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
-                        self.u32v(c)
-                    }
-                }
-            } else {
+            let x = if c < comps {
+                let e = if comps == 1 { v } else { self.extract(v, c) };
+                let r = match t.bits {
+                    32 => e,
+                    _ => self.spv(if signed { op::S_CONVERT } else { op::U_CONVERT }, Ty::U32, &[e]),
+                };
+                self.typed_value(r, t.num, u32::from(t.bits))
+            } else if c == 3 {
                 // missing channels: 0, alpha 1
-                if c == 3 {
-                    match num {
-                        Num::Uint | Num::Sint => self.k32(1),
-                        _ => self.k32(1.0f32.to_bits()),
-                    }
-                } else {
-                    self.k32(0)
-                }
+                self.k32(if matches!(t.num, Num::Uint | Num::Sint) { 1 } else { 1.0f32.to_bits() })
+            } else {
+                self.k32(0)
             };
             out.push(x);
         }
         out
+    }
+
+    /// A channel's raw bits (widened to 32) as its value's bits.
+    fn typed_value(&mut self, r: V, num: Num, bits: u32) -> V {
+        match num {
+            Num::Uint | Num::Sint => r,
+            Num::Float if bits == 32 => r,
+            Num::Float => {
+                // f16 bits to f32
+                let h = self.spv(op::U_CONVERT, Ty::U16, &[r]);
+                let hf = self.spv(op::BITCAST, Ty::F16, &[h]);
+                let f = self.spv(op::F_CONVERT, Ty::F32, &[hf]);
+                self.u32v(f)
+            }
+            Num::Unorm => {
+                let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
+                let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
+                let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                self.u32v(m)
+            }
+            Num::Snorm => {
+                let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
+                let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
+                let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                let lo = self.kf(-1.0);
+                let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
+                self.u32v(c)
+            }
+        }
     }
 
     /// A 2_10_10_10 element (x in the low bits): one dword.
@@ -497,39 +497,28 @@ impl Lift<'_> {
             return Err(unsupported(off, "GDS"));
         }
         let o16 = u32::from(offset0) | u32::from(offset1) << 8;
-        let dreg = |d: &Option<Operand>| match d {
-            Some(Operand::Vector { reg, .. }) => Some(*reg),
+        let d = match dst {
+            Some(Operand::Vector { reg, .. }) => Some(reg),
             _ => None,
+        };
+        let need_d = || d.ok_or(unsupported(off, name));
+        // the two-address forms: offsets in elements (of 64 with st64)
+        let pair = |w: u32| {
+            let st = if name.contains("st64") { 64 } else { 1 };
+            [offset0, offset1].map(|o| u32::from(o) * 4 * w * st)
         };
         match name {
             "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128" => {
-                let n = match name {
-                    "ds_read_b32" => 1,
-                    "ds_read_b64" => 2,
-                    "ds_read_b96" => 3,
-                    _ => 4,
-                };
+                let n = ds_dwords(name);
                 let i = self.lds_index(inst, &addr, o16)?;
-                let d = dreg(&dst).ok_or(unsupported(off, name))?;
-                for k in 0..n {
-                    let kk = self.k32(k);
-                    let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
-                    let v = self.emit(Op::LdsLoad, Ty::U32, vec![ii]);
-                    self.def(inst, Reg::V(d + k as u8), R::D(v));
-                }
+                self.lds_read(inst, i, n, need_d()?)?;
             }
             "ds_read2_b32" | "ds_read2st64_b32" | "ds_read2_b64" | "ds_read2st64_b64" => {
-                let st = if name.contains("st64") { 64 } else { 1 };
                 let w = if name.ends_with("b64") { 2 } else { 1 };
-                let d = dreg(&dst).ok_or(unsupported(off, name))?;
-                for (j, o) in [offset0, offset1].into_iter().enumerate() {
-                    let i = self.lds_index(inst, &addr, u32::from(o) * 4 * w * st)?;
-                    for k in 0..w {
-                        let kk = self.k32(k);
-                        let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
-                        let v = self.emit(Op::LdsLoad, Ty::U32, vec![ii]);
-                        self.def(inst, Reg::V(d + (j as u32 * w + k) as u8), R::D(v));
-                    }
+                let dd = need_d()?;
+                for (j, o) in pair(w).into_iter().enumerate() {
+                    let i = self.lds_index(inst, &addr, o)?;
+                    self.lds_read(inst, i, w, dd + (j as u32 * w) as u8)?;
                 }
             }
             "ds_write_b32" | "ds_write_b64" | "ds_write_b96" | "ds_write_b128" => {
@@ -537,97 +526,111 @@ impl Lift<'_> {
                 let Some(Operand::Vector { dwords, .. }) = data.first().copied() else {
                     return Err(unsupported(off, name));
                 };
-                for k in 0..dwords {
-                    let x = self.opnd_dw(inst, &data[0], k, false)?;
-                    let x = self.u32v(x);
-                    let kk = self.k32(u32::from(k));
-                    let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
-                    self.emit(Op::LdsStore, Ty::VOID, vec![ii, x]);
-                }
+                self.lds_write(inst, i, &data[0], u32::from(dwords))?;
             }
             "ds_write2_b32" | "ds_write2st64_b32" | "ds_write2_b64" | "ds_write2st64_b64" => {
-                let st = if name.contains("st64") { 64 } else { 1 };
-                let w: u32 = if name.ends_with("b64") { 2 } else { 1 };
-                for (j, o) in [offset0, offset1].into_iter().enumerate() {
-                    let i = self.lds_index(inst, &addr, u32::from(o) * 4 * w * st)?;
-                    for k in 0..w {
-                        let x = self.opnd_dw(inst, &data[j], k as u8, false)?;
-                        let x = self.u32v(x);
-                        let kk = self.k32(k);
-                        let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
-                        self.emit(Op::LdsStore, Ty::VOID, vec![ii, x]);
-                    }
+                let w = if name.ends_with("b64") { 2 } else { 1 };
+                for (j, o) in pair(w).into_iter().enumerate() {
+                    let i = self.lds_index(inst, &addr, o)?;
+                    self.lds_write(inst, i, &data[j], w)?;
                 }
             }
             "ds_read_u16" | "ds_read_u8" | "ds_read_i16" | "ds_read_i8" => {
-                let a = match &addr {
-                    Some(o) => {
-                        let x = self.opnd(inst, o)?;
-                        self.u32v(x)
-                    }
-                    None => self.k32(0),
-                };
-                let k = self.k32(o16);
-                let b = self.spv(op::I_ADD, Ty::U32, &[a, k]);
-                let two = self.k32(2);
-                let i = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]);
-                let w = self.emit(Op::LdsLoad, Ty::U32, vec![i]);
-                let three = self.k32(3);
-                let bo = self.spv(op::BITWISE_AND, Ty::U32, &[b, three]);
-                let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[bo, three]);
-                let width = self.k32(if name.ends_with("16") { 16 } else { 8 });
-                let opc = if name.contains("_i") { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
-                let v = self.spv(opc, Ty::U32, &[w, sh, width]);
-                let d = dreg(&dst).ok_or(unsupported(off, name))?;
-                self.def(inst, Reg::V(d), R::D(v));
+                let v = self.lds_read_small(inst, &addr, o16, name)?;
+                self.def(inst, Reg::V(need_d()?), R::D(v));
             }
-            "ds_write_b16" | "ds_write_b8" => {
-                // a half or byte of a dword: clear it, then set it (two
-                // atomics, so lanes writing the other bytes are kept)
-                let a = match &addr {
-                    Some(o) => {
-                        let x = self.opnd(inst, o)?;
-                        self.u32v(x)
-                    }
-                    None => self.k32(0),
-                };
-                let k = self.k32(o16);
-                let b = self.spv(op::I_ADD, Ty::U32, &[a, k]);
-                let two = self.k32(2);
-                let i = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]);
-                let three = self.k32(3);
-                let bo = self.spv(op::BITWISE_AND, Ty::U32, &[b, three]);
-                let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[bo, three]);
-                let m = self.k32(if name.ends_with("16") { 0xFFFF } else { 0xFF });
-                let x = self.opnd_dw(inst, &data[0], 0, false)?;
-                let x = self.u32v(x);
-                let x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
-                let xs = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[x, sh]);
-                let ms = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[m, sh]);
-                let keep = self.spv(op::NOT, Ty::U32, &[ms]);
-                self.emit(Op::LdsAtomic(op::ATOMIC_AND), Ty::U32, vec![i, keep]);
-                self.emit(Op::LdsAtomic(op::ATOMIC_OR), Ty::U32, vec![i, xs]);
-            }
+            "ds_write_b16" | "ds_write_b8" => self.lds_write_small(inst, &addr, o16, &data[0], name)?,
             _ if name.starts_with("ds_") && atomic_op(name).is_some() => {
-                let opc = atomic_op(name).unwrap();
                 let i = self.lds_index(inst, &addr, o16)?;
-                let x = self.opnd_dw(inst, &data[0], 0, false)?;
-                let x = self.u32v(x);
-                let mut args = vec![i, x];
-                if name.contains("cmpst") {
-                    // ds_cmpst: data0 = compare, data1 = new
-                    let y = self.opnd_dw(inst, &data[1], 0, false)?;
-                    let y = self.u32v(y);
-                    args = vec![i, y, x];
-                }
-                let r = self.emit(Op::LdsAtomic(opc), Ty::U32, args);
-                if let Some(d) = dreg(&dst) {
+                let r = self.lds_atomic(inst, i, &data, name)?;
+                if let Some(d) = d {
                     self.def(inst, Reg::V(d), R::D(r));
                 }
             }
             _ => return Err(unsupported(off, name)),
         }
         Ok(())
+    }
+
+    /// `n` dwords from LDS dword `i` into v[d..].
+    fn lds_read(&mut self, inst: &Inst, i: V, n: u32, d: u8) -> Res<()> {
+        for k in 0..n {
+            let kk = self.k32(k);
+            let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
+            let v = self.emit(Op::LdsLoad, Ty::U32, vec![ii]);
+            self.def(inst, Reg::V(d + k as u8), R::D(v));
+        }
+        Ok(())
+    }
+
+    /// `n` dwords of `src` to LDS dword `i` on.
+    fn lds_write(&mut self, inst: &Inst, i: V, src: &Operand, n: u32) -> Res<()> {
+        for k in 0..n {
+            let x = self.opnd_dw(inst, src, k as u8, false)?;
+            let x = self.u32v(x);
+            let kk = self.k32(k);
+            let ii = self.spv(op::I_ADD, Ty::U32, &[i, kk]);
+            self.emit(Op::LdsStore, Ty::VOID, vec![ii, x]);
+        }
+        Ok(())
+    }
+
+    /// A byte address's dword index and bit shift.
+    fn lds_byte(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32) -> Res<(V, V)> {
+        let a = match addr {
+            Some(o) => {
+                let x = self.opnd(inst, o)?;
+                self.u32v(x)
+            }
+            None => self.k32(0),
+        };
+        let k = self.k32(o16);
+        let b = self.spv(op::I_ADD, Ty::U32, &[a, k]);
+        let (two, three) = (self.k32(2), self.k32(3));
+        let i = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]);
+        let bo = self.spv(op::BITWISE_AND, Ty::U32, &[b, three]);
+        let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[bo, three]);
+        Ok((i, sh))
+    }
+
+    /// A byte or half read, zero or sign extended.
+    fn lds_read_small(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, name: &str) -> Res<V> {
+        let (i, sh) = self.lds_byte(inst, addr, o16)?;
+        let w = self.emit(Op::LdsLoad, Ty::U32, vec![i]);
+        let width = self.k32(if name.ends_with("16") { 16 } else { 8 });
+        let opc = if name.contains("_i") { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
+        Ok(self.spv(opc, Ty::U32, &[w, sh, width]))
+    }
+
+    /// A half or byte of a dword: clear it, then set it (two atomics, so
+    /// lanes writing the other bytes are kept).
+    fn lds_write_small(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, src: &Operand, name: &str) -> Res<()> {
+        let (i, sh) = self.lds_byte(inst, addr, o16)?;
+        let m = self.k32(if name.ends_with("16") { 0xFFFF } else { 0xFF });
+        let x = self.opnd_dw(inst, src, 0, false)?;
+        let x = self.u32v(x);
+        let x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
+        let xs = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[x, sh]);
+        let ms = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[m, sh]);
+        let keep = self.spv(op::NOT, Ty::U32, &[ms]);
+        self.emit(Op::LdsAtomic(op::ATOMIC_AND), Ty::U32, vec![i, keep]);
+        self.emit(Op::LdsAtomic(op::ATOMIC_OR), Ty::U32, vec![i, xs]);
+        Ok(())
+    }
+
+    /// An LDS atomic; ds_cmpst takes data0 = compare, data1 = new.
+    fn lds_atomic(&mut self, inst: &Inst, i: V, data: &[Operand], name: &'static str) -> Res<V> {
+        let opc = atomic_op(name).unwrap();
+        let x = self.opnd_dw(inst, &data[0], 0, false)?;
+        let x = self.u32v(x);
+        let args = if name.contains("cmpst") {
+            let y = self.opnd_dw(inst, &data[1], 0, false)?;
+            let y = self.u32v(y);
+            vec![i, y, x]
+        } else {
+            vec![i, x]
+        };
+        Ok(self.emit(Op::LdsAtomic(opc), Ty::U32, args))
     }
 
     pub(super) fn ds_cross(&mut self, inst: &Inst, name: &'static str) -> Res<()> {
@@ -851,5 +854,15 @@ pub(super) fn tformat(f: u8) -> Option<(u32, TFormat)> {
         76 => t(4, 32, Sint),
         77 => t(4, 32, Float),
         _ => None,
+    }
+}
+
+/// Dwords of a ds_read_b*/ds_write_b*.
+fn ds_dwords(name: &str) -> u32 {
+    match &name[name.len() - 3..] {
+        "b32" => 1,
+        "b64" => 2,
+        "b96" => 3,
+        _ => 4,
     }
 }

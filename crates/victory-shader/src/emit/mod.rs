@@ -228,18 +228,9 @@ impl HostShader {
     }
 }
 
-/// One dword of user data and the root parameter that fills it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UserData {
-    /// Dword in the user-data buffer (the console's user-data index).
-    pub index: u32,
-    /// Root parameter index in the title's root signature.
-    pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
-    pub root: RootType,
-    /// Dword within the parameter.
-    pub dword: u32,
-}
+/// One dword of user data and the root parameter that fills it (shared
+/// with the Vulkan back end, which owns it).
+pub use crate::vk::UserData;
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.

@@ -30,391 +30,327 @@ impl Lift<'_> {
         if name.starts_with("image_bvh") {
             return self.bvh_miss(inst, &data);
         }
-        self.a16 = false;
-        self.a16_vals.clear();
+        let Operand::Vector { reg: dreg, .. } = data else { return Err(unsupported(off, name)) };
+        let (sdim, arrayed, ms, coords) = dim_class(dim);
+        let rest = name.trim_start_matches("image_");
         // T# word 7 (slot and flags)
         let tw = self.opnd_dw(inst, &rsrc, 7, false)?;
         let tw = self.u32v(tw);
-        let (sdim, arrayed, ms, coords) = match dim {
-            0 => (0u8, false, false, 1usize),
-            1 => (1, false, false, 2),
-            2 => (2, false, false, 3),
-            3 => (3, false, false, 3),
-            4 => (0, true, false, 2),
-            5 => (1, true, false, 3),
-            6 => (1, false, true, 2),
-            _ => (1, true, true, 3),
-        };
-        let class = ImageClass { dim: sdim, arrayed, ms, uint: false, storage: false, dynamic: false };
-        let rest = name.trim_start_matches("image_");
-        // destination
-        let dreg = match data {
-            Operand::Vector { reg, .. } => reg,
-            _ => return Err(unsupported(off, name)),
-        };
-        // The address as components in order. With a16 the components after
-        // the whole dwords (offset, bias, z-compare) are 16-bit, two per
-        // dword, low half first: the derivatives (x then y, each set from a
-        // fresh dword), then coordinates, level and clamp.
-        let addr = if a16 {
-            let sample = rest.starts_with("sample") || rest.starts_with("gather4");
-            let mods = rest.trim_start_matches("sample").trim_start_matches("gather4");
-            let has = |m: &str| mods.split('_').any(|t| t == m);
-            let (pre, g, more) = if sample {
-                let dims = match sdim {
-                    0 => 1,
-                    2 | 3 => 3,
-                    _ => 2,
-                };
-                let pre = usize::from(has("o")) + usize::from(has("b")) + usize::from(has("c"));
-                let g = if has("d") { dims } else { 0 };
-                (pre, g, coords + usize::from(has("l")) + usize::from(has("cl")))
-            } else {
-                (0, 0, coords + usize::from(rest.ends_with("_mip")) + usize::from(ms))
-            };
-            let mut out = Vec::new();
-            let mut dw = 0usize;
-            for i in 0..pre {
-                let x = self.addr_dw(inst, &addr, dw)?;
-                // the bias is an f16 in the low half of its dword
-                let bias_at = usize::from(has("o"));
-                let x = if sample && has("b") && i == bias_at { self.half_f32(x, false) } else { x };
-                out.push(Operand::Literal(0));
-                self.a16_vals.push(x);
-                dw += 1;
-            }
-            let half = |l: &mut Self, dw: usize, j: usize| -> Res<V> {
-                let x = l.addr_dw(inst, &addr, dw + j / 2)?;
-                Ok(if sample {
-                    let f = l.half_f32(x, j % 2 == 1);
-                    l.u32v(f)
-                } else {
-                    let (o, w) = (l.k32(16 * (j % 2) as u32), l.k32(16));
-                    l.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[x, o, w])
-                })
-            };
-            for _ in 0..(if g > 0 { 2 } else { 0 }) {
-                for j in 0..g {
-                    let x = half(self, dw, j)?;
-                    out.push(Operand::Literal(0));
-                    self.a16_vals.push(x);
-                }
-                dw += g.div_ceil(2);
-            }
-            for j in 0..more {
-                let x = half(self, dw, j)?;
-                out.push(Operand::Literal(0));
-                self.a16_vals.push(x);
-            }
-            self.a16 = true;
-            out
-        } else {
-            addr
-        };
-        let mut k = 0usize; // address dword cursor
-        let mut args = vec![tw];
-        let mut flags = 0u16;
-        let samp_ref = |l: &mut Self, args: &mut Vec<V>| -> Res<Sampler> {
-            let s = sampler.ok_or(unsupported(off, "a sample without a sampler"))?;
-            let w: Vec<V> = (0..4)
-                .map(|i| {
-                    let x = l.opnd_dw(inst, &s, i, false)?;
-                    Ok(l.u32v(x))
-                })
-                .collect::<Res<_>>()?;
-            let c: Vec<Option<u64>> = w.iter().map(|&x| l.f.as_const(x)).collect();
-            if c.iter().all(Option::is_some) {
-                let words = [c[0].unwrap() as u32, c[1].unwrap() as u32, c[2].unwrap() as u32, c[3].unwrap() as u32];
-                let n = match l.iface.samplers.iter().position(|s| *s == words) {
-                    Some(n) => n,
-                    None => {
-                        l.iface.samplers.push(words);
-                        l.iface.samplers.len() - 1
-                    }
-                };
-                return Ok(Sampler::Static(n as u32));
-            }
-            args.push(w[3]);
-            Ok(Sampler::Dynamic)
-        };
-        let fcoord = |l: &mut Self, k: &mut usize, n: usize| -> Res<V> {
-            let mut c = Vec::new();
-            for _ in 0..n {
-                let x = l.addr_dw(inst, &addr, *k)?;
-                c.push(l.f32v(x));
-                *k += 1;
-            }
-            Ok(if n == 1 { c[0] } else { l.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, n as u8), &c) })
+        self.a16 = false;
+        self.a16_vals.clear();
+        let addr = if a16 { self.a16_addr(inst, &addr, rest, sdim, coords, ms)? } else { addr };
+        let mut m = Mimg {
+            inst,
+            name,
+            rest,
+            addr,
+            k: 0,
+            args: vec![tw],
+            flags: 0,
+            class: ImageClass { dim: sdim, arrayed, ms, uint: false, storage: false, dynamic: false },
+            coords,
+            dreg,
+            dmask,
+            d16,
+            tw,
+            sampler,
+            data,
+            glc: cache.glc,
         };
         if rest.starts_with("sample") || rest.starts_with("gather4") {
-            let gather = rest.starts_with("gather4");
-            let mods = rest.trim_start_matches("sample").trim_start_matches("gather4");
-            let has = |m: &str| mods.split('_').any(|t| t == m);
-            let offset = has("o");
-            let bias = has("b");
-            let dref = has("c");
-            let grad = has("d") || has("cd");
-            let lz = has("lz");
-            let lod = has("l") || lz;
-            let min_lod = has("cl");
-            if has("cd") {
-                return Err(unsupported(off, "coarse derivatives"));
-            }
-            let s = samp_ref(self, &mut args)?;
-            // the address order: offset, bias, z-compare, derivatives, coords, lod/clamp
-            let off_v = if offset {
-                let o = self.addr_dw(inst, &addr, k)?;
-                k += 1;
-                Some(o)
-            } else {
-                None
-            };
-            let bias_v = if bias {
-                let b = self.addr_dw(inst, &addr, k)?;
-                k += 1;
-                Some(self.f32v(b))
-            } else {
-                None
-            };
-            let dref_v = if dref {
-                let d = self.addr_dw(inst, &addr, k)?;
-                k += 1;
-                Some(self.f32v(d))
-            } else {
-                None
-            };
-            let dims = match sdim {
-                0 => 1,
-                2 | 3 => 3,
-                _ => 2,
-            };
-            let grad_v = if grad {
-                if sdim == 3 {
-                    return Err(unsupported(off, "cube derivatives"));
-                }
-                let mut dx = Vec::new();
-                let mut dy = Vec::new();
-                for _ in 0..dims {
-                    let x = self.addr_dw(inst, &addr, k)?;
-                    dx.push(self.f32v(x));
-                    k += 1;
-                }
-                for _ in 0..dims {
-                    let x = self.addr_dw(inst, &addr, k)?;
-                    dy.push(self.f32v(x));
-                    k += 1;
-                }
-                let mk = |l: &mut Self, v: &[V]| {
-                    if v.len() == 1 { v[0] } else { l.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, v.len() as u8), v) }
-                };
-                Some((mk(self, &dx), mk(self, &dy)))
-            } else {
-                None
-            };
-            let coord = if sdim == 3 {
-                let c = fcoord(self, &mut k, 3)?;
-                self.cube_dir(c)
-            } else {
-                fcoord(self, &mut k, coords)?
-            };
-            args.push(coord);
-            let lod_v = if lod && !lz {
-                let x = self.addr_dw(inst, &addr, k)?;
-                k += 1;
-                Some(self.f32v(x))
-            } else if lz {
-                Some(self.kf(0.0))
-            } else {
-                None
-            };
-            let min_v = if min_lod {
-                let x = self.addr_dw(inst, &addr, k)?;
-                Some(self.f32v(x))
-            } else {
-                None
-            };
-            if let Some(d) = dref_v {
-                flags |= img::DREF;
-                args.push(d);
-            }
-            if let Some(b) = bias_v {
-                flags |= img::BIAS;
-                args.push(b);
-            }
-            if let Some(l) = lod_v {
-                flags |= img::LOD;
-                args.push(l);
-            }
-            if let Some((dx, dy)) = grad_v {
-                flags |= img::GRAD;
-                args.push(dx);
-                args.push(dy);
-            }
-            if let Some(o) = off_v {
-                // packed 6-bit offsets per coordinate
-                flags |= img::OFFSET;
-                let mut comps = Vec::new();
-                for c in 0..dims.min(if sdim == 3 { 0 } else { 3 }) {
-                    let (sh, w) = (self.k32(8 * c as u32), self.k32(6));
-                    comps.push(self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w]));
-                }
-                if comps.is_empty() {
-                    return Err(unsupported(off, "a cube offset"));
-                }
-                let v = if comps.len() == 1 {
-                    comps[0]
-                } else {
-                    self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, comps.len() as u8), &comps)
-                };
-                args.push(v);
-            }
-            if let Some(m) = min_v {
-                flags |= img::MIN_LOD;
-                args.push(m);
-            }
-            let kind = if gather {
-                ImageKind::Gather { comp: dmask.trailing_zeros() as u8, lod, dref, offset }
-            } else {
-                ImageKind::Sample { lod, bias, grad, dref, offset, min_lod }
-            };
-            let r = self.emit(Op::Image { kind, class, sampler: s, flags }, Ty::vec(S::F32, 4), args);
-            let mask = if gather { 0xF } else { dmask };
-            if dref && !gather {
-                // a comparison returns one value
-                let x = if self.f.ty(r) == Ty::F32 { r } else { self.extract(r, 0) };
-                return self.write_result(inst, dreg, &[x], d16);
-            }
-            let vals: Vec<V> = (0..4).filter(|c| mask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
-            return self.write_result(inst, dreg, &vals, d16);
+            return self.image_sample(&mut m);
         }
         match rest {
-            "load" | "load_mip" | "store" | "store_mip" => {
-                let mut c = Vec::new();
-                for _ in 0..coords {
-                    c.push(self.addr_dw(inst, &addr, k)?);
-                    k += 1;
-                }
-                let coord = if c.len() == 1 { c[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, c.len() as u8), &c) };
-                args.push(coord);
-                let mip = rest.ends_with("_mip");
-                if mip {
-                    let m = self.addr_dw(inst, &addr, k)?;
-                    k += 1;
-                    flags |= img::LOD;
-                    args.push(m);
-                }
-                if ms {
-                    let s = self.addr_dw(inst, &addr, k)?;
-                    flags |= img::SAMPLE;
-                    args.push(s);
-                }
-                let class = ImageClass { dynamic: true, ..class };
-                if rest.starts_with("load") {
-                    let r = self.emit(
-                        Op::Image { kind: ImageKind::Load { mip }, class, sampler: Sampler::None, flags },
-                        Ty::vec(S::U32, 4),
-                        args,
-                    );
-                    let vals: Vec<V> = (0..4).filter(|c| dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
-                    self.write_result(inst, dreg, &vals, d16)
-                } else {
-                    if d16 {
-                        return Err(unsupported(off, "a d16 image store"));
-                    }
-                    let mut vals = Vec::new();
-                    let mut j = 0u8;
-                    for c in 0..4 {
-                        if dmask >> c & 1 != 0 {
-                            let x = self.opnd_dw(inst, &data, j, false)?;
-                            vals.push(self.u32v(x));
-                            j += 1;
-                        } else {
-                            vals.push(self.k32(0));
-                        }
-                    }
-                    let v = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 4), &vals);
-                    flags |= img::DATA;
-                    args.push(v);
-                    self.emit(
-                        Op::Image { kind: ImageKind::Store { mip }, class, sampler: Sampler::None, flags },
-                        Ty::VOID,
-                        args,
-                    );
-                    Ok(())
-                }
-            }
-            _ if rest.starts_with("atomic_") => {
-                let opc = atomic_op(name).ok_or(unsupported(off, name))?;
-                let mut c = Vec::new();
-                for _ in 0..coords {
-                    c.push(self.addr_dw(inst, &addr, k)?);
-                    k += 1;
-                }
-                let coord = if c.len() == 1 { c[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, c.len() as u8), &c) };
-                args.push(coord);
-                let x = self.opnd_dw(inst, &data, 0, false)?;
-                let x = self.u32v(x);
-                flags |= img::DATA;
-                args.push(x);
-                if rest.contains("cmpswap") {
-                    let y = self.opnd_dw(inst, &data, 1, false)?;
-                    let y = self.u32v(y);
-                    flags |= img::CMP;
-                    args.push(y);
-                }
-                let class = ImageClass { uint: true, storage: true, ..class };
-                let r = self.emit(Op::Image { kind: ImageKind::Atomic(opc), class, sampler: Sampler::None, flags }, Ty::U32, args);
-                if cache.glc {
-                    self.def(inst, Reg::V(dreg), R::D(r));
-                }
-                Ok(())
-            }
-            "get_resinfo" => {
-                let m = self.addr_dw(inst, &addr, 0)?;
-                flags |= img::LOD;
-                // no coordinate (a placeholder), then the level
-                let z = self.k32(0);
-                args.push(z);
-                args.push(m);
-                let class = ImageClass { dynamic: true, ..class };
-                let n = match (sdim, arrayed) {
-                    (0, false) => 1,
-                    (0, true) | (1, false) | (3, false) => 2,
-                    _ => 3,
-                };
-                let sz = self.emit(
-                    Op::Image { kind: ImageKind::Size, class, sampler: Sampler::None, flags },
-                    Ty::vec(S::U32, n),
-                    args.clone(),
-                );
-                let z = self.k32(0);
-                let lv = self.emit(
-                    Op::Image { kind: ImageKind::Levels, class, sampler: Sampler::None, flags: 0 },
-                    Ty::U32,
-                    vec![tw, z],
-                );
-                let mut all = Vec::new();
-                for c in 0..3u32 {
-                    all.push(if c < u32::from(n) { if n == 1 { sz } else { self.extract(sz, c) } } else { self.k32(1) });
-                }
-                all.push(lv);
-                let vals: Vec<V> = (0..4).filter(|c| dmask >> c & 1 != 0).map(|c| all[c as usize]).collect();
-                self.write_result(inst, dreg, &vals, false)
-            }
-            "get_lod" => {
-                let s = samp_ref(self, &mut args)?;
-                let coord = fcoord(self, &mut k, coords.min(3))?;
-                args.push(coord);
-                let r = self.emit(
-                    Op::Image { kind: ImageKind::QueryLod, class, sampler: s, flags: 0 },
-                    Ty::vec(S::F32, 2),
-                    args,
-                );
-                let vals: Vec<V> = (0..2).filter(|c| dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
-                self.write_result(inst, dreg, &vals, false)
-            }
+            "load" | "load_mip" => self.image_load(&mut m),
+            "store" | "store_mip" => self.image_store(&mut m),
+            _ if rest.starts_with("atomic_") => self.image_atomic(&mut m),
+            "get_resinfo" => self.image_resinfo(&mut m),
+            "get_lod" => self.image_lod(&mut m),
             _ => Err(unsupported(off, name)),
         }
+    }
+
+    /// The address as components in order. With a16 the components after
+    /// the whole dwords (offset, bias, z-compare) are 16-bit, two per dword,
+    /// low half first: the derivatives (x then y, each set from a fresh
+    /// dword), then coordinates, level and clamp. The components go to
+    /// `a16_vals`; the operands returned are placeholders.
+    fn a16_addr(&mut self, inst: &Inst, addr: &[Operand], rest: &str, sdim: u8, coords: usize, ms: bool) -> Res<Vec<Operand>> {
+        let sample = rest.starts_with("sample") || rest.starts_with("gather4");
+        let mods = SampleMods::of(rest);
+        let (pre, g, more) = if sample {
+            let pre = usize::from(mods.offset) + usize::from(mods.bias) + usize::from(mods.dref);
+            let g = if mods.grad { grad_dims(sdim) } else { 0 };
+            (pre, g, coords + usize::from(mods.lod && !mods.lz) + usize::from(mods.min_lod))
+        } else {
+            (0, 0, coords + usize::from(rest.ends_with("_mip")) + usize::from(ms))
+        };
+        let mut vals = Vec::new();
+        for i in 0..pre {
+            let x = self.addr_dw(inst, addr, i)?;
+            // the bias is an f16 in the low half of its dword
+            let bias = sample && mods.bias && i == usize::from(mods.offset);
+            vals.push(if bias { self.half_f32(x, false) } else { x });
+        }
+        let mut dw = pre;
+        let halves = if g > 0 { [g, g, more] } else { [0, 0, more] };
+        for n in halves {
+            for j in 0..n {
+                let x = self.addr_dw(inst, addr, dw + j / 2)?;
+                vals.push(if sample {
+                    let f = self.half_f32(x, j % 2 == 1);
+                    self.u32v(f)
+                } else {
+                    let (o, w) = (self.k32(16 * (j % 2) as u32), self.k32(16));
+                    self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[x, o, w])
+                });
+            }
+            dw += n.div_ceil(2);
+        }
+        let out = vec![Operand::Literal(0); vals.len()];
+        self.a16_vals = vals;
+        self.a16 = true;
+        Ok(out)
+    }
+
+    /// The next address component (as bits).
+    fn next_u(&mut self, m: &mut Mimg) -> Res<V> {
+        let x = self.addr_dw(m.inst, &m.addr, m.k)?;
+        m.k += 1;
+        Ok(x)
+    }
+
+    fn next_f(&mut self, m: &mut Mimg) -> Res<V> {
+        let x = self.next_u(m)?;
+        Ok(self.f32v(x))
+    }
+
+    /// `n` components as a vector (a scalar for one).
+    fn next_vec(&mut self, m: &mut Mimg, n: usize, float: bool) -> Res<V> {
+        let mut c = Vec::new();
+        for _ in 0..n {
+            c.push(if float { self.next_f(m)? } else { self.next_u(m)? });
+        }
+        Ok(self.vec_of(&c, if float { S::F32 } else { S::U32 }))
+    }
+
+    fn vec_of(&mut self, c: &[V], s: S) -> V {
+        if c.len() == 1 { c[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(s, c.len() as u8), c) }
+    }
+
+    /// An optional operand: its flag and value.
+    fn push_opt(m: &mut Mimg, flag: u16, v: Option<V>) {
+        if let Some(v) = v {
+            m.flags |= flag;
+            m.args.push(v);
+        }
+    }
+
+    /// The sampler: an immediate S# (constant words) is a static sampler
+    /// of the interface; else the S#'s word 3 (its slot) is an argument.
+    fn image_sampler(&mut self, m: &mut Mimg) -> Res<Sampler> {
+        let s = m.sampler.ok_or(unsupported(m.inst.machine.offset, "a sample without a sampler"))?;
+        let mut w = Vec::new();
+        for i in 0..4 {
+            let x = self.opnd_dw(m.inst, &s, i, false)?;
+            w.push(self.u32v(x));
+        }
+        let c: Option<Vec<u32>> = w.iter().map(|&x| self.f.as_const(x).map(|k| k as u32)).collect();
+        if let Some(words) = c {
+            let words = [words[0], words[1], words[2], words[3]];
+            let n = self.iface.samplers.iter().position(|s| *s == words).unwrap_or_else(|| {
+                self.iface.samplers.push(words);
+                self.iface.samplers.len() - 1
+            });
+            return Ok(Sampler::Static(n as u32));
+        }
+        m.args.push(w[3]);
+        Ok(Sampler::Dynamic)
+    }
+
+    /// Sample and gather. The address order: offset, bias, z-compare,
+    /// derivatives, coordinates, level, clamp.
+    fn image_sample(&mut self, m: &mut Mimg) -> Res<()> {
+        let off = m.inst.machine.offset;
+        let gather = m.rest.starts_with("gather4");
+        let md = SampleMods::of(m.rest);
+        if md.coarse {
+            return Err(unsupported(off, "coarse derivatives"));
+        }
+        if md.grad && m.class.dim == 3 {
+            return Err(unsupported(off, "cube derivatives"));
+        }
+        let s = self.image_sampler(m)?;
+        let off_v = if md.offset { Some(self.next_u(m)?) } else { None };
+        let bias_v = if md.bias { Some(self.next_f(m)?) } else { None };
+        let dref_v = if md.dref { Some(self.next_f(m)?) } else { None };
+        let dims = grad_dims(m.class.dim);
+        let grad_v = if md.grad { Some((self.next_vec(m, dims, true)?, self.next_vec(m, dims, true)?)) } else { None };
+        let coord = if m.class.dim == 3 {
+            let c = self.next_vec(m, 3, true)?;
+            self.cube_dir(c)
+        } else {
+            self.next_vec(m, m.coords, true)?
+        };
+        m.args.push(coord);
+        let lod_v = match (md.lz, md.lod) {
+            (true, _) => Some(self.kf(0.0)),
+            (false, true) => Some(self.next_f(m)?),
+            _ => None,
+        };
+        let min_v = if md.min_lod { Some(self.next_f(m)?) } else { None };
+        Self::push_opt(m, img::DREF, dref_v);
+        Self::push_opt(m, img::BIAS, bias_v);
+        Self::push_opt(m, img::LOD, lod_v);
+        if let Some((dx, dy)) = grad_v {
+            m.flags |= img::GRAD;
+            m.args.extend([dx, dy]);
+        }
+        let offs = off_v.map(|o| self.sample_offset(o, dims, m.class.dim, off)).transpose()?;
+        Self::push_opt(m, img::OFFSET, offs);
+        Self::push_opt(m, img::MIN_LOD, min_v);
+        let (lod, dref, offset) = (md.lod, md.dref, md.offset);
+        let kind = if gather {
+            ImageKind::Gather { comp: m.dmask.trailing_zeros() as u8, lod, dref, offset }
+        } else {
+            ImageKind::Sample { lod, bias: md.bias, grad: md.grad, dref, offset, min_lod: md.min_lod }
+        };
+        let args = std::mem::take(&mut m.args);
+        let r = self.emit(Op::Image { kind, class: m.class, sampler: s, flags: m.flags }, Ty::vec(S::F32, 4), args);
+        self.sample_result(m, r, gather, dref)
+    }
+
+    /// A sample's channels by dmask (a gather's four; a comparison's one).
+    fn sample_result(&mut self, m: &Mimg, r: V, gather: bool, dref: bool) -> Res<()> {
+        if dref && !gather {
+            let x = if self.f.ty(r) == Ty::F32 { r } else { self.extract(r, 0) };
+            return self.write_result(m.inst, m.dreg, &[x], m.d16);
+        }
+        let mask = if gather { 0xF } else { m.dmask };
+        let vals: Vec<V> = (0..4).filter(|c| mask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
+        self.write_result(m.inst, m.dreg, &vals, m.d16)
+    }
+
+    /// Packed 6-bit texel offsets, one per coordinate (none for cubes).
+    fn sample_offset(&mut self, o: V, dims: usize, sdim: u8, off: usize) -> Res<V> {
+        if sdim == 3 {
+            return Err(unsupported(off, "a cube offset"));
+        }
+        let mut comps = Vec::new();
+        for c in 0..dims.min(3) {
+            let (sh, w) = (self.k32(8 * c as u32), self.k32(6));
+            comps.push(self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w]));
+        }
+        Ok(self.vec_of(&comps, S::U32))
+    }
+
+    /// Integer coordinates, then the level (`_mip`) and the sample (MSAA).
+    fn image_texel(&mut self, m: &mut Mimg) -> Res<bool> {
+        let coord = self.next_vec(m, m.coords, false)?;
+        m.args.push(coord);
+        let mip = m.rest.ends_with("_mip");
+        if mip {
+            let l = self.next_u(m)?;
+            Self::push_opt(m, img::LOD, Some(l));
+        }
+        if m.class.ms {
+            let s = self.next_u(m)?;
+            Self::push_opt(m, img::SAMPLE, Some(s));
+        }
+        m.class.dynamic = true;
+        Ok(mip)
+    }
+
+    fn image_load(&mut self, m: &mut Mimg) -> Res<()> {
+        let mip = self.image_texel(m)?;
+        let args = std::mem::take(&mut m.args);
+        let op = Op::Image { kind: ImageKind::Load { mip }, class: m.class, sampler: Sampler::None, flags: m.flags };
+        let r = self.emit(op, Ty::vec(S::U32, 4), args);
+        let vals: Vec<V> = (0..4).filter(|c| m.dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
+        self.write_result(m.inst, m.dreg, &vals, m.d16)
+    }
+
+    fn image_store(&mut self, m: &mut Mimg) -> Res<()> {
+        if m.d16 {
+            return Err(unsupported(m.inst.machine.offset, "a d16 image store"));
+        }
+        let mip = self.image_texel(m)?;
+        let mut vals = Vec::new();
+        let mut j = 0u8;
+        for c in 0..4 {
+            if m.dmask >> c & 1 == 0 {
+                vals.push(self.k32(0));
+                continue;
+            }
+            let x = self.opnd_dw(m.inst, &m.data, j, false)?;
+            vals.push(self.u32v(x));
+            j += 1;
+        }
+        let v = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 4), &vals);
+        Self::push_opt(m, img::DATA, Some(v));
+        let args = std::mem::take(&mut m.args);
+        let op = Op::Image { kind: ImageKind::Store { mip }, class: m.class, sampler: Sampler::None, flags: m.flags };
+        self.emit(op, Ty::VOID, args);
+        Ok(())
+    }
+
+    fn image_atomic(&mut self, m: &mut Mimg) -> Res<()> {
+        let opc = atomic_op(m.name).ok_or(unsupported(m.inst.machine.offset, m.name))?;
+        let coord = self.next_vec(m, m.coords, false)?;
+        m.args.push(coord);
+        let x = self.opnd_dw(m.inst, &m.data, 0, false)?;
+        let x = self.u32v(x);
+        Self::push_opt(m, img::DATA, Some(x));
+        if m.rest.contains("cmpswap") {
+            let y = self.opnd_dw(m.inst, &m.data, 1, false)?;
+            let y = self.u32v(y);
+            Self::push_opt(m, img::CMP, Some(y));
+        }
+        let class = ImageClass { uint: true, storage: true, ..m.class };
+        let args = std::mem::take(&mut m.args);
+        let r = self.emit(Op::Image { kind: ImageKind::Atomic(opc), class, sampler: Sampler::None, flags: m.flags }, Ty::U32, args);
+        if m.glc {
+            self.def(m.inst, Reg::V(m.dreg), R::D(r));
+        }
+        Ok(())
+    }
+
+    /// Width, height, depth or layers (1 past the image's), and levels.
+    fn image_resinfo(&mut self, m: &mut Mimg) -> Res<()> {
+        let lvl = self.addr_dw(m.inst, &m.addr, 0)?;
+        // no coordinate (a placeholder), then the level
+        let z = self.k32(0);
+        m.args.extend([z, lvl]);
+        let class = ImageClass { dynamic: true, ..m.class };
+        let n = match (class.dim, class.arrayed) {
+            (0, false) => 1,
+            (0, true) | (1, false) | (3, false) => 2,
+            _ => 3,
+        };
+        let args = std::mem::take(&mut m.args);
+        let sz = self.emit(Op::Image { kind: ImageKind::Size, class, sampler: Sampler::None, flags: img::LOD }, Ty::vec(S::U32, n), args);
+        let lv = self.emit(Op::Image { kind: ImageKind::Levels, class, sampler: Sampler::None, flags: 0 }, Ty::U32, vec![m.tw, z]);
+        let mut all = Vec::new();
+        for c in 0..3u32 {
+            all.push(match c < u32::from(n) {
+                true if n == 1 => sz,
+                true => self.extract(sz, c),
+                false => self.k32(1),
+            });
+        }
+        all.push(lv);
+        let vals: Vec<V> = (0..4).filter(|c| m.dmask >> c & 1 != 0).map(|c| all[c as usize]).collect();
+        self.write_result(m.inst, m.dreg, &vals, false)
+    }
+
+    fn image_lod(&mut self, m: &mut Mimg) -> Res<()> {
+        let s = self.image_sampler(m)?;
+        let coord = self.next_vec(m, m.coords.min(3), true)?;
+        m.args.push(coord);
+        let args = std::mem::take(&mut m.args);
+        let r = self.emit(Op::Image { kind: ImageKind::QueryLod, class: m.class, sampler: s, flags: 0 }, Ty::vec(S::F32, 2), args);
+        let vals: Vec<V> = (0..2).filter(|c| m.dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
+        self.write_result(m.inst, m.dreg, &vals, false)
     }
 
     /// Writes image results to consecutive VGPRs (d16: two per dword).
@@ -491,5 +427,81 @@ impl Lift<'_> {
             self.def(inst, Reg::V(reg + k), R::D(all));
         }
         Ok(())
+    }
+}
+
+/// One image instruction being lowered: its fields, the address cursor and
+/// the arguments gathered so far.
+pub(super) struct Mimg<'i> {
+    inst: &'i Inst,
+    name: &'static str,
+    /// The name after `image_`.
+    rest: &'static str,
+    addr: Vec<Operand>,
+    /// Address component cursor.
+    k: usize,
+    args: Vec<V>,
+    flags: u16,
+    class: ImageClass,
+    coords: usize,
+    dreg: u8,
+    dmask: u8,
+    d16: bool,
+    /// T# word 7.
+    tw: V,
+    sampler: Option<Operand>,
+    data: Operand,
+    glc: bool,
+}
+
+/// The modifiers of a sample or gather name (`_o`, `_b`, `_c`, `_d`, ...).
+struct SampleMods {
+    offset: bool,
+    bias: bool,
+    dref: bool,
+    grad: bool,
+    coarse: bool,
+    lz: bool,
+    lod: bool,
+    min_lod: bool,
+}
+
+impl SampleMods {
+    fn of(rest: &str) -> Self {
+        let mods = rest.trim_start_matches("sample").trim_start_matches("gather4");
+        let has = |m: &str| mods.split('_').any(|t| t == m);
+        SampleMods {
+            offset: has("o"),
+            bias: has("b"),
+            dref: has("c"),
+            grad: has("d") || has("cd"),
+            coarse: has("cd"),
+            lz: has("lz"),
+            lod: has("l") || has("lz"),
+            min_lod: has("cl"),
+        }
+    }
+}
+
+/// (SPIR-V dim, arrayed, multisampled, coordinates) of a MIMG dim.
+fn dim_class(dim: u8) -> (u8, bool, bool, usize) {
+    match dim {
+        0 => (0, false, false, 1),
+        1 => (1, false, false, 2),
+        2 => (2, false, false, 3),
+        3 => (3, false, false, 3),
+        4 => (0, true, false, 2),
+        5 => (1, true, false, 3),
+        6 => (1, false, true, 2),
+        _ => (1, true, true, 3),
+    }
+}
+
+/// Derivative components per direction.
+fn grad_dims(sdim: u8) -> usize {
+    match sdim {
+        0 => 1,
+        2 | 3 => 3,
+        _ => 2,
     }
 }

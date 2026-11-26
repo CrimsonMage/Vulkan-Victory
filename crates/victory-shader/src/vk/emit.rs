@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::lift::{Interface, OUT_DEPTH, OUT_POSITION, OUT_PRIMITIVE, OUT_SAMPLE_MASK, OUT_STENCIL};
+use super::graph::Graph;
 use super::spirv::{Id, Module, en, glsl, op};
 use super::tir::{Builtin, Func, Helper, ImageClass, ImageKind, Interp, Item, Op, S, Sampler, Term, Ty, V, img};
 use crate::native::HwStage;
@@ -23,7 +24,6 @@ pub struct Stage {
     pub local_size: [u32; 3],
     /// Output types per location: 0 float, 1 uint, 2 int.
     pub out_types: HashMap<u16, u8>,
-    pub loop_limit: u32,
     /// Interface rows and channels to (location, component): the fixed
     /// location of each semantic (`super::SEMANTIC_LOCATIONS`).
     pub locs: HashMap<(u8, u8), (u8, u8)>,
@@ -65,9 +65,6 @@ struct Construct {
     passes: bool,
     /// Jumps from inner constructs that arrive here: bit 0 exit, bit 1 continue.
     wanted: u8,
-    /// Loop constructs: the iteration count (a phi at the header) and its
-    /// next value (made at the continue target).
-    counter: Option<(Id, Id)>,
     /// Jumps passing out through this construct's merge: they bring the
     /// jump's code and the values for its target's phis (a ladder of phis,
     /// no variables).
@@ -84,157 +81,6 @@ struct Arrival {
     vals: Vec<(usize, Vec<Id>)>,
 }
 
-struct Graph {
-    rpo: Vec<usize>,
-    header: Vec<bool>,
-    merge: Vec<bool>,
-    children: Vec<Vec<usize>>,
-    /// Per loop header: the exit placed at the loop construct's merge (a
-    /// merge child of the header outside the loop, the most entered), so
-    /// leaving the loop for it is a plain break.
-    exit: Vec<Option<usize>>,
-    /// Per loop header: its merge children outside the loop placed after
-    /// the exit (their blocks wrap the loop).
-    after_exit: Vec<Vec<usize>>,
-}
-
-impl Graph {
-    fn new(f: &Func) -> Result<Self, &'static str> {
-        let n = f.blocks.len();
-        let succ: Vec<Vec<usize>> = f
-            .blocks
-            .iter()
-            .map(|b| match b.term {
-                Term::Jump(t) => vec![t],
-                Term::Branch(_, t, e) => vec![t, e],
-                Term::Return => vec![],
-            })
-            .collect();
-        let mut post = Vec::new();
-        let mut seen = vec![false; n];
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-            if *k < succ[b].len() {
-                let s = succ[b][*k];
-                *k += 1;
-                if !seen[s] {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-            } else {
-                post.push(b);
-                stack.pop();
-            }
-        }
-        let order: Vec<usize> = post.into_iter().rev().collect();
-        let mut rpo = vec![usize::MAX; n];
-        for (i, &b) in order.iter().enumerate() {
-            rpo[b] = i;
-        }
-        let mut preds = vec![Vec::new(); n];
-        for &b in &order {
-            for &s in &succ[b] {
-                preds[s].push(b);
-            }
-        }
-        let mut idom = vec![usize::MAX; n];
-        idom[0] = 0;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in order.iter().skip(1) {
-                let mut new = usize::MAX;
-                for &p in &preds[b] {
-                    if idom[p] == usize::MAX {
-                        continue;
-                    }
-                    new = if new == usize::MAX {
-                        p
-                    } else {
-                        let (mut x, mut y) = (p, new);
-                        while x != y {
-                            while rpo[x] > rpo[y] {
-                                x = idom[x];
-                            }
-                            while rpo[y] > rpo[x] {
-                                y = idom[y];
-                            }
-                        }
-                        x
-                    };
-                }
-                if new != idom[b] {
-                    idom[b] = new;
-                    changed = true;
-                }
-            }
-        }
-        let dominates = |a: usize, mut b: usize| loop {
-            if a == b {
-                return true;
-            }
-            if b == 0 {
-                return false;
-            }
-            b = idom[b];
-        };
-        let mut header = vec![false; n];
-        let mut forward = vec![0usize; n];
-        for &b in &order {
-            for &s in &succ[b] {
-                if rpo[s] <= rpo[b] {
-                    if !dominates(s, b) {
-                        return Err("irreducible control flow");
-                    }
-                    header[s] = true;
-                } else {
-                    forward[s] += 1;
-                }
-            }
-        }
-        let merge: Vec<bool> = forward.iter().map(|&k| k >= 2).collect();
-        let mut children = vec![Vec::new(); n];
-        for &b in order.iter().skip(1) {
-            children[idom[b]].push(b);
-        }
-        // natural loops: what reaches a back edge's source without the header
-        let mut exit = vec![None; n];
-        let mut after_exit = vec![Vec::new(); n];
-        for &h in &order {
-            if !header[h] {
-                continue;
-            }
-            let mut inside = vec![false; n];
-            inside[h] = true;
-            let mut work: Vec<usize> = preds[h].iter().copied().filter(|&p| rpo[p] >= rpo[h]).collect();
-            while let Some(b) = work.pop() {
-                if std::mem::replace(&mut inside[b], true) {
-                    continue;
-                }
-                work.extend(preds[b].iter().copied());
-            }
-            let mut best: Option<(usize, usize)> = None;
-            for &c in &children[h] {
-                if !merge[c] || inside[c] {
-                    continue;
-                }
-                let edges = preds[c].iter().filter(|&&p| inside[p]).count();
-                if edges > 0 && best.is_none_or(|b| edges > b.1) {
-                    best = Some((c, edges));
-                }
-            }
-            exit[h] = best.map(|b| b.0);
-            if let Some((y, _)) = best {
-                let mut after: Vec<usize> =
-                    children[h].iter().copied().filter(|&c| merge[c] && !inside[c] && rpo[c] > rpo[y]).collect();
-                after.sort_by_key(|&c| std::cmp::Reverse(rpo[c]));
-                after_exit[h] = after;
-            }
-        }
-        Ok(Graph { rpo, header, merge, children, exit, after_exit })
-    }
-}
 
 #[derive(Default)]
 struct Types {
@@ -287,21 +133,14 @@ pub struct Emit<'a> {
     spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,
     picks: HashMap<V, Id>,
-    g: Option<Graph>,
+    /// Merges of the selections `open_if` opened.
+    if_merge: Vec<Id>,
+    g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
     entry_vars: Vec<u32>,
     input_locations: Vec<(u8, usize)>,
     frag: bool,
-}
-
-/// Function control of a helper: DontInline (2) when `VK_NOINLINE` names it
-/// (experiment).
-fn helper_control(which: &str) -> u32 {
-    match std::env::var("VK_NOINLINE") {
-        Ok(v) if v == "all" || v == which => 2,
-        _ => 0,
-    }
 }
 
 /// Jump codes: construct at stack position i; continue (loop) or exit.
@@ -310,7 +149,7 @@ fn code(i: usize, cont: bool) -> u32 {
 }
 
 impl<'a> Emit<'a> {
-    pub fn new(f: &'a Func, iface: &'a Interface, st: &'a Stage) -> Self {
+    pub fn new(f: &'a Func, g: &'a Graph, iface: &'a Interface, st: &'a Stage) -> Self {
         let mut m = Module::new();
         let t = Types {
             void: m.t_void(),
@@ -353,7 +192,8 @@ impl<'a> Emit<'a> {
             spec_samplers: HashMap::new(),
             helpers: HashMap::new(),
             picks: HashMap::new(),
-            g: None,
+            if_merge: Vec::new(),
+            g,
             ctx: Vec::new(),
             cons: Vec::new(),
             entry_vars: Vec::new(),
@@ -517,7 +357,7 @@ impl<'a> Emit<'a> {
                     _ => unreachable!(),
                 }
             }
-            Op::Image { kind, class, sampler, flags } => self.image(v, kind, class, sampler, flags, &args, tid),
+            Op::Image { kind, class, sampler, flags } => self.image(kind, class, sampler, flags, &args, tid),
             Op::Wave(o, g) => {
                 self.m.capability(en::CAP_GROUP_NON_UNIFORM);
                 match o {
@@ -709,20 +549,16 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// A guard whose body has no effects and is small enough is emitted
-    /// flat (`VICTORY_VK_PRED`-free policy: every such guard; the experiment
-    /// switch `VK_PRED=n` caps its size, 0 keeps every guard a branch).
+    /// A guard whose body has no effects but stores (their addresses go to
+    /// the sink outside the guard) is emitted flat, whatever its size.
     fn predicable(&self, body: &[Item]) -> bool {
-        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let cap = *CAP.get_or_init(|| std::env::var("VK_PRED").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX));
-        body.len() <= cap
-            && body.iter().all(|it| {
-                matches!(it, Item::N(v) if {
-                    let op = &self.f.node(*v).op;
-                    (op.removable() && *op != Op::Phi)
-                        || matches!(op, Op::Store { .. } | Op::Atomic(_) | Op::LdsStore | Op::LdsAtomic(_))
-                })
+        body.iter().all(|it| {
+            matches!(it, Item::N(v) if {
+                let op = &self.f.node(*v).op;
+                (op.removable() && *op != Op::Phi)
+                    || matches!(op, Op::Store { .. } | Op::Atomic(_) | Op::LdsStore | Op::LdsAtomic(_))
             })
+        })
     }
 
     /// A store's address: the sink where the lanes outside a flat guard
@@ -746,7 +582,6 @@ impl<'a> Emit<'a> {
     /// A function variable (declared at the entry later).
 
     pub fn run(mut self) -> Result<Emitted, &'static str> {
-        self.g = Some(Graph::new(self.f)?);
         let fid = self.m.id();
         let void = self.t.void;
         // pick arrays

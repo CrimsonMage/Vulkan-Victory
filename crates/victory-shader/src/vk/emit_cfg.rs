@@ -16,7 +16,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn tree(&mut self, x: usize) {
-        let g = self.g.as_ref().unwrap();
+        let g = self.g;
         let exit = if g.header[x] { g.exit[x] } else { None };
         let after: Vec<usize> = if exit.is_some() { g.after_exit[x].clone() } else { Vec::new() };
         let mut merges: Vec<usize> = g.children[x]
@@ -54,24 +54,18 @@ impl Emit<'_> {
             self.m.label(body);
             self.block = body;
             self.ctx.push(Ctx::Block(z));
-            self.cons.push(Construct { node: z, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, counter: None, arrivals: Vec::new() });
+            self.cons.push(Construct { node: z, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
             self.loop_tree(x, rest, merges, exit, entry);
             self.close();
             self.tree(z);
             return;
         }
         let phis = self.f.blocks[x].phis.clone();
-        let z = self.c32(0);
         let (h, merge, cont) = (self.m.id(), self.m.id(), self.m.id());
         let pre = self.block;
         self.branch_to(h);
         self.m.label(h);
         self.block = h;
-        // the iteration count
-        let u = self.t.u32_;
-        let next = self.m.id();
-        let count = self.m.op(op::PHI, u, &[z, pre, next, cont]);
-        let counter = (count, next);
         let tys = self.phi_tys(x);
         let cids: Vec<Id> = phis.iter().map(|_| self.m.id()).collect();
         for (k, &ph) in phis.iter().enumerate() {
@@ -85,7 +79,7 @@ impl Emit<'_> {
         self.m.label(body);
         self.block = body;
         self.ctx.push(Ctx::Loop(x));
-        self.cons.push(Construct { node: x, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, counter: Some(counter), arrivals: Vec::new() });
+        self.cons.push(Construct { node: x, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
         let b = self.f.blocks[x].body.clone();
         self.items(&b);
         self.within(x, merges);
@@ -129,7 +123,7 @@ impl Emit<'_> {
                 let c = self.id(c);
                 let merge = self.m.id();
                 self.ctx.push(Ctx::Sel(y));
-                self.cons.push(Construct { node: y, head: x, header: 0, merge, cont: 0, passes: false, wanted: 0, counter: None, arrivals: Vec::new() });
+                self.cons.push(Construct { node: y, head: x, header: 0, merge, cont: 0, passes: false, wanted: 0, arrivals: Vec::new() });
                 let header = self.block;
                 let arm = |e: &mut Self, to: usize| -> Id { if to == y { merge } else { e.m.id() } };
                 let (lt, le) = (arm(self, t), arm(self, e));
@@ -161,7 +155,7 @@ impl Emit<'_> {
                 self.m.label(body);
                 self.block = body;
                 self.ctx.push(Ctx::Block(y));
-                self.cons.push(Construct { node: y, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, counter: None, arrivals: Vec::new() });
+                self.cons.push(Construct { node: y, head: usize::MAX, header: h, merge, cont, passes: false, wanted: 0, arrivals: Vec::new() });
                 self.within(x, rest);
                 self.close();
                 self.tree(y);
@@ -200,54 +194,19 @@ impl Emit<'_> {
     pub(super) fn close(&mut self) {
         let c = self.cons.pop().unwrap();
         let kind = self.ctx.pop().unwrap();
-        let (u, b) = (self.t.u32_, self.t.bool_);
-        let h = c.header;
-        if matches!(kind, Ctx::Sel(_)) {
-            // no continue target
-        } else {
-        // continue target
-        self.m.label(c.cont);
-        self.block = c.cont;
-        match c.counter {
-            Some((count, next)) => {
-                // the loop's back edges meet here
-                let x = c.node;
-                let cids = self.cphi.remove(&x).unwrap_or_default();
-                let inc = self.back.remove(&x).unwrap_or_default();
-                let tys = self.phi_tys(x);
-                for (k, &t) in tys.iter().enumerate() {
-                    let mut ops = Vec::new();
-                    for (vals, blk) in &inc {
-                        ops.push(vals[k]);
-                        ops.push(*blk);
-                    }
-                    if ops.is_empty() {
-                        let u = self.m.undef(t);
-                        ops.push(u);
-                        ops.push(h);
-                    }
-                    self.m.op_to(op::PHI, t, cids[k], &ops);
-                }
-                let one = self.c32(1);
-                self.m.op_to(op::I_ADD, u, next, &[count, one]);
-                let lim = self.c32(self.st.loop_limit);
-                let over = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[next, lim]);
-                // past the limit: leave through the merge, then return
-                self.merge_preds.entry(c.merge).or_default().push(c.cont);
-                self.m.op_void(op::BRANCH_CONDITIONAL, &[over, c.merge, h]);
+        if !matches!(kind, Ctx::Sel(_)) {
+            self.m.label(c.cont);
+            self.block = c.cont;
+            if matches!(kind, Ctx::Loop(_)) {
+                self.back_phis(c.node, c.header);
             }
-            None => self.branch_to(h),
-        }
+            self.branch_to(c.header);
         }
         self.m.label(c.merge);
         self.block = c.merge;
         let preds = self.merge_preds.remove(&c.merge).unwrap_or_default();
         // the block placed at this merge: a Block's node, or a loop's exit
-        let at_merge = match kind {
-            Ctx::Block(y) | Ctx::Sel(y) => Some(y),
-            Ctx::Loop(x) => self.g.as_ref().unwrap().exit[x],
-        };
-        if let Some(y) = at_merge
+        if let Some(y) = self.at_merge(kind)
             && !self.f.blocks[y].phis.is_empty()
         {
             let inc = self.fwd.remove(&y).unwrap_or_default();
@@ -255,172 +214,209 @@ impl Emit<'_> {
             let ids = self.phis_at(&tys, &preds, &|p, k| inc.iter().find(|e| e.1 == p).map(|e| e.0[k]));
             self.pending.insert(y, ids);
         }
-        // the ladder: which jump passes, with what values
-        let mut code_id = 0;
-        let mut ladder: Vec<(usize, Vec<Id>)> = Vec::new();
-        let mut possible: Vec<u32> = c.arrivals.iter().flat_map(|a| a.possible.iter().copied()).collect();
-        possible.sort_unstable();
-        possible.dedup();
-        if !c.arrivals.is_empty() {
-            let zero = self.c32(0);
-            let arr = &c.arrivals;
-            let codes = self.phis_at(&[u], &preds, &|p, _| Some(arr.iter().find(|a| a.from == p).map_or(zero, |a| a.code)));
-            code_id = codes[0];
-            let mut targets: Vec<usize> = arr.iter().flat_map(|a| a.vals.iter().map(|v| v.0)).collect();
-            targets.sort_unstable();
-            targets.dedup();
-            for t in targets {
-                let tys = self.phi_tys(t);
-                if tys.is_empty() {
-                    ladder.push((t, Vec::new()));
-                    continue;
-                }
-                let ids = self.phis_at(&tys, &preds, &|p, k| {
-                    arr.iter().find(|a| a.from == p).and_then(|a| a.vals.iter().find(|v| v.0 == t)).map(|v| v.1[k])
-                });
-                ladder.push((t, ids));
-            }
+        if c.arrivals.is_empty() || self.ctx.is_empty() {
+            return;
         }
-        if c.counter.is_some() {
-            // the iteration limit: arrived from the continue target
-            let (t, f) = (self.m.c_bool(true), self.m.c_bool(false));
-            let cont = c.cont;
-            let over = self.phis_at(&[b], &preds, &|p, _| Some(if p == cont { t } else { f }))[0];
-            let (lr, lc) = (self.m.id(), self.m.id());
-            self.m.op_void(op::SELECTION_MERGE, &[lc, 0]);
-            self.m.op_void(op::BRANCH_CONDITIONAL, &[over, lr, lc]);
-            self.m.label(lr);
-            self.m.op_void(op::RETURN, &[]);
-            self.m.label(lc);
-            self.block = lc;
-        }
-        let i = self.ctx.len();
-        if i > 0 && code_id != 0 {
-            let outer = i - 1;
-            let z = self.c32(0);
-            let outer_kind = self.ctx[outer];
-            let codes: Vec<(u32, bool)> = match outer_kind {
-                Ctx::Loop(_) => vec![(code(outer, true), true), (code(outer, false), false)],
-                Ctx::Block(_) | Ctx::Sel(_) => vec![(code(outer, false), false)],
-            };
-            let of = |l: &Vec<(usize, Vec<Id>)>, t: usize| l.iter().find(|v| v.0 == t).map(|v| v.1.clone()).unwrap_or_default();
-            let mut rest = possible.clone();
-            for (k, cont) in codes {
-                if !possible.contains(&k) {
-                    continue;
-                }
-                rest.retain(|&x| x != k);
-                let kk = self.c32(k);
-                let is = self.m.op(op::I_EQUAL, b, &[code_id, kk]);
-                let (lt, lf) = (self.m.id(), self.m.id());
-                self.m.op_void(op::SELECTION_MERGE, &[lf, 0]);
-                self.m.op_void(op::BRANCH_CONDITIONAL, &[is, lt, lf]);
-                self.m.label(lt);
-                self.block = lt;
-                let node = self.cons[outer].node;
-                if cont {
-                    let vals = of(&ladder, node);
-                    self.back.entry(node).or_default().push((vals, lt));
-                    let t = self.cons[outer].cont;
-                    self.branch_to(t);
-                } else {
-                    let exit = match outer_kind {
-                        Ctx::Block(y) | Ctx::Sel(y) => Some(y),
-                        Ctx::Loop(x) => self.g.as_ref().unwrap().exit[x],
-                    };
-                    if let Some(y) = exit {
-                        let vals = of(&ladder, y);
-                        self.fwd.entry(y).or_default().push((vals, lt));
-                    }
-                    self.to_merge(outer);
-                }
-                self.m.label(lf);
-                self.block = lf;
-            }
-            if !rest.is_empty() {
-                // further out: pass the code and the values on
-                let nz = self.m.op(op::I_NOT_EQUAL, b, &[code_id, z]);
-                let (lt, lf) = (self.m.id(), self.m.id());
-                self.m.op_void(op::SELECTION_MERGE, &[lf, 0]);
-                self.m.op_void(op::BRANCH_CONDITIONAL, &[nz, lt, lf]);
-                self.m.label(lt);
-                self.block = lt;
-                self.cons[outer].arrivals.push(Arrival { from: lt, code: code_id, possible: rest, vals: ladder.clone() });
-                self.to_merge(outer);
-                self.m.label(lf);
-                self.block = lf;
-            }
+        let ladder = self.ladder(&c.arrivals, &preds);
+        self.dispatch(ladder);
+    }
+
+    /// The block placed at a construct's merge.
+    fn at_merge(&self, kind: Ctx) -> Option<usize> {
+        match kind {
+            Ctx::Block(y) | Ctx::Sel(y) => Some(y),
+            Ctx::Loop(x) => self.g.exit[x],
         }
     }
 
+    /// A loop's back edges meet at its continue target: the phis that feed
+    /// the header's.
+    fn back_phis(&mut self, x: usize, h: Id) {
+        let cids = self.cphi.remove(&x).unwrap_or_default();
+        let inc = self.back.remove(&x).unwrap_or_default();
+        let tys = self.phi_tys(x);
+        for (k, &t) in tys.iter().enumerate() {
+            let mut ops: Vec<Id> = inc.iter().flat_map(|(vals, blk)| [vals[k], *blk]).collect();
+            if ops.is_empty() {
+                ops = vec![self.m.undef(t), h];
+            }
+            self.m.op_to(op::PHI, t, cids[k], &ops);
+        }
+    }
+
+    /// The ladder at a merge: which jump passes (its code, 0 for none) and
+    /// the values for each target's phis.
+    fn ladder(&mut self, arr: &[Arrival], preds: &[Id]) -> Ladder {
+        let mut possible: Vec<u32> = arr.iter().flat_map(|a| a.possible.iter().copied()).collect();
+        possible.sort_unstable();
+        possible.dedup();
+        let zero = self.c32(0);
+        let u = self.t.u32_;
+        let code = self.phis_at(&[u], preds, &|p, _| Some(arr.iter().find(|a| a.from == p).map_or(zero, |a| a.code)))[0];
+        let mut targets: Vec<usize> = arr.iter().flat_map(|a| a.vals.iter().map(|v| v.0)).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let mut vals = Vec::new();
+        for t in targets {
+            let tys = self.phi_tys(t);
+            let ids = if tys.is_empty() {
+                Vec::new()
+            } else {
+                self.phis_at(&tys, preds, &|p, k| {
+                    arr.iter().find(|a| a.from == p).and_then(|a| a.vals.iter().find(|v| v.0 == t)).map(|v| v.1[k])
+                })
+            };
+            vals.push((t, ids));
+        }
+        Ladder { code, possible, vals }
+    }
+
+    /// After a merge, the jumps the ladder carries: those that end at the
+    /// next construct out (its continue or its merge) go there; the rest
+    /// pass on through its merge.
+    fn dispatch(&mut self, l: Ladder) {
+        let outer = self.ctx.len() - 1;
+        let codes: &[bool] = if matches!(self.ctx[outer], Ctx::Loop(_)) { &[true, false] } else { &[false] };
+        let mut rest = l.possible.clone();
+        for &cont in codes {
+            let k = code(outer, cont);
+            if !l.possible.contains(&k) {
+                continue;
+            }
+            rest.retain(|&x| x != k);
+            let kk = self.c32(k);
+            let is = self.m.op(op::I_EQUAL, self.t.bool_, &[l.code, kk]);
+            let lt = self.open_if(is);
+            let node = self.cons[outer].node;
+            if cont {
+                self.back.entry(node).or_default().push((l.of(node), lt));
+                let t = self.cons[outer].cont;
+                self.branch_to(t);
+            } else {
+                if let Some(y) = self.at_merge(self.ctx[outer]) {
+                    self.fwd.entry(y).or_default().push((l.of(y), lt));
+                }
+                self.to_merge(outer);
+            }
+            self.close_if();
+        }
+        if !rest.is_empty() {
+            // further out: pass the code and the values on
+            let z = self.c32(0);
+            let nz = self.m.op(op::I_NOT_EQUAL, self.t.bool_, &[l.code, z]);
+            let lt = self.open_if(nz);
+            self.cons[outer].arrivals.push(Arrival { from: lt, code: l.code, possible: rest, vals: l.vals });
+            self.to_merge(outer);
+            self.close_if();
+        }
+    }
+
+    /// Opens the true arm of a selection that ends at the next `close_if`;
+    /// the arm's label.
+    fn open_if(&mut self, cond: Id) -> Id {
+        let (lt, lf) = (self.m.id(), self.m.id());
+        self.m.op_void(op::SELECTION_MERGE, &[lf, 0]);
+        self.m.op_void(op::BRANCH_CONDITIONAL, &[cond, lt, lf]);
+        self.m.label(lt);
+        self.block = lt;
+        self.if_merge.push(lf);
+        lt
+    }
+
+    fn close_if(&mut self) {
+        let lf = self.if_merge.pop().unwrap();
+        self.m.label(lf);
+        self.block = lf;
+    }
+
     pub(super) fn jump(&mut self, from: usize, to: usize) {
-        let g = self.g.as_ref().unwrap();
+        let g = self.g;
         let back = g.rpo[to] <= g.rpo[from];
         let merge = g.merge[to];
         let vals = self.edge_vals(from, to);
-        let exit_of = (!back && merge)
-            .then(|| self.ctx.iter().rposition(|c| matches!(*c, Ctx::Loop(h) if g.exit[h] == Some(to))))
-            .flatten();
-        let block_at = (!back && merge)
-            .then(|| self.ctx.iter().rposition(|c| *c == Ctx::Block(to) || *c == Ctx::Sel(to)))
-            .flatten();
-        if back || merge {
-            // the innermost of the construct ending at `to`: a Block, or a Loop it exits
-            let i = if back {
-                self.ctx.iter().rposition(|c| *c == Ctx::Loop(to)).expect("a back edge inside its loop")
-            } else {
-                match (exit_of, block_at) {
-                    (Some(a), Some(b)) => a.max(b),
-                    (Some(a), None) => a,
-                    (None, Some(b)) => b,
-                    (None, None) => panic!("a merge after its block"),
-                }
-            };
-            let inner = self.ctx.len() - 1;
-            // direct: the innermost construct, or a loop or block construct
-            // with only selections inside it (break and continue of the
-            // innermost loop are allowed from selections)
-            let direct = i == inner
-                || (!matches!(self.ctx[i], Ctx::Sel(_)) && self.ctx[i + 1..].iter().all(|c| matches!(c, Ctx::Sel(_))));
-            // leaving a selection with no merge of its own (the arms of a
-            // two-way branch) for a selection's merge is not allowed either
-            let into = if direct { i } else { inner };
-            if matches!(self.ctx[into], Ctx::Sel(_)) && self.base.iter().any(|&m| m > into) {
-                self.bad_sel.push(self.cons[into].head);
-            }
-            if direct {
-                let blk = self.block;
-                let list = if back { self.back.entry(to).or_default() } else { self.fwd.entry(to).or_default() };
-                list.push((vals, blk));
-                if back {
-                    let t = self.cons[i].cont;
-                    self.branch_to(t);
-                } else {
-                    self.to_merge(i);
-                }
-                return;
-            }
-            // out of several constructs: the code and the values ride a
-            // ladder of phis out to the target. A selection cannot take a
-            // dispatched branch out of a nested one: such a selection's
-            // header becomes a block construct in the next attempt.
-            for k in i..inner {
-                if matches!(self.ctx[k], Ctx::Sel(_)) {
-                    self.bad_sel.push(self.cons[k].head);
-                }
-            }
-                for k in i + 1..=inner {
-                self.cons[k].passes = true;
-            }
-            self.cons[i].wanted |= 1 << u8::from(back);
-            let k = code(i, back);
-            let code = self.c32(k);
-            let blk = self.block;
-            self.cons[inner].arrivals.push(Arrival { from: blk, code, possible: vec![k], vals: vec![(to, vals)] });
-            self.to_merge(inner);
-        } else {
+        if !back && !merge {
             self.pending.insert(to, vals);
             self.tree(to);
+            return;
         }
+        let i = self.target_construct(to, back);
+        let inner = self.ctx.len() - 1;
+        // direct: the innermost construct, or a loop or block construct
+        // with only selections inside it (break and continue of the
+        // innermost loop are allowed from selections)
+        let direct =
+            i == inner || (!matches!(self.ctx[i], Ctx::Sel(_)) && self.ctx[i + 1..].iter().all(|c| matches!(c, Ctx::Sel(_))));
+        // leaving a selection with no merge of its own (the arms of a
+        // two-way branch) for a selection's merge is not allowed either
+        let into = if direct { i } else { inner };
+        if matches!(self.ctx[into], Ctx::Sel(_)) && self.base.iter().any(|&m| m > into) {
+            self.bad_sel.push(self.cons[into].head);
+        }
+        if direct {
+            self.leave_direct(i, to, back, vals);
+        } else {
+            self.leave_passing(i, to, back, vals);
+        }
+    }
+
+    /// The construct a jump to `to` ends in: the loop it continues, or the
+    /// innermost block, selection or loop (by its exit) merging at it.
+    fn target_construct(&self, to: usize, back: bool) -> usize {
+        let g = self.g;
+        if back {
+            return self.ctx.iter().rposition(|c| *c == Ctx::Loop(to)).expect("a back edge inside its loop");
+        }
+        let exit_of = self.ctx.iter().rposition(|c| matches!(*c, Ctx::Loop(h) if g.exit[h] == Some(to)));
+        let block_at = self.ctx.iter().rposition(|c| *c == Ctx::Block(to) || *c == Ctx::Sel(to));
+        exit_of.max(block_at).expect("a merge after its block")
+    }
+
+    /// A break or continue of construct `i`.
+    fn leave_direct(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) {
+        let blk = self.block;
+        let list = if back { self.back.entry(to).or_default() } else { self.fwd.entry(to).or_default() };
+        list.push((vals, blk));
+        if back {
+            let t = self.cons[i].cont;
+            self.branch_to(t);
+        } else {
+            self.to_merge(i);
+        }
+    }
+
+    /// Out of several constructs: the code and the values ride a ladder of
+    /// phis out to the target. A selection cannot take a dispatched branch
+    /// out of a nested one: such a selection's header becomes a block
+    /// construct in the next attempt.
+    fn leave_passing(&mut self, i: usize, to: usize, back: bool, vals: Vec<Id>) {
+        let inner = self.ctx.len() - 1;
+        for k in i..inner {
+            if matches!(self.ctx[k], Ctx::Sel(_)) {
+                self.bad_sel.push(self.cons[k].head);
+            }
+        }
+        for k in i + 1..=inner {
+            self.cons[k].passes = true;
+        }
+        self.cons[i].wanted |= 1 << u8::from(back);
+        let k = code(i, back);
+        let code = self.c32(k);
+        let blk = self.block;
+        self.cons[inner].arrivals.push(Arrival { from: blk, code, possible: vec![k], vals: vec![(to, vals)] });
+        self.to_merge(inner);
+    }
+}
+
+/// The jumps a merge passes on: the code of the one taken (0: none), the
+/// codes possible, and each target's phi values.
+struct Ladder {
+    code: Id,
+    possible: Vec<u32>,
+    vals: Vec<(usize, Vec<Id>)>,
+}
+
+impl Ladder {
+    fn of(&self, t: usize) -> Vec<Id> {
+        self.vals.iter().find(|v| v.0 == t).map(|v| v.1.clone()).unwrap_or_default()
     }
 }
