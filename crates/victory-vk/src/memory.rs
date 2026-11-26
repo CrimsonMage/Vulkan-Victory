@@ -200,6 +200,12 @@ pub struct Buffer {
     pub mapped: *mut u8,
 }
 
+// SAFETY: Vulkan handles and a mapping of memory that lives as long as the
+// buffer; callers order their own reads and writes of the mapping.
+unsafe impl Send for Buffer {}
+// SAFETY: as above.
+unsafe impl Sync for Buffer {}
+
 impl Buffer {
     pub fn new(
         host: &Host,

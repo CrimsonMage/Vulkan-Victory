@@ -36,6 +36,8 @@
 //! lists at once, as the title's threads did before; what lists share was
 //! made for that then.
 
+mod vulkan;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -614,6 +616,9 @@ pub(super) fn own(this: This, f: Own) {
 /// Makes the calls of a stream on `list`: how many, and whether one of them
 /// was a reset (what the draw state kept of the stream before is let go).
 fn translate(list: This, stream: &[u64]) -> (u64, bool) {
+    if crate::vulkan::on() {
+        return vulkan::translate(list, stream);
+    }
     let (mut i, mut calls, mut reset) = (0, 0, false);
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);

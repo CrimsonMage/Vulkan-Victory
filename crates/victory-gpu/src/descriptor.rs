@@ -155,6 +155,11 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    // Under Vulkan the slots hold the console's descriptors: nothing to
+    // mirror (and no host heap would ever take the pending slots).
+    if crate::vulkan::on() {
+        return;
+    }
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -276,6 +281,13 @@ pub(crate) struct RtvRecord {
     described: u32,
     pub(crate) resource: This,
     desc: [u32; 6],
+}
+
+impl RtvRecord {
+    /// The view description the title gave, if it gave one.
+    pub(crate) fn words(&self) -> Option<[u32; 6]> {
+        (self.described != 0).then_some(self.desc)
+    }
 }
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
@@ -768,6 +780,12 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // `VICTORY_GPU=vulkan`: the console's own descriptor goes into the slot.
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::write_descriptor(handle, &view);
+        return;
+    }
     let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
@@ -1024,6 +1042,10 @@ pub(crate) extern "system" fn create_heap(
         }
     };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::heap_created(start, size, desc.kind, visible, placed);
+    }
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
@@ -1034,12 +1056,12 @@ pub(crate) extern "system" fn create_heap(
         #[cfg(windows)]
         pending: Default::default(),
         #[cfg(windows)]
-        written: (placed && visible)
+        written: (placed && visible && !crate::vulkan::on())
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
     #[cfg(windows)]
-    if visible {
+    if visible && !crate::vulkan::on() {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));

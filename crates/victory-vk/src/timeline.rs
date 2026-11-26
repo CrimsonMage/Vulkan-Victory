@@ -32,6 +32,12 @@ struct State {
     recorders: Vec<Recorder>,
 }
 
+/// A command buffer being recorded ([`Timeline::begin`]).
+pub struct Recording {
+    index: usize,
+    pub cmd: vk::CommandBuffer,
+}
+
 pub struct Timeline {
     pub semaphore: vk::Semaphore,
     queue: vk::Queue,
@@ -177,7 +183,10 @@ impl Timeline {
         let completed = self.completed(host);
         let mut s = self.state();
         let device = &host.device;
-        let at = s.recorders.iter().position(|r| r.done_at <= completed);
+        let at = s
+            .recorders
+            .iter()
+            .position(|r| r.done_at != u64::MAX && r.done_at <= completed);
         let i = match at {
             Some(i) => i,
             None => {
@@ -220,6 +229,89 @@ impl Timeline {
             s.recorders[i].done_at = value;
             Ok(value)
         }
+    }
+
+    /// A command buffer of the pool's to record into on this thread (M2b:
+    /// the list workers record parts in parallel), begun. Hand it back with
+    /// [`Timeline::submit_recordings`] or [`Timeline::abandon`].
+    pub fn begin(&self, host: &Host) -> Result<Recording> {
+        let completed = self.completed(host);
+        let device = &host.device;
+        let (i, pool, cmd) = {
+            let mut s = self.state();
+            let at = s
+                .recorders
+                .iter()
+                .position(|r| r.done_at != u64::MAX && r.done_at <= completed);
+            let i = match at {
+                Some(i) => i,
+                None => {
+                    // SAFETY: valid create and allocate infos.
+                    let (pool, cmd) = unsafe {
+                        let pool = device.create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(self.family)
+                                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                            None,
+                        )?;
+                        let cmd = device.allocate_command_buffers(
+                            &vk::CommandBufferAllocateInfo::default()
+                                .command_pool(pool)
+                                .level(vk::CommandBufferLevel::PRIMARY)
+                                .command_buffer_count(1),
+                        )?[0];
+                        (pool, cmd)
+                    };
+                    s.recorders.push(Recorder {
+                        pool,
+                        cmd,
+                        done_at: 0,
+                    });
+                    s.recorders.len() - 1
+                }
+            };
+            // Taken: no other thread picks it until it is handed back.
+            s.recorders[i].done_at = u64::MAX;
+            (i, s.recorders[i].pool, s.recorders[i].cmd)
+        };
+        // SAFETY: the recorder's last submission has completed and it is ours.
+        unsafe {
+            device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+        }
+        Ok(Recording { index: i, cmd })
+    }
+
+    /// Ends `recordings` (begun by [`Timeline::begin`]) and submits them in
+    /// order as one submission behind everything given before; returns the
+    /// value it signals.
+    pub fn submit_recordings(&self, host: &Host, recordings: Vec<Recording>) -> Result<u64> {
+        let device = &host.device;
+        let mut cmds = Vec::with_capacity(recordings.len());
+        for r in &recordings {
+            // SAFETY: begun by `begin`, recorded by its owner only.
+            unsafe { device.end_command_buffer(r.cmd) }?;
+            cmds.push(r.cmd);
+        }
+        let mut s = self.state();
+        // SAFETY: as `submit`.
+        let r = unsafe { self.submit_locked(host, &mut s, &cmds) };
+        let done = *r.as_ref().unwrap_or(&0);
+        for rec in recordings {
+            s.recorders[rec.index].done_at = done;
+        }
+        r
+    }
+
+    /// Hands back a recording that is not submitted.
+    pub fn abandon(&self, host: &Host, recording: Recording) {
+        // SAFETY: begun by `begin`; never submitted.
+        let _ = unsafe { host.device.end_command_buffer(recording.cmd) };
+        self.state().recorders[recording.index].done_at = 0;
     }
 
     /// Binds sparse memory behind everything given before; returns the

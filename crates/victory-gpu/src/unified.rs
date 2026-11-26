@@ -816,7 +816,7 @@ unsafe fn open_unit(device: &ID3D12Device, rig: &mut Option<Rig>, len: u64, home
 /// whatever another thread does) so that pages a write watch keeps
 /// read-only become writable and can be pinned. Refuses pages the title
 /// protected otherwise.
-unsafe fn ready_region(base: usize, total: usize) -> Result<(), String> {
+pub(crate) unsafe fn ready_region(base: usize, total: usize) -> Result<(), String> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualQuery};
     let end = base + total;
     let mut at = base;

@@ -395,6 +395,22 @@ pub(crate) struct Plane {
     rest: [u32; 7],
 }
 const _: () = assert!(size_of::<Plane>() == 0x48);
+/// The planes as the Vulkan backend shows them.
+#[cfg(windows)]
+fn shown(given: &[Plane]) -> Vec<crate::vulkan::Shown> {
+    given
+        .iter()
+        .filter(|p| p.count > 0 && !p.resources.is_null())
+        .map(|p| crate::vulkan::Shown {
+            // SAFETY: the plane lists `count` resources; its rectangles are
+            // given or null.
+            resource: unsafe { *p.resources },
+            source: unsafe { p.source.as_ref() }.copied(),
+            placement: unsafe { p.placement.as_ref() }.copied(),
+        })
+        .collect()
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -628,7 +644,7 @@ extern "system" fn present(
             .filter_map(|p| crate::resource::texture_memory(unsafe { *p.resources }))
             .map(|(_, desc)| desc.extent())
             .max_by_key(|&(w, h)| u64::from(w) * u64::from(h));
-        crate::vulkan::present(frame, size);
+        crate::vulkan::present(frame, size, &shown(given));
         return S_OK;
     }
     #[cfg(windows)]

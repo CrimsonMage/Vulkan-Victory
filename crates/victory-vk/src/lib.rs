@@ -24,6 +24,7 @@ pub mod descriptors;
 pub mod gfx10;
 pub mod graphics;
 pub mod host;
+pub mod limits;
 pub mod map;
 pub mod memory;
 pub mod pool;

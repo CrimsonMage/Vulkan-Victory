@@ -776,3 +776,8 @@ mod tests {
         MAKING_FOR.with(|m| m.set(ON_FRAME_THREAD));
     }
 }
+
+/// The graphics state of `p`, if it is a graphics pipeline.
+pub(crate) fn graphics(p: &Pending) -> Option<&GraphicsState> {
+    p.graphics.as_deref()
+}
