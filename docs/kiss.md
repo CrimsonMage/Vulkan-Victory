@@ -88,7 +88,7 @@ driver errors and no new crash, and the captures look no worse.
 | Rust lines | 128,292 | 106,472 |
 | `VICTORY_*` switches | 224 | 43 |
 | `diagnostics`-only blocks | 283 | 71 |
-| World frame time (Proton, 8 GB card) | 0.5–5 s | ~530–580 ms (1.7 fps) in a 4,500-draw scene; per-draw CPU halved (0.28 → 0.15 ms); console instruction traps 21,000/s → 0; card 4.0 GB of ours; RSS 21.6 GB (to fix) |
+| World frame time (Proton, 8 GB card) | 0.5–5 s | ~295 ms (~3.3 fps), Series S (run p20) |
 
 ## Workstreams
 
@@ -231,6 +231,14 @@ driver errors and no new crash, and the captures look no worse.
   stops the game on any NVIDIA Xid.
 - 2026-11-25: the title's ray-tracing builder stays off: 3 of its 53 programs
   don't translate (wave64 first-lane reads); being fixed.
+- 2026-11-25: run p20 (thin recording on 8 workers, pool by directory,
+  texture copy queue, builder translating): 294 ms/frame (~3.3 fps, from
+  ~560); title threads 1 ms in our layer; windows 0 MB; GPU busy 84 ms;
+  workers 458 ms summed, submissions wait 222 ms for translation. Next:
+  descriptors read from memory by shaders (per-call binding → constants),
+  a VRAM cache of streamed pool pages, then splitting big lists across
+  workers. Leonida built here crashed ~20 s in, twice (heap corruption;
+  title assert).
 - 2026-11-25: dropped the shader control-flow reshaping pass (not needed
   with a current vkd3d-proton).
 - 2026-11-25: pool memory goes by directory (workstream 24): the one way
