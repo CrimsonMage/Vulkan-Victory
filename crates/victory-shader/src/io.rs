@@ -35,7 +35,7 @@ use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Exit, Inst, Program, Reg, Value, operand_reads};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
-use crate::resource::Site;
+use crate::ir::Site;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {

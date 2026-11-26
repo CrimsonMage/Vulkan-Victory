@@ -325,7 +325,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Operand::Scalar { code, .. } if code != NULL => inst
                         .read(Reg::S(code))
                         .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
-                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Const(c) => crate::ir::inline(c).map_or(Sym::Unknown, Sym::K),
                     Operand::Literal(x) => Sym::K(x),
                     _ => Sym::Unknown,
                 };
@@ -359,7 +359,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
-                Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
+                Operand::Const(c) => one(crate::ir::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
             }
@@ -372,7 +372,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 continue;
             };
             let l = match *lane {
-                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Const(c) => crate::ir::inline(c),
                 Operand::Literal(x) => Some(x),
                 _ => None,
             };
@@ -589,7 +589,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
-                    Some(&Operand::Const(c)) => crate::resource::inline(c),
+                    Some(&Operand::Const(c)) => crate::ir::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
@@ -675,14 +675,14 @@ fn constant(inst: &Inst) -> Option<u64> {
     match *src.first()? {
         Operand::Scalar { code: NULL, .. } => Some(0),
         Operand::Const(c @ 128..=208) => {
-            let x = crate::resource::inline(c)?;
+            let x = crate::ir::inline(c)?;
             Some(if wide {
                 i64::from(x as i32) as u64
             } else {
                 u64::from(x)
             })
         }
-        Operand::Const(c) if !wide => crate::resource::inline(c).map(u64::from),
+        Operand::Const(c) if !wide => crate::ir::inline(c).map(u64::from),
         Operand::Literal(x) => Some(u64::from(x)),
         _ => None,
     }
@@ -827,7 +827,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 /// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
 /// those outside the saved EXEC (s[4:5]) with 0.
 #[cfg(test)]
-pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
+pub(crate) const WAVE_OR_V7_TO_S7: [u32; 20] = [
     0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
     0xD501_0001,
     0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]

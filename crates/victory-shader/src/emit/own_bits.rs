@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::wave::{self, Op, Shape};
+use crate::wave::{self, Op, Shape};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -776,7 +776,7 @@ pub(super) fn find(p: &Program, st: &Structured) -> OwnBits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::wave::WAVE_OR_V7_TO_S7;
+    use crate::wave::WAVE_OR_V7_TO_S7;
 
     const ADD_BIT_NUMBER: u32 = 0x4A0A_0A0A; // v_add_nc_u32 v5, s10, v5
 

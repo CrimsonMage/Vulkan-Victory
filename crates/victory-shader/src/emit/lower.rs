@@ -417,7 +417,7 @@ struct Lower<'a> {
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
-    sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    sections: HashMap<usize, HashMap<usize, crate::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -616,7 +616,7 @@ enum Wave {
     /// The number of the wave's first lane in a mask (`s_ff1`).
     First,
     /// A reduction over the wave's lanes: a count, a sum, a minimum...
-    Total(super::wave::Op),
+    Total(crate::wave::Op),
     /// A count or sum over the lanes below this one.
     Prefix,
     /// Derived from what a first-lane atomic returned: the slots the wave reserved.
@@ -638,7 +638,7 @@ enum Wave {
 // host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
 // the only mix of old and new lanes that is looked at.
 pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
-    use super::wave::{Op, Shape};
+    use crate::wave::{Op, Shape};
     const FIRST: Why = "a wave's first-lane number used as data";
     const TOTAL: Why = "a count or sum over the wave used as data";
     const PREFIX: Why = "a count or sum over the lanes below used without a reserved base";
@@ -801,7 +801,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         };
         Ok((out, reserved))
     };
-    let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
+    let sections: Vec<_> = (0..p.blocks.len()).map(|b| crate::wave::sections(p, b)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
     let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
@@ -1757,7 +1757,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
-            let found = super::wave::sections(p, b);
+            let found = crate::wave::sections(p, b);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
@@ -1817,8 +1817,8 @@ impl<'a> Lower<'a> {
     /// `own`: a wave OR that only steers a loop over each lane's own bits
     /// ([`super::own_bits`]); where two host waves cannot exchange their halves' ORs it is
     /// this host wave's.
-    fn shape(&mut self, shape: super::wave::Shape, own: bool) -> Result<V, Why> {
-        use super::wave::{Op, Shape};
+    fn shape(&mut self, shape: crate::wave::Shape, own: bool) -> Result<V, Why> {
+        use crate::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -2077,7 +2077,7 @@ impl<'a> Lower<'a> {
     /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
     /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
     /// in their order (lanes 2k and 2k+1, then pairs, ... then the wave's two halves;
-    /// [`super::wave::buddies`]). Each lane adds its partner's partial sum, read from the
+    /// [`crate::wave::buddies`]). Each lane adds its partner's partial sum, read from the
     /// lane whose number differs in one bit, step by step; two host waves of 32 then exchange
     /// their halves' sums for the last addition. The high half of the result is lane 0's,
     /// which no `v_add_f16` writes.

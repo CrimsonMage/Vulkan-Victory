@@ -119,7 +119,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
         0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
     ];
     // (the wave OR's words with v_add_f16 for v_or_b32: opcode 50 for 28)
-    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
+    words.extend(crate::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
     words.extend_from_slice(&[
         0x7E00_0207, // v_mov_b32 v0, s7
         0x38 << 26 | 0x1C << 18,
@@ -196,7 +196,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         0x4A0E_0EFF,
         0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
     ];
-    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
+    words.extend(crate::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
     words.extend_from_slice(&[
         0x7E00_0207, // v_mov_b32 v0, s7
         0x38 << 26 | 0x1C << 18,

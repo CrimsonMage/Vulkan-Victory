@@ -19,7 +19,7 @@ use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
-pub type Site = (usize, usize);
+pub use crate::ir::Site;
 
 /// A byte address: a root parameter's, plus a constant and at most one
 /// value the program computes (an index times a stride, say).
@@ -2356,24 +2356,7 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     }
 }
 
-/// The 32-bit value of an inline constant operand.
-pub(crate) fn inline(code: u8) -> Option<u32> {
-    let float = |f: f32| Some(f.to_bits());
-    match code {
-        128..=192 => Some(u32::from(code) - 128),
-        193..=208 => Some((192 - i32::from(code)) as u32),
-        240 => float(0.5),
-        241 => float(-0.5),
-        242 => float(1.0),
-        243 => float(-1.0),
-        244 => float(2.0),
-        245 => float(-2.0),
-        246 => float(4.0),
-        247 => float(-4.0),
-        248 => Some(0x3E22_F983),
-        _ => None,
-    }
-}
+pub(crate) use crate::ir::inline;
 
 #[cfg(test)]
 pub(crate) mod tests {
