@@ -33,9 +33,11 @@ fn workers() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(4, 8)
 }
 
-/// SPIR-V words compiling at once at most (the driver's memory for a
-/// compile grows with the module).
-const WORDS_IN_FLIGHT: u64 = 1_000_000;
+/// SPIR-V words compiling at once at most: the driver's memory for a
+/// compile grows with the module (seven mesh modules of ~140,000 words
+/// compiling together took 14 GiB and the bake was killed for it; about
+/// 2 GiB a module of that size).
+const WORDS_IN_FLIGHT: u64 = 300_000;
 
 /// Stages bigger than this go to the slow lane (the CS_RaytracingResolve
 /// variants, 1.2-1.5 M words, ran over 25 minutes each in NVIDIA's
