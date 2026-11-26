@@ -13,7 +13,7 @@
 //! BCPack data unpacked from there into the destination.
 //!
 //! Submitted requests of every queue go, in submission order, into one
-//! line taken by a few workers ([`WORKERS`]), which run them in parallel
+//! line taken by a few workers ([`workers`]), which run them in parallel
 //! and sleep on a condition variable while the line is empty. Completion
 //! is what stays in order: a status entry is written once every request
 //! enqueued before it on its queue has finished, with the first failure
@@ -567,11 +567,14 @@ impl Job {
     }
 }
 
-/// Workers of [`LINE`]. A request is one positioned read, then mostly an
-/// inflate and/or BCPack unpack: the loading bursts took ~6 s of worker
-/// time per 10 s on one worker per core (28, the `dstorage streaming`
-/// line), so four keep up. Idle, they sleep on the condition variable.
-const WORKERS: usize = 4;
+/// Workers of [`LINE`]: half the cores. A request is one positioned read
+/// (waiting on the disk) then an inflate and/or BCPack unpack; loading
+/// bursts take ~25 s of worker time per 10 s (run p31), and four workers
+/// doubled the load (run p33). Idle, they sleep on the condition variable,
+/// so more of them cost nothing.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).clamp(4, 16))
+}
 
 /// The submitted requests of every queue, in submission order, and the
 /// condition variable signalled once per request put in.
@@ -582,7 +585,7 @@ fn start_workers() {
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         let spawn = |name: String, f: fn()| std::thread::Builder::new().name(name).spawn(f).is_ok();
-        let started = (0..WORKERS).filter(|i| spawn(format!("dstorage {i}"), work)).count();
+        let started = (0..workers()).filter(|i| spawn(format!("dstorage {i}"), work)).count();
         spawn("dstorage stats".into(), report);
         tracing::info!(workers = started, "dstorage: workers");
     });
