@@ -19,7 +19,7 @@ use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
-pub use crate::ir::Site;
+pub use crate::io::Site;
 
 /// A byte address: a root parameter's, plus a constant and at most one
 /// value the program computes (an index times a stride, say).
@@ -2356,7 +2356,7 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     }
 }
 
-pub(crate) use crate::ir::inline;
+pub(crate) use crate::gfx10::inline;
 
 #[cfg(test)]
 pub(crate) mod tests {

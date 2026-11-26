@@ -325,7 +325,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Operand::Scalar { code, .. } if code != NULL => inst
                         .read(Reg::S(code))
                         .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
-                    Operand::Const(c) => crate::ir::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Const(c) => crate::gfx10::inline(c).map_or(Sym::Unknown, Sym::K),
                     Operand::Literal(x) => Sym::K(x),
                     _ => Sym::Unknown,
                 };
@@ -359,7 +359,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
-                Operand::Const(c) => one(crate::ir::inline(c).map_or(Sym::Unknown, Sym::K)),
+                Operand::Const(c) => one(crate::gfx10::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
             }
@@ -372,7 +372,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 continue;
             };
             let l = match *lane {
-                Operand::Const(c) => crate::ir::inline(c),
+                Operand::Const(c) => crate::gfx10::inline(c),
                 Operand::Literal(x) => Some(x),
                 _ => None,
             };
@@ -589,7 +589,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
-                    Some(&Operand::Const(c)) => crate::ir::inline(c),
+                    Some(&Operand::Const(c)) => crate::gfx10::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
@@ -675,14 +675,14 @@ fn constant(inst: &Inst) -> Option<u64> {
     match *src.first()? {
         Operand::Scalar { code: NULL, .. } => Some(0),
         Operand::Const(c @ 128..=208) => {
-            let x = crate::ir::inline(c)?;
+            let x = crate::gfx10::inline(c)?;
             Some(if wide {
                 i64::from(x as i32) as u64
             } else {
                 u64::from(x)
             })
         }
-        Operand::Const(c) if !wide => crate::ir::inline(c).map(u64::from),
+        Operand::Const(c) if !wide => crate::gfx10::inline(c).map(u64::from),
         Operand::Literal(x) => Some(u64::from(x)),
         _ => None,
     }
