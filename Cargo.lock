@@ -925,6 +925,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "proc-macro2",
+ "serde",
+ "syn 2.0.119",
+ "toml",
  "walkdir",
 ]
 
