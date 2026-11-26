@@ -192,6 +192,7 @@ pub mod op {
 pub mod en {
     pub const CAP_SHADER: u32 = 1;
     pub const CAP_FLOAT16: u32 = 9;
+    pub const CAP_FLOAT64: u32 = 10;
     pub const CAP_INT64: u32 = 11;
     pub const CAP_INT16: u32 = 22;
     pub const CAP_IMAGE_GATHER_EXTENDED: u32 = 25;
@@ -479,6 +480,9 @@ impl Module {
         if width == 16 {
             self.capability(en::CAP_FLOAT16);
         }
+        if width == 64 {
+            self.capability(en::CAP_FLOAT64);
+        }
         self.global(op::TYPE_FLOAT, &[width])
     }
     pub fn t_vec(&mut self, elem: Id, n: u32) -> Id {
@@ -545,6 +549,10 @@ impl Module {
     pub fn c_typed(&mut self, ty: Id, v: u32) -> Id {
         self.constant(op::CONSTANT, ty, &[v])
     }
+    /// A 64-bit constant of type `ty`.
+    pub fn c_typed64(&mut self, ty: Id, v: u64) -> Id {
+        self.constant(op::CONSTANT, ty, &[v as u32, (v >> 32) as u32])
+    }
     pub fn t_sampler(&mut self) -> Id {
         self.global(op::TYPE_SAMPLER, &[])
     }
@@ -590,6 +598,11 @@ impl Module {
         let id = self.id();
         put(&mut self.globals, 48, &[ty, id]);
         id
+    }
+    /// Whether `id` is a constant of the module (not a type or a value).
+    pub fn is_constant(&self, id: Id) -> bool {
+        const KINDS: [u16; 5] = [op::CONSTANT_TRUE, op::CONSTANT_FALSE, op::CONSTANT, op::CONSTANT_COMPOSITE, op::CONSTANT_NULL];
+        self.dedup.iter().any(|((o, _), &i)| i == id && KINDS.contains(o))
     }
     pub fn c_null(&mut self, ty: Id) -> Id {
         self.constant(op::CONSTANT_NULL, ty, &[])

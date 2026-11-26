@@ -136,8 +136,14 @@ impl Emit<'_> {
             ops.extend([dx, dy]);
         }
         if let Some(o) = a.offset {
-            mask |= en::IMG_OFFSET;
-            self.m.capability(en::CAP_IMAGE_GATHER_EXTENDED);
+            // a constant offset is valid on every sample; a variable one
+            // only on gathers (the lift refuses it elsewhere)
+            if self.m.is_constant(o) {
+                mask |= en::IMG_CONST_OFFSET;
+            } else {
+                mask |= en::IMG_OFFSET;
+                self.m.capability(en::CAP_IMAGE_GATHER_EXTENDED);
+            }
             ops.push(o);
         }
         let clamp = matches!(kind, ImageKind::Sample { .. }) && (explicit_lod.is_none() || a.grad.is_some());

@@ -29,6 +29,7 @@ pub enum S {
     U64,
     F16,
     F32,
+    F64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,6 +45,7 @@ impl Ty {
     pub const U32: Ty = Ty { s: S::U32, n: 1 };
     pub const U64: Ty = Ty { s: S::U64, n: 1 };
     pub const F16: Ty = Ty { s: S::F16, n: 1 };
+    pub const F64: Ty = Ty { s: S::F64, n: 1 };
     pub const F32: Ty = Ty { s: S::F32, n: 1 };
     pub const U8: Ty = Ty { s: S::U8, n: 1 };
     pub fn vec(s: S, n: u8) -> Ty {
@@ -420,7 +422,7 @@ fn bits(t: Ty) -> u32 {
         S::U8 => 8,
         S::U16 | S::F16 => 16,
         S::U32 | S::F32 => 32,
-        S::U64 => 64,
+        S::U64 | S::F64 => 64,
         S::Void => 0,
     };
     e * u32::from(t.n)

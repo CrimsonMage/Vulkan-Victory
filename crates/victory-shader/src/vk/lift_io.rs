@@ -26,6 +26,13 @@ impl Lift<'_> {
                 let b = u(self, Builtin::BaseInstance);
                 self.global_bin(op::I_SUB, Ty::U32, i, b)
             }
+            // A vertex program has no primitive id on the PC: a third of
+            // the vertex index (exact for a triangle list without indices).
+            Input::PrimitiveId if self.native.stage == HwStage::Vs => {
+                self.approx("a vertex program's primitive id is a third of its vertex index");
+                let (v, three) = (u(self, Builtin::VertexIndex), self.k32(3));
+                self.global_bin(op::U_DIV, Ty::U32, v, three)
+            }
             Input::PrimitiveId => u(self, Builtin::PrimitiveId),
             Input::ThreadIdInGroup(c) => self.thread_id(c),
             Input::GroupId(c) => u(self, Builtin::WorkgroupId(c)),

@@ -238,8 +238,18 @@ impl Lift<'_> {
         }
         let mut comps = Vec::new();
         for c in 0..dims.min(3) {
-            let (sh, w) = (self.k32(8 * c as u32), self.k32(6));
-            comps.push(self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w]));
+            comps.push(match self.f.as_const(o) {
+                // a literal offset stays a constant: SPIR-V takes only
+                // constant offsets outside gathers
+                Some(k) => {
+                    let six = (k >> (8 * c)) as u32 & 0x3f;
+                    self.k32(if six & 0x20 != 0 { six | !0x3f } else { six })
+                }
+                None => {
+                    let (sh, w) = (self.k32(8 * c as u32), self.k32(6));
+                    self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w])
+                }
+            });
         }
         Ok(self.vec_of(&comps, S::U32))
     }
@@ -296,6 +306,11 @@ impl Lift<'_> {
 
     fn image_atomic(&mut self, m: &mut Mimg) -> Res<()> {
         let opc = atomic_op(m.name).ok_or(unsupported(m.inst.machine.offset, m.name))?;
+        if !m.rest.contains("cmpswap") && m.dmask.count_ones() > 1 {
+            // two data dwords: one 64-bit texel (needs an R64 view and
+            // 64-bit image atomics on the host; one weather program uses it)
+            return Err(unsupported(m.inst.machine.offset, "a 64-bit image atomic"));
+        }
         let coord = self.next_vec(m, m.coords, false)?;
         m.args.push(coord);
         let x = self.opnd_dw(m.inst, &m.data, 0, false)?;

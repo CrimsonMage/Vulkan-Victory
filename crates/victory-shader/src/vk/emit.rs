@@ -290,6 +290,8 @@ impl<'a> Emit<'a> {
                 self.t.f16_
             }
             S::F32 => self.t.f32_,
+            // 64-bit floats: a handful of water programs add two
+            S::F64 => self.m.t_float(64),
         }
     }
 
@@ -335,6 +337,10 @@ impl<'a> Emit<'a> {
             Op::Builtin(b) => self.builtin(b),
             Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
             Op::PerVertex { loc, comp, vertex } => self.per_vertex_input(loc, comp, vertex),
+            // a vector of constants is a constant (texel offsets must be)
+            Op::Spv(op::COMPOSITE_CONSTRUCT) if n.imm.is_empty() && args.iter().all(|&a| self.m.is_constant(a)) => {
+                self.m.c_composite(tid, &args)
+            }
             Op::Spv(o) => {
                 let mut ops = args.clone();
                 ops.extend_from_slice(&n.imm);
@@ -397,6 +403,10 @@ impl<'a> Emit<'a> {
             S::U8 => {
                 let t = self.scalar(S::U8);
                 self.m.c_typed(t, bits as u32)
+            }
+            S::F64 => {
+                let t = self.scalar(S::F64);
+                self.m.c_typed64(t, bits)
             }
             S::Void => 0,
         }

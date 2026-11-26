@@ -3,7 +3,7 @@
 //! when their memory's fingerprint changes; images freed with their memory.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use victory_vk::ash::vk;
 use victory_vk::memory::{Buffer, Place};

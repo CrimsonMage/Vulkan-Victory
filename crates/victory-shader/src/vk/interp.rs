@@ -137,7 +137,7 @@ fn width(s: S) -> u32 {
         S::U8 => 8,
         S::U16 | S::F16 => 16,
         S::U32 | S::F32 => 32,
-        S::U64 => 64,
+        S::U64 | S::F64 => 64,
         S::Void => 32,
     }
 }
@@ -207,6 +207,7 @@ fn to_f(s: S, x: u64) -> f64 {
     match s {
         S::F16 => f64::from(f16_to_f32(x as u16)),
         S::F32 => f64::from(f32::from_bits(x as u32)),
+        S::F64 => f64::from_bits(x),
         _ => x as f64,
     }
 }
@@ -214,6 +215,7 @@ fn to_f(s: S, x: u64) -> f64 {
 fn from_f(s: S, x: f64) -> u64 {
     match s {
         S::F16 => u64::from(f32_to_f16(x as f32)),
+        S::F64 => x.to_bits(),
         _ => u64::from((x as f32).to_bits()),
     }
 }

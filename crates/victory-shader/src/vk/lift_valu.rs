@@ -582,6 +582,7 @@ impl Lift<'_> {
                 f(self, x)
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => self.op_lshlrev_b64(inst, name, v, a_exec),
+            "v_add_f64" | "v_mul_f64" | "v_cvt_f32_f64" | "v_cvt_f64_f32" => self.op_f64(inst, name, v, a_exec),
             "v_lshl_add_u32" | "v_add_lshl_u32" | "v_lshl_or_b32" | "v_and_or_b32" | "v_or3_b32" | "v_add3_u32"
             | "v_xad_u32" | "v_xor3_b32" => {
                 let a = self.usrc(inst, v, 0)?;
@@ -896,6 +897,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_not_b32" => 10,
         "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => 10,
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => 10,
+        "v_add_f64" | "v_mul_f64" | "v_cvt_f32_f64" | "v_cvt_f64_f32" => 10,
         "v_lshl_add_u32" | "v_add_lshl_u32" | "v_lshl_or_b32" | "v_and_or_b32" | "v_or3_b32" | "v_add3_u32" | "v_xad_u32" | "v_xor3_b32" => 10,
         "v_bfe_u32" | "v_bfe_i32" => 10,
         "v_bfi_b32" => 11,

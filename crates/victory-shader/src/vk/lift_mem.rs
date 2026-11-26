@@ -572,6 +572,23 @@ impl Lift<'_> {
                 let v = self.lds_read_small(inst, &addr, o16, name)?;
                 self.def(inst, Reg::V(need_d()?), R::D(v));
             }
+            "ds_read_u16_d16" | "ds_read_u16_d16_hi" | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" => {
+                // into one half of the destination; the other half stays
+                let base = name.split("_d16").next().unwrap_or(name);
+                let v = self.lds_read_small(inst, &addr, o16, base)?;
+                let d = need_d()?;
+                let old = match inst.read(Reg::V(d)) {
+                    Some(o) => {
+                        let r = self.value(o, off)?;
+                        let x = self.data(r);
+                        self.u32v(x)
+                    }
+                    None => self.k32(0),
+                };
+                let (at, w) = (self.k32(if name.ends_with("_hi") { 16 } else { 0 }), self.k32(16));
+                let r = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[old, v, at, w]);
+                self.def(inst, Reg::V(d), R::D(r));
+            }
             "ds_write_b16" | "ds_write_b8" | "ds_write_b16_d16_hi" | "ds_write_b8_d16_hi" => {
                 self.lds_write_small(inst, &addr, o16, &data[0], name)?
             }

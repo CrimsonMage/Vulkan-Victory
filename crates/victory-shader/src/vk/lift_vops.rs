@@ -297,6 +297,56 @@ impl Lift<'_> {
         Ok(())
     }
 
+    /// 64-bit float arithmetic and conversions: a double is a pair of
+    /// VGPRs (low dword first).
+    pub(super) fn op_f64(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
+        let off = inst.machine.offset;
+        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err(unsupported(off, name)) };
+        if name == "v_cvt_f64_f32" {
+            let a = self.fsrc(inst, v, 0)?;
+            let d = self.spv(op::F_CONVERT, Ty::F64, &[a]);
+            return self.def_f64(inst, reg, d);
+        }
+        let mut src = Vec::new();
+        for i in 0..if name == "v_cvt_f32_f64" { 1 } else { 2 } {
+            let mut x = self.opnd_u64(inst, &v.src[i])?;
+            let top = self.f.konst(Ty::U64, 1 << 63);
+            if v.abs >> i & 1 != 0 {
+                let rest = self.f.konst(Ty::U64, !(1 << 63));
+                x = self.spv(op::BITWISE_AND, Ty::U64, &[x, rest]);
+            }
+            if v.neg >> i & 1 != 0 {
+                x = self.spv(op::BITWISE_XOR, Ty::U64, &[x, top]);
+            }
+            src.push(self.spv(op::BITCAST, Ty::F64, &[x]));
+        }
+        match name {
+            "v_cvt_f32_f64" => {
+                let x = self.spv(op::F_CONVERT, Ty::F32, &[src[0]]);
+                let x = self.spv(op::BITCAST, Ty::U32, &[x]);
+                self.def(inst, Reg::V(reg), R::D(x));
+                Ok(())
+            }
+            "v_add_f64" => {
+                let d = self.spv(op::F_ADD, Ty::F64, &src);
+                self.def_f64(inst, reg, d)
+            }
+            "v_mul_f64" => {
+                let d = self.spv(op::F_MUL, Ty::F64, &src);
+                self.def_f64(inst, reg, d)
+            }
+            _ => Err(unsupported(off, name)),
+        }
+    }
+
+    fn def_f64(&mut self, inst: &Inst, reg: u8, d: V) -> Res<()> {
+        let x = self.spv(op::BITCAST, Ty::U64, &[d]);
+        let (lo, hi) = self.split64(x);
+        self.def(inst, Reg::V(reg), R::D(lo));
+        self.def(inst, Reg::V(reg + 1), R::D(hi));
+        Ok(())
+    }
+
     pub(super) fn op_alignbit_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.usrc(inst, v, 0)?;
