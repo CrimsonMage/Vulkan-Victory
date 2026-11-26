@@ -3,6 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(windows)]
+mod bake;
 mod census;
 mod inspect;
 mod run;
@@ -182,7 +184,10 @@ fn bake(jobs: Option<usize>, index: Option<PathBuf>) -> Result<()> {
     {
         let cfg = victory_core::Config::load()?;
         victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-        victory_gpu::bake(jobs, index)
+        bake::translate_wanted(jobs)?;
+        victory_gpu::bake(jobs, index)?;
+        println!("bake: {} translations of older translator keys deleted", victory_gpu::bake_prune());
+        Ok(())
     }
     #[cfg(not(windows))]
     {

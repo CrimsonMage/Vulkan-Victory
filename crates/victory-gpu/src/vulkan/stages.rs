@@ -34,9 +34,38 @@ fn workers() -> usize {
 }
 
 /// SPIR-V words compiling at once at most (the driver's memory for a
-/// compile grows with the module; a module bigger than this compiles
-/// alone).
+/// compile grows with the module).
 const WORDS_IN_FLIGHT: u64 = 1_000_000;
+
+/// Stages bigger than this go to the slow lane (the CS_RaytracingResolve
+/// variants, 1.2-1.5 M words, ran over 25 minutes each in NVIDIA's
+/// compiler; the next biggest stages are well under).
+pub(super) const SLOW_WORDS: usize = 600_000;
+
+static SLOW: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// This stage worker handed its place to a new one: it ends after its
+    /// slow-lane compile.
+    static RETIRING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The slow lane: stages over [`SLOW_WORDS`] compile one at a time, outside
+/// the words-in-flight budget (one of them alone would hold it for the
+/// whole compile). A stage worker that takes one first starts a worker in
+/// its place and ends after it, so the other stages never wait for it.
+pub(super) fn slow_lane(words: usize, hash: &str) -> std::sync::MutexGuard<'static, ()> {
+    tracing::info!(words, hash, "Vulkan: a stage over the slow-lane size compiles on the slow lane");
+    if WORKER.with(std::cell::Cell::get)
+        && !RETIRING.with(std::cell::Cell::get)
+        && let Some(b) = super::backend()
+    {
+        RETIRING.with(|r| r.set(true));
+        spawn_worker(b, usize::MAX);
+    }
+    SLOW.lock().unwrap_or_else(|e| e.into_inner())
+}
 static IN_FLIGHT: Mutex<u64> = Mutex::new(0);
 static ROOM: Condvar = Condvar::new();
 
@@ -528,15 +557,19 @@ fn hash_hex(full: &[u8; 32]) -> String {
 fn start(b: &'static Backend) {
     super::baking::in_background(b);
     let n = workers();
-    tracing::info!(workers = n, words_in_flight = WORDS_IN_FLIGHT, "Vulkan: stage workers");
+    tracing::info!(workers = n, words_in_flight = WORDS_IN_FLIGHT, slow_words = SLOW_WORDS, "Vulkan: stage workers");
     for i in 0..n {
-        let _ = std::thread::Builder::new()
-            .name(format!("victory-vk-stage-{i}"))
-            .spawn(move || worker(b));
+        spawn_worker(b, i);
     }
 }
 
+fn spawn_worker(b: &'static Backend, i: usize) {
+    let name = if i == usize::MAX { "victory-vk-stage-extra".to_string() } else { format!("victory-vk-stage-{i}") };
+    let _ = std::thread::Builder::new().name(name).spawn(move || worker(b));
+}
+
 fn worker(b: &'static Backend) {
+    WORKER.with(|w| w.set(true));
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
@@ -557,6 +590,9 @@ fn worker(b: &'static Backend) {
             q.states.insert(shader.full, state);
         }
         DONE.notify_all();
+        if RETIRING.with(std::cell::Cell::get) {
+            return;
+        }
     }
 }
 
@@ -656,11 +692,13 @@ fn make(b: &Backend, shader: &Shader) -> State {
             use std::io::Write;
             let _ = std::io::stderr().flush();
         }
-        let flight = Flight::take(vs.spirv.len() as u64);
+        let giant = vs.spirv.len() > SLOW_WORDS;
+        let lane = giant.then(|| slow_lane(vs.spirv.len(), &hash));
+        let flight = (!giant).then(|| Flight::take(vs.spirv.len() as u64));
         let (t, cpu) = (Instant::now(), thread_cpu_us());
         let p = compile(b, vs.stage, module, &vs.samplers, None);
         let cpu_ms = thread_cpu_us().saturating_sub(cpu) / 1000;
-        drop(flight);
+        drop((flight, lane));
         if cfg!(feature = "diagnostics") {
             tracing::info!(
                 stage = ?vs.stage,

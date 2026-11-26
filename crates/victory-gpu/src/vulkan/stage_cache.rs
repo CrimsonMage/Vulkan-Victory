@@ -148,18 +148,68 @@ pub(crate) fn note_name(full: &[u8; 32], name: &str) {
     }
 }
 
+/// Every translation file of any translator key: (hash, key, file). The
+/// cache folder is also the record of which containers the title uses.
+fn every_key() -> Vec<(String, String, PathBuf)> {
+    let Some(d) = dir() else { return Vec::new() };
+    std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (hash, key) = name.strip_suffix(".vks")?.split_once('-')?;
+            (hash.len() == 32 && key.len() == 16).then(|| (hash.to_string(), key.to_string(), e.path()))
+        })
+        .collect()
+}
+
+/// The containers the title used (a translation under any key, or a name
+/// noted) with no translation under this key.
+pub(crate) fn wanted() -> std::collections::BTreeSet<String> {
+    let here: std::collections::BTreeSet<String> = all().into_iter().map(|(h, _)| h).collect();
+    every_key()
+        .into_iter()
+        .map(|(h, _, _)| h)
+        .chain(names().into_keys())
+        .filter(|h| !here.contains(h))
+        .collect()
+}
+
+/// Translations of other keys whose container has one under this key are
+/// deleted (each translator change would add ~1,000 files); how many.
+pub(crate) fn prune_old_keys() -> usize {
+    let here: std::collections::BTreeSet<String> = all().into_iter().map(|(h, _)| h).collect();
+    every_key()
+        .into_iter()
+        .filter(|(h, k, _)| k != key() && here.contains(h))
+        .filter(|(_, _, p)| std::fs::remove_file(p).is_ok())
+        .count()
+}
+
 /// The file listing what `victory bake` (or the game's background bake)
-/// compiled with this translator key on the device of `uuid`.
+/// did with each stage with this translator key on the device of `uuid`:
+/// one line a stage, `hash<TAB>outcome` (compiled, refused or failed with
+/// its reason, slow lane).
 fn baked_file(uuid: &str) -> String {
     format!("baked-{}-{uuid}.txt", key())
 }
 
-pub(crate) fn baked(uuid: &str) -> std::collections::BTreeSet<String> {
-    lines_of(&baked_file(uuid))
+/// What earlier bakes did, by hash (the last line of a hash wins).
+pub(crate) fn baked(uuid: &str) -> std::collections::BTreeMap<String, String> {
+    let text = dir().and_then(|d| std::fs::read_to_string(d.join(baked_file(uuid))).ok()).unwrap_or_default();
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .map(|l| match l.split_once('\t') {
+            Some((h, o)) => (h.to_string(), o.to_string()),
+            None => (l, "compiled".to_string()),
+        })
+        .collect()
 }
 
-pub(crate) fn mark_baked(uuid: &str, hash: &str) {
-    append_line(&baked_file(uuid), hash);
+pub(crate) fn mark_baked(uuid: &str, hash: &str, outcome: &str) {
+    append_line(&baked_file(uuid), &format!("{hash}\t{}", outcome.replace(['\t', '\n'], " ")));
 }
 
 /// The cached translation of the container `full`, if there is one.

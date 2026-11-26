@@ -49,7 +49,7 @@ pub mod upscale;
 #[cfg(windows)]
 mod vulkan;
 #[cfg(windows)]
-pub use vulkan::bake;
+pub use vulkan::{bake, bake_prune, bake_translate, bake_wanted};
 #[cfg(windows)]
 mod watch;
 

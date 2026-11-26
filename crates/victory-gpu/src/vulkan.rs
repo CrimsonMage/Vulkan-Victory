@@ -907,3 +907,22 @@ fn report(b: &Backend, frame: u64) {
 pub fn bake(jobs: Option<usize>, index: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     baking::run(jobs, index)
 }
+
+/// `victory bake`, before compiling: the containers (BLAKE3, the first 16
+/// bytes in hex) the title used with no translation under this
+/// translator's key.
+pub fn bake_wanted() -> std::collections::BTreeSet<String> {
+    baking::wanted()
+}
+
+/// `victory bake`: translates a container of the title's packs as the game
+/// would and keeps it (with its program name).
+pub fn bake_translate(container: &[u8]) -> Result<(), String> {
+    baking::translate(container)
+}
+
+/// `victory bake`, at the end: older keys' translations with a current
+/// twin are deleted; how many.
+pub fn bake_prune() -> usize {
+    baking::prune()
+}
