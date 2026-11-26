@@ -147,7 +147,8 @@ impl Swapchain {
                         .image_array_layers(1)
                         .image_usage(
                             vk::ImageUsageFlags::COLOR_ATTACHMENT
-                                | vk::ImageUsageFlags::TRANSFER_DST,
+                                | vk::ImageUsageFlags::TRANSFER_DST
+                                | vk::ImageUsageFlags::TRANSFER_SRC,
                         )
                         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .pre_transform(caps.current_transform)

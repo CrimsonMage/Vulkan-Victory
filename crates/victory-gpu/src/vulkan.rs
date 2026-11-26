@@ -590,6 +590,8 @@ struct Engine {
 }
 
 static FORCED: AtomicU64 = AtomicU64::new(0);
+/// The buffer captures are read back into.
+static READBACK: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
 /// Presents that showed at least one plane.
 static PLANES_SHOWN: AtomicU64 = AtomicU64::new(0);
 
@@ -1067,6 +1069,35 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
         lost_once();
         return;
     }
+    // Captures (`VICTORY_CAPTURE`, as the D3D12 path): the composed image
+    // read back into a buffer of ours.
+    let capture = crate::capture::wanted(frame).then(|| {
+        let bytes = u64::from(s.extent.width) * u64::from(s.extent.height) * 4;
+        let mut rb = lock(&READBACK);
+        if rb.as_ref().is_none_or(|r| r.size != bytes) {
+            if let Some(old) = rb.take() {
+                b.timeline.with_queue(|q, _| {
+                    // SAFETY: waits for our queue, under its lock.
+                    let _ = unsafe { b.host.device.queue_wait_idle(q) };
+                    ((), false)
+                })
+                .ok();
+                // SAFETY: the queue is idle.
+                unsafe { old.destroy(&b.host) };
+            }
+            *rb = victory_vk::memory::Buffer::new(
+                &b.host,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                victory_vk::memory::Place::Readback,
+            )
+            .ok();
+        }
+        rb.as_ref().map(|r| (r.buffer, r.mapped as usize, r.size))
+    })
+    .flatten();
+    let extent = s.extent;
+    let bgra = matches!(s.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
             float32: [0.0, 0.0, 0.0, 1.0],
@@ -1090,8 +1121,47 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
             if compose::record(b, cmd, t, planes) {
                 PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
             }
+            if let Some((buffer, _, _)) = capture {
+                let range = victory_vk::swapchain::color_range();
+                let to = |from: vk::ImageLayout, to: vk::ImageLayout| {
+                    [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                        .old_layout(from)
+                        .new_layout(to)
+                        .image(t.image)
+                        .subresource_range(range)]
+                };
+                let b1 = to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&b1));
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width: t.extent.width, height: t.extent.height, depth: 1 });
+                d.cmd_copy_image_to_buffer(cmd, t.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+                let b2 = to(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&b2));
+            }
         }
     });
+    if let (Some((_, mapped, size)), Ok(())) = (capture, r.as_ref()) {
+        let idle = b.timeline.with_queue(|q, _| {
+            // SAFETY: waits for our queue, under its lock.
+            (unsafe { b.host.device.queue_wait_idle(q) }, false)
+        });
+        if matches!(idle, Ok(Ok(()))) {
+            // SAFETY: the readback buffer is mapped, `size` bytes, and the
+            // copy into it has finished.
+            let rows = unsafe { std::slice::from_raw_parts(mapped as *const u8, size as usize) };
+            crate::capture::save(frame, extent.width, extent.height, extent.width as usize * 4, bgra, rows);
+        }
+    }
     if let Err(e) = r {
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
