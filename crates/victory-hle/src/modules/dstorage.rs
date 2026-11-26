@@ -12,15 +12,17 @@
 //! into the worker's reusable buffer, then zlib data is inflated and/or
 //! BCPack data unpacked from there into the destination.
 //!
-//! Submitted requests of every queue go, in submission order, through one
-//! channel to one pool of workers (one per core), which run them in
-//! parallel. Completion is what stays in order: a status entry is written
-//! once every request enqueued before it on its queue has finished, with
-//! the first failure (in queue order) since the previous status entry, or
-//! success. A status entry closes a segment of its queue's requests; the
-//! segment counts what it still waits for (its requests, the segment
-//! before it, its own submission) and the last of those writes the status
-//! and lets the next segment go on. No lock is taken per request.
+//! Submitted requests of every queue go, in submission order, into one
+//! line taken by a few workers ([`workers`]), which run them in parallel
+//! and sleep on a condition variable while the line is empty. Completion
+//! is what stays in order: a status entry is written once every request
+//! enqueued before it on its queue has finished, with the first failure
+//! (in queue order) since the previous status entry, or success. A status
+//! entry closes a segment of its queue's requests; the segment counts what
+//! it still waits for (its requests, the segment before it, its own
+//! submission) and the last of those writes the status and lets the next
+//! segment go on. Per request, only the line's lock is taken (to put it in
+//! and to take it out).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -29,8 +31,8 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
@@ -507,14 +509,14 @@ impl Lane {
 
     /// Hands the enqueued requests to the workers, in order.
     fn submit(&self, open: &mut Open) {
-        let workers = workers();
+        start_workers();
         for command in open.commands.drain(..) {
             match command {
                 Command::Read(job) => {
                     let depth = STATS.depth.fetch_add(1, Ordering::Relaxed) + 1;
                     STATS.peak.fetch_max(depth, Ordering::Relaxed);
-                    // The workers' end of the channel lives for the process.
-                    let _ = workers.send(job);
+                    lock(&LINE.0).push_back(job);
+                    LINE.1.notify_one();
                 }
                 Command::Status(segment) => segment.release(self),
             }
@@ -565,35 +567,40 @@ impl Job {
     }
 }
 
-/// The workers' channel, with the workers started on first use: one per
-/// core. One worker at a time waits on the channel, the rest for it.
-fn workers() -> &'static Sender<Job> {
-    static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
-    JOBS.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Job>();
-        let receiver: &'static Mutex<Receiver<Job>> = Box::leak(Box::new(Mutex::new(receiver)));
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(move || {
-                        victory_core::heap::enter_for_thread(victory_core::heap::Owner::Streaming);
-                        loop {
-                            let next = lock(receiver).recv();
-                            let Ok(job) = next else { return };
-                            job.run();
-                        }
-                    })
-                    .is_ok()
-            })
-            .count();
-        let _ = std::thread::Builder::new()
-            .name("dstorage stats".into())
-            .spawn(report);
+/// Workers of [`LINE`]: half the cores. A request is one positioned read
+/// (waiting on the disk) then an inflate and/or BCPack unpack; loading
+/// bursts take ~25 s of worker time per 10 s (run p31), and four workers
+/// doubled the load (run p33). Idle, they sleep on the condition variable,
+/// so more of them cost nothing.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).clamp(4, 16))
+}
+
+/// The submitted requests of every queue, in submission order, and the
+/// condition variable signalled once per request put in.
+static LINE: (Mutex<VecDeque<Job>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+
+/// Starts the workers and the streaming line, once.
+fn start_workers() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let spawn = |name: String, f: fn()| std::thread::Builder::new().name(name).spawn(f).is_ok();
+        let started = (0..workers()).filter(|i| spawn(format!("dstorage {i}"), work)).count();
+        spawn("dstorage stats".into(), report);
         tracing::info!(workers = started, "dstorage: workers");
-        sender
-    })
+    });
+}
+
+/// A worker: the line's requests in order, asleep while there are none.
+fn work() {
+    victory_core::heap::enter_for_thread(victory_core::heap::Owner::Streaming);
+    let (line, ready) = &LINE;
+    loop {
+        let next = ready.wait_while(lock(line), |jobs| jobs.is_empty()).unwrap_or_else(PoisonError::into_inner).pop_front();
+        if let Some(job) = next {
+            job.run();
+        }
+    }
 }
 
 /// What the workers did since the last streaming line.
@@ -785,12 +792,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         };
         return into_destination(request, size, |out| match memory {
             Some(source) => copy(source, out),
-            // Straight into the destination. A kernel read into a block the
-            // GPU side guarded again meanwhile (the guard over all the views
-            // of a page protects other views from other threads) is refused
-            // instead of faulting into the guard; that one is read beside
-            // and copied in from user mode, where it faults like the title's
-            // own writes.
+            // Straight into the destination. A kernel read into a page that
+            // is not there for a moment (its view away while xmem maps it
+            // again, either GPU path) or, on the D3D12 path, into a block
+            // guarded again meanwhile is refused instead of faulting; that
+            // one is read beside and copied in from user mode, where it
+            // faults like the title's own writes (`xmem::on_fault` waits).
             None => match read_at(request, out) {
                 Err(hr) if REFUSED.contains(&hr) => {
                     STATS.bounced.fetch_add(1, Ordering::Relaxed);
@@ -860,9 +867,9 @@ thread_local! {
 
 /// Runs `f` on `len` bytes of a worker's buffer, which is kept for the
 /// next request up to 1 MiB (larger ones give their memory back). Requests
-/// average 20 to 100 KiB; with a worker per core (28 here) and three
-/// buffers each, keeping up to 8 MiB held up to 670 MB of the PC's memory
-/// after a burst, never given back.
+/// average 20 to 100 KiB; when there was a worker per core (28 here),
+/// keeping up to 8 MiB in each of three buffers held up to 670 MB of the
+/// PC's memory after a burst, never given back.
 fn scratch<R>(buffer: &'static LocalKey<RefCell<Vec<u8>>>, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     const KEPT: usize = 1 << 20;
     buffer.with_borrow_mut(|bytes| {
@@ -997,11 +1004,11 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. A kernel read into a block guarded again meanwhile
-        // is refused (`execute` reads that one beside); `fill`'s own writes
-        // fault into the guard.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // The D3D12 path opens its guarded blocks and learns a placed
+        // texture there changes. A kernel read into a block guarded again
+        // meanwhile is refused (`execute` reads that one beside); `fill`'s
+        // own writes fault into the guard.
+        super::xmem::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1099,584 +1106,4 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::windows::ffi::OsStrExt;
-    use std::time::{Duration, Instant};
-
-    use super::*;
-    use crate::modules::xgameruntime::method;
-
-    fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
-        // SAFETY: every object here starts with the runtime header.
-        method(unsafe { &*object.cast::<Object>() }, slot)
-    }
-
-    fn factory() -> *mut c_void {
-        let mut factory = std::ptr::null_mut();
-        assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
-        factory
-    }
-
-    fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x20);
-        let mut file = std::ptr::null_mut();
-        assert_eq!(
-            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
-            S_OK
-        );
-        file
-    }
-
-    fn status_array(capacity: u32) -> *mut c_void {
-        let create: extern "system" fn(
-            *mut c_void,
-            u32,
-            *const c_char,
-            *const Guid,
-            Out,
-        ) -> HRESULT = call(factory(), 0x28);
-        let mut array = std::ptr::null_mut();
-        let name = c"test".as_ptr();
-        assert_eq!(
-            create(factory(), capacity, name, std::ptr::null(), &mut array),
-            S_OK
-        );
-        array
-    }
-
-    fn new_queue(source_type: u64) -> *mut c_void {
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type,
-            capacity: 0x80,
-            priority: 0,
-            name: c"test".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        queue
-    }
-
-    fn request(
-        options: u64,
-        destination: *mut c_void,
-        destination_size: usize,
-        source: *const c_void,
-        offset: u64,
-        source_size: usize,
-    ) -> Request {
-        Request {
-            options,
-            destination,
-            page_offset: 0,
-            destination_size: destination_size as u32,
-            source,
-            offset,
-            source_size: source_size as u32,
-            intermediate_size: 0,
-            tag: 0,
-            name: std::ptr::null(),
-        }
-    }
-
-    fn enqueue(queue: *mut c_void, request: &Request) {
-        let f: extern "system" fn(*mut c_void, *const Request) = call(queue, 0x18);
-        f(queue, request);
-    }
-
-    fn enqueue_status(queue: *mut c_void, array: *mut c_void, index: u32) {
-        let f: extern "system" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
-        f(queue, array, index);
-    }
-
-    fn void(object: *mut c_void, slot: usize) {
-        let f: extern "system" fn(*mut c_void) = call(object, slot);
-        f(object);
-    }
-
-    fn result(array: *mut c_void, index: u32) -> HRESULT {
-        let f: extern "system" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
-        f(array, index)
-    }
-
-    /// Polls as the title does, then returns the entry's result.
-    fn wait(array: *mut c_void, index: u32) -> HRESULT {
-        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
-        let start = Instant::now();
-        while !done(array, index) {
-            assert!(start.elapsed() < Duration::from_secs(10), "never completed");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        result(array, index)
-    }
-
-    fn file_with(bytes: &[u8]) -> (tempfile::TempDir, *mut c_void) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.bin");
-        std::fs::write(&path, bytes).unwrap();
-        let file = open(&path);
-        (dir, file)
-    }
-
-    fn pattern(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
-    }
-
-    #[test]
-    fn request_layout_is_the_titles() {
-        assert_eq!(size_of::<Request>(), 0x48);
-        assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
-        assert_eq!(std::mem::offset_of!(Request, source), 0x20);
-        assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
-        assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
-    }
-
-    fn compress_zlib(plain: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; zlib_rs::compress_bound(plain.len())];
-        let (packed, rc) =
-            zlib_rs::compress_slice(&mut buf, plain, zlib_rs::DeflateConfig::new(6));
-        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-        packed.to_vec()
-    }
-
-    #[test]
-    fn raw_and_zlib_reads_from_a_file() {
-        let plain = pattern(300_000);
-        let packed = compress_zlib(&plain);
-        let mut contents = plain.clone();
-        contents.extend_from_slice(&packed);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(1));
-
-        let mut raw = vec![0u8; 1000];
-        let mut inflated = vec![0u8; plain.len()];
-        let at = |b: &mut Vec<u8>| b.as_mut_ptr().cast();
-        enqueue(queue, &request(0, at(&mut raw), 1000, file, 5000, 1000));
-        let offset = plain.len() as u64;
-        let zlib = request(
-            ZLIB,
-            at(&mut inflated),
-            plain.len(),
-            file,
-            offset,
-            packed.len(),
-        );
-        enqueue(queue, &zlib);
-        enqueue_status(queue, array, 0);
-        assert_eq!(result(array, 0), E_PENDING, "pending until done");
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(raw, plain[5000..6000]);
-        assert_eq!(inflated, plain);
-        void(queue, 0x40);
-    }
-
-    #[test]
-    fn memory_sources_inflate_too() {
-        let plain = pattern(70_000);
-        let packed = compress_zlib(&plain);
-        let (queue, array) = (new_queue(1), status_array(1));
-        let mut out = vec![0u8; plain.len()];
-        let options = ZLIB | MEMORY_SOURCE;
-        let r = request(
-            options,
-            out.as_mut_ptr().cast(),
-            out.len(),
-            packed.as_ptr().cast(),
-            0,
-            packed.len(),
-        );
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn statuses_complete_in_order_with_the_first_failure() {
-        let contents = pattern(4096);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(3));
-        // Requests in flight together run in any order, so none of them
-        // shares a destination (failed ones leave theirs undefined).
-        let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
-
-        // Segment 0: a read past the end, then a bad stream; the first wins.
-        enqueue(queue, &request(0, failed, 16, file, 4090, 16));
-        enqueue(queue, &request(ZLIB, failed_too, 16, file, 0, 16));
-        enqueue_status(queue, array, 0);
-        // Segment 1: two reads.
-        enqueue(queue, &request(0, other, 16, file, 0, 16));
-        enqueue(queue, &request(0, out, 16, file, 100, 16));
-        enqueue_status(queue, array, 1);
-        void(queue, 0x30);
-        // Segment 2: a BCPack request (BC7) whose stream is empty fails.
-        with_test_tables();
-        enqueue(queue, &request(7 << 1, bcpack, 16, file, 0, 0));
-        enqueue_status(queue, array, 2);
-        void(queue, 0x30);
-
-        assert_eq!(wait(array, 2), INVALID_DATA);
-        assert_eq!(result(array, 0), END_OF_FILE);
-        assert_eq!(result(array, 1), S_OK);
-        assert_eq!(buffers[2], contents[100..116]);
-        assert_eq!(buffers[3], contents[..16]);
-    }
-
-    #[test]
-    fn half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
-    }
-
-    /// A queue without the workers: requests kept back and finished by
-    /// hand, status entries submitted as `submit` does.
-    fn held_read(lane: &Arc<Lane>) -> Job {
-        let r = request(0, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
-        lane.read(&mut lane.slot().unwrap(), r)
-    }
-
-    fn held_status(lane: &Arc<Lane>, array: Array, index: u32) -> Arc<Segment> {
-        // SAFETY: an array we created.
-        let entries = unsafe { &(*array).state.entries };
-        entries[index as usize].store(E_PENDING, Ordering::Release);
-        add_ref_instance(array);
-        Lane::close_segment(&mut lane.slot().unwrap(), Status { array, index })
-    }
-
-    #[test]
-    fn a_status_waits_for_every_earlier_read() {
-        let lane = Arc::new(Lane::new(64));
-        let array = status_array(2).cast::<Instance<StatusArray>>();
-        let (first, second) = (held_read(&lane), held_read(&lane));
-        let status0 = held_status(&lane, array, 0);
-        let third = held_read(&lane);
-        let status1 = held_status(&lane, array, 1);
-        let results = || (result(array.cast(), 0), result(array.cast(), 1));
-        // Submitted: nothing has finished yet.
-        status0.release(&lane);
-        status1.release(&lane);
-        assert_eq!(results(), (E_PENDING, E_PENDING));
-        // The last read and the first finish; the second then fails.
-        third.finish(Ok(()));
-        first.finish(Ok(()));
-        assert_eq!(results(), (E_PENDING, E_PENDING));
-        second.finish(Err(INVALID_DATA));
-        assert_eq!(results(), (INVALID_DATA, S_OK));
-        assert_eq!(lane.held.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn the_first_failure_is_first_in_queue_order() {
-        let lane = Arc::new(Lane::new(64));
-        let array = status_array(1).cast::<Instance<StatusArray>>();
-        let (first, second, third) = (held_read(&lane), held_read(&lane), held_read(&lane));
-        held_status(&lane, array, 0).release(&lane);
-        third.finish(Err(E_NOTIMPL));
-        second.finish(Err(END_OF_FILE));
-        first.finish(Ok(()));
-        assert_eq!(result(array.cast(), 0), END_OF_FILE);
-    }
-
-    #[test]
-    fn a_status_is_written_only_once_submitted() {
-        let lane = Arc::new(Lane::new(64));
-        let array = status_array(1).cast::<Instance<StatusArray>>();
-        held_read(&lane).finish(Ok(()));
-        let status = held_status(&lane, array, 0);
-        assert_eq!(result(array.cast(), 0), E_PENDING);
-        status.release(&lane);
-        assert_eq!(result(array.cast(), 0), S_OK);
-    }
-
-    #[test]
-    fn a_full_queue_waits_for_room() {
-        let lane = Arc::new(Lane::new(4));
-        // Three held: the fourth slot stays free.
-        let mut jobs: Vec<Job> = (0..3).map(|_| held_read(&lane)).collect();
-        let got = Arc::new(AtomicBool::new(false));
-        let waiter = {
-            let (lane, got) = (Arc::clone(&lane), Arc::clone(&got));
-            std::thread::spawn(move || {
-                drop(lane.slot().unwrap());
-                got.store(true, Ordering::SeqCst);
-            })
-        };
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!got.load(Ordering::SeqCst), "the queue is full");
-        jobs.pop().unwrap().finish(Ok(()));
-        waiter.join().unwrap();
-        assert!(got.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn zlib_then_bcpack() {
-        with_test_tables();
-        let packed = compress_zlib(&BC4_STREAM);
-        let (_dir, file) = file_with(&packed);
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        let options = ZLIB | 4 << 1;
-        let mut r = request(options, out.as_mut_ptr().cast(), 16, file, 0, packed.len());
-        r.intermediate_size = BC4_STREAM.len() as u32;
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, bc4_blocks());
-    }
-
-    /// BCPack tables we made (uniform models; BC4 index pairs: low 3 bits,
-    /// next 3 bits), in a folder kept for the test process.
-    fn with_test_tables() {
-        static DIR: OnceLock<()> = OnceLock::new();
-        DIR.get_or_init(|| {
-            let mut t = Vec::new();
-            for m in 0..128 {
-                let g = m / 16;
-                for b in 0..9 {
-                    let f: u16 = if b < g + 2 { 1 << (15 - g) } else { 0 };
-                    t.extend_from_slice(&f.to_le_bytes());
-                }
-            }
-            t.extend([0; 256 + 64 + 256]);
-            t.extend((0..64u8).map(|v| (v & 7) | (v >> 3) << 4));
-            t.resize(bcpack::TABLES_SIZE, 0);
-            let dir = tempfile::tempdir().unwrap().keep();
-            std::fs::write(dir.join("tables.bin"), t).unwrap();
-            use_bcpack_tables(dir);
-        });
-    }
-
-    /// Two BC4 blocks from the format's test encoder: endpoints 10, -3 with
-    /// indices p -> p & 7, then the same block plus 1 everywhere.
-    const BC4_STREAM: [u8; 88] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 5, 5, 4, 4, 4, 4, 1, 1, 1, 1, 0x10, 0x10, 0x10, 0x10, 2, 1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0x14, 5, 0x20, 0x68, 0xb0, 0xf8, 3, 3, 2, 2, 0x24, 0x24, 0x24,
-        0x24, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0x10, 0x10, 0x10, 0x10, 0, 0, 0, 0,
-        0x20, 0x68, 0xb0, 0xf8, 0x24, 0x24, 0x24, 0x24, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
-
-    /// What `BC4_STREAM` unpacks to.
-    fn bc4_blocks() -> [u8; 16] {
-        let code = [0u64, 2, 3, 4, 5, 6, 7, 1];
-        let block = |e0: u64, e1: u64, add: usize| {
-            let bits = (0..16).fold(0, |a, p| a | code[(p + add) & 7] << (16 + 3 * p));
-            (e0 | e1 << 8 | bits).to_le_bytes()
-        };
-        let mut out = [0; 16];
-        out[..8].copy_from_slice(&block(138, 125, 0));
-        out[8..].copy_from_slice(&block(139, 126, 1));
-        out
-    }
-
-    #[test]
-    fn bcpack_requests_unpack_into_the_destination() {
-        with_test_tables();
-        let mut contents = pattern(100);
-        contents.extend_from_slice(&BC4_STREAM);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, bc4_blocks());
-    }
-
-    #[test]
-    fn a_closed_queue_completes_nothing() {
-        let (_dir, file) = file_with(&pattern(64));
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
-        enqueue_status(queue, array, 0);
-        void(queue, 0x40);
-        void(queue, 0x30);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(result(array, 0), E_PENDING);
-        assert_eq!(out, [0; 16]);
-    }
-
-    #[test]
-    fn physical_page_destinations() {
-        use crate::modules::xmem;
-        let mut pages = [0usize; 2];
-        let mut n = 2;
-        assert_eq!(
-            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
-            1
-        );
-        // Where the title would see them: a reservation of 64 KiB pages.
-        let mapped = xmem::XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            2 * PAGE,
-            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
-            0x04,
-        );
-        assert!(!mapped.is_null());
-        assert_eq!(
-            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
-            mapped
-        );
-
-        let plain = pattern(100);
-        let (queue, array) = (new_queue(1), status_array(1));
-        let mut r = request(
-            PAGE_DESTINATION | MEMORY_SOURCE,
-            pages.as_mut_ptr().cast(),
-            plain.len(),
-            plain.as_ptr().cast(),
-            0,
-            plain.len(),
-        );
-        r.page_offset = (PAGE - 40) as u64; // across the page boundary
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        // SAFETY: both pages are mapped read-write.
-        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
-        assert_eq!(seen, plain);
-    }
-    #[test]
-    fn zlib_into_pages_in_place_and_across_allocations() {
-        use crate::modules::xmem;
-        let allocate = |n: usize| {
-            let (mut pages, mut given) = (vec![0usize; n], n);
-            assert_eq!(
-                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
-                1
-            );
-            pages
-        };
-        let (a, b) = (allocate(3), allocate(1));
-        let plain = pattern(2 * PAGE + 100);
-        let packed = compress_zlib(&plain);
-        // One allocation's pages in order (one window), then pages of two
-        // (through a buffer), both from 50 bytes into the first.
-        let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
-        let (queue, array) = (new_queue(1), status_array(1));
-        for pages in &mut destinations {
-            let mut r = request(
-                ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
-                pages.as_mut_ptr().cast(),
-                plain.len(),
-                packed.as_ptr().cast(),
-                0,
-                packed.len(),
-            );
-            r.page_offset = 50;
-            enqueue(queue, &r);
-        }
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        for pages in &destinations {
-            let mapped = xmem::XMemVirtualAlloc(
-                std::ptr::null_mut(),
-                3 * PAGE,
-                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-                0,
-                0x04,
-            );
-            assert!(!mapped.is_null());
-            assert_eq!(
-                xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
-                mapped
-            );
-            // SAFETY: all three pages are mapped read-write.
-            let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
-            assert!(seen[..50].iter().all(|&b| b == 0));
-            assert_eq!(seen[50..50 + plain.len()], plain);
-            assert_eq!(
-                xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
-                mapped
-            );
-        }
-        assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
-        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
-    }
-
-    #[test]
-    fn zlib_inflate_handles_short_exact_empty_and_bad_streams() {
-        let plain = pattern(65_537);
-        let packed = compress_zlib(&plain);
-
-        // Exact fit.
-        let mut exact = vec![0u8; plain.len()];
-        assert_eq!(inflate(&packed, &mut exact), Ok(plain.len()));
-        assert_eq!(exact, plain);
-
-        // Short stream into a larger buffer passes and returns bytes written;
-        // guard bytes outside the slice passed to `inflate` stay untouched.
-        let mut larger = vec![0xAA; plain.len() + 64];
-        assert_eq!(
-            inflate(&packed, &mut larger[..plain.len() + 32]),
-            Ok(plain.len())
-        );
-        assert_eq!(&larger[..plain.len()], &plain[..]);
-        assert!(larger[plain.len() + 32..].iter().all(|&b| b == 0xAA));
-
-        // Empty valid stream passes for empty or non-empty destinations.
-        let empty = compress_zlib(&[]);
-        assert_eq!(inflate(&empty, &mut []), Ok(0));
-        let mut scratch = [0x55u8; 4];
-        assert_eq!(inflate(&empty, &mut scratch), Ok(0));
-
-        // Oversized stream (destination too small, including empty) fails.
-        let mut small = vec![0u8; plain.len() - 1];
-        assert_eq!(inflate(&packed, &mut small), Err(INVALID_DATA));
-        assert_eq!(inflate(&packed, &mut []), Err(INVALID_DATA));
-
-        // Truncated stream (missing trailer or payload bytes) fails.
-        let mut out = vec![0u8; plain.len()];
-        assert_eq!(
-            inflate(&packed[..packed.len() - 1], &mut out),
-            Err(INVALID_DATA)
-        );
-        assert_eq!(
-            inflate(&packed[..packed.len() / 2], &mut out),
-            Err(INVALID_DATA)
-        );
-        assert_eq!(inflate(&[], &mut out), Err(INVALID_DATA));
-
-        // Corrupt Adler-32 trailer fails.
-        let mut bad_adler = packed.clone();
-        *bad_adler.last_mut().unwrap() ^= 1;
-        assert_eq!(inflate(&bad_adler, &mut out), Err(INVALID_DATA));
-
-        // Corrupt header/payload fails, and subsequent valid inflate on the
-        // same thread still succeeds (verifies thread-local state reset).
-        let mut bad_body = packed.clone();
-        bad_body[2] ^= 0xFF;
-        assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
-        assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
-        assert_eq!(out, plain);
-    }
-}
+mod tests;

@@ -106,3 +106,19 @@ pub use watch::{
     title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Whether the Vulkan backend runs (`VICTORY_GPU=vulkan`). The runtime then
+/// sets up none of the D3D12 path's memory machinery: no write watching,
+/// no canary pages, no guards opened for kernel writes.
+#[cfg(windows)]
+pub fn vulkan_on() -> bool {
+    vulkan::on()
+}
+
+/// `xmem` took what `[at, at + len)` showed away: a view of physical pages
+/// unmapped (back to a placeholder) or a filler stand-in released. What
+/// still shows there afterwards is announced again (`title_memory_view`).
+/// The Vulkan backend prunes its memory map and imports here; a no-op until
+/// it does (the D3D12 path learns of it from `title_memory_remapped`).
+#[cfg(windows)]
+pub fn title_memory_unmapped(_at: usize, _len: usize) {}

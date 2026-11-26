@@ -13,9 +13,8 @@
 "crates/victory-gpu/src/resource.rs" = 3949
 "crates/victory-gpu/src/texture.rs" = 1629
 "crates/victory-gpu/src/tiles.rs" = 1585
-"crates/victory-hle/src/modules/dstorage.rs" = 1682
 "crates/victory-hle/src/modules/gameinput.rs" = 1612
-"crates/victory-hle/src/modules/xmem.rs" = 2239
+"crates/victory-hle/src/modules/xmem.rs" = 1757
 "crates/victory-shader/src/emit/bitcode/opt.rs" = 2177
 "crates/victory-shader/src/emit/lower.rs" = 12999
 "crates/victory-shader/src/emit/mod.rs" = 1567
@@ -114,7 +113,7 @@
 "guard" = { cognitive = 29, cyclomatic = 20 }
 
 [functions."crates/victory-hle/src/modules/xmem.rs"]
-"show" = { cognitive = 35, cyclomatic = 24 }
+"show" = { cognitive = 34, cyclomatic = 23 }
 
 [functions."crates/victory-loader/src/console_insn.rs"]
 "emulate" = { cognitive = 43, cyclomatic = 31 }
