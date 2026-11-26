@@ -80,6 +80,13 @@ comparing. If something seems to need that, it is in the wrong class.
 - Linux runs exactly the Windows build under stock Proton, with app-local
   DLLs only: a current vkd3d-proton, `d3dcompiler_47`, DXC.
 - Every change passes the gate before it lands.
+- Code shape (`cargo xtask quality`, run by the pre-commit hook): a file
+  over 1,000 lines plans a split, over 1,500 must split; per function,
+  cognitive complexity (SonarSource) over 15 / 25 and cyclomatic over
+  10 / 20 mean plan / must simplify. New code stays under the second
+  number. Today's offenders are listed in `xtask/quality-baseline.toml` and
+  may only shrink; `cargo xtask quality --update-baseline` lowers them as
+  code is split.
 
 ## Gate
 
