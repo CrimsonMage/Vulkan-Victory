@@ -492,6 +492,15 @@ impl Module {
         let len = self.c_u32_typed(u, n);
         self.global(op::TYPE_ARRAY, &[elem, len])
     }
+    /// An array type of its own (no explicit layout from a buffer's array
+    /// of the same shape): for workgroup variables.
+    pub fn t_array_plain(&mut self, elem: Id, n: u32) -> Id {
+        let u = self.t_int(32);
+        let len = self.c_u32_typed(u, n);
+        let id = self.id();
+        put(&mut self.globals, op::TYPE_ARRAY, &[id, elem, len]);
+        id
+    }
     pub fn t_runtime_array(&mut self, elem: Id) -> Id {
         self.global(op::TYPE_RUNTIME_ARRAY, &[elem])
     }
@@ -601,6 +610,13 @@ impl Module {
     pub fn variable(&mut self, ptr_ty: Id, storage: u32) -> Id {
         let id = self.id();
         put(&mut self.globals, op::VARIABLE, &[ptr_ty, id, storage]);
+        id
+    }
+
+    /// A global variable with an initializer.
+    pub fn variable_init(&mut self, ptr_ty: Id, storage: u32, init: Id) -> Id {
+        let id = self.id();
+        put(&mut self.globals, op::VARIABLE, &[ptr_ty, id, storage, init]);
         id
     }
 

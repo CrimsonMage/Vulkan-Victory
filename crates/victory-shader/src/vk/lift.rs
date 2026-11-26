@@ -204,11 +204,13 @@ pub struct Lift<'a> {
     cur: Vec<Item>,
     cse: HashMap<Node, V>,
     open: Option<Open>,
-    /// A console wave64 in a group of one wave: the halves exchange
-    /// whole-wave values (lift_wave.rs).
+    /// A console wave64 run as two host subgroups that exchange whole-wave
+    /// values (lift_wave.rs).
     xwave: bool,
     /// The exchanged dwords of masks, per block.
     words: HashMap<V, (V, V)>,
+    /// An LDS access since the halves last met (lift_wave.rs).
+    lds_dirty: bool,
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
@@ -235,6 +237,9 @@ pub struct Lift<'a> {
     a16_vals: Vec<V>,
     /// 16-bit interface rows: (row, half) -> (row, column) ([`super::pack16`]).
     pub halves: HashMap<(u8, u8), (u8, u8)>,
+    /// Per block: phis of a wave64 lane-mask pair (low dword's index, high
+    /// dword's), which share the low one's node.
+    mask_pairs: HashMap<usize, Vec<(usize, usize)>>,
     /// Mesh: the row of the parameter entry the compiler left unnamed.
     pub unnamed_row: Option<u8>,
     /// Vertex inputs: whether each input-signature row is a float.
@@ -294,8 +299,9 @@ impl<'a> Lift<'a> {
             cur: Vec::new(),
             cse: HashMap::new(),
             open: None,
-            xwave: Self::one_wave(native),
+            xwave: Self::paired_halves(native),
             words: HashMap::new(),
+            lds_dirty: false,
             guarded: false,
             sel: None,
             undo: Vec::new(),
@@ -312,6 +318,7 @@ impl<'a> Lift<'a> {
             a16: false,
             a16_vals: Vec::new(),
             halves: HashMap::new(),
+            mask_pairs: HashMap::new(),
             unnamed_row: None,
             vs_float: HashMap::new(),
             per_vertex: io
@@ -475,9 +482,7 @@ impl<'a> Lift<'a> {
         if !self.wave64 || !matches!(self.native.stage, HwStage::Cs | HwStage::Ms) {
             return lane;
         }
-        let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
-        let one = self.k32(1);
-        let half = self.global_bin(op::BITWISE_AND, Ty::U32, sg, one);
+        let half = self.half_index();
         let k5 = self.k32(5);
         let up = self.global_bin(op::SHIFT_LEFT_LOGICAL, Ty::U32, half, k5);
         self.global_bin(op::BITWISE_OR, Ty::U32, up, lane)
@@ -508,8 +513,8 @@ impl<'a> Lift<'a> {
         }
     }
 
-    /// A wave64 program whose halves do not exchange (more than one
-    /// console wave per group): cross-half values are per half.
+    /// A wave64 program whose halves do not exchange (graphics stages, a
+    /// group of at most 32 threads): cross-half values are per half.
     fn wave64_halves(&self) -> bool {
         self.wave64 && !self.xwave
     }
@@ -660,15 +665,13 @@ impl<'a> Lift<'a> {
                 }
                 match c {
                     251 => {
-                        let r = self.val(inst, Reg::S(ir::VCC))?;
-                        let m = self.mask_of(r);
+                        let m = self.mask_reg(inst, ir::VCC)?;
                         let a = self.any(m);
                         let n = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[a]);
                         self.u32v(n)
                     }
                     252 => {
-                        let r = self.val(inst, Reg::S(ir::EXEC))?;
-                        let m = self.mask_of(r);
+                        let m = self.mask_reg(inst, ir::EXEC)?;
                         let a = self.any(m);
                         let n = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[a]);
                         self.u32v(n)
@@ -691,10 +694,7 @@ impl<'a> Lift<'a> {
 
     fn opnd_mask(&mut self, inst: &Inst, o: &Operand) -> Res<V> {
         match *o {
-            Operand::Scalar { code, .. } if code != crate::gfx10::NULL => {
-                let r = self.val(inst, Reg::S(code))?;
-                Ok(self.mask_of(r))
-            }
+            Operand::Scalar { code, .. } if code != crate::gfx10::NULL => self.mask_reg(inst, code),
             _ => {
                 let v = self.opnd(inst, o)?;
                 Ok(self.data_mask(v))
@@ -826,8 +826,7 @@ impl<'a> Lift<'a> {
 
     /// The current EXEC as `active`.
     fn active(&mut self, inst: &Inst) -> Res<V> {
-        let r = self.val(inst, Reg::S(ir::EXEC))?;
-        Ok(self.mask_of(r))
+        self.mask_reg(inst, ir::EXEC)
     }
 
     fn mask_def(&mut self, inst: &Inst, d: &Option<Operand>, b: V) {

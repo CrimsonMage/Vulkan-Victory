@@ -396,11 +396,10 @@ impl Lift<'_> {
         }
         let (k2, k3, k4) = (self.k32(2), self.k32(3), self.k32(4));
         let mut row = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[lane, k4]);
-        if self.wave64 {
+        if self.upper_half().is_some() {
             // the subgroup's half of the console wave
-            let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+            let half = self.half_index();
             let one = self.k32(1);
-            let half = self.spv(op::BITWISE_AND, Ty::U32, &[sg, one]);
             let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[half, one]);
             row = self.spv(op::BITWISE_OR, Ty::U32, &[row, hi]);
         }

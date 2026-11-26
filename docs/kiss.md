@@ -141,6 +141,25 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: wave64 compute exact on the translator side (branch
+  `worktree-agent-a08b3058c5f4bb083`). Found in CS_Tree_BatchCull (and the
+  other BatchCull programs with wave prefix sums): `s_mov_b32 exec_lo, 0` /
+  `exec_hi, -1` before the step that adds the lower half's total to the
+  upper half was read as EXEC's low dword in both halves, so the upper
+  half's prefix offsets missed the lower half's count and its lanes wrote
+  over the lower lanes' output slots (the slots past them kept stale data).
+  The halves also touched LDS unordered (lane 0 initialises, the wave
+  ors/mins, lane 0 reads the total). Now: 64-bit masks per half, LDS
+  accesses ordered by a meeting of the halves, exchanges in every wave64
+  compute/mesh group (counters per pair beyond 64 threads, bounded),
+  compute groups padded to whole console waves (identity in the lanes past
+  the group), console thread numbering from the subgroup ids, loop guard
+  2^14 iterations per invocation over all its loops. No wave64 compute
+  approximation left in the used set. CS_Grass/Simple/Slod_BatchCull have
+  no cross-lane code, only scalar loops over ranges read from memory: if
+  they still give up, their input (constants, indirect group counts) is
+  wrong, not the waves.
+
 - 2026-11-26: vk28 hung the card (Xid 109) at the first world frame
   (`docs/vulkan-host.md`, "vk28"). The pool view's error path had left its
   pages showing other pages' bytes; the translator has no loop cap since

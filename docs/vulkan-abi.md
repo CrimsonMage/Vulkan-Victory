@@ -71,10 +71,12 @@ A compute program may use dwords 4–63 (k < 60).
 
 ### 2.1 The loop guard
 
-Every loop counts its iterations and gives up after 2^16 of them: it
-leaves and the invocation returns, so a
-loop that never exits (a mistranslation, or memory that reads zeros) cannot
-hang the GPU. Before returning, when push dwords 2–3 hold an address, the
+Every invocation counts the iterations of all its loops together and
+gives up after 2^14 of them: the loop leaves and the invocation returns, so
+a loop that never exits (a mistranslation, or memory that reads zeros), or
+nested loops that multiply, cannot hang the GPU. (2^16 per loop let a
+culling dispatch of thousands of waves take a large part of the ~2 s
+timeout.) Before returning, when push dwords 2–3 hold an address, the
 invocation adds 1 to **dword 0** of the guard buffer (`OpAtomicIAdd`,
 device scope) and stores the program's **guard id** in **dword 1**
 (`VkShader::guard_id`, FNV-1a of the console container). The host gives
@@ -305,8 +307,15 @@ at pipeline creation.
   (float, uint or int vec4); depth, stencil export and sample mask as
   `FragDepth`, `FragStencilRefEXT`, `SampleMask`. A lane killed by the
   program is demoted (`OpDemoteToHelperInvocation`).
-- **Compute.** `LocalSize` from the console's thread-group size; thread
-  and group ids from `LocalInvocationId` / `WorkgroupId`.
+- **Compute.** `LocalSize` is the console's thread-group size rounded up
+  to whole console waves (32 or 64 invocations), in one dimension
+  (`VkShader::local_size`): the console's hardware runs a group's last
+  wave with all its lanes too, the ones past the group inactive. The
+  console thread index is `SubgroupId * 32 + SubgroupLocalInvocationId`
+  (so a thread's id, lane and wave agree whichever invocations the driver
+  puts in a subgroup); thread ids (x, y, z) come from it over the console's
+  group shape, EXEC starts with the threads inside the group; group ids
+  from `WorkgroupId`.
 - **Mesh.** `VK_EXT_mesh_shader`, `OutputVertices`/`OutputPrimitivesEXT`
   the console's maxima, triangles. The module sets the output counts to
   the maxima at its start and culls every primitive
@@ -321,11 +330,12 @@ The console runs waves of 32 or 64 lanes; the host runs subgroups of 32.
 Each host subgroup acts as a console wave: scalar (wave-uniform) values
 are uniform per subgroup, lane masks are per-invocation booleans
 (`OpGroupNonUniformBallot` where the code reads a mask as a number).
-A console wave64 program runs as two subgroups; cross-lane operations
-that reach across the two halves (a 64-bit ballot read as a number,
-`v_readlane` of a lane ≥ 32, DPP row broadcasts across 32) are taken per
-half. Programs where that changes the result are listed by the
-translator (`VkShader::approximate`).
+A console wave64 compute or mesh program runs as two subgroups
+("halves") that exchange whole-wave values (section 9): every scalar value
+is then the same in both. A wave64 vertex or pixel program runs as one
+subgroup standing for the wave; cross-lane operations that reach across
+32 lanes there are taken per half, and the translator lists them
+(`VkShader::approximate`).
 
 ## 8. What the translator returns
 
@@ -350,15 +360,22 @@ Known gaps (the program translates; the result differs from the console):
 - Ray/node tests (`image_bvh*_intersect_ray`) miss every node.
 - Typed buffer stores through a V#'s format are written as 32-bit
   channels.
-- Wave64 programs run as two host subgroups. In a compute group of one
-  console wave (33 to 64 threads) the halves exchange whole-wave values
-  through a workgroup `u32[2]` between two group barriers: 64-bit masks
-  read as numbers (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, `v_mbcnt_hi`, the
-  high half), `any` of a mask (`s_cbranch_execz`, SCC of mask logic),
-  `v_readlane`, `v_readfirstlane` and `v_writelane` are exact. In larger
-  groups (mesh programs, compute groups of several waves) and for a mask
-  read inside a lane guard they are taken per half (`VkShader::approximate`
-  lists them).
+- Wave64 compute and mesh programs run each console wave as two host
+  subgroups that exchange one word where a value must be whole-wave:
+  64-bit masks read as numbers (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`,
+  `v_mbcnt_hi`, the high dword), `any` of a mask (`s_cbranch_execz`, SCC of
+  mask logic), `v_readlane`, `v_readfirstlane` and `v_writelane` are exact;
+  a mask whose two dwords are written apart (`s_mov_b32 exec_hi, -1` in a
+  wave prefix sum) gives each half its own dword. In a group of one console
+  wave the halves meet at two group barriers around a workgroup slot; in
+  larger groups each pair meets through workgroup arrival counters with a
+  bounded wait (2^20 polls; a pair that runs out stops exchanging instead
+  of hanging), as in xcl's `docs/wave64-on-wave32.md`. Before an LDS
+  access, when either half may have made another since they last met, the
+  halves meet (the console's wave runs its LDS accesses in order across all
+  64 lanes). A mask read inside a lane guard stays per half (listed in
+  `VkShader::approximate`). Global memory written by one half and read by
+  the other within one console wave, without a barrier, is not ordered.
 - Cube samples with derivatives or offsets read the faces as a 2D array:
   no filtering across face edges.
 

@@ -162,13 +162,12 @@ pub struct Emit<'a> {
     picks: HashMap<V, Id>,
     /// Merges of the selections `open_if` opened.
     if_merge: Vec<Id>,
-    /// Per loop continue target: its iteration count (a header phi) and
-    /// the next count (made at the continue target).
-    counters: HashMap<Id, (Id, Id)>,
+    /// The invocation's loop iterations so far (the loop guard; 0: none yet).
+    spent_var: Id,
     /// The guard function (0: no loop gave up a way to it yet).
     guard_fn: Id,
-    /// The halves' exchange slots: workgroup `u32[2]` (0: none yet).
-    xchg_var: Id,
+    /// The wave64 halves' exchange (emit_xchg.rs).
+    xv: xchg::XchgVars,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -238,9 +237,9 @@ impl<'a> Emit<'a> {
             helpers: HashMap::new(),
             picks: HashMap::new(),
             if_merge: Vec::new(),
-            counters: HashMap::new(),
+            spent_var: 0,
             guard_fn: 0,
-            xchg_var: 0,
+            xv: Default::default(),
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -519,6 +518,7 @@ impl<'a> Emit<'a> {
         if self.st.stage == HwStage::Ms {
             self.mesh_prologue();
         }
+        self.xchg_init();
         if self.f.nodes.iter().any(|n| matches!(n.op, Op::Store { .. } | Op::Atomic(_))) {
             let q = self.t.u64_;
             self.sink = self.map_load(q, &[1]);
@@ -540,6 +540,7 @@ impl<'a> Emit<'a> {
         self.m.op_void(op::FUNCTION_END, &[]);
         self.write_helpers();
         self.write_guard_fn();
+        self.write_xchg_fn();
         // entry point and modes
         let (model, name) = match self.st.stage {
             HwStage::Ps => (en::EXEC_FRAGMENT, "main"),
@@ -597,3 +598,5 @@ mod disp;
 mod ops;
 #[path = "emit_guard.rs"]
 mod guard;
+#[path = "emit_xchg.rs"]
+mod xchg;
