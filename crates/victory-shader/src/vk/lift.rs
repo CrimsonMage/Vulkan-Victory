@@ -57,6 +57,85 @@ pub struct Interface {
     pub demotes: bool,
 }
 
+/// How each value is read: above 0 mostly as a float (so loads and phis
+/// make it one and the bitcasts go), below as an integer.
+fn float_uses(p: &Program) -> HashMap<Value, i32> {
+    let mut score: HashMap<Value, i32> = HashMap::new();
+    let mut moves: Vec<(Value, Value)> = Vec::new();
+    for b in &p.blocks {
+        for phi in &b.phis {
+            for &a in &phi.args {
+                moves.push((phi.value, a));
+            }
+        }
+        for inst in &b.insts {
+            let name = inst.name();
+            let mut regs = ir::operand_reads(p, inst);
+            if name.contains("mac_") {
+                regs.extend(inst.writes.iter().map(|w| w.0).filter(|r| matches!(r, Reg::V(_))));
+            }
+            let val = |r: Reg| inst.read(r);
+            let w = match &inst.fields {
+                Fields::Valu(_) => {
+                    if matches!(name, "v_mov_b32" | "v_cndmask_b32") {
+                        if let Some((_, d)) = inst.writes.iter().find(|w| matches!(w.0, Reg::V(_))) {
+                            for &r in &regs {
+                                if let (Reg::V(_) | Reg::S(_), Some(v)) = (r, val(r)) {
+                                    moves.push((*d, v));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let src = if let Some(rest) = name.strip_prefix("v_cvt_") {
+                        rest.rsplit('_').next().unwrap_or("")
+                    } else {
+                        name.rsplit('_').next().unwrap_or("")
+                    };
+                    match src {
+                        "f32" => 1,
+                        "u32" | "i32" | "b32" | "u24" | "i24" | "u64" | "i64" | "b64" | "ubyte0" | "ubyte1" | "ubyte2"
+                        | "ubyte3" => -1,
+                        _ => 0,
+                    }
+                }
+                Fields::Image { addr, .. } if name.starts_with("image_sample") || name.starts_with("image_gather") => {
+                    for a in addr {
+                        if let Operand::Vector { reg, dwords } = *a {
+                            for k in 0..dwords {
+                                if let Some(v) = val(Reg::V(reg + k)) {
+                                    *score.entry(v).or_default() += 1;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => 0,
+            };
+            if w == 0 {
+                continue;
+            }
+            for r in regs {
+                if matches!(r, Reg::V(_) | Reg::S(_))
+                    && let Some(v) = val(r)
+                {
+                    *score.entry(v).or_default() += w;
+                }
+            }
+        }
+    }
+    for _ in 0..3 {
+        for &(d, s) in moves.iter().rev() {
+            let x = score.get(&d).copied().unwrap_or(0);
+            if x != 0 {
+                *score.entry(s).or_default() += x.signum();
+            }
+        }
+    }
+    score
+}
+
 /// Built-in output slots.
 pub const OUT_POSITION: u16 = 0x100;
 pub const OUT_DEPTH: u16 = 0x101;
@@ -90,6 +169,8 @@ pub struct Lift<'a> {
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
+    /// Float or integer use of each value ([`float_uses`]).
+    floaty: HashMap<Value, i32>,
     /// Undo log of the CSE table (dominator-tree scopes).
     undo: Vec<(Node, Option<V>)>,
     no_cse: bool,
@@ -158,6 +239,7 @@ impl<'a> Lift<'a> {
             guarded: false,
             sel: None,
             undo: Vec::new(),
+            floaty: float_uses(p),
             no_cse: false,
             all_phis: vec![Vec::new(); p.blocks.len()],
             made: vec![false; p.blocks.len()],
@@ -846,7 +928,7 @@ impl<'a> Lift<'a> {
     // ---- guards ----
 
     fn close(&mut self) {
-        let Some(o) = self.open.take() else { return };
+        let Some(mut o) = self.open.take() else { return };
         let mut phis = Vec::new();
         let mut masks: HashMap<V, V> = HashMap::new();
         for (_, new, old) in o.defs {
@@ -865,10 +947,26 @@ impl<'a> Lift<'a> {
                 self.vals.insert(new, R::M(phi, half));
                 continue;
             }
-            let inner = match self.vals.get(&new) {
+            let mut inner = match self.vals.get(&new) {
                 Some(R::D(v)) => *v,
                 _ => continue,
             };
+            // the type its readers want
+            let want = match self.floaty.get(&new).copied().unwrap_or(0) {
+                x if x > 0 => Ty::F32,
+                x if x < 0 => Ty::U32,
+                _ => self.f.ty(inner),
+            };
+            if want != self.f.ty(inner) && matches!(self.f.ty(inner), Ty::F32 | Ty::U32) {
+                inner = match self.f.as_const(inner) {
+                    Some(c) => self.f.konst(want, c),
+                    None => {
+                        let c = self.f.push(Node { op: Op::Spv(op::BITCAST), ty: want, args: vec![inner], imm: Vec::new() });
+                        o.items.push(Item::N(c));
+                        c
+                    }
+                };
+            }
             let ty = self.f.ty(inner);
             let outer = match self.value(old, 0) {
                 Ok(r) => {
@@ -971,7 +1069,7 @@ impl<'a> Lift<'a> {
                 let mask = mask || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
                 let ty = if mask {
                     Ty::BOOL
-                } else if !known.is_empty() && known.iter().all(|r| matches!(r, R::D(v) if self.f.ty(*v) == Ty::F32)) {
+                } else if self.floaty.get(&phi.value).copied().unwrap_or(0) > 0 {
                     Ty::F32
                 } else {
                     Ty::U32
@@ -1864,7 +1962,8 @@ impl<'a> Lift<'a> {
                 let m = (u32::from(n) - at).min(4);
                 let ka = self.k32(at * 4);
                 let oo = self.spv(op::I_ADD, Ty::U32, &[o, ka]);
-                let v = self.buffer_load_raw(&vs, oo, m)?;
+                let fl = self.floats(inst, (at..at + m).map(|k| Reg::S(d + k as u8)));
+                let v = self.buffer_load_raw(&vs, oo, m, fl)?;
                 for i in 0..m {
                     out.push(if m == 1 { v } else { self.extract(v, i) });
                 }
@@ -1882,7 +1981,8 @@ impl<'a> Lift<'a> {
                 let ka = self.f.konst(Ty::U64, u64::from(at * 4));
                 let aa = self.spv(op::I_ADD, Ty::U64, &[addr, ka]);
                 let dev = self.translate(aa);
-                let ty = Ty::vec(S::U32, m as u8);
+                let fl = self.floats(inst, (at..at + m).map(|k| Reg::S(d + k as u8)));
+                let ty = Ty::vec(if fl { S::F32 } else { S::U32 }, m as u8);
                 let v = self.emit(Op::Load { align: 4 }, ty, vec![dev]);
                 for i in 0..m {
                     out.push(if m == 1 { v } else { self.extract(v, i) });
@@ -1954,9 +2054,21 @@ impl<'a> Lift<'a> {
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
     }
 
-    fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32) -> Res<V> {
+    fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
         let a = self.buffer_addr(vs, o, 4 * n, false);
-        Ok(self.emit(Op::Load { align: 4 }, Ty::vec(S::U32, n as u8), vec![a]))
+        Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
+    }
+
+    /// Whether the values `inst` writes to `regs` are read as floats.
+    fn floats(&self, inst: &Inst, regs: impl Iterator<Item = Reg>) -> bool {
+        let mut any = false;
+        for r in regs {
+            match inst.write(r).and_then(|v| self.floaty.get(&v)) {
+                Some(&x) if x > 0 => any = true,
+                _ => return false,
+            }
+        }
+        any
     }
 
     fn buffer(&mut self, inst: &Inst, name: &'static str) -> Res<()> {
@@ -2039,18 +2151,18 @@ impl<'a> Lift<'a> {
         };
         if load {
             let a = self.buffer_addr(&vs, o, size, false);
+            let kind = match kind {
+                Kind::Dwords(n) if self.floats(inst, (0..n).map(|k| Reg::V(reg + k as u8))) => Kind::Floats(n),
+                k => k,
+            };
             let vals = self.load_kind(a, kind)?;
             for (i, v) in vals.into_iter().enumerate() {
                 self.def(inst, Reg::V(reg + i as u8), R::D(v));
             }
         } else {
             let a = self.buffer_addr(&vs, o, size, true);
-            let vals: Vec<V> = (0..n)
-                .map(|i| {
-                    let x = self.opnd_dw(inst, &data.unwrap(), i as u8, false)?;
-                    Ok(self.u32v(x))
-                })
-                .collect::<Res<_>>()?;
+            let vals: Vec<V> =
+                (0..n).map(|i| self.opnd_dw(inst, &data.unwrap(), i as u8, false)).collect::<Res<_>>()?;
             self.store_kind(a, kind, &vals)?;
         }
         Ok(())
@@ -2058,8 +2170,9 @@ impl<'a> Lift<'a> {
 
     fn load_kind(&mut self, a: V, kind: Kind) -> Res<Vec<V>> {
         Ok(match kind {
-            Kind::Dwords(n) => {
-                let v = self.emit(Op::Load { align: 4 }, Ty::vec(S::U32, n as u8), vec![a]);
+            Kind::Dwords(n) | Kind::Floats(n) => {
+                let s = if matches!(kind, Kind::Floats(_)) { S::F32 } else { S::U32 };
+                let v = self.emit(Op::Load { align: 4 }, Ty::vec(s, n as u8), vec![a]);
                 if n == 1 { vec![v] } else { (0..n).map(|i| self.extract(v, i)).collect() }
             }
             Kind::Byte(s) => {
@@ -2084,22 +2197,27 @@ impl<'a> Lift<'a> {
     fn store_kind(&mut self, a: V, kind: Kind, vals: &[V]) -> Res<()> {
         match kind {
             Kind::Dwords(n) => {
+                // floats stay floats when every dword is one
+                let float = vals.iter().all(|&x| self.f.ty(x) == Ty::F32);
+                let vals: Vec<V> = vals.iter().map(|&x| if float { x } else { self.u32v(x) }).collect();
                 let v = if n == 1 {
                     vals[0]
                 } else {
-                    self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, n as u8), vals)
+                    self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), &vals)
                 };
                 self.emit(Op::Store { align: 4 }, Ty::VOID, vec![a, v]);
             }
             Kind::Byte(_) => {
-                let v = self.spv(op::U_CONVERT, Ty::U8, &[vals[0]]);
+                let x = self.u32v(vals[0]);
+                let v = self.spv(op::U_CONVERT, Ty::U8, &[x]);
                 self.emit(Op::Store { align: 1 }, Ty::VOID, vec![a, v]);
             }
             Kind::Short(_) => {
-                let v = self.spv(op::U_CONVERT, Ty::U16, &[vals[0]]);
+                let x = self.u32v(vals[0]);
+                let v = self.spv(op::U_CONVERT, Ty::U16, &[x]);
                 self.emit(Op::Store { align: 2 }, Ty::VOID, vec![a, v]);
             }
-            Kind::T(..) => return Err(unsupported(0, "a typed buffer store")),
+            Kind::T(..) | Kind::Floats(_) => return Err(unsupported(0, "a typed buffer store")),
         }
         Ok(())
     }
@@ -2435,12 +2553,7 @@ impl<'a> Lift<'a> {
             }
         } else {
             let Some(d @ Operand::Vector { dwords, .. }) = data else { return Err(unsupported(off, name)) };
-            let vals: Vec<V> = (0..dwords)
-                .map(|i| {
-                    let x = self.opnd_dw(inst, &d, i, false)?;
-                    Ok(self.u32v(x))
-                })
-                .collect::<Res<_>>()?;
+            let vals: Vec<V> = (0..dwords).map(|i| self.opnd_dw(inst, &d, i, false)).collect::<Res<_>>()?;
             self.store_kind(dev, kind, &vals)?;
         }
         Ok(())
@@ -2479,7 +2592,6 @@ impl<'a> Lift<'a> {
                             2 => OUT_SAMPLE_MASK,
                             _ => continue,
                         };
-                        let x = self.u32v(x);
                         self.emit(Op::Output { slot, comp: 0 }, Ty::VOID, vec![x]);
                         self.note_output(slot, 0);
                     }
@@ -2492,7 +2604,6 @@ impl<'a> Lift<'a> {
             if let Some(v) = v {
                 let r = self.value(*v, off)?;
                 let x = self.data(r);
-                let x = self.u32v(x);
                 self.emit(Op::Output { slot, comp: c as u8 }, Ty::VOID, vec![x]);
                 self.note_output(slot, c as u8);
             }
@@ -2590,6 +2701,7 @@ struct TFormat {
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     Dwords(u32),
+    Floats(u32),
     Byte(bool),
     Short(bool),
     T(TFormat, u32, bool),

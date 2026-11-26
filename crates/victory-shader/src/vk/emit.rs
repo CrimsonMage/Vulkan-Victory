@@ -799,7 +799,9 @@ impl<'a> Emit<'a> {
             }
             Op::Output { slot, comp } => {
                 let (var, elem) = self.output(slot);
-                let x = if elem == self.t.f32_ { self.m.op(op::BITCAST, elem, &[args[0]]) } else { args[0] };
+                let at = self.f.ty(n.args[0]);
+                let at = self.ty(at);
+                let x = if at != elem { self.m.op(op::BITCAST, elem, &[args[0]]) } else { args[0] };
                 let ptr = match slot {
                     OUT_DEPTH | OUT_STENCIL => var,
                     _ => {

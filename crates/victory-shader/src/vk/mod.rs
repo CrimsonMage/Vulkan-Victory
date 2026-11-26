@@ -101,6 +101,10 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         return Err(ShaderError::Unsupported { offset: 0, what: "mesh programs (not yet)" });
     }
     let p = crate::spill::build(&native)?;
+    // The branches that only skip code when no lane is left for it go: the
+    // skipped vector code is guarded by EXEC anyway, and without them the
+    // wave's graph is the structured program.
+    let p = if std::env::var_os("VK_SKIPS").is_some() { p } else { crate::ir::without_skips(&p, true).unwrap_or(p) };
     let io = io::raise(&p, &native)?;
     let (mut f, iface) = lift::Lift::new(&p, &native, &io).run()?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {

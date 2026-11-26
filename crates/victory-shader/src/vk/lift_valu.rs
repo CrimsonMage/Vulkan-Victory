@@ -75,14 +75,7 @@ impl Lift<'_> {
         let x = self.opnd_dw(inst, o, 0, true)?;
         let x = self.u32v(x);
         let high = v.opsel >> i & 1 != 0 || v.sdwa.is_some_and(|s| s.src_sel.get(i) == Some(&5));
-        let x = if high {
-            let k = self.k32(16);
-            self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[x, k])
-        } else {
-            x
-        };
-        let h = self.spv(op::U_CONVERT, Ty::U16, &[x]);
-        let mut f = self.spv(op::BITCAST, Ty::F16, &[h]);
+        let mut f = self.half_f16(x, high);
         if v.abs >> i & 1 != 0 {
             f = self.gl(glsl::F_ABS, Ty::F16, &[f]);
         }
@@ -90,6 +83,25 @@ impl Lift<'_> {
             f = self.spv(op::F_NEGATE, Ty::F16, &[f]);
         }
         Ok(f)
+    }
+
+    /// Half `high` of a dword as f16 (the dword's split is shared).
+    pub(super) fn half_f16(&mut self, x: V, high: bool) -> V {
+        if let Some(c) = self.f.as_const(x) {
+            return self.f.konst(Ty::F16, (c >> if high { 16 } else { 0 }) & 0xFFFF);
+        }
+        let v2 = self.spv(op::BITCAST, Ty::vec(S::F16, 2), &[x]);
+        self.extract(v2, u32::from(high))
+    }
+
+    /// Half `high` of a dword, an f16, as f32.
+    pub(super) fn half_f32(&mut self, x: V, high: bool) -> V {
+        if let Some(c) = self.f.as_const(x) {
+            let h = ((c >> if high { 16 } else { 0 }) & 0xFFFF) as u16;
+            return self.kf(f16_to_f32(h));
+        }
+        let v2 = self.gl(glsl::UNPACK_HALF_2X16, Ty::vec(S::F32, 2), &[x]);
+        self.extract(v2, u32::from(high))
     }
 
     /// Writes an f16 or u16 result into the destination's low half (high
@@ -541,15 +553,7 @@ impl Lift<'_> {
                     let x = self.opnd_dw(inst, &o, 0, v.opsel_hi >> i & 1 != 0)?;
                     let x = self.u32v(x);
                     let mut y = if v.opsel_hi >> i & 1 != 0 {
-                        let x = if v.opsel >> i & 1 != 0 {
-                            let k = self.k32(16);
-                            self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[x, k])
-                        } else {
-                            x
-                        };
-                        let h = self.spv(op::U_CONVERT, Ty::U16, &[x]);
-                        let hf = self.spv(op::BITCAST, Ty::F16, &[h]);
-                        self.spv(op::F_CONVERT, Ty::F32, &[hf])
+                        self.half_f32(x, v.opsel >> i & 1 != 0)
                     } else {
                         self.f32v(x)
                     };
@@ -1421,4 +1425,22 @@ impl Lift<'_> {
         self.def(inst, Reg::V(reg), R::D(x));
         Ok(())
     }
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let s = u32::from(h >> 15) << 31;
+    let e = u32::from(h >> 10 & 0x1F);
+    let m = u32::from(h & 0x3FF);
+    let bits = match (e, m) {
+        (0, 0) => s,
+        (0, _) => {
+            // subnormal
+            let f = m as f32 / 1024.0 / 16384.0;
+            return if s != 0 { -f } else { f };
+        }
+        (31, 0) => s | 0x7F80_0000,
+        (31, _) => s | 0x7FC0_0000 | (m << 13),
+        _ => s | ((e + 112) << 23) | (m << 13),
+    };
+    f32::from_bits(bits)
 }
