@@ -250,6 +250,15 @@ driver errors and no new crash, and the captures look no worse.
   entries come from the batches, and victory's CPU reads of it go through
   the sections' whole views. Windows stay only as the fallback, without
   copy-out.
+- 2026-11-25: pool views lowered once (workstream 24): a raw or
+  structured access picks the view's slot or the directory's copy by
+  selects and makes one access; the directory is looked up once per view
+  and dynamic offset (both pages in one load), uniform lookups kept for
+  the blocks they dominate; pool views read zeros past their bytes.
+  Constant views keep their rows beside the directory's raw read (no raw
+  read of a constant buffer view on the host). Shaders run p27 used:
+  40.2M → 28.0M SPIR-V instructions (no directory at all: 16.3M); whole
+  pack 25,639 translated as before, DXIL 1.94 → 1.52 GB.
 - 2026-11-25: VIctory-7900XTX study (GPL-3.0, code reusable with notice).
   Taken: list calls written down on the title's threads and translated by
   workers of ours (their `VICTORY_THIN`; here the only path, into the

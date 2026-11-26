@@ -500,15 +500,30 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
     and an entry in its heap's **pool table** (title address | flag,
     bytes; `descriptor/host.rs` `make_slot`). Root views are read by
     directory at the address in user data (section 14). The
-    translator lowers every raw, structured and constant buffer access
-    twice: the view's way (read at offset 0 where the flag is set), and
-    under a branch on the flag (uniform where the descriptor is) the
-    directory's way at the view's address plus the access's byte; loads
-    and stores of several dwords that cross a 64 KiB edge are split per
-    dword; byte and 16-bit accesses, typed-format loads from raw views
-    (`tbuffer_load_format_*`, decoded in the shader) and atomics go too.
-    A pool view's record count comes from the pool table. Typed views
-    (`buffer_*_format_*`, d16) keep windows.
+    translator lowers every raw and structured buffer access once
+    (`emit/lower.rs` `reach`): selects pick a heap slot and byte, the
+    view's own (its slot, the access's byte) where the flag is clear, or
+    the directory's (the copy's raw view, the byte there) where it is
+    set, and one raw load or store per dword follows on that slot (per
+    16 bytes for a constant view at a constant offset; constant views
+    begin on 256 bytes). The directory is looked up once per view and
+    dynamic offset, not per access: both entries of the page holding the
+    view's address plus the dynamic part and of the next page come in one
+    load, and an access's constant offset (below 64 KiB) picks the page;
+    accesses every lane makes alike keep those for the IR blocks the
+    lookup dominates, others for their own block; an access that shares
+    nothing looks up its own byte. A constant view's way still reads its
+    rows (a constant buffer view is not read raw on the host): the
+    directory's raw read is taken instead by a select where the flag is
+    set. An access that begins at or past the pool table's bytes (a
+    constant view's: at most 64 KiB) reads the null view (zeros) and
+    drops its writes. Every access that may take the directory's copies
+    is annotated as a raw unordered access view, also over a host shader
+    resource view (on vkd3d-proton raw views of both kinds are the same
+    storage-buffer descriptor). Byte and 16-bit accesses, typed-format
+    loads from raw views (`tbuffer_load_format_*`, decoded in the shader)
+    and atomics go too. Typed views (`buffer_*_format_*`, d16) keep
+    windows.
   - *Entries.* The GPU view of the pool has no host view at all
     (`xmem::map_alias`): each page-mapping copy writes its entries
     (`memory::title_pages_aliased`) and the CPU side reads those pages
