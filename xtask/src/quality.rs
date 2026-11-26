@@ -654,8 +654,13 @@ mod tests {
             [Level::Plan, Level::Plan]
         );
         assert_eq!(levels(&[file("a.rs", 1501, &[])], &b), [Level::Error]);
+        // Cyclomatic only warns, however high.
         assert_eq!(
-            levels(&[file("a.rs", 10, &[("f", 3, 21)])], &b),
+            levels(&[file("a.rs", 10, &[("f", 3, 99)])], &b),
+            [Level::Plan]
+        );
+        assert_eq!(
+            levels(&[file("a.rs", 10, &[("f", 26, 3)])], &b),
             [Level::Error]
         );
     }
@@ -669,8 +674,8 @@ mod tests {
         assert_eq!(at(2000, 40, 12), [Level::Baselined, Level::Baselined]);
         assert_eq!(at(1900, 30, 20), [Level::Baselined, Level::Baselined]);
         assert_eq!(at(2001, 41, 12), [Level::Error, Level::Error]);
-        // The other metric may grow up to the mandatory limit, not past it.
-        assert_eq!(at(1400, 40, 21), [Level::Plan, Level::Error]);
+        // Cyclomatic may grow freely: it only warns.
+        assert_eq!(at(1400, 40, 99), [Level::Plan, Level::Baselined]);
         // Moved to another file of the same crate: the allowance follows.
         let moved = levels(&[file("crates/c/src/b.rs", 100, &[("f", 40, 12)])], &b);
         assert_eq!(moved, [Level::Baselined]);
