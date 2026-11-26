@@ -270,6 +270,18 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: merged into integrate (720b18b): per-title-queue lines on 3
+  queues with card-written bottom-of-pipe values and timestamps,
+  ExecuteIndirect with a bounding pass built by vk::spirv, FSR4 as a linear
+  blit on Vulkan (gated on the FFX DLL version), console list slots
+  (UAV clears, fills, DrawIndexedX, predication, top-of-pipe writes,
+  KickoffX, depth bias), real occlusion/timestamp queries, run-time
+  layout detection, up to 8 present planes, kernelx exports and console
+  VirtualAlloc flags. Translator: lever 2 reverted (no general gain, 39f0
+  8.8 s vs 145 s); compute sample p50 15 / p90 179 / max 250 ms. Run vk27:
+  0 errors, record 20.5 ms; killed by the VRAM watchdog at ~frame 1,024
+  (the process jumped 3.1 -> 6.4 GB in 3 s at world-load start while our
+  accounting read 2.8 GB): under investigation.
 - 2026-11-26: ABI v2 merged (translator 5d4ea8d, host 1f1c2a4): per-title
   semantic registry beside the stage cache, cube 2D-array views on set 0
   binding 2, T# check word, generic DPP. Used set 1,527/1,527 translate.
