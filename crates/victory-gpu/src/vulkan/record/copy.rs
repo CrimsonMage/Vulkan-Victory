@@ -1,6 +1,6 @@
 //! Copies and resolves recorded into a list's command buffer.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_vk::ash::vk;
 
@@ -9,6 +9,17 @@ use super::super::images::{self, Image};
 use super::Rec;
 use crate::list::CopyLocation;
 use crate::object::This;
+
+/// The format of the plane a depth-to-colour copy moves: a depth image's
+/// depth plane, a colour image's own.
+fn plane_format(i: &Image) -> vk::Format {
+    match i.format {
+        vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D32_SFLOAT => vk::Format::R32_SFLOAT,
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32 => vk::Format::R32_UINT,
+        vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT => vk::Format::R16_UNORM,
+        f => f,
+    }
+}
 
 impl Rec {
     // ---- copies ----
@@ -72,9 +83,38 @@ impl Rec {
     }
 
     pub(super) fn copy_images(&mut self, b: &'static Backend, src: &Image, dst: &Image, regions: &[vk::ImageCopy]) {
-        if src.aspect() != dst.aspect() || regions.is_empty() {
+        if regions.is_empty() {
             return;
         }
+        // The console copies a depth plane into a colour texture of the
+        // same bits and back (the title keeps a copy of its depth and
+        // writes it back with PS_Copy_SRV_To_Depth): one aspect of each
+        // side, which the card takes with VK_KHR_maintenance8. Skipping
+        // these left the depth buffer empty for everything after.
+        let crossed: Vec<vk::ImageCopy>;
+        let regions = if src.depth() == dst.depth() {
+            regions
+        } else {
+            static TOLD: AtomicU64 = AtomicU64::new(0);
+            let can = b.host.caps.maintenance8 && images::format_bytes(plane_format(src)) == images::format_bytes(plane_format(dst));
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(from = ?src.format, to = ?dst.format, copied = can, "Vulkan: a copy between a depth image and a colour image");
+            }
+            if !can {
+                return;
+            }
+            let one = |i: &Image| if i.depth() { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+            crossed = regions
+                .iter()
+                .map(|r| {
+                    let mut r = *r;
+                    r.src_subresource.aspect_mask = one(src);
+                    r.dst_subresource.aspect_mask = one(dst);
+                    r
+                })
+                .collect();
+            &crossed
+        };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
         // SAFETY: outside rendering; images in GENERAL.

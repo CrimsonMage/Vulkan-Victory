@@ -277,6 +277,10 @@ pub struct Caps {
     /// `shaderImageInt64Atomics` (VK_EXT_shader_image_atomic_int64): 64-bit
     /// image atomics on R64_UINT storage views (ABI v5 section 5.1).
     pub image_int64_atomics: bool,
+    /// `VK_KHR_maintenance8`: copies between a depth or stencil aspect and
+    /// a colour image of matching bits, and sample offsets that are not
+    /// constants.
+    pub maintenance8: bool,
 }
 
 /// Whether null descriptors of any type are on (`VK_EXT_robustness2`).
@@ -803,6 +807,7 @@ impl Host {
             timestamp_period: props.limits.timestamp_period,
             null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
             image_int64_atomics: int64_image.shader_image_int64_atomics == vk::TRUE,
+            maintenance8: has(MAINTENANCE8) && m8.maintenance8 == vk::TRUE,
             extensions,
             features,
             core,
