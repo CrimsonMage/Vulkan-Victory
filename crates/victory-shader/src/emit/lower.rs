@@ -5972,6 +5972,35 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // The same, picked at an offset the code computes (from the
+            // heap, say): the address and bytes of the buffer view from its
+            // pool table entry, as the console's code reads them out of the
+            // descriptor (the host writes the entry when the title writes
+            // the view; a view the directory does not reach reads 0).
+            if count <= 4
+                && let Some(p) = self.pool_view(site, &Source::Loaded { load: site, first: 0 })
+            {
+                let c = self.cur;
+                let zero = self.s.m.i32(0);
+                let lo = self.s.m.select(c, p.on, p.lo, zero);
+                let hi = self.s.m.select(c, p.on, p.hi, zero);
+                let bytes = self.s.m.select(c, p.on, p.bytes, zero);
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    match k {
+                        0 => self.write(inst, reg, lo, None),
+                        1 => self.write(inst, reg, hi, None),
+                        2 => self.write(inst, reg, bytes, None),
+                        _ => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
