@@ -73,6 +73,11 @@ pub const EXTENSIONS: &[Extension] = &[
         "null descriptors for empty slots",
     ),
     ext(
+        ext::shader_stencil_export::NAME,
+        Need::Wanted,
+        "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
+    ),
+    ext(
         ext::extended_dynamic_state3::NAME,
         Need::Wanted,
         "blend, raster and depth state set per draw (fewer pipelines)",

@@ -204,21 +204,102 @@ static REASONS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 /// The title created a pipeline with `shaders`: those not seen go to the
 /// stage workers.
 pub(crate) fn created(b: &'static Backend, shaders: &[Arc<Shader>]) {
-    let mut q = queue();
-    let q = q.get_or_insert_with(|| {
+    let mut guard = queue();
+    let q = guard.get_or_insert_with(|| {
         start(b);
         Queue {
             states: HashMap::new(),
             todo: VecDeque::new(),
         }
     });
+    let inline = mode() == Mode::Inline;
+    let mut mine = Vec::new();
     for s in shaders {
         if let std::collections::hash_map::Entry::Vacant(e) = q.states.entry(s.full) {
             e.insert(State::Queued);
-            q.todo.push_back(s.clone());
+            if inline {
+                mine.push(s.clone());
+            } else {
+                q.todo.push_back(s.clone());
+            }
         }
     }
     WORK.notify_all();
+    drop(guard);
+    // Diagnostics: compiled here, on the title's thread, one at a time.
+    for s in mine {
+        let state = make(b, &s);
+        if let Some(q) = queue().as_mut() {
+            q.states.insert(s.full, state);
+        }
+    }
+}
+
+/// How stages are compiled (`VICTORY_VK_STAGES`, diagnostics builds only):
+/// on the stage workers (default), on the title's thread that created the
+/// pipeline, one at a time (`inline`), or not at all, modules only
+/// (`modules`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Workers,
+    Inline,
+    Modules,
+}
+
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Mode::Workers;
+        }
+        let m = match std::env::var("VICTORY_VK_STAGES").as_deref() {
+            Ok("inline") => Mode::Inline,
+            Ok("modules") => Mode::Modules,
+            _ => Mode::Workers,
+        };
+        tracing::info!(mode = ?m, "Vulkan: how stages compile (VICTORY_VK_STAGES)");
+        m
+    })
+}
+
+/// Diagnostics builds: the folder each module's words are written to before
+/// it is compiled (`VICTORY_VK_DUMP`), as `<hash>.<stage>.spv`.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return None;
+        }
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_VK_DUMP")?);
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// The device limits modules are checked against, read once.
+fn limits(b: &Backend) -> &'static victory_vk::limits::Limits {
+    static LIMITS: OnceLock<victory_vk::limits::Limits> = OnceLock::new();
+    LIMITS.get_or_init(|| {
+        let l = victory_vk::limits::Limits::of(&b.host);
+        tracing::info!(
+            compute_invocations = l.compute_invocations,
+            compute_shared = l.compute_shared,
+            mesh_invocations = l.mesh_invocations,
+            mesh_shared = l.mesh_shared,
+            mesh_output_memory = l.mesh_output_memory,
+            mesh_vertices = l.mesh_vertices,
+            mesh_primitives = l.mesh_primitives,
+            mesh_components = l.mesh_components,
+            stencil_export = l.stencil_export,
+            "Vulkan: the limits modules are checked against before they compile"
+        );
+        l
+    })
+}
+
+fn hash_hex(full: &[u8; 32]) -> String {
+    full[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn start(b: &'static Backend) {
@@ -279,6 +360,18 @@ fn make(b: &Backend, shader: &Shader) -> State {
     };
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[8].fetch_add(vs.spirv.len() as u64, Ordering::Relaxed);
+    let hash = hash_hex(&shader.full);
+    let usage = victory_vk::limits::usage(&vs.spirv);
+    if let Some(dir) = dump_dir() {
+        let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(dir.join(format!("{hash}.{:?}.spv", vs.stage)), bytes);
+    }
+    if let Some(why) = usage.refused(limits(b)) {
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(stage = ?vs.stage, hash = %hash, why = %why, "Vulkan part: refused before compiling");
+        }
+        return fail(format!("over the device: {why}"));
+    }
     let t = Instant::now();
     // SAFETY: the translator's words, a SPIR-V module.
     let module = unsafe {
@@ -293,10 +386,40 @@ fn make(b: &Backend, shader: &Shader) -> State {
     };
     STATS[3].fetch_add(1, Ordering::Relaxed);
     #[allow(clippy::absurd_extreme_comparisons)]
-    let speaks = victory_shader::vk::ABI_VERSION >= HOST_ABI;
+    let speaks = victory_shader::vk::ABI_VERSION >= HOST_ABI && mode() != Mode::Modules;
     let part = if speaks {
+        // Diagnostics builds name each part before the driver sees it, and
+        // flush: a fault inside the driver ends the process without a word
+        // (winevulkan's ExitProcess(3)), so the last such line names it.
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(
+                stage = ?vs.stage,
+                hash = %hash,
+                words = vs.spirv.len(),
+                samplers = vs.samplers.len(),
+                local = ?usage.local_size,
+                workgroup_bytes = usage.workgroup_bytes,
+                out_vertices = usage.out_vertices,
+                out_primitives = usage.out_primitives,
+                out_locations = usage.out_locations,
+                mesh_out_bytes = usage.mesh_output_bytes(limits(b)),
+                thread = std::thread::current().name().unwrap_or("?"),
+                "Vulkan part: compiling"
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
         let t = Instant::now();
         let p = compile(b, vs.stage, module, &vs.samplers);
+        if cfg!(feature = "diagnostics") {
+            tracing::info!(
+                stage = ?vs.stage,
+                hash = %hash,
+                ms = t.elapsed().as_millis() as u64,
+                ok = p.is_ok(),
+                "Vulkan part: compiled"
+            );
+        }
         STATS[7].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         match p {
             Ok(p) => {
