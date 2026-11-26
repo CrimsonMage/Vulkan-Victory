@@ -94,6 +94,14 @@ pub(crate) struct Image {
     pending: AtomicBool,
     /// Not yet in GENERAL (the next flush moves and clears it).
     fresh: AtomicBool,
+    /// Diagnostics: draws into it as an attachment, clears, copies into it,
+    /// fills.
+    pub(crate) written: [AtomicU64; 4],
+    /// The fingerprint of its title memory when last checked (0: never),
+    /// and the frame until which it is checked every present (it changed
+    /// lately: a movie frame, a glyph atlas).
+    hash: AtomicU64,
+    hot_until: AtomicU64,
 }
 
 impl Image {
@@ -223,8 +231,9 @@ unsafe impl Send for Registry {}
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// Images made, fills done, bytes filled, images that could not be made.
-pub(crate) static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Images made, fills done, bytes filled, images that could not be made,
+/// refills found by fingerprint.
+pub(crate) static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn registry() -> std::sync::MutexGuard<'static, Option<Registry>> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
@@ -501,6 +510,9 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc) -> Option<
         views: Mutex::new(Vec::new()),
         pending: AtomicBool::new(false),
         fresh: AtomicBool::new(true),
+        written: [const { AtomicU64::new(0) }; 4],
+        hash: AtomicU64::new(0),
+        hot_until: AtomicU64::new(0),
     })
 }
 
@@ -672,6 +684,7 @@ pub(crate) fn flush(b: &Backend) {
         for (img, subs, start) in &jobs {
             match detile(b, img, subs, &mut linear[*start as usize..], *start) {
                 Ok(regions) => {
+                    img.written[3].fetch_add(1, Ordering::Relaxed);
                     STATS[1].fetch_add(1, Ordering::Relaxed);
                     STATS[2].fetch_add(subs.iter().map(|s| s.bytes).sum::<u64>(), Ordering::Relaxed);
                     copies.push((img.image, regions));
@@ -867,6 +880,97 @@ pub(crate) fn format_bytes(f: vk::Format) -> u32 {
         | F::A4R4G4B4_UNORM_PACK16 => 2,
         F::R8_UNORM | F::R8_UINT | F::R8_SNORM | F::R8_SINT => 1,
         _ => 0,
+    }
+}
+
+/// Textures the title fills that changed without an API call saying so
+/// (movie frames, glyph atlases: the CPU writes them in place). At each
+/// present their memory's fingerprint (three 16 KiB windows,
+/// `texture::fingerprint`) is compared: every texture that changed in the
+/// last 120 frames, and up to [`ROUND`] others in turn. A changed one is
+/// filled again at the next flush. (The D3D12 path watched pages for this;
+/// a fingerprint of a few windows is the cheap form of the same check.)
+pub(crate) fn refresh(b: &Backend, frame: u64) {
+    const ROUND: usize = 256;
+    static CURSOR: Mutex<Option<Key>> = Mutex::new(None);
+    let candidates: Vec<Arc<Image>> = {
+        let guard = registry();
+        let Some(r) = guard.as_ref() else { return };
+        let mut cursor = lock(&CURSOR);
+        let mut out: Vec<Arc<Image>> = r
+            .images
+            .values()
+            .filter(|i| !i.card_written && i.hot_until.load(Ordering::Relaxed) >= frame)
+            .cloned()
+            .collect();
+        let start = cursor.unwrap_or(Key {
+            address: 0,
+            dimension: 0,
+            width: 0,
+            height: 0,
+            depth_or_array: 0,
+            mips: 0,
+            element: 0,
+            samples: 0,
+            depth: false,
+        });
+        let mut last = None;
+        for (k, i) in r.images.range(start..).filter(|(_, i)| !i.card_written).take(ROUND) {
+            out.push(i.clone());
+            last = Some(*k);
+        }
+        *cursor = match last {
+            Some(mut k) => {
+                k.samples += 1;
+                Some(k)
+            }
+            None => None,
+        };
+        out
+    };
+    let mut changed = Vec::new();
+    for img in candidates {
+        if img.bytes == 0 || img.pending.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Only memory with a CPU view at its own address.
+        if !super::cpu_readable(b, img.key.address, img.bytes) {
+            continue;
+        }
+        let h = crate::texture::fingerprint(img.key.address, img.bytes).max(1);
+        let was = img.hash.swap(h, Ordering::Relaxed);
+        if was != 0 && was != h {
+            img.hot_until.store(frame + 120, Ordering::Relaxed);
+            if !img.pending.swap(true, Ordering::Relaxed) {
+                changed.push(img);
+            }
+        }
+    }
+    if !changed.is_empty() {
+        STATS[4].fetch_add(changed.len() as u64, Ordering::Relaxed);
+        if let Some(r) = registry().as_mut() {
+            r.pending.extend(changed);
+        }
+    }
+}
+
+/// Diagnostics: the image of `resource` and what wrote it.
+pub(crate) fn describe(b: &Backend, resource: This) -> String {
+    match of_resource(b, resource) {
+        Some(i) => format!(
+            "image {} at {:#x} {:?} {}x{} card_written={} draws={} clears={} copies={} fills={}",
+            i.id,
+            i.key.address,
+            i.format,
+            i.extent.width,
+            i.extent.height,
+            i.card_written,
+            i.written[0].load(Ordering::Relaxed),
+            i.written[1].load(Ordering::Relaxed),
+            i.written[2].load(Ordering::Relaxed),
+            i.written[3].load(Ordering::Relaxed),
+        ),
+        None => "no image".into(),
     }
 }
 

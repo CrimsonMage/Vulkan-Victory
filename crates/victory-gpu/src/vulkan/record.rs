@@ -113,6 +113,8 @@ pub(crate) struct Rec {
     bound_compute: vk::Pipeline,
     /// Images the recording names (kept alive until the list is reset).
     keep: Vec<Arc<Image>>,
+    /// The open pass's attachment images (draws are counted on them).
+    attached: Vec<Arc<Image>>,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -143,6 +145,7 @@ impl Default for Rec {
             bound: vk::Pipeline::null(),
             bound_compute: vk::Pipeline::null(),
             keep: Vec::new(),
+            attached: Vec::new(),
         }
     }
 }
@@ -605,6 +608,7 @@ impl Rec {
             b.host.device.cmd_clear_color_image(cmd, image.image, vk::ImageLayout::GENERAL, &value, &[range]);
             images::full_barrier(&b.host.device, cmd);
         }
+        image.written[1].fetch_add(1, Ordering::Relaxed);
         self.keep.push(image);
     }
 
@@ -659,6 +663,7 @@ impl Rec {
             extent: (u32::MAX, u32::MAX),
         };
         let mut formats = [vk::Format::UNDEFINED; 8];
+        let mut att: Vec<Arc<Image>> = Vec::new();
         let mut depth_format = vk::Format::UNDEFINED;
         for i in 0..self.color_count as usize {
             if let Some(r) = self.colors[i]
@@ -667,7 +672,7 @@ impl Rec {
                 key.colors[i] = view;
                 formats[i] = format;
                 key.extent = (key.extent.0.min(extent.0), key.extent.1.min(extent.1));
-                self.keep.push(image);
+                att.push(image);
             }
         }
         if let Some(r) = self.depth
@@ -676,11 +681,13 @@ impl Rec {
             key.depth = view;
             depth_format = format;
             key.extent = (key.extent.0.min(extent.0), key.extent.1.min(extent.1));
-            self.keep.push(image);
+            att.push(image);
         }
         if key.extent.0 == u32::MAX {
             return None;
         }
+        self.keep.extend(att.iter().cloned());
+        self.attached = att;
         self.targets_changed = false;
         if let Some((open, ..)) = &self.pass
             && *open == key
@@ -965,7 +972,31 @@ impl Rec {
         if let Some(cmd) = self.prepare_draw(b, false) {
             // SAFETY: rendering open, pipeline bound.
             unsafe { b.host.device.cmd_draw(cmd, vertices, instances, first, first_instance) };
-            STATS[0].fetch_add(1, Ordering::Relaxed);
+            self.drawn(&format!("draw {vertices}x{instances}"));
+        }
+    }
+
+    /// Counts a recorded draw, on the attachments too; diagnostics builds
+    /// describe the first ones.
+    fn drawn(&self, what: &str) {
+        let n = STATS[0].fetch_add(1, Ordering::Relaxed);
+        for i in &self.attached {
+            i.written[0].fetch_add(1, Ordering::Relaxed);
+        }
+        if cfg!(feature = "diagnostics") && n < 24 {
+            let names = crate::pipeline::parts(self.pipeline)
+                .map(|(s, _)| s.iter().map(|s| format!("{}:{}", s.stage, s.name)).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            let targets: Vec<String> = self.attached.iter().map(|i| format!("{}@{:#x} {:?} {}x{}", i.id, i.key.address, i.format, i.extent.width, i.extent.height)).collect();
+            tracing::info!(
+                what,
+                pipeline = %names,
+                viewports = ?self.viewports.iter().map(|v| (v.x, v.y, v.width, v.height)).collect::<Vec<_>>(),
+                scissors = ?self.scissors.iter().map(|s| (s.offset.x, s.offset.y, s.extent.width, s.extent.height)).collect::<Vec<_>>(),
+                topology = self.topology,
+                targets = ?targets,
+                "Vulkan: a draw recorded"
+            );
         }
     }
 
@@ -985,7 +1016,7 @@ impl Rec {
                 b.host.device.cmd_bind_index_buffer(cmd, buffer, offset, ty);
                 b.host.device.cmd_draw_indexed(cmd, indices, instances, first, base, first_instance);
             }
-            STATS[0].fetch_add(1, Ordering::Relaxed);
+            self.drawn(&format!("indexed {indices}x{instances}"));
         }
     }
 
@@ -997,7 +1028,7 @@ impl Rec {
         if let Some(cmd) = self.prepare_draw(b, true) {
             // SAFETY: rendering open, a mesh pipeline bound.
             unsafe { mesh.cmd_draw_mesh_tasks(cmd, x.max(1), y.max(1), z.max(1)) };
-            STATS[0].fetch_add(1, Ordering::Relaxed);
+            self.drawn(&format!("mesh {x}x{y}x{z}"));
         }
     }
 
@@ -1093,6 +1124,7 @@ impl Rec {
             regions.push(vk::ImageCopy::default().src_subresource(layers(&si)).dst_subresource(layers(&di)).extent(ext));
         }
         self.copy_images(b, &si, &di, &regions);
+        di.written[2].fetch_add(1, Ordering::Relaxed);
         self.keep.extend([si, di]);
     }
 
@@ -1129,6 +1161,7 @@ impl Rec {
                     .dst_offset(vk::Offset3D { x: x as i32, y: y as i32, z: z as i32 })
                     .extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
                 self.copy_images(b, &si, &di, &[region]);
+                di.written[2].fetch_add(1, Ordering::Relaxed);
                 self.keep.extend([si, di]);
             }
             (Some(di), None) if src.kind == 1 => {
@@ -1155,6 +1188,7 @@ impl Rec {
                     b.host.device.cmd_copy_buffer_to_image(cmd, buffer, di.image, vk::ImageLayout::GENERAL, &[region]);
                     images::full_barrier(&b.host.device, cmd);
                 }
+                di.written[2].fetch_add(1, Ordering::Relaxed);
                 self.keep.push(di);
             }
             (None, Some(si)) if dst.kind == 1 => {
@@ -1240,6 +1274,7 @@ pub(crate) fn report() {
         fills = i[1],
         filled_mb = i[2] >> 20,
         images_refused = i[3],
+        refills_by_fingerprint = i[4],
         "Vulkan: draws recorded"
     );
 }

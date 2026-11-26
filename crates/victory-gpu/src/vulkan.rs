@@ -598,6 +598,9 @@ fn compose_test() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_VK_COMPOSE_TEST").is_ok_and(|v| v == "1"))
 }
 
+/// The buffer plane texels are read back into (diagnostics).
+static PROBE: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
+
 /// The buffer captures are read back into.
 static READBACK: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
 /// Presents that showed at least one plane.
@@ -859,6 +862,14 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
         m.rebuild_map();
     }
     (m.map.generation, m.map.block(zero, sink))
+}
+
+/// Whether `[at, at + len)` is title memory the CPU reads at its own
+/// address (not the pool's GPU view, whose pages live elsewhere).
+fn cpu_readable(b: &Backend, at: u64, len: u64) -> bool {
+    let m = memory(b);
+    !m.pools.iter().any(|p| at < p.title_start + p.len && at + len > p.title_start)
+        && m.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| at + len <= (a + r.len) as u64)
 }
 
 /// The buffer and offset of title address `title`.
@@ -1141,6 +1152,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
         e.pump(b, true);
         split(Split::Submit, t);
     }
+    images::refresh(b, frame);
     let presented = Instant::now();
     memory(b).tick = frame;
     let mut sc = lock(&b.present);
@@ -1211,6 +1223,28 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     let extent = s.extent;
     let bgra = matches!(s.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
     let test = compose_test();
+    if test {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!("Vulkan: the compose test colour (magenta) is cleared under the planes"));
+    }
+    // Diagnostics: at captured frames, what wrote each plane's image, and a
+    // few texels of plane 0 read back.
+    let probe = (cfg!(feature = "diagnostics") && capture.is_some())
+        .then(|| planes.first().and_then(|p| images::of_resource(b, p.resource)))
+        .flatten()
+        .filter(|i| !i.depth());
+    if capture.is_some() && cfg!(feature = "diagnostics") {
+        for (n, p) in planes.iter().enumerate() {
+            tracing::info!(frame, plane = n, what = %images::describe(b, p.resource), "Vulkan: a plane at a captured frame");
+        }
+    }
+    let probe_buffer = probe.as_ref().and_then(|_| {
+        let mut pb = lock(&PROBE);
+        if pb.is_none() {
+            *pb = victory_vk::memory::Buffer::new(&b.host, 256, vk::BufferUsageFlags::TRANSFER_DST, victory_vk::memory::Place::Readback).ok();
+        }
+        pb.as_ref().map(|p| (p.buffer, p.mapped as usize))
+    });
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
             float32: if test { [1.0, 0.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] },
@@ -1233,6 +1267,28 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&barrier));
             if compose::record(b, cmd, t, planes) {
                 PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
+            }
+            if let (Some(img), Some((pbuf, _))) = (&probe, probe_buffer) {
+                // Four texels: the centre and a quarter in, of mip 0 layer 0.
+                let (w, h) = (img.extent.width, img.extent.height);
+                let at = [(w / 2, h / 2), (w / 4, h / 4), (3 * w / 4, h / 4), (w / 4, 3 * h / 4)];
+                let regions: Vec<vk::BufferImageCopy> = at
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &(x, y))| {
+                        vk::BufferImageCopy::default()
+                            .buffer_offset(k as u64 * 16)
+                            .image_subresource(vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            })
+                            .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
+                            .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+                    })
+                    .collect();
+                d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, pbuf, &regions);
             }
             if let Some((buffer, _, _)) = capture {
                 let range = victory_vk::swapchain::color_range();
@@ -1273,6 +1329,12 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
             // copy into it has finished.
             let rows = unsafe { std::slice::from_raw_parts(mapped as *const u8, size as usize) };
             crate::capture::save(frame, extent.width, extent.height, extent.width as usize * 4, bgra, rows);
+            if let (Some(img), Some((_, mapped))) = (&probe, probe_buffer) {
+                // SAFETY: 64 bytes of the mapped probe buffer, copied into.
+                let texels = unsafe { std::slice::from_raw_parts(mapped as *const u8, 64) };
+                let hex: Vec<String> = texels.chunks(16).map(|c| c[..images::format_bytes(img.format).clamp(1, 16) as usize].iter().map(|x| format!("{x:02x}")).collect()).collect();
+                tracing::info!(frame, format = ?img.format, texels = ?hex, "Vulkan: plane 0 texels (centre, then three quarter points)");
+            }
         }
     }
     if let Err(e) = r {
