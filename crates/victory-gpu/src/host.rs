@@ -1255,6 +1255,17 @@ struct Deferred {
     /// Windows over scattered pages the list names (`crate::gather`):
     /// their pages the title changed since are copied in before it runs.
     windows: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    /// Pool memory the list names by directory (`crate::memory::named`):
+    /// the ranges whose pages the card's page cache should hold, and the
+    /// ranges its shaders write that way (address, bytes).
+    pool: Vec<(u64, u64)>,
+    pool_writes: Vec<(u64, u64)>,
+    /// Title memory the heap's unordered access views name, for shaders of
+    /// the list that pick buffers by index and write them (from, to).
+    pool_heap: Vec<(u64, u64)>,
+    /// Pool views of the heap that shaders picking by index may read
+    /// (address, bytes).
+    pool_maybe: Vec<(u64, u64)>,
 }
 
 impl Deferred {
@@ -2181,6 +2192,9 @@ impl Host {
         let part = phase(Phase::Upkeep, part);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut batch = Batch::default();
+        // Where each title list ends in `lists`: what the card's page cache
+        // copies back after it goes there.
+        let mut ends = Vec::with_capacity(runs.len());
         for list in runs {
             list.run_deferred(&mut batch);
             // Windows over scattered pages (the fallback): what the title
@@ -2193,11 +2207,20 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            ends.push(lists.len());
         }
         // The directory of title memory: entries written since (remaps,
-        // pages named), ahead of every list of this submission
+        // pages named) and the pool pages the card's page cache takes in,
+        // ahead of every list of this submission; after each list, what its
+        // shaders wrote into cached pages goes back to the pages
         // (`crate::memory`).
-        if let Some(directory) = crate::memory::flush() {
+        let (head, after) = crate::memory::flush(runs, this_submission);
+        for (end, after) in ends.into_iter().zip(after).rev() {
+            if let Some(after) = after {
+                lists.insert(end, Some(after));
+            }
+        }
+        if let Some(directory) = head {
             lists.insert(0, Some(directory));
         }
         // What its shaders write in place, announced once it has finished.
@@ -2492,6 +2515,15 @@ impl HostList {
     /// by index (`crate::indirect`).
     pub(crate) fn wrote_heap(&self, uavs: Option<&[(u64, u64)]>) {
         self.indirect().wrote_heap(uavs);
+        // Pool pages there are not cached on the card while such shaders
+        // write them (`crate::memory`).
+        match uavs {
+            Some(uavs) if self.first_use(uavs.as_ptr() as usize | 1 << 60) => {
+                self.deferred().pool_heap.extend_from_slice(uavs);
+            }
+            Some(_) => {}
+            None => crate::memory::heap_written_unknown(),
+        }
     }
 
     /// The list's bounded indirect records (`crate::indirect`).
@@ -2948,6 +2980,50 @@ impl HostList {
     /// the first time since its reset.
     pub(crate) fn name_window(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         self.deferred().windows.push(shadow.clone());
+    }
+
+    /// The list names pool memory by directory (`crate::memory::named`):
+    /// `[address, address + cache)` for the card's page cache, and with
+    /// `writes` its shaders write `[address, address + writes)` that way.
+    pub(crate) fn name_pool(&self, address: u64, cache: u64, writes: Option<u64>) {
+        let mut deferred = self.deferred();
+        if cache > 0 {
+            deferred.pool.push((address, cache));
+        }
+        if let Some(len) = writes {
+            deferred.pool_writes.push((address, len));
+        }
+    }
+
+    /// The list's shaders that pick buffers from the heap by index may read
+    /// the pool view `[address, address + len)` (`crate::memory::named_heap`).
+    pub(crate) fn name_pool_maybe(&self, address: u64, len: u64) {
+        self.deferred().pool_maybe.push((address, len));
+    }
+
+    /// For the card's page cache at submission (`crate::memory::flush`):
+    /// the pool ranges the list names, those its shaders write by
+    /// directory, and the other title memory its shaders or card copies
+    /// write (in place: the pages' own memory).
+    pub(crate) fn pool_names(&self) -> crate::memory::Named {
+        let deferred = self.deferred();
+        let by_directory: crate::fast::FastSet<(u64, u64)> = deferred.pool_writes.iter().copied().collect();
+        let other = deferred
+            .copies
+            .iter()
+            .filter_map(|step| match *step {
+                Step::GpuWrite(address, len) => Some((address as u64, len as u64)),
+                _ => None,
+            })
+            .filter(|w| !by_directory.contains(w))
+            .collect();
+        crate::memory::Named {
+            reads: deferred.pool.clone(),
+            writes: deferred.pool_writes.clone(),
+            other,
+            heap: deferred.pool_heap.clone(),
+            maybe: deferred.pool_maybe.clone(),
+        }
     }
 
     /// Shaders of the list write `[address, address + len)` of title

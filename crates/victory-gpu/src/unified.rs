@@ -815,6 +815,8 @@ pub(crate) fn written(at: usize, len: usize) {
         epochs().write(at as u64, len as u64);
         // Windows over those pages take them again (`crate::gather`).
         crate::gather::written(at as u64, len as u64);
+        // So do the card's copies of pool pages (`crate::memory`).
+        crate::memory::written(at as u64, len as u64);
     }
 }
 

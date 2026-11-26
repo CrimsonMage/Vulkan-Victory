@@ -532,6 +532,57 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
     CPU steps of later submissions that read it wait for it, textures over
     it detile again once it ran, and windows over the same pages copy
     them in again.
+- **The card's page cache for the pool** (`memory/cache.rs`). Pool pages
+  are streamed once and then read by the card over and over, so their home
+  on the PC is the card's memory (`docs/kiss.md`, "Unified memory on split
+  hardware"). A *physical* pool page (a section page) that a list names
+  through a pool view (a root view: its first 128 KiB) gets a copy in a
+  64 MiB block of the card's memory (1,024 slots of 64 KiB, each block one
+  more copy number of the directory, a raw view as a section is), one copy
+  however many title pages show the page; the entry of every title page
+  that shows it (GPU view, CPU view, pool view) names the slot. The
+  mirror keeps the section entries; the slot is put in when the blocks go
+  to the card (`Memory::record_head`), and a page that comes or goes marks
+  the blocks of all its title pages. No translator change.
+  - *Taken in once*, at the head of the first submission that names it
+    (at most 512 MiB of new pages per submission; the rest is read from
+    the section that time), and again only when the title announces a
+    change: DirectStorage completion, file reads, title copies on the CPU,
+    page mappings (`unified::written` queues the section pages; the next
+    head list copies them in). An announced write into a page the
+    directory shows but no list named yet takes it in ahead, into room the
+    cache has (64 MiB per submission). Pool views of the heap that shaders
+    picking by index may read (`heap_buffers`) also only go into room.
+  - *Shader writes* (declared: pool views written by directory) land in the
+    slot. Each such page has a *twin* slot holding what the slot held
+    before the list; a list of ours right after the list compares slot and
+    twin 16 bytes per thread and stores only the words that changed into
+    the section page (and the twin). Words the title's CPU wrote meanwhile,
+    announced or not, are never overwritten by one the shaders left alone
+    (the window copy-out overwrote whole declared ranges). Pages are clean
+    again after every list, so later lists' windows and in-place buffers,
+    CPU steps, read-backs and textures see the writes, and eviction copies
+    nothing back. Writes into a cached page through its own memory
+    (in-place buffers, title copies on the card) copy it in again after
+    the list. Pages that shaders picking buffers from the heap by index
+    may write (the heap's unordered access views; not declared view by
+    view) are evicted before such a list and not cached for 120 frames:
+    their writes go to the section page, as before.
+  - *Room*: blocks are made while the card's memory in use stays under 90%
+    of the layer's budget (`memcap`; the line where idle texture copies
+    start to go), and one block is given back per submission while it is
+    over 95% (its pages evicted; its copy number's views nulled once that
+    submission has finished, then reused). With no room, the least
+    recently named page goes (a clock by frame), never one named in this
+    frame or the last: a working set larger than the cache keeps what it
+    holds and reads the rest from the sections instead of churning. A slot
+    is reused only in a later head list (queue order).
+  - shortcut: raw-address code's writes into pool pages are not declared:
+    with the cache they land in the slot and are lost when it is taken in
+    again or evicted (the structure builder is off by default).
+  - shortcut: inside one list, a page written by directory and read
+    through an in-place buffer or a window shows the bytes from before the
+    list (they reach the page right after it).
 - **Windows over scattered pages** (`gather.rs`), the fallback for what
   the directory cannot express: index and vertex buffers, indirect
   arguments, title copies on the card, typed buffer views, root views of
@@ -645,7 +696,10 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   the ask on average; buffers named by lists: in place (read over the bus)
   X MB, pool by directory P MB, windows Z MB (the fallback, copies on the
   card; gathers n, M MB), not in place (filled at submission) Y MB;
-  directory blocks copied n; dispatch binding ms/n: whole, skipped,
+  directory blocks copied n; pool page cache: C MB cached (twins T MB; B
+  blocks, M MB of the card; H MB held off for heap-picked writes), taken in
+  U MB, written back W MB (pages compared, changed words stored), evicted
+  E MB, pool pages named served from the card S%; dispatch binding ms/n: whole, skipped,
   tables, by-address memory, root views; top pipelines (ms of a
   sampled frame, of A in all): name ms; …` (`frametime.rs`). All per
   frame. B and I come from GPU timestamps around each submission (B + I ≈
@@ -691,6 +745,12 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
 
 ### Risks of this build
 
+0. **Pool page cache.** Taken in grows with every new page named and with
+   announced changes; in a steady scene it should be near 0 and evicted
+   near 0 (both high every frame: the working set is larger than the
+   room, and S% says how much is served from the card). Wrong pixels on
+   GPU-written geometry within a list, or pages that lose shader writes
+   (raw-address code), point at the two shortcuts above.
 1. **Bus bandwidth.** In-place buffers are read over PCIe 4 x8. If the GPU
    time per frame rises, look at which buffers are read most (stage 5 of
    section 9: copy big read-mostly buffers to the card at DirectStorage

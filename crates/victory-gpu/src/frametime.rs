@@ -797,11 +797,12 @@ pub(crate) fn frame() {
     let ahead = crate::texture::ahead::line();
     #[cfg(not(windows))]
     let ahead = String::new();
+    let cache = crate::memory::cache_text(frames);
     tracing::info!(
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; {lists}; translation into our lists {:.1} ms (summed; {calls}); \
          in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms; first uploads detiled by the copy-queue workers {:.1} ms, {ahead}), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, pool by directory {:.0} MB, windows {:.0} MB (the fallback, \
-         copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {dispatch}; {indirect}; {pipes}",
+         copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {cache}; {dispatch}; {indirect}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
