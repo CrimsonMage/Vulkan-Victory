@@ -19,8 +19,15 @@ const MAGIC: &[u8; 8] = b"vkstage1";
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = crate::pipeline::cache_dir()?.with_file_name("vulkan-stages");
-        std::fs::create_dir_all(&dir).ok()?;
+        let Some(dir) = crate::pipeline::cache_dir().map(|d| d.with_file_name("vulkan-stages")) else {
+            tracing::warn!("Vulkan: no cache folder: translations are not kept");
+            return None;
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "Vulkan: translations are not kept");
+            return None;
+        }
+        tracing::info!(dir = %dir.display(), key = key(), "Vulkan: translations kept on disk");
         Some(dir)
     })
     .as_ref()

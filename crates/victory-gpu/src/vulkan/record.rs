@@ -28,18 +28,28 @@ use victory_vk::timeline::Recording;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::images::{self, Image, ViewKey};
-use super::stages::{self, Lookup, Stage};
+use super::stages::{self, Stage};
 use super::{Backend, lock};
 use crate::descriptor::RtvRecord;
 use crate::draw::{IndexView, VertexView};
-use crate::list::{CopyLocation, Rect};
+use crate::list::Rect;
 use crate::object::This;
 use victory_shader::{HwStage, RootType};
 
+mod copy;
+mod link;
+mod state;
+
+use state::d3d_flip;
+
+use link::{LinkKey, attributes, draw_test, empty_fragment, fullscreen_vertex, layout_text, link, part, solid_fragment, stage_of};
+
 /// Counters for the 10 s line: draws recorded, dispatches, skipped (stage
 /// not ready), skipped (stage failed or no pipeline), skipped (other:
-/// indirect, MSAA, unknown topology), command buffers, links.
-pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// indirect, MSAA, unknown topology), command buffers, links, maps bound
+/// again inside a command buffer, draws whose first table the bound map
+/// does not reach (diagnostics).
+pub(crate) static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 #[derive(Default, Clone)]
 struct Root {
@@ -91,6 +101,10 @@ struct PassKey {
 /// What a list records with, between its calls.
 pub(crate) struct Rec {
     cmd: Option<Recording>,
+    /// The map generation the command buffer has bound, and whether an
+    /// address was named since (the map may need a newer block).
+    map_gen: u64,
+    touched: bool,
     /// The statistics query of the command buffer (diagnostics).
     query: Option<u32>,
     pipeline: This,
@@ -133,6 +147,8 @@ impl Default for Rec {
     fn default() -> Rec {
         Rec {
             cmd: None,
+            map_gen: 0,
+            touched: false,
             query: None,
             pipeline: std::ptr::null(),
             graphics: Root::default(),
@@ -182,46 +198,6 @@ pub(crate) fn forget(list: This) {
     let rec = lock(&RECS).as_mut().and_then(|m| m.remove(&(list as usize)));
     if let (Some(mut rec), Some(b)) = (rec, super::backend()) {
         rec.abandon(b);
-    }
-}
-
-/// A D3D viewport as Vulkan's, flipped (negative height): the console's
-/// programs put +y up, as D3D does.
-fn d3d_flip(v: &D3D12_VIEWPORT) -> vk::Viewport {
-    let (w, h) = (v.Width.max(1.0), v.Height.max(1.0));
-    vk::Viewport {
-        x: v.TopLeftX,
-        y: v.TopLeftY + h,
-        width: w,
-        height: -h,
-        min_depth: v.MinDepth.clamp(0.0, 1.0),
-        max_depth: v.MaxDepth.clamp(0.0, 1.0),
-    }
-}
-
-fn blend_factor(f: D3D12_BLEND) -> vk::BlendFactor {
-    use vk::BlendFactor as B;
-    match f.0 {
-        1 => B::ZERO,
-        2 => B::ONE,
-        3 => B::SRC_COLOR,
-        4 => B::ONE_MINUS_SRC_COLOR,
-        5 => B::SRC_ALPHA,
-        6 => B::ONE_MINUS_SRC_ALPHA,
-        7 => B::DST_ALPHA,
-        8 => B::ONE_MINUS_DST_ALPHA,
-        9 => B::DST_COLOR,
-        10 => B::ONE_MINUS_DST_COLOR,
-        11 => B::SRC_ALPHA_SATURATE,
-        14 => B::CONSTANT_COLOR,
-        15 => B::ONE_MINUS_CONSTANT_COLOR,
-        16 => B::SRC1_COLOR,
-        17 => B::ONE_MINUS_SRC1_COLOR,
-        18 => B::SRC1_ALPHA,
-        19 => B::ONE_MINUS_SRC1_ALPHA,
-        20 => B::CONSTANT_ALPHA,
-        21 => B::ONE_MINUS_CONSTANT_ALPHA,
-        _ => B::ONE,
     }
 }
 
@@ -276,381 +252,6 @@ fn target_view(b: &Backend, r: &RtvRecord, depth: bool) -> Option<(Arc<Image>, v
     Some((image, view, format, extent))
 }
 
-/// Fast-linked pipelines by their parts and keys.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct LinkKey {
-    pre: vk::Pipeline,
-    fragment: vk::Pipeline,
-    colors: [vk::Format; 8],
-    count: u32,
-    depth: vk::Format,
-    inputs: Vec<(u32, u32, vk::Format, u32)>,
-}
-
-static LINKS: Mutex<Option<HashMap<LinkKey, vk::Pipeline>>> = Mutex::new(None);
-static PARTS: Mutex<Option<HashMap<(Vec<(u32, u32, vk::Format, u32)>, [vk::Format; 8], u32, vk::Format, bool), vk::Pipeline>>> =
-    Mutex::new(None);
-
-fn library_flags(b: &Backend) -> vk::PipelineCreateFlags {
-    let mut f = vk::PipelineCreateFlags::LIBRARY_KHR;
-    if b.host.caps.descriptor_buffer {
-        f |= vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT;
-    }
-    f
-}
-
-/// The vertex-input part (`inputs`: location, binding, format, offset) or
-/// the fragment-output part (formats), made once each.
-fn part(b: &Backend, inputs: &[(u32, u32, vk::Format, u32)], colors: [vk::Format; 8], count: u32, depth: vk::Format, output: bool) -> Option<vk::Pipeline> {
-    let key = (inputs.to_vec(), colors, count, depth, output);
-    let mut guard = lock(&PARTS);
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(&p) = map.get(&key) {
-        return Some(p);
-    }
-    let layout = stages::layout(b)?;
-    use vk::DynamicState as D;
-    let mut flags = vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE;
-    let mut states = vec![D::PRIMITIVE_TOPOLOGY, D::PRIMITIVE_RESTART_ENABLE, D::VERTEX_INPUT_BINDING_STRIDE];
-    if output {
-        flags = vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE;
-        states = vec![D::BLEND_CONSTANTS];
-        if b.host.caps.dynamic_blend {
-            states.extend([D::COLOR_BLEND_ENABLE_EXT, D::COLOR_BLEND_EQUATION_EXT, D::COLOR_WRITE_MASK_EXT]);
-        }
-        if b.host.caps.dynamic_raster {
-            states.extend([D::SAMPLE_MASK_EXT, D::ALPHA_TO_COVERAGE_ENABLE_EXT]);
-        }
-    }
-    let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
-    let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(flags);
-    let formats = &colors[..count as usize];
-    let stencil = matches!(depth, vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT);
-    let mut rendering = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(formats)
-        .depth_attachment_format(depth)
-        .stencil_attachment_format(if stencil { depth } else { vk::Format::UNDEFINED });
-    let mut bindings: Vec<vk::VertexInputBindingDescription> = Vec::new();
-    for &(_, binding, _, _) in inputs {
-        if !bindings.iter().any(|x| x.binding == binding & 0xff) {
-            bindings.push(
-                vk::VertexInputBindingDescription::default()
-                    .binding(binding & 0xff)
-                    .stride(0)
-                    .input_rate(if binding & 0x100 != 0 { vk::VertexInputRate::INSTANCE } else { vk::VertexInputRate::VERTEX }),
-            );
-        }
-    }
-    let attributes: Vec<vk::VertexInputAttributeDescription> = inputs
-        .iter()
-        .map(|&(location, binding, format, offset)| {
-            vk::VertexInputAttributeDescription::default()
-                .location(location)
-                .binding(binding & 0xff)
-                .format(format)
-                .offset(offset)
-        })
-        .collect();
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_binding_descriptions(&bindings)
-        .vertex_attribute_descriptions(&attributes);
-    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-    let attachments: Vec<vk::PipelineColorBlendAttachmentState> = (0..count)
-        .map(|_| vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA))
-        .collect();
-    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
-    let samples = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let mut info = vk::GraphicsPipelineCreateInfo::default()
-        .flags(library_flags(b))
-        .dynamic_state(&dyn_info)
-        .push_next(&mut library);
-    if output {
-        info = info
-            .color_blend_state(&blend)
-            .multisample_state(&samples)
-            .layout(layout.pipeline)
-            .push_next(&mut rendering);
-    } else {
-        info = info.vertex_input_state(&vertex_input).input_assembly_state(&assembly);
-    }
-    // SAFETY: valid create infos.
-    let p = unsafe { b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None) }.ok()?[0];
-    map.insert(key, p);
-    Some(p)
-}
-
-/// A fragment part without a shader (depth-only pipelines).
-fn empty_fragment(b: &Backend) -> Option<vk::Pipeline> {
-    static EMPTY: std::sync::OnceLock<Option<vk::Pipeline>> = std::sync::OnceLock::new();
-    *EMPTY.get_or_init(|| {
-        let layout = stages::layout(b)?;
-        use vk::DynamicState as D;
-        let states = [
-            D::DEPTH_TEST_ENABLE,
-            D::DEPTH_WRITE_ENABLE,
-            D::DEPTH_COMPARE_OP,
-            D::DEPTH_BOUNDS_TEST_ENABLE,
-            D::DEPTH_BOUNDS,
-            D::STENCIL_TEST_ENABLE,
-            D::STENCIL_OP,
-            D::STENCIL_COMPARE_MASK,
-            D::STENCIL_WRITE_MASK,
-            D::STENCIL_REFERENCE,
-        ];
-        let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
-        let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
-        let mut rendering = vk::PipelineRenderingCreateInfo::default();
-        let depth = vk::PipelineDepthStencilStateCreateInfo::default();
-        let samples = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let info = vk::GraphicsPipelineCreateInfo::default()
-            .flags(library_flags(b))
-            .layout(layout.pipeline)
-            .dynamic_state(&dyn_info)
-            .depth_stencil_state(&depth)
-            .multisample_state(&samples)
-            .push_next(&mut library)
-            .push_next(&mut rendering);
-        // SAFETY: valid create infos.
-        unsafe { b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None) }.ok().map(|p| p[0])
-    })
-}
-
-fn link(b: &Backend, key: LinkKey, vertex_input: Option<vk::Pipeline>, output: vk::Pipeline) -> Option<vk::Pipeline> {
-    let mut guard = lock(&LINKS);
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(&p) = map.get(&key) {
-        return Some(p);
-    }
-    let layout = stages::layout(b)?;
-    let mut libs = vec![key.pre, key.fragment, output];
-    if let Some(vi) = vertex_input {
-        libs.push(vi);
-    }
-    let mut libraries = vk::PipelineLibraryCreateInfoKHR::default().libraries(&libs);
-    let flags = if b.host.caps.descriptor_buffer {
-        vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT
-    } else {
-        vk::PipelineCreateFlags::empty()
-    };
-    let info = vk::GraphicsPipelineCreateInfo::default()
-        .flags(flags)
-        .layout(layout.pipeline)
-        .push_next(&mut libraries);
-    // SAFETY: valid create infos over live parts.
-    let p = unsafe { b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None) }.ok()?[0];
-    STATS[6].fetch_add(1, Ordering::Relaxed);
-    map.insert(key, p);
-    Some(p)
-}
-
-fn stage_of(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], name: &str) -> Result<Option<Arc<Stage>>, bool> {
-    let Some(s) = shaders.iter().find(|s| s.stage == name) else {
-        return Ok(None);
-    };
-    match stages::lookup(b, s) {
-        Lookup::Ready(st) => Ok(Some(st)),
-        Lookup::Waiting => Err(true),
-        Lookup::Failed => Err(false),
-    }
-}
-
-/// The vertex attributes of a fetch-shader program (ABI section 6) from
-/// the title's input layout: (location, binding | 0x100 per instance,
-/// format, offset). D3D12's "append aligned" offsets follow the elements
-/// before them in the same slot.
-fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState) -> Vec<(u32, u32, vk::Format, u32)> {
-    if pre.inputs.is_empty() {
-        return Vec::new();
-    }
-    // Every element's offset, in layout order.
-    let mut ends = [0u32; 32];
-    let offsets: Vec<u32> = gs
-        .inputs
-        .iter()
-        .map(|e| {
-            let slot = (e.InputSlot as usize).min(31);
-            let at = if e.AlignedByteOffset == u32::MAX { ends[slot] } else { e.AlignedByteOffset };
-            let bytes = crate::resource::element(e.Format.0 as u32).map_or(4, |(b, _)| b as u32);
-            ends[slot] = at + bytes;
-            at
-        })
-        .collect();
-    let mut out = Vec::new();
-    for (semantic, index, location) in &pre.inputs {
-        let found = gs.inputs.iter().zip(&offsets).find(|(e, _)| {
-            // SAFETY: the element's name points into the state's names.
-            let name = unsafe { e.SemanticName.to_string() }.unwrap_or_default();
-            name.eq_ignore_ascii_case(semantic) && e.SemanticIndex == *index
-        });
-        if let Some((e, &offset)) = found
-            && let Some(f) = victory_vk::gfx10::from_dxgi(e.Format.0 as u32)
-        {
-            let rate = if e.InputSlotClass.0 == 1 { 0x100 } else { 0 };
-            out.push((u32::from(*location), e.InputSlot | rate, f, offset));
-        }
-    }
-    out
-}
-
-/// Diagnostics: the program's attribute inputs, the title's input layout
-/// and the attributes made of them.
-fn layout_text(pre: &Stage, gs: &crate::pipeline::host::GraphicsState, made: &[(u32, u32, vk::Format, u32)]) -> String {
-    let wants: Vec<String> = pre.inputs.iter().map(|(s, i, l)| format!("{s}{i}@{l}")).collect();
-    let elements: Vec<String> = gs
-        .inputs
-        .iter()
-        .map(|e| {
-            // SAFETY: the element's name points into the state's names.
-            let name = unsafe { e.SemanticName.to_string() }.unwrap_or_default();
-            format!("{name}{} fmt{} slot{} off{:#x} class{}", e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0)
-        })
-        .collect();
-    let attrs: Vec<String> = made.iter().map(|(l, b, f, o)| format!("loc{l} bind{b:#x} {f:?} +{o}")).collect();
-    format!("program wants [{}]; layout [{}]; attributes [{}]", wants.join(", "), elements.join(", "), attrs.join(", "))
-}
-
-/// `VICTORY_VK_DRAW_TEST` (diagnostics): 1 draws with depth, stencil,
-/// culling and blending off and every channel written; 2 also replaces
-/// every pixel program by a constant magenta; 3 also every vertex program
-/// by a triangle over the whole target. A capture then tells draws
-/// that never rasterise from draws that compute zero.
-fn draw_test() -> u32 {
-    static TEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| {
-        let t = if cfg!(feature = "diagnostics") {
-            std::env::var("VICTORY_VK_DRAW_TEST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
-        } else {
-            0
-        };
-        if t > 0 {
-            tracing::info!(test = t, "Vulkan: draw test (VICTORY_VK_DRAW_TEST)");
-        }
-        t
-    })
-}
-
-/// The constant magenta pixel program of draw test 2 (HLSL
-/// `float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }`, compiled
-/// with `glslc -x hlsl`), as a fragment part.
-fn solid_fragment(b: &Backend) -> Option<vk::Pipeline> {
-    const SOLID: &[u32] = &[
-    0x07230203, 0x00010600, 0x000d000b, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000011, 0x00030010, 0x00000004,
-    0x00000007, 0x00030003, 0x00000005, 0x000001f4, 0x000a0004, 0x475f4c47, 0x4c474f4f, 0x70635f45,
-    0x74735f70, 0x5f656c79, 0x656e696c, 0x7269645f, 0x69746365, 0x00006576, 0x00080004, 0x475f4c47,
-    0x4c474f4f, 0x6e695f45, 0x64756c63, 0x69645f65, 0x74636572, 0x00657669, 0x00040005, 0x00000004,
-    0x6e69616d, 0x00000000, 0x00070005, 0x00000011, 0x746e6540, 0x6f507972, 0x4f746e69, 0x75707475,
-    0x00000074, 0x00040047, 0x00000011, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
-    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
-    0x00000004, 0x0004002b, 0x00000006, 0x0000000b, 0x3f800000, 0x0004002b, 0x00000006, 0x0000000c,
-    0x00000000, 0x0007002c, 0x00000007, 0x0000000d, 0x0000000b, 0x0000000c, 0x0000000b, 0x0000000b,
-    0x00040020, 0x00000010, 0x00000003, 0x00000007, 0x0004003b, 0x00000010, 0x00000011, 0x00000003,
-    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0003003e,
-    0x00000011, 0x0000000d, 0x000100fd, 0x00010038
-    ];
-    static PART: std::sync::OnceLock<Option<vk::Pipeline>> = std::sync::OnceLock::new();
-    *PART.get_or_init(|| {
-        let layout = stages::layout(b)?;
-        let d = &b.host.device;
-        // SAFETY: valid create infos; the module is kept with the part.
-        unsafe {
-            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(SOLID), None).ok()?;
-            use vk::DynamicState as D;
-            let states = [
-                D::DEPTH_TEST_ENABLE,
-                D::DEPTH_WRITE_ENABLE,
-                D::DEPTH_COMPARE_OP,
-                D::DEPTH_BOUNDS_TEST_ENABLE,
-                D::DEPTH_BOUNDS,
-                D::STENCIL_TEST_ENABLE,
-                D::STENCIL_OP,
-                D::STENCIL_COMPARE_MASK,
-                D::STENCIL_WRITE_MASK,
-                D::STENCIL_REFERENCE,
-            ];
-            let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
-            let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
-            let mut rendering = vk::PipelineRenderingCreateInfo::default();
-            let depth = vk::PipelineDepthStencilStateCreateInfo::default();
-            let samples = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            let stage = [vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(module).name(c"main")];
-            let info = vk::GraphicsPipelineCreateInfo::default()
-                .flags(library_flags(b))
-                .stages(&stage)
-                .layout(layout.pipeline)
-                .dynamic_state(&dyn_info)
-                .depth_stencil_state(&depth)
-                .multisample_state(&samples)
-                .push_next(&mut library)
-                .push_next(&mut rendering);
-            d.create_graphics_pipelines(stages::cache(b), &[info], None).ok().map(|p| p[0])
-        }
-    })
-}
-
-/// The vertex program of draw test 3: a triangle over the whole target
-/// from the vertex index (HLSL `float4 main(uint id : SV_VertexID) :
-/// SV_Position { float2 t = float2((id << 1) & 2, id & 2); return
-/// float4(t * 2 - 1, 0.5, 1); }`, compiled with `glslc -x hlsl`), as a
-/// pre-rasterisation part.
-fn fullscreen_vertex(b: &Backend) -> Option<vk::Pipeline> {
-    const FULL: &[u32] = &[
-        0x07230203, 0x00010600, 0x000d000b, 0x00000045, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-        0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-        0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000002a, 0x0000002d, 0x00030003,
-        0x00000005, 0x000001f4, 0x000a0004, 0x475f4c47, 0x4c474f4f, 0x70635f45, 0x74735f70, 0x5f656c79,
-        0x656e696c, 0x7269645f, 0x69746365, 0x00006576, 0x00080004, 0x475f4c47, 0x4c474f4f, 0x6e695f45,
-        0x64756c63, 0x69645f65, 0x74636572, 0x00657669, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
-        0x00030005, 0x0000002a, 0x00006469, 0x00070005, 0x0000002d, 0x746e6540, 0x6f507972, 0x4f746e69,
-        0x75707475, 0x00000074, 0x00040047, 0x0000002a, 0x0000000b, 0x0000002a, 0x00040047, 0x0000002d,
-        0x0000000b, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015,
-        0x00000006, 0x00000020, 0x00000000, 0x00030016, 0x00000008, 0x00000020, 0x00040017, 0x00000009,
-        0x00000008, 0x00000004, 0x00040017, 0x0000000e, 0x00000008, 0x00000002, 0x00040015, 0x00000012,
-        0x00000020, 0x00000001, 0x0004002b, 0x00000012, 0x00000013, 0x00000001, 0x0004002b, 0x00000006,
-        0x00000015, 0x00000002, 0x0004002b, 0x00000008, 0x0000001d, 0x40000000, 0x0004002b, 0x00000008,
-        0x0000001f, 0x3f800000, 0x0004002b, 0x00000008, 0x00000022, 0x3f000000, 0x00040020, 0x00000029,
-        0x00000001, 0x00000006, 0x0004003b, 0x00000029, 0x0000002a, 0x00000001, 0x00040020, 0x0000002c,
-        0x00000003, 0x00000009, 0x0004003b, 0x0000002c, 0x0000002d, 0x00000003, 0x0005002c, 0x0000000e,
-        0x00000044, 0x0000001f, 0x0000001f, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
-        0x000200f8, 0x00000005, 0x0004003d, 0x00000006, 0x0000002b, 0x0000002a, 0x000500c4, 0x00000006,
-        0x00000036, 0x0000002b, 0x00000013, 0x000500c7, 0x00000006, 0x00000037, 0x00000036, 0x00000015,
-        0x00040070, 0x00000008, 0x00000038, 0x00000037, 0x000500c7, 0x00000006, 0x0000003a, 0x0000002b,
-        0x00000015, 0x00040070, 0x00000008, 0x0000003b, 0x0000003a, 0x00050050, 0x0000000e, 0x0000003c,
-        0x00000038, 0x0000003b, 0x0005008e, 0x0000000e, 0x0000003e, 0x0000003c, 0x0000001d, 0x00050083,
-        0x0000000e, 0x00000040, 0x0000003e, 0x00000044, 0x00050051, 0x00000008, 0x00000041, 0x00000040,
-        0x00000000, 0x00050051, 0x00000008, 0x00000042, 0x00000040, 0x00000001, 0x00070050, 0x00000009,
-        0x00000043, 0x00000041, 0x00000042, 0x00000022, 0x0000001f, 0x0003003e, 0x0000002d, 0x00000043,
-        0x000100fd, 0x00010038
-    ];
-    static PART: std::sync::OnceLock<Option<vk::Pipeline>> = std::sync::OnceLock::new();
-    *PART.get_or_init(|| {
-        let layout = stages::layout(b)?;
-        let d = &b.host.device;
-        // SAFETY: valid create infos; the module is kept with the part.
-        unsafe {
-            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(FULL), None).ok()?;
-            let states = stages::pre_raster_dynamic(b);
-            let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
-            let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS);
-            let mut rendering = vk::PipelineRenderingCreateInfo::default();
-            let viewport = vk::PipelineViewportStateCreateInfo::default();
-            let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).line_width(1.0);
-            let stage = [vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(module).name(c"main")];
-            let info = vk::GraphicsPipelineCreateInfo::default()
-                .flags(library_flags(b))
-                .stages(&stage)
-                .layout(layout.pipeline)
-                .dynamic_state(&dyn_info)
-                .viewport_state(&viewport)
-                .rasterization_state(&raster)
-                .push_next(&mut library)
-                .push_next(&mut rendering);
-            d.create_graphics_pipelines(stages::cache(b), &[info], None).ok().map(|p| p[0])
-        }
-    })
-}
-
 /// Counts a skipped draw or dispatch: not ready (`true`) or not to be.
 fn skipped(waiting: bool) {
     STATS[if waiting { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
@@ -666,6 +267,8 @@ impl Rec {
             let map = heaps.map_offset(b, generation, &block);
             // SAFETY: recording into our own command buffer.
             unsafe { heaps.bind(b, rec.cmd, map) };
+            self.map_gen = generation;
+            self.touched = false;
             // SAFETY: outside rendering in our new command buffer.
             self.query = unsafe { super::gpu_stats::begin(b, rec.cmd) };
             STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -675,6 +278,22 @@ impl Rec {
             self.pass = None;
         }
         self.cmd.as_ref().map(|r| r.cmd)
+    }
+
+    /// Binds a newer memory map when an address named since the command
+    /// buffer began brought memory in (heaps, tables, views, buffers).
+    fn refresh_map(&mut self, b: &'static Backend, cmd: vk::CommandBuffer) {
+        if !std::mem::take(&mut self.touched) || super::map_generation(b) == self.map_gen {
+            return;
+        }
+        let Some(heaps) = super::descriptors::heaps(b) else { return };
+        let (generation, block) = super::map_block(b, heaps.zero_sink());
+        let map = heaps.map_offset(b, generation, &block);
+        // SAFETY: recording into our own command buffer (binding descriptor
+        // buffers is allowed inside rendering).
+        unsafe { heaps.bind(b, cmd, map) };
+        self.map_gen = generation;
+        STATS[7].fetch_add(1, Ordering::Relaxed);
     }
 
     fn end_pass(&mut self, b: &Backend) {
@@ -752,6 +371,7 @@ impl Rec {
             .collect();
     }
     pub(crate) fn heaps(&mut self, heaps: &[This]) {
+        self.touched = true;
         for &h in heaps {
             if h.is_null() {
                 continue;
@@ -762,10 +382,12 @@ impl Rec {
         }
     }
     pub(crate) fn table(&mut self, compute: bool, slot: u32, handle: u64) {
+        self.touched = true;
         super::touch(handle);
         self.root(compute).set_address(slot, handle);
     }
     pub(crate) fn view(&mut self, compute: bool, slot: u32, address: u64) {
+        self.touched = true;
         super::touch(address);
         self.root(compute).set_address(slot, address);
     }
@@ -776,9 +398,11 @@ impl Rec {
         if compute { &mut self.compute } else { &mut self.graphics }
     }
     pub(crate) fn index_buffer(&mut self, v: Option<IndexView>) {
+        self.touched = true;
         self.index = v;
     }
     pub(crate) fn vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
+        self.touched = true;
         for (i, v) in views.iter().enumerate() {
             if let Some(slot) = self.vertex.get_mut(start as usize + i) {
                 *slot = Some(*v);
@@ -1032,6 +656,7 @@ impl Rec {
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
+        self.refresh_map(b, cmd);
         self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
         let inputs = attributes(&pre, gs);
@@ -1093,107 +718,6 @@ impl Rec {
         Some(cmd)
     }
 
-    /// Sets every dynamic state the parts declare.
-    ///
-    /// # Safety
-    /// Recording into `cmd`.
-    unsafe fn dynamic(&self, b: &'static Backend, cmd: vk::CommandBuffer, gs: &crate::pipeline::host::GraphicsState, topology: vk::PrimitiveTopology, count: u32) {
-        let d = &b.host.device;
-        let r = &gs.rasterizer;
-        let z = &gs.depth;
-        let viewports = if self.viewports.is_empty() {
-            vec![vk::Viewport { x: 0.0, y: 1.0, width: 1.0, height: -1.0, min_depth: 0.0, max_depth: 1.0 }]
-        } else {
-            self.viewports.clone()
-        };
-        let scissors = if self.scissors.is_empty() {
-            vec![vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: 16384, height: 16384 } }]
-        } else {
-            self.scissors.clone()
-        };
-        let n = viewports.len().min(scissors.len()).max(1);
-        let stencil_op = |o: &D3D12_DEPTH_STENCILOP_DESC| {
-            (
-                vk::StencilOp::from_raw((o.StencilFailOp.0 - 1).max(0)),
-                vk::StencilOp::from_raw((o.StencilPassOp.0 - 1).max(0)),
-                vk::StencilOp::from_raw((o.StencilDepthFailOp.0 - 1).max(0)),
-                vk::CompareOp::from_raw((o.StencilFunc.0 - 1).max(0)),
-            )
-        };
-        // SAFETY: as the caller says.
-        unsafe {
-            d.cmd_set_viewport_with_count(cmd, &viewports[..n]);
-            d.cmd_set_scissor_with_count(cmd, &scissors[..n]);
-            d.cmd_set_cull_mode(
-                cmd,
-                match r.CullMode.0 {
-                    2 => vk::CullModeFlags::FRONT,
-                    3 => vk::CullModeFlags::BACK,
-                    _ => vk::CullModeFlags::NONE,
-                },
-            );
-            d.cmd_set_front_face(cmd, if r.FrontCounterClockwise.as_bool() { vk::FrontFace::COUNTER_CLOCKWISE } else { vk::FrontFace::CLOCKWISE });
-            let bias = r.DepthBias != 0 || r.SlopeScaledDepthBias != 0.0;
-            d.cmd_set_depth_bias_enable(cmd, bias);
-            d.cmd_set_depth_bias(cmd, r.DepthBias as f32, r.DepthBiasClamp, r.SlopeScaledDepthBias);
-            d.cmd_set_rasterizer_discard_enable(cmd, false);
-            d.cmd_set_depth_test_enable(cmd, z.DepthEnable.as_bool());
-            d.cmd_set_depth_write_enable(cmd, z.DepthEnable.as_bool() && z.DepthWriteMask.0 == 1);
-            d.cmd_set_depth_compare_op(cmd, vk::CompareOp::from_raw((z.DepthFunc.0 - 1).clamp(0, 7)));
-            d.cmd_set_depth_bounds_test_enable(cmd, gs.depth_bounds);
-            d.cmd_set_depth_bounds(cmd, self.depth_bounds.0.clamp(0.0, 1.0), self.depth_bounds.1.clamp(0.0, 1.0));
-            d.cmd_set_stencil_test_enable(cmd, z.StencilEnable.as_bool());
-            for (face, o) in [(vk::StencilFaceFlags::FRONT, &z.FrontFace), (vk::StencilFaceFlags::BACK, &z.BackFace)] {
-                let (fail, pass, depth_fail, compare) = stencil_op(o);
-                d.cmd_set_stencil_op(cmd, face, fail, pass, depth_fail, compare);
-            }
-            d.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::FRONT_AND_BACK, u32::from(z.StencilReadMask));
-            d.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::FRONT_AND_BACK, u32::from(z.StencilWriteMask));
-            d.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::FRONT_AND_BACK, self.stencil_ref);
-            d.cmd_set_primitive_topology(cmd, topology);
-            let strip = matches!(topology, vk::PrimitiveTopology::LINE_STRIP | vk::PrimitiveTopology::TRIANGLE_STRIP);
-            d.cmd_set_primitive_restart_enable(cmd, strip && gs.strip_cut.0 != 0);
-            d.cmd_set_blend_constants(cmd, &self.blend);
-            let eds3 = super::eds3(b);
-            if let Some(e) = eds3 {
-                if b.host.caps.dynamic_raster {
-                    e.cmd_set_polygon_mode(cmd, if r.FillMode.0 == 2 { vk::PolygonMode::LINE } else { vk::PolygonMode::FILL });
-                    e.cmd_set_depth_clamp_enable(cmd, !r.DepthClipEnable.as_bool());
-                    e.cmd_set_sample_mask(cmd, vk::SampleCountFlags::TYPE_1, &[gs.sample_mask]);
-                    e.cmd_set_alpha_to_coverage_enable(cmd, gs.blend.AlphaToCoverageEnable.as_bool());
-                }
-                if b.host.caps.dynamic_blend && count > 0 {
-                    let independent = gs.blend.IndependentBlendEnable.as_bool();
-                    let t = |i: usize| &gs.blend.RenderTarget[if independent { i } else { 0 }];
-                    let enables: Vec<u32> = (0..count as usize).map(|i| u32::from(t(i).BlendEnable.as_bool())).collect();
-                    let equations: Vec<vk::ColorBlendEquationEXT> = (0..count as usize)
-                        .map(|i| {
-                            let x = t(i);
-                            vk::ColorBlendEquationEXT {
-                                src_color_blend_factor: blend_factor(x.SrcBlend),
-                                dst_color_blend_factor: blend_factor(x.DestBlend),
-                                color_blend_op: vk::BlendOp::from_raw((x.BlendOp.0 - 1).clamp(0, 4)),
-                                src_alpha_blend_factor: blend_factor(x.SrcBlendAlpha),
-                                dst_alpha_blend_factor: blend_factor(x.DestBlendAlpha),
-                                alpha_blend_op: vk::BlendOp::from_raw((x.BlendOpAlpha.0 - 1).clamp(0, 4)),
-                            }
-                        })
-                        .collect();
-                    let masks: Vec<vk::ColorComponentFlags> = (0..count as usize)
-                        .map(|i| vk::ColorComponentFlags::from_raw(u32::from(t(i).RenderTargetWriteMask) & 0xf))
-                        .collect();
-                    let enables: Vec<vk::Bool32> = enables;
-                    e.cmd_set_color_blend_enable(cmd, 0, &enables);
-                    e.cmd_set_color_blend_equation(cmd, 0, &equations);
-                    e.cmd_set_color_write_mask(cmd, 0, &masks);
-                }
-            }
-            if draw_test() >= 1 {
-                self.test_state(b, cmd, count);
-            }
-        }
-    }
-
     /// Diagnostics: the descriptor the first table of the vertex program
     /// points at (push dword 12), the memory its V# names as the CPU sees
     /// it, and whether the memory map reaches that memory.
@@ -1224,38 +748,6 @@ impl Rec {
         }
     }
 
-    /// Draw test state: nothing hidden, every channel written.
-    ///
-    /// # Safety
-    /// Recording into `cmd`.
-    unsafe fn test_state(&self, b: &'static Backend, cmd: vk::CommandBuffer, count: u32) {
-        let d = &b.host.device;
-        // SAFETY: as the caller says.
-        unsafe {
-            d.cmd_set_cull_mode(cmd, vk::CullModeFlags::NONE);
-            d.cmd_set_depth_test_enable(cmd, false);
-            d.cmd_set_depth_write_enable(cmd, false);
-            d.cmd_set_depth_bounds_test_enable(cmd, false);
-            d.cmd_set_stencil_test_enable(cmd, false);
-            if let Some(e) = super::eds3(b)
-                && b.host.caps.dynamic_raster
-            {
-                e.cmd_set_sample_mask(cmd, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
-                e.cmd_set_alpha_to_coverage_enable(cmd, false);
-                e.cmd_set_polygon_mode(cmd, vk::PolygonMode::FILL);
-                e.cmd_set_depth_clamp_enable(cmd, false);
-            }
-            if let Some(e) = super::eds3(b)
-                && b.host.caps.dynamic_blend
-                && count > 0
-            {
-                let n = count as usize;
-                e.cmd_set_color_blend_enable(cmd, 0, &vec![vk::FALSE; n]);
-                e.cmd_set_color_write_mask(cmd, 0, &vec![vk::ColorComponentFlags::RGBA; n]);
-            }
-        }
-    }
-
     pub(crate) fn draw(&mut self, b: &'static Backend, vertices: u32, instances: u32, first: u32, first_instance: u32) {
         if let Some(cmd) = self.prepare_draw(b, false) {
             // SAFETY: rendering open, pipeline bound.
@@ -1268,6 +760,13 @@ impl Rec {
     /// describe the first ones.
     fn drawn(&self, what: &str) {
         let n = STATS[0].fetch_add(1, Ordering::Relaxed);
+        if cfg!(feature = "diagnostics")
+            && self.last_push[12] != 0
+            && let Some(b) = super::backend()
+            && !super::map_reaches(b, u64::from(self.last_push[12]))
+        {
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+        }
         for i in &self.attached {
             i.written[0].fetch_add(1, Ordering::Relaxed);
         }
@@ -1369,6 +868,7 @@ impl Rec {
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
+        self.refresh_map(b, cmd);
         // SAFETY: outside rendering, in our command buffer.
         unsafe {
             if self.bound_compute != pipeline {
@@ -1385,177 +885,6 @@ impl Rec {
         STATS[4].fetch_add(1, Ordering::Relaxed);
     }
 
-    // ---- copies ----
-
-    fn copy_buffer(&mut self, b: &'static Backend, dst: u64, src: u64, len: u64) {
-        let (Some((db, doff)), Some((sb, soff))) = (super::buffer_of(b, dst), super::buffer_of(b, src)) else {
-            return;
-        };
-        self.end_pass(b);
-        let Some(cmd) = self.cmd(b) else { return };
-        // SAFETY: outside rendering; title buffers.
-        unsafe {
-            images::full_barrier(&b.host.device, cmd);
-            b.host.device.cmd_copy_buffer(cmd, sb, db, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: len }]);
-            images::full_barrier(&b.host.device, cmd);
-        }
-    }
-
-    pub(crate) fn copy_memory(&mut self, b: &'static Backend, dst: u64, src: u64, len: u64) {
-        self.copy_buffer(b, dst, src, len);
-    }
-
-    pub(crate) fn copy_buffer_region(&mut self, b: &'static Backend, dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64) {
-        let (Some((d, _)), Some((s, _))) = (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src)) else {
-            return;
-        };
-        self.copy_buffer(b, d as u64 + dst_offset, s as u64 + src_offset, len);
-    }
-
-    pub(crate) fn copy_resource(&mut self, b: &'static Backend, dst: This, src: This) {
-        if let (Some((d, len)), Some((s, _))) = (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src)) {
-            self.copy_buffer(b, d as u64, s as u64, len);
-            return;
-        }
-        let (Some(di), Some(si)) = (images::of_resource(b, dst), images::of_resource(b, src)) else {
-            return;
-        };
-        let mut regions = Vec::new();
-        for mip in 0..di.mips.min(si.mips) {
-            let ext = vk::Extent3D {
-                width: (di.extent.width.min(si.extent.width) >> mip).max(1),
-                height: (di.extent.height.min(si.extent.height) >> mip).max(1),
-                depth: (di.extent.depth.min(si.extent.depth) >> mip).max(1),
-            };
-            let layers = |i: &Image| vk::ImageSubresourceLayers {
-                aspect_mask: i.aspect(),
-                mip_level: mip,
-                base_array_layer: 0,
-                layer_count: di.layers.min(si.layers),
-            };
-            regions.push(vk::ImageCopy::default().src_subresource(layers(&si)).dst_subresource(layers(&di)).extent(ext));
-        }
-        self.copy_images(b, &si, &di, &regions);
-        di.written[2].fetch_add(1, Ordering::Relaxed);
-        self.keep.extend([si, di]);
-    }
-
-    fn copy_images(&mut self, b: &'static Backend, src: &Image, dst: &Image, regions: &[vk::ImageCopy]) {
-        if src.aspect() != dst.aspect() || regions.is_empty() {
-            return;
-        }
-        self.end_pass(b);
-        let Some(cmd) = self.cmd(b) else { return };
-        // SAFETY: outside rendering; images in GENERAL.
-        unsafe {
-            images::full_barrier(&b.host.device, cmd);
-            b.host.device.cmd_copy_image(cmd, src.image, vk::ImageLayout::GENERAL, dst.image, vk::ImageLayout::GENERAL, regions);
-            images::full_barrier(&b.host.device, cmd);
-        }
-    }
-
-    pub(crate) fn copy_texture(&mut self, b: &'static Backend, dst: &CopyLocation, x: u32, y: u32, z: u32, src: &CopyLocation, boxed: Option<[u32; 6]>) {
-        let sub = |l: &CopyLocation, i: &Image| {
-            let index = l.footprint.offset as u32;
-            (index % i.mips, index / i.mips)
-        };
-        let dst_image = if dst.kind == 0 { images::of_resource(b, dst.resource) } else { None };
-        let src_image = if src.kind == 0 { images::of_resource(b, src.resource) } else { None };
-        match (dst_image, src_image) {
-            (Some(di), Some(si)) => {
-                let (dm, dl) = sub(dst, &di);
-                let (sm, sl) = sub(src, &si);
-                let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, (si.extent.width >> sm).max(1), (si.extent.height >> sm).max(1), (si.extent.depth >> sm).max(1)]);
-                let region = vk::ImageCopy::default()
-                    .src_subresource(vk::ImageSubresourceLayers { aspect_mask: si.aspect(), mip_level: sm, base_array_layer: sl, layer_count: 1 })
-                    .src_offset(vk::Offset3D { x: l as i32, y: t as i32, z: f as i32 })
-                    .dst_subresource(vk::ImageSubresourceLayers { aspect_mask: di.aspect(), mip_level: dm, base_array_layer: dl, layer_count: 1 })
-                    .dst_offset(vk::Offset3D { x: x as i32, y: y as i32, z: z as i32 })
-                    .extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
-                self.copy_images(b, &si, &di, &[region]);
-                di.written[2].fetch_add(1, Ordering::Relaxed);
-                self.keep.extend([si, di]);
-            }
-            (Some(di), None) if src.kind == 1 => {
-                // Buffer rows (a placed footprint) into a texture.
-                let Some((data, _)) = crate::resource::buffer_bytes(src.resource) else { return };
-                let fp = src.footprint;
-                let Some((buffer, offset)) = super::buffer_of(b, data as u64 + fp.offset) else { return };
-                let (dm, dl) = sub(dst, &di);
-                let (element, block) = crate::resource::element(fp.format).unwrap_or((4, 1));
-                let row_texels = (u64::from(fp.row_pitch) / element * block) as u32;
-                let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, fp.width, fp.height, fp.depth]);
-                let region = vk::BufferImageCopy::default()
-                    .buffer_offset(offset + u64::from(t / block as u32) * u64::from(fp.row_pitch) + u64::from(l / block as u32) * element)
-                    .buffer_row_length(row_texels)
-                    .buffer_image_height(fp.height.next_multiple_of(block as u32))
-                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: di.aspect() & !vk::ImageAspectFlags::STENCIL, mip_level: dm, base_array_layer: dl, layer_count: 1 })
-                    .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: z as i32 })
-                    .image_extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
-                self.end_pass(b);
-                let Some(cmd) = self.cmd(b) else { return };
-                // SAFETY: outside rendering; a title buffer and an image in GENERAL.
-                unsafe {
-                    images::full_barrier(&b.host.device, cmd);
-                    b.host.device.cmd_copy_buffer_to_image(cmd, buffer, di.image, vk::ImageLayout::GENERAL, &[region]);
-                    images::full_barrier(&b.host.device, cmd);
-                }
-                di.written[2].fetch_add(1, Ordering::Relaxed);
-                self.keep.push(di);
-            }
-            (None, Some(si)) if dst.kind == 1 => {
-                let Some((data, _)) = crate::resource::buffer_bytes(dst.resource) else { return };
-                let fp = dst.footprint;
-                let Some((buffer, offset)) = super::buffer_of(b, data as u64 + fp.offset) else { return };
-                let (sm, sl) = sub(src, &si);
-                let (element, block) = crate::resource::element(fp.format).unwrap_or((4, 1));
-                let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, (si.extent.width >> sm).max(1), (si.extent.height >> sm).max(1), (si.extent.depth >> sm).max(1)]);
-                let region = vk::BufferImageCopy::default()
-                    .buffer_offset(offset + u64::from(y / block as u32) * u64::from(fp.row_pitch) + u64::from(x / block as u32) * element)
-                    .buffer_row_length((u64::from(fp.row_pitch) / element * block) as u32)
-                    .buffer_image_height(fp.height.next_multiple_of(block as u32))
-                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: si.aspect() & !vk::ImageAspectFlags::STENCIL, mip_level: sm, base_array_layer: sl, layer_count: 1 })
-                    .image_offset(vk::Offset3D { x: l as i32, y: t as i32, z: f as i32 })
-                    .image_extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
-                self.end_pass(b);
-                let Some(cmd) = self.cmd(b) else { return };
-                // SAFETY: outside rendering; an image in GENERAL and a title buffer.
-                unsafe {
-                    images::full_barrier(&b.host.device, cmd);
-                    b.host.device.cmd_copy_image_to_buffer(cmd, si.image, vk::ImageLayout::GENERAL, buffer, &[region]);
-                    images::full_barrier(&b.host.device, cmd);
-                }
-                self.keep.push(si);
-            }
-            _ => {}
-        }
-    }
-
-    pub(crate) fn resolve(&mut self, b: &'static Backend, dst: This, dst_sub: u32, src: This, src_sub: u32) {
-        let (Some(di), Some(si)) = (images::of_resource(b, dst), images::of_resource(b, src)) else { return };
-        if si.samples <= 1 || di.samples != 1 {
-            return;
-        }
-        self.end_pass(b);
-        let Some(cmd) = self.cmd(b) else { return };
-        let layers = |i: &Image, s: u32| vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: s % i.mips,
-            base_array_layer: s / i.mips,
-            layer_count: 1,
-        };
-        let region = vk::ImageResolve::default()
-            .src_subresource(layers(&si, src_sub))
-            .dst_subresource(layers(&di, dst_sub))
-            .extent(vk::Extent3D { width: si.extent.width.min(di.extent.width), height: si.extent.height.min(di.extent.height), depth: 1 });
-        // SAFETY: outside rendering; images in GENERAL.
-        unsafe {
-            images::full_barrier(&b.host.device, cmd);
-            b.host.device.cmd_resolve_image(cmd, si.image, vk::ImageLayout::GENERAL, di.image, vk::ImageLayout::GENERAL, &[region]);
-            images::full_barrier(&b.host.device, cmd);
-        }
-        self.keep.extend([si, di]);
-    }
 }
 
 /// Clear rectangles are not taken yet (the whole view is cleared).
@@ -1578,6 +907,8 @@ pub(crate) fn report() {
         not_yet = s[4],
         command_buffers = s[5],
         links = s[6],
+        maps_rebound = s[7],
+        draws_table_unmapped = s[8],
         views = v[0],
         samplers = v[1],
         views_without_image = v[2],

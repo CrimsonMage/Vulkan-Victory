@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use victory_vk::ash::vk;
@@ -41,6 +41,7 @@ use victory_vk::timeline::{Recording, Timeline};
 mod compose;
 mod descriptors;
 mod gpu_stats;
+mod present;
 mod images;
 pub(crate) mod record;
 mod stage_cache;
@@ -157,6 +158,9 @@ struct Memory {
     reservations: BTreeMap<usize, usize>,
     pools: Vec<PoolView>,
     map: MemoryMap,
+    /// Imports replaced by larger ones: kept for the run (recorded command
+    /// buffers not yet submitted may bind maps that name them).
+    retired: Vec<Imported>,
     /// The frame, for the pool view's least-recently-touched eviction.
     tick: u64,
     warned: u32,
@@ -595,21 +599,6 @@ struct Engine {
 }
 
 static FORCED: AtomicU64 = AtomicU64::new(0);
-/// `VICTORY_VK_COMPOSE_TEST=1` (diagnostics): the swapchain is cleared
-/// magenta under the planes, so a capture tells undrawn planes (magenta)
-/// from black plane images.
-fn compose_test() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_VK_COMPOSE_TEST").is_ok_and(|v| v == "1"))
-}
-
-/// The buffer plane texels are read back into (diagnostics).
-static PROBE: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
-
-/// The buffer captures are read back into.
-static READBACK: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
-/// Presents that showed at least one plane.
-static PLANES_SHOWN: AtomicU64 = AtomicU64::new(0);
 
 impl Engine {
     fn signalled(&self, fence: usize, value: u64) -> bool {
@@ -638,83 +627,94 @@ impl Engine {
     /// are not met (at a present, as the D3D12 path does).
     fn pump(&mut self, b: &Backend, force: bool) {
         loop {
-            let mut moved = false;
             let keys: Vec<usize> = self.queues.keys().copied().collect();
+            let mut moved = false;
             for q in keys {
-                while let Some(front) = self.queues.get_mut(&q).and_then(|l| l.pop_front()) {
-                    match front {
-                        Item::Wait(fence, value) => {
-                            if !force && !self.signalled(fence, value) {
-                                self.queues
-                                    .get_mut(&q)
-                                    .expect("queue")
-                                    .push_front(Item::Wait(fence, value));
-                                break;
-                            }
-                            if force && !self.signalled(fence, value) {
-                                FORCED.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Item::Signal(fence, value) => match self.flights.back_mut() {
-                            Some(f) => f.signals.push((fence, value)),
-                            None => crate::fence::set(fence as This, value),
-                        },
-                        Item::Run(mut parts) => {
-                            while let Some(part) = parts.pop_front() {
-                                let ready = part.waits.iter().all(|w| self.met(w));
-                                if !ready && !force {
-                                    parts.push_front(part);
-                                    break;
-                                }
-                                if !ready {
-                                    FORCED.fetch_add(1, Ordering::Relaxed);
-                                }
-                                // A part with neither commands nor writes has
-                                // nothing to run.
-                                if part.writes.is_empty() && part.cmds.is_empty() {
-                                    continue;
-                                }
-                                let submitted = if part.cmds.is_empty() {
-                                    b.timeline.submit(&b.host, &[])
-                                } else {
-                                    images::flush(b);
-                                    b.timeline.submit_recordings(&b.host, part.cmds)
-                                };
-                                match submitted {
-                                    Ok(value) => self.flights.push_back(Flight {
-                                        value,
-                                        writes: part.writes,
-                                        signals: Vec::new(),
-                                    }),
-                                    Err(e) => {
-                                        if b.timeline.lost() {
-                                            lost_once();
-                                        } else {
-                                            tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
-                                        }
-                                        for (at, what, bytes) in part.writes {
-                                            write_now(b, at, what, bytes);
-                                        }
-                                    }
-                                }
-                            }
-                            if !parts.is_empty() {
-                                self.queues
-                                    .get_mut(&q)
-                                    .expect("queue")
-                                    .push_front(Item::Run(parts));
-                                break;
-                            }
-                        }
-                    }
-                    moved = true;
-                }
+                moved |= self.run_line(b, q, force);
             }
             if !moved {
                 break;
             }
         }
         self.queues.retain(|_, l| !l.is_empty());
+    }
+
+    /// Runs queue `q`'s line as far as it can; whether anything moved.
+    fn run_line(&mut self, b: &Backend, q: usize, force: bool) -> bool {
+        let mut moved = false;
+        while let Some(front) = self.queues.get_mut(&q).and_then(|l| l.pop_front()) {
+            if let Some(held) = self.run_item(b, front, force) {
+                self.queues.get_mut(&q).expect("queue").push_front(held);
+                break;
+            }
+            moved = true;
+        }
+        moved
+    }
+
+    /// Runs one item of a line; what is left of it if it must wait.
+    fn run_item(&mut self, b: &Backend, item: Item, force: bool) -> Option<Item> {
+        match item {
+            Item::Wait(fence, value) => {
+                let signalled = self.signalled(fence, value);
+                if !signalled && !force {
+                    return Some(Item::Wait(fence, value));
+                }
+                if !signalled {
+                    FORCED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Item::Signal(fence, value) => match self.flights.back_mut() {
+                Some(f) => f.signals.push((fence, value)),
+                None => crate::fence::set(fence as This, value),
+            },
+            Item::Run(mut parts) => {
+                while let Some(part) = parts.pop_front() {
+                    let ready = part.waits.iter().all(|w| self.met(w));
+                    if !ready && !force {
+                        parts.push_front(part);
+                        return Some(Item::Run(parts));
+                    }
+                    if !ready {
+                        FORCED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.submit_part(b, part);
+                }
+            }
+        }
+        None
+    }
+
+    /// Submits a part's commands (or a marker for its writes) behind
+    /// everything before it.
+    fn submit_part(&mut self, b: &Backend, part: Part) {
+        // A part with neither commands nor writes has nothing to run.
+        if part.writes.is_empty() && part.cmds.is_empty() {
+            return;
+        }
+        let submitted = if part.cmds.is_empty() {
+            b.timeline.submit(&b.host, &[])
+        } else {
+            images::flush(b);
+            b.timeline.submit_recordings(&b.host, part.cmds)
+        };
+        match submitted {
+            Ok(value) => self.flights.push_back(Flight {
+                value,
+                writes: part.writes,
+                signals: Vec::new(),
+            }),
+            Err(e) => {
+                if b.timeline.lost() {
+                    lost_once();
+                } else {
+                    tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
+                }
+                for (at, what, bytes) in part.writes {
+                    write_now(b, at, what, bytes);
+                }
+            }
+        }
     }
 }
 
@@ -869,6 +869,15 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
     (m.map.generation, m.map.block(zero, sink))
 }
 
+/// The map's generation now (regions wanted imported first).
+fn map_generation(b: &Backend) -> u64 {
+    let mut m = memory(b);
+    if m.import_regions(&b.host) {
+        m.rebuild_map();
+    }
+    m.map.generation
+}
+
 /// Diagnostics: whether the current memory map has a range holding `at`.
 fn map_reaches(b: &Backend, at: u64) -> bool {
     memory(b).map.range_of(at).is_some()
@@ -955,11 +964,10 @@ impl Memory {
             }
             return false;
         };
-        // Not over a neighbour already known.
-        let clash = self.regions.range(..(base + len)).next_back().is_some_and(|(&a, r)| a + r.len > base);
-        if clash {
-            return false;
-        }
+        // Over loose memory imported before (the allocation has grown, or
+        // was touched first at a higher address): one region of the union;
+        // the old imports go once the card is done with them.
+        let (base, len) = self.merge_loose(base, len);
         tracing::info!(at = format_args!("{at:#x}"), base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
         self.regions.insert(
             base,
@@ -975,6 +983,30 @@ impl Memory {
 }
 
 /// The committed read-write run of pages holding `at` (one allocation).
+impl Memory {
+    /// Takes the regions overlapping `[base, base + len)` out (their
+    /// imports retired); the union.
+    fn merge_loose(&mut self, base: usize, len: usize) -> (usize, usize) {
+        let (mut lo, mut hi) = (base, base + len);
+        let over: Vec<usize> = self
+            .regions
+            .range(..hi)
+            .filter(|&(&a, r)| a + r.len > lo)
+            .map(|(&a, _)| a)
+            .collect();
+        for a in over {
+            if let Some(r) = self.regions.remove(&a) {
+                lo = lo.min(a);
+                hi = hi.max(a + r.len);
+                if let Some(i) = r.import {
+                    self.retired.push(i);
+                }
+            }
+        }
+        (lo, hi - lo)
+    }
+}
+
 /// From the allocation's base, so that an address below one touched
 /// earlier in the same allocation is in it too.
 fn committed_run(at: u64) -> Option<(usize, usize)> {
@@ -1180,221 +1212,10 @@ fn landing() {
 // Presentation
 
 pub(crate) use compose::Shown;
+pub(crate) use present::present;
+use present::{FRAME, PLANES_SHOWN};
 
-pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
-    let Some(b) = backend() else { return };
-    {
-        let t = Instant::now();
-        images::flush(b);
-        split(Split::Flush, t);
-        let t = Instant::now();
-        let mut e = engine(b);
-        e.pump(b, true);
-        split(Split::Submit, t);
-    }
-    images::refresh(b, frame);
-    let presented = Instant::now();
-    memory(b).tick = frame;
-    let mut sc = lock(&b.present);
-    if sc.is_none() {
-        let (w, h) = size.unwrap_or((1920, 1080));
-        let hwnd = crate::host::title_window()
-            .map(Ok)
-            .unwrap_or_else(|| crate::host::window(w, h));
-        // SAFETY: a plain query of this module's instance handle.
-        let hinstance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) };
-        match (hwnd, hinstance) {
-            (Ok(hwnd), Ok(inst)) => {
-                match unsafe { Swapchain::new(&b.host, inst.0 as isize, hwnd.0 as isize) } {
-                    Ok(s) => {
-                        tracing::info!(
-                            width = s.extent.width,
-                            height = s.extent.height,
-                            format = ?s.format,
-                            mode = ?s.mode,
-                            "Vulkan: presenting to a window"
-                        );
-                        *sc = Some(s);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "Vulkan: no swapchain");
-                        return;
-                    }
-                }
-            }
-            _ => {
-                tracing::error!("Vulkan: no window to present to");
-                return;
-            }
-        }
-    }
-    let Some(s) = sc.as_mut() else { return };
-    if b.timeline.lost() {
-        lost_once();
-        return;
-    }
-    // Captures (`VICTORY_CAPTURE`, as the D3D12 path): the composed image
-    // read back into a buffer of ours.
-    let capture = crate::capture::wanted(frame).then(|| {
-        let bytes = u64::from(s.extent.width) * u64::from(s.extent.height) * 4;
-        let mut rb = lock(&READBACK);
-        if rb.as_ref().is_none_or(|r| r.size != bytes) {
-            if let Some(old) = rb.take() {
-                b.timeline.with_queue(|q, _| {
-                    // SAFETY: waits for our queue, under its lock.
-                    let _ = unsafe { b.host.device.queue_wait_idle(q) };
-                    ((), false)
-                })
-                .ok();
-                // SAFETY: the queue is idle.
-                unsafe { old.destroy(&b.host) };
-            }
-            *rb = victory_vk::memory::Buffer::new(
-                &b.host,
-                bytes,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                victory_vk::memory::Place::Readback,
-            )
-            .ok();
-        }
-        rb.as_ref().map(|r| (r.buffer, r.mapped as usize, r.size))
-    })
-    .flatten();
-    let extent = s.extent;
-    let bgra = matches!(s.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
-    let test = compose_test();
-    if test {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::info!("Vulkan: the compose test colour (magenta) is cleared under the planes"));
-    }
-    // Diagnostics: at captured frames, what wrote each plane's image, and a
-    // few texels of plane 0 read back.
-    let probes: Vec<Arc<images::Image>> = if cfg!(feature = "diagnostics") && capture.is_some() {
-        planes.iter().filter_map(|p| images::of_resource(b, p.resource)).filter(|i| !i.depth()).take(4).collect()
-    } else {
-        Vec::new()
-    };
-    if capture.is_some() && cfg!(feature = "diagnostics") {
-        for (n, p) in planes.iter().enumerate() {
-            tracing::info!(frame, plane = n, what = %images::describe(b, p.resource), "Vulkan: a plane at a captured frame");
-        }
-    }
-    let probe_buffer = (!probes.is_empty())
-        .then(|| {
-            let mut pb = lock(&PROBE);
-            if pb.is_none() {
-                *pb = victory_vk::memory::Buffer::new(&b.host, 256, vk::BufferUsageFlags::TRANSFER_DST, victory_vk::memory::Place::Readback).ok();
-            }
-            pb.as_ref().map(|p| (p.buffer, p.mapped as usize))
-        })
-        .flatten();
-    let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
-        let color = vk::ClearColorValue {
-            float32: if test { [1.0, 0.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] },
-        };
-        // SAFETY: the image is in TRANSFER_DST_OPTIMAL while recording;
-        // the planes are drawn over the clear and leave it so.
-        unsafe {
-            d.cmd_clear_color_image(
-                cmd,
-                t.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &color,
-                &[victory_vk::swapchain::color_range()],
-            );
-            let barrier = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
-            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&barrier));
-            if compose::record(b, cmd, t, planes) {
-                PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
-            }
-            for (pn, img) in probes.iter().enumerate() {
-                let Some((pbuf, _)) = probe_buffer else { break };
-                // Four texels: the centre and a quarter in, of mip 0 layer 0.
-                let (w, h) = (img.extent.width, img.extent.height);
-                let at = [(w / 2, h / 2), (w / 4, h / 4), (3 * w / 4, h / 4), (w / 4, 3 * h / 4)];
-                let regions: Vec<vk::BufferImageCopy> = at
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &(x, y))| {
-                        vk::BufferImageCopy::default()
-                            .buffer_offset((pn * 4 + k) as u64 * 16)
-                            .image_subresource(vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            })
-                            .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
-                            .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
-                    })
-                    .collect();
-                d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, pbuf, &regions);
-            }
-            if let Some((buffer, _, _)) = capture {
-                let range = victory_vk::swapchain::color_range();
-                let to = |from: vk::ImageLayout, to: vk::ImageLayout| {
-                    [vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
-                        .old_layout(from)
-                        .new_layout(to)
-                        .image(t.image)
-                        .subresource_range(range)]
-                };
-                let b1 = to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&b1));
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D { width: t.extent.width, height: t.extent.height, depth: 1 });
-                d.cmd_copy_image_to_buffer(cmd, t.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
-                let b2 = to(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-                d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&b2));
-            }
-        }
-    });
-    if let (Some((_, mapped, size)), Ok(())) = (capture, r.as_ref()) {
-        let idle = b.timeline.with_queue(|q, _| {
-            // SAFETY: waits for our queue, under its lock.
-            (unsafe { b.host.device.queue_wait_idle(q) }, false)
-        });
-        if matches!(idle, Ok(Ok(()))) {
-            // SAFETY: the readback buffer is mapped, `size` bytes, and the
-            // copy into it has finished.
-            let rows = unsafe { std::slice::from_raw_parts(mapped as *const u8, size as usize) };
-            crate::capture::save(frame, extent.width, extent.height, extent.width as usize * 4, bgra, rows);
-            for (pn, img) in probes.iter().enumerate() {
-                let Some((_, mapped)) = probe_buffer else { break };
-                // SAFETY: 64 bytes a plane of the mapped probe buffer, copied into.
-                let texels = unsafe { std::slice::from_raw_parts((mapped as *const u8).add(pn * 64), 64) };
-                let hex: Vec<String> = texels.chunks(16).map(|c| c[..images::format_bytes(img.format).clamp(1, 16) as usize].iter().map(|x| format!("{x:02x}")).collect()).collect();
-                tracing::info!(frame, plane = pn, image = img.id, format = ?img.format, texels = ?hex, "Vulkan: plane texels (centre, then three quarter points)");
-            }
-        }
-    }
-    if let Err(e) = r {
-        static SEEN: AtomicU64 = AtomicU64::new(0);
-        if SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
-            tracing::error!(error = %format!("{e:#}"), "Vulkan: a present failed");
-        }
-    }
-    drop(sc);
-    split(Split::Present, presented);
-    FRAME.store(frame, Ordering::Relaxed);
-}
 
-/// The last frame presented, for the 10 s line.
-static FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// The 10 s lines are written by a thread of ours: the title's presenting
 /// thread may be deep in its own stack (vk12 overflowed in `report`).
