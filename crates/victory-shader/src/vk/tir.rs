@@ -396,3 +396,83 @@ pub fn dump(f: &Func) {
         eprintln!("  -> {:?}", b.term);
     }
 }
+
+fn bits(t: Ty) -> u32 {
+    let e = match t.s {
+        S::Bool => 1,
+        S::U8 => 8,
+        S::U16 | S::F16 => 16,
+        S::U32 | S::F32 => 32,
+        S::U64 => 64,
+        S::Void => 0,
+    };
+    e * u32::from(t.n)
+}
+
+/// Structural checks of what the backend will write (types of composite
+/// operations, bitcasts, selects, arithmetic, phis): a module that fails
+/// them is refused rather than handed to a driver (NVIDIA crashed on an
+/// extract from a scalar).
+pub fn check(f: &Func) -> Result<(), &'static str> {
+    use super::spirv::op;
+    let ty = |v: V| f.nodes.get(v as usize).map(|n| n.ty);
+    for n in &f.nodes {
+        if n.args.iter().any(|&a| a as usize >= f.nodes.len()) {
+            return Err("an operand that is no value (a translator bug)");
+        }
+        // constants are scalars (the backend writes no composite constants)
+        if matches!(n.op, Op::Const(_)) && n.ty.n != 1 {
+            return Err("a composite constant (a translator bug)");
+        }
+        let Op::Spv(o) = n.op else { continue };
+        let a: Vec<Ty> = n.args.iter().map(|&x| ty(x).unwrap()).collect();
+        let ok = match o {
+            op::COMPOSITE_EXTRACT => {
+                let s = a[0];
+                (s.n > 1 || s.s == S::Void) && n.imm.first().is_some_and(|&i| i < u32::from(s.n)) && n.ty.n == 1
+            }
+            op::COMPOSITE_CONSTRUCT => {
+                a.iter().all(|t| t.s == n.ty.s) && a.iter().map(|t| u32::from(t.n)).sum::<u32>() == u32::from(n.ty.n)
+            }
+            op::BITCAST => bits(a[0]) == bits(n.ty) && a[0].s != S::Bool && n.ty.s != S::Bool,
+            op::SELECT => a[0].s == S::Bool && a[1] == n.ty && a[2] == n.ty,
+            op::I_ADD | op::I_SUB | op::I_MUL | op::F_ADD | op::F_SUB | op::F_MUL | op::F_DIV | op::BITWISE_AND
+            | op::BITWISE_OR | op::BITWISE_XOR => a.iter().all(|&t| t == n.ty),
+            op::LOGICAL_AND | op::LOGICAL_OR | op::LOGICAL_EQUAL | op::LOGICAL_NOT_EQUAL | op::LOGICAL_NOT => {
+                n.ty == Ty::BOOL && a.iter().all(|&t| t == Ty::BOOL)
+            }
+            _ => true,
+        };
+        if !ok {
+            return Err("an inconsistent module (a translator bug)");
+        }
+    }
+    for b in &f.blocks {
+        for &p in &b.phis {
+            let n = &f.nodes[p as usize];
+            if n.args.len() != b.preds.len() || n.args.iter().any(|&x| ty(x) != Some(n.ty)) {
+                return Err("an inconsistent phi (a translator bug)");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vk::spirv::op;
+
+    #[test]
+    fn the_check_refuses_an_extract_from_a_scalar_and_composite_constants() {
+        let mut f = Func::default();
+        let _ = f.konst(Ty::vec(S::F16, 2), 0x4000_4000);
+        f.blocks.push(Block { phis: vec![], preds: vec![], body: vec![], term: Term::Return });
+        assert!(check(&f).is_err());
+        let mut f = Func::default();
+        let s = f.konst(Ty::F16, 0x4000);
+        let x = f.push(Node { op: Op::Spv(op::COMPOSITE_EXTRACT), ty: Ty::F16, args: vec![s], imm: vec![0] });
+        f.blocks.push(Block { phis: vec![], preds: vec![], body: vec![Item::N(x)], term: Term::Return });
+        assert!(check(&f).is_err());
+    }
+}
