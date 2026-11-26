@@ -182,6 +182,7 @@ pub struct Limits {
     pub vertex_components: u32,
     pub mesh: bool,
     pub stencil_export: bool,
+    pub barycentric: bool,
     pub storage_image_multisample: bool,
 }
 
@@ -214,6 +215,7 @@ impl Limits {
             vertex_components: l.max_vertex_output_components,
             mesh: host.caps.mesh_shader,
             stencil_export: host.caps.has(ash::ext::shader_stencil_export::NAME),
+            barycentric: host.caps.has(ash::khr::fragment_shader_barycentric::NAME),
             storage_image_multisample: host.caps.core.shader_storage_image_multisample
                 == vk::TRUE,
         }
@@ -240,8 +242,8 @@ impl Usage {
         if has(CAP_STENCIL_EXPORT) && !l.stencil_export {
             return Some("stencil export without VK_EXT_shader_stencil_export".into());
         }
-        if has(CAP_FRAGMENT_BARYCENTRIC) {
-            return Some("per-vertex attributes (VK_KHR_fragment_shader_barycentric not enabled)".into());
+        if has(CAP_FRAGMENT_BARYCENTRIC) && !l.barycentric {
+            return Some("per-vertex attributes without VK_KHR_fragment_shader_barycentric".into());
         }
         if has(CAP_MESH_SHADING) && !l.mesh {
             return Some("a mesh program without mesh shaders".into());

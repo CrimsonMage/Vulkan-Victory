@@ -73,6 +73,11 @@ pub const EXTENSIONS: &[Extension] = &[
         "null descriptors for empty slots",
     ),
     ext(
+        khr::fragment_shader_barycentric::NAME,
+        Need::Wanted,
+        "pixel programs that read per-vertex attributes (v_interp_mov; without it those programs are refused)",
+    ),
+    ext(
         ext::shader_stencil_export::NAME,
         Need::Wanted,
         "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
@@ -449,6 +454,7 @@ impl Host {
         let mut border = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut clip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
         let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
+        let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -485,6 +491,9 @@ impl Host {
             if on(ext::shader_object::NAME) {
                 f2 = f2.push_next(&mut objects);
             }
+            if on(khr::fragment_shader_barycentric::NAME) {
+                f2 = f2.push_next(&mut bary);
+            }
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -502,6 +511,7 @@ impl Host {
         border.p_next = null;
         clip.p_next = null;
         objects.p_next = null;
+        bary.p_next = null;
 
         let features = feature_table(&core, &v11, &v12, &v13);
         let descriptor_buffer = db.descriptor_buffer == vk::TRUE;
@@ -630,6 +640,9 @@ impl Host {
             }
             if shader_object {
                 info = info.push_next(&mut objects);
+            }
+            if has(khr::fragment_shader_barycentric::NAME) {
+                info = info.push_next(&mut bary);
             }
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
