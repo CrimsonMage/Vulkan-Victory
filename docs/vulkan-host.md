@@ -1035,12 +1035,28 @@ images, 6.7 GiB of card memory).
   committed (as grown loose memory is imported again), so the map stays
   far under 64. In the end, the title window: one range.
 
-**ABI v2 (approved, waiting for the translator's commit):**
-- a title-wide semantic registry for `vk::translate`, persisted beside
-  the stage cache, with its version in the cache key;
-- set 0 binding 2 with 2D-array views of cube images (6×N layers);
-- the T# check word WORD6 = WORD7 ^ 0x7A3C5E91;
-- slot 0 a null view on bindings 0–2, never handed out.
+**ABI v2, host side (4b53b11, with the translator's 5d4ea8d merged):**
+- The semantic registry is kept beside the stage cache as
+  `vulkan-stages/semantics-<key>.txt`.
+  - It is loaded when the cache folder is first opened, before any
+    translation.
+  - It is saved, if it grew, before a translation is written.
+  - A missing or bad registry drops the translations of its key.
+  - `SEMANTICS_VERSION` is part of the key.
+- Set 0 binding 2 holds a six-layer 2D-array view of each cube image, at
+  the T#'s slot.
+- Every T# the host writes has WORD6 = WORD7 ^ 0x7A3C5E91
+  (`gfx10::T_CHECK`, in `Image::encode`).
+- Slot 0 is the null image on bindings 0, 1 and 2.
+- The rectangle geometry stage passes locations 0..30.
+- `HOST_ABI` is 2.
+
+**Loose imports joined (cff995e).** A loose region the card reads takes
+in its loose neighbours when the pages between are committed read-write
+memory (gaps up to 16 MiB). If the 64 KiB blocks at 0xad2b00000 have
+reserved gaps between them, they still cannot join, and the map still
+fills: `map_refused` tells. The way out then is the title window, one
+range. The helpers moved to `vulkan/loose.rs`.
 
 **Open, in order** (the coordinator's audit and its comparison list):
 
