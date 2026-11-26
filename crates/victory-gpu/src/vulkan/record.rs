@@ -852,6 +852,15 @@ impl Rec {
             skipped(false);
             return None;
         };
+        // The ray-tracing structure builder (the GDK's XboxBvhBuilder.dll:
+        // compute programs without a program name) is not run unless asked
+        // for: partly working, it writes garbage structures into title
+        // memory (wild light, and the title crashing on what it reads
+        // back). Without structures every ray of the title misses.
+        if !bvh_builder() && shaders.iter().all(|s| s.name.is_empty()) {
+            BUILDER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let stage = match stage_of(b, shaders, "compute") {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -894,6 +903,15 @@ impl Rec {
     }
 
 }
+
+/// `VICTORY_BVH_BUILDER=1`: the title's ray-tracing structure builder runs.
+fn bvh_builder() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v != "0"))
+}
+
+/// Dispatches of the structure builder left out (the 10 s line).
+pub(crate) static BUILDER_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// What the recording does not do yet (counted by kind in the 10 s line).
 #[derive(Clone, Copy)]
@@ -976,6 +994,7 @@ pub(crate) fn report() {
     tracing::info!(
         draws = s[0],
         dispatches = s[1],
+        builder_dispatches_left_out = BUILDER_SKIPPED.load(Ordering::Relaxed),
         skipped_not_ready = s[2],
         skipped_no_pipeline = s[3],
         not_yet = s[4],
