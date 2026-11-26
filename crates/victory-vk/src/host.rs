@@ -149,8 +149,8 @@ pub const EXTENSIONS: &[Extension] = &[
     ),
     ext(
         ext::conditional_rendering::NAME,
-        Need::Report,
-        "predication",
+        Need::Wanted,
+        "predication (SetPredicationBufferX; without it predicated work always runs)",
     ),
     ext(
         ext::memory_priority::NAME,
@@ -231,6 +231,8 @@ pub struct Caps {
     pub descriptor_buffer: bool,
     pub host_memory: bool,
     pub mesh_shader: bool,
+    /// `VK_EXT_conditional_rendering` with its feature (predication).
+    pub conditional_rendering: bool,
     /// Graphics pipeline libraries (with their pair extension).
     pub pipeline_library: bool,
     /// The driver's fast link is fast (property `graphicsPipelineLibraryFastLinking`).
@@ -469,6 +471,7 @@ impl Host {
         let mut clip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
         let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+        let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -506,6 +509,7 @@ impl Host {
                 f2 = f2.push_next(&mut objects);
             }
             f2 = chain_features(f2, on(khr::fragment_shader_barycentric::NAME), &mut bary);
+            f2 = chain_features(f2, on(ext::conditional_rendering::NAME), &mut conditional);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -524,6 +528,8 @@ impl Host {
         clip.p_next = null;
         objects.p_next = null;
         bary.p_next = null;
+        conditional.p_next = null;
+        conditional.inherited_conditional_rendering = vk::FALSE;
 
         let features = feature_table(&core, &v11, &v12, &v13);
         let descriptor_buffer = db.descriptor_buffer == vk::TRUE;
@@ -654,6 +660,7 @@ impl Host {
                 info = info.push_next(&mut objects);
             }
             info = chain_device(info, has(khr::fragment_shader_barycentric::NAME), &mut bary);
+            info = chain_device(info, has(ext::conditional_rendering::NAME), &mut conditional);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 
@@ -687,6 +694,7 @@ impl Host {
             descriptor_buffer,
             host_memory: true,
             mesh_shader,
+            conditional_rendering: conditional.conditional_rendering == vk::TRUE,
             pipeline_library,
             fast_linking: gpl_props.graphics_pipeline_library_fast_linking == vk::TRUE,
             independent_interpolation: gpl_props

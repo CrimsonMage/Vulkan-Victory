@@ -519,16 +519,26 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
         return E_INVALIDARG;
     }
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(timestamp_frequency_now()) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// Ticks per second of GPU timestamps: the card's under the Vulkan backend
+/// (its queries write its own ticks), else [`TIMESTAMP_FREQUENCY`].
+pub(crate) fn timestamp_frequency_now() -> u64 {
+    #[cfg(windows)]
+    if let Some(f) = crate::vulkan::record::timestamp_frequency() {
+        return f;
+    }
+    TIMESTAMP_FREQUENCY
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
     Value(u64),
-    /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
+    /// The GPU clock: [`timestamp_frequency_now`] ticks per second since the
     /// process started (our GPU work is done on the CPU's timeline).
     GpuTimestamp,
     /// The CPU's performance counter.
@@ -543,7 +553,7 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                (elapsed.as_nanos() * u128::from(timestamp_frequency_now()) / 1_000_000_000) as u64
             }
             Written::SystemTimestamp => system_timestamp(),
         };

@@ -31,16 +31,55 @@ use crate::object::This;
 /// `FFX_API_DISPATCH_DESC_TYPE_UPSCALE`.
 pub const UPSCALE: u64 = 0x0001_0001;
 
-/// `ffxDispatchDescUpscale` offsets (FidelityFX API 1.1, as the title's
-/// upscaler reads them: command list 0x10, colour 0x18, depth 0x48, motion
-/// vectors 0x78, exposure 0xa8, output 0x138, each a 0x30-byte
-/// `FfxApiResource` whose first word is the resource; then jitter 0x168,
-/// motion-vector scale 0x170, render size 0x178, upscale size 0x180).
-const LIST: usize = 0x10;
-const COLOR: usize = 0x18;
-const OUTPUT: usize = 0x138;
-const RENDER_SIZE: usize = 0x178;
-const UPSCALE_SIZE: usize = 0x180;
+/// `FfxApiResource` (FidelityFX API `ffx_api_types.h`): the resource, its
+/// description (type, format, width, height, depth, mips, flags, usage)
+/// and its state.
+#[repr(C)]
+pub struct ApiResource {
+    pub resource: *mut std::ffi::c_void,
+    pub description: [u32; 8],
+    pub state: u32,
+}
+
+/// `ffxDispatchDescUpscale` as the FidelityFX API's `ffx_upscale.h` lays
+/// it out (the same from FSR 3.1, the API's first upscaler, to FSR 4; the
+/// caller checks the upscaler's version).
+#[repr(C)]
+pub struct DispatchDescUpscale {
+    pub kind: u64,
+    pub next: *const std::ffi::c_void,
+    pub command_list: *mut std::ffi::c_void,
+    pub color: ApiResource,
+    pub depth: ApiResource,
+    pub motion_vectors: ApiResource,
+    pub exposure: ApiResource,
+    pub reactive: ApiResource,
+    pub transparency_and_composition: ApiResource,
+    pub output: ApiResource,
+    pub jitter_offset: [f32; 2],
+    pub motion_vector_scale: [f32; 2],
+    pub render_size: [u32; 2],
+    pub upscale_size: [u32; 2],
+    pub enable_sharpening: bool,
+    pub sharpness: f32,
+    pub frame_time_delta: f32,
+    pub pre_exposure: f32,
+    pub reset: bool,
+    pub camera_near: f32,
+    pub camera_far: f32,
+    pub camera_fov_angle_vertical: f32,
+    pub view_space_to_meters_factor: f32,
+    pub flags: u32,
+}
+const _: () = {
+    use std::mem::offset_of;
+    assert!(size_of::<ApiResource>() == 0x30);
+    assert!(offset_of!(DispatchDescUpscale, color) == 0x18);
+    assert!(offset_of!(DispatchDescUpscale, output) == 0x138);
+    assert!(offset_of!(DispatchDescUpscale, render_size) == 0x178);
+    assert!(offset_of!(DispatchDescUpscale, flags) == 0x1ac);
+    assert!(size_of::<DispatchDescUpscale>() == 0x1b0);
+};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants = 8, b0), \
@@ -138,14 +177,8 @@ fn plain(desc: &D3D12_RESOURCE_DESC) -> bool {
         && desc.DepthOrArraySize == 1
 }
 
-/// Reads a `u32` pair at `offset` of the description.
-fn pair(desc: *const u8, offset: usize) -> (u32, u32) {
-    // SAFETY: inside the description the title passes (0x1b0 bytes).
-    unsafe { desc.add(offset).cast::<[u32; 2]>().read_unaligned() }.into()
-}
-
 /// `width` x `height` if both are set and fit in `w` x `h`, else all of it.
-fn within((width, height): (u32, u32), w: u32, h: u32) -> (u32, u32) {
+pub(crate) fn within((width, height): (u32, u32), w: u32, h: u32) -> (u32, u32) {
     if width == 0 || height == 0 || width > w || height > h {
         (w, h)
     } else {
@@ -163,15 +196,21 @@ fn within((width, height): (u32, u32), w: u32, h: u32) -> (u32, u32) {
 /// as the title passes it to `ffxDispatch`, on the thread recording its
 /// command list.
 pub unsafe fn dispatch(desc: *const u8) -> bool {
-    // SAFETY: the description the title passes: pointers at these offsets.
-    let word = |offset: usize| unsafe { desc.add(offset).cast::<usize>().read_unaligned() };
+    // SAFETY: as the caller says.
+    let d = unsafe { &*desc.cast::<DispatchDescUpscale>() };
     let (list, color, output) = (
-        word(LIST) as This,
-        word(COLOR) as This,
-        word(OUTPUT) as This,
+        d.command_list as This,
+        d.color.resource as This,
+        d.output.resource as This,
     );
+    let (render, upscale) = ((d.render_size[0], d.render_size[1]), (d.upscale_size[0], d.upscale_size[1]));
     if !crate::resource::is_resource(color) || !crate::resource::is_resource(output) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::error!("the title's upscale is left to its upscaler: its colour or output is no resource of ours"));
         return false;
+    }
+    if crate::vulkan::on() {
+        return crate::vulkan::record::upscale::dispatch(list, color, output, render, upscale);
     }
     let (Some(host), Some(pass)) = (host(), pass()) else {
         return false;
@@ -197,8 +236,8 @@ pub unsafe fn dispatch(desc: *const u8) -> bool {
         return false;
     }
     let (cw, ch) = (a.Width as u32, a.Height);
-    let (rw, rh) = within(pair(desc, RENDER_SIZE), cw, ch);
-    let (ow, oh) = within(pair(desc, UPSCALE_SIZE), b.Width as u32, b.Height);
+    let (rw, rh) = within(render, cw, ch);
+    let (ow, oh) = within(upscale, b.Width as u32, b.Height);
     // (Run later, by the worker that translates the list: `move`.)
     crate::list::record_own(list, move |list: &HostList| {
         static ONCE: std::sync::Once = std::sync::Once::new();

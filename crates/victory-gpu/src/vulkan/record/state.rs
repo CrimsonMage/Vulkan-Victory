@@ -125,6 +125,7 @@ impl Rec {
             (r.offset.x, r.offset.y, r.extent.width, r.extent.height).hash(&mut h);
         }
         (self.blend.map(f32::to_bits), self.depth_bounds.0.to_bits(), self.depth_bounds.1.to_bits()).hash(&mut h);
+        self.console.depth_bias.map(|b| b.map(f32::to_bits)).hash(&mut h);
         h.finish()
     }
 
@@ -138,6 +139,11 @@ impl Rec {
         unsafe {
             self.viewport_state(d, cmd);
             raster_state(d, cmd, &gs.rasterizer);
+            if let Some([bias, clamp, slope]) = self.console.depth_bias {
+                // `RSSetDepthBiasX` over the pipeline's.
+                d.cmd_set_depth_bias_enable(cmd, bias != 0.0 || slope != 0.0);
+                d.cmd_set_depth_bias(cmd, bias, clamp, slope);
+            }
             self.depth_stencil_state(d, cmd, gs);
             d.cmd_set_primitive_topology(cmd, topology);
             let strip = matches!(topology, vk::PrimitiveTopology::LINE_STRIP | vk::PrimitiveTopology::TRIANGLE_STRIP);
