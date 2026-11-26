@@ -41,10 +41,10 @@ static IN_FLIGHT: Mutex<u64> = Mutex::new(0);
 static ROOM: Condvar = Condvar::new();
 
 /// Waits until `words` more may compile; hands them back on drop.
-struct Flight(u64);
+pub(super) struct Flight(u64);
 
 impl Flight {
-    fn take(words: u64) -> Flight {
+    pub(super) fn take(words: u64) -> Flight {
         let mut n = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         while *n > 0 && *n + words > WORDS_IN_FLIGHT {
             n = ROOM.wait(n).unwrap_or_else(|e| e.into_inner());
@@ -524,6 +524,7 @@ fn hash_hex(full: &[u8; 32]) -> String {
 }
 
 fn start(b: &'static Backend) {
+    super::baking::in_background(b);
     let n = workers();
     tracing::info!(workers = n, words_in_flight = WORDS_IN_FLIGHT, "Vulkan: stage workers");
     for i in 0..n {
@@ -604,6 +605,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
     STATS[8].fetch_add(vs.spirv.len() as u64, Ordering::Relaxed);
     let hash = hash_hex(&shader.full);
     super::guard::register(vs.guard_id, &shader.name, &hash);
+    super::stage_cache::note_name(&shader.full, &shader.name);
     let usage = victory_vk::limits::usage(&vs.spirv);
     if let Some(dir) = dump_dir() {
         let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -786,7 +788,7 @@ fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {
 /// Compiles one stage: a library part (vertex: pre-rasterisation, with
 /// `geometry` behind it if given; pixel: fragment shader) or a compute
 /// pipeline.
-fn compile(
+pub(super) fn compile(
     b: &Backend,
     stage: HwStage,
     module: vk::ShaderModule,

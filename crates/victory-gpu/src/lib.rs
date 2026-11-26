@@ -49,6 +49,8 @@ pub mod upscale;
 #[cfg(windows)]
 mod vulkan;
 #[cfg(windows)]
+pub use vulkan::bake;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

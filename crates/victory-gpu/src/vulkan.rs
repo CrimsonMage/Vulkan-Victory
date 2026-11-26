@@ -33,6 +33,7 @@ use victory_vk::swapchain::Swapchain;
 use victory_vk::timeline::Timeline;
 
 mod bound;
+mod baking;
 mod budget;
 mod compose;
 mod descriptors;
@@ -898,4 +899,11 @@ fn report(b: &Backend, frame: u64) {
     record::report();
     images::report();
     card_memory(b);
+}
+
+/// `victory bake`: compiles every translation the stage cache holds, as
+/// the game would, into the pipeline caches; writes the pipeline index
+/// (`baking.rs`).
+pub fn bake(jobs: Option<usize>, index: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    baking::run(jobs, index)
 }

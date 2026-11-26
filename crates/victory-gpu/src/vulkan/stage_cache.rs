@@ -83,6 +83,83 @@ pub(crate) fn known(full: &[u8; 32]) -> bool {
     dir().is_some() && kept().contains(&file_name(full))
 }
 
+/// Every translation of this key: (the container's hash, 32 hex digits,
+/// and its file), sorted by hash.
+pub(crate) fn all() -> Vec<(String, PathBuf)> {
+    let Some(d) = dir() else { return Vec::new() };
+    let tail = format!("-{}.vks", key());
+    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(&tail).map(|h| (h.to_string(), e.path()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The translation in `file`.
+pub(crate) fn read_file(file: &std::path::Path) -> Option<VkShader> {
+    decode(&std::fs::read(file).ok()?)
+}
+
+/// A line file of the cache folder as a set of its lines.
+fn lines_of(name: &str) -> std::collections::BTreeSet<String> {
+    dir()
+        .and_then(|d| std::fs::read_to_string(d.join(name)).ok())
+        .map(|t| t.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Appends `line` to a line file of the cache folder.
+fn append_line(name: &str, line: &str) {
+    use std::io::Write;
+    let Some(d) = dir() else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(d.join(name)) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The program names of the containers (hash, 32 hex digits -> name), kept
+/// as the game translates or reads them (`stage-names.txt`).
+pub(crate) fn names() -> std::collections::HashMap<String, String> {
+    lines_of("stage-names.txt")
+        .into_iter()
+        .filter_map(|l| l.split_once(' ').map(|(h, n)| (h.to_string(), n.to_string())))
+        .collect()
+}
+
+/// Notes the program name of container `full` (once per run and hash).
+pub(crate) fn note_name(full: &[u8; 32], name: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    if name.is_empty() {
+        return;
+    }
+    let hash: String = full[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(|| names().into_keys().collect());
+    if seen.insert(hash.clone()) {
+        append_line("stage-names.txt", &format!("{hash} {name}"));
+    }
+}
+
+/// The file listing what `victory bake` (or the game's background bake)
+/// compiled with this translator key on the device of `uuid`.
+fn baked_file(uuid: &str) -> String {
+    format!("baked-{}-{uuid}.txt", key())
+}
+
+pub(crate) fn baked(uuid: &str) -> std::collections::BTreeSet<String> {
+    lines_of(&baked_file(uuid))
+}
+
+pub(crate) fn mark_baked(uuid: &str, hash: &str) {
+    append_line(&baked_file(uuid), hash);
+}
+
 /// The cached translation of the container `full`, if there is one.
 pub(crate) fn read(full: &[u8; 32]) -> Option<VkShader> {
     decode(&std::fs::read(path(full)?).ok()?)

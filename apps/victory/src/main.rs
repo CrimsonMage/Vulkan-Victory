@@ -110,6 +110,18 @@ enum Command {
     /// what it lacks, title memory imported and read by device address,
     /// descriptor buffer, a SPIR-V compute program, a cleared swapchain.
     Vkprobe,
+    /// Compile every shader translation the Vulkan stage cache holds, as
+    /// the game would, into the pipeline caches (the driver's and ours),
+    /// before the game runs; write the pipeline index.
+    Bake {
+        /// Worker threads (default: half the logical processors).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Where the pipeline index goes (default: `pipeline-index.md`
+        /// beside the caches).
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -154,12 +166,28 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::Bake { jobs, index } => bake(jobs, index),
         Command::Vkprobe => {
             if !victory_vk::vkprobe()? {
                 std::process::exit(1);
             }
             Ok(())
         }
+    }
+}
+
+/// `victory bake` (the Windows build, under Proton on Linux).
+fn bake(jobs: Option<usize>, index: Option<PathBuf>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let cfg = victory_core::Config::load()?;
+        victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+        victory_gpu::bake(jobs, index)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (jobs, index);
+        anyhow::bail!("bake runs on the Windows build (under Proton on Linux)")
     }
 }
 
