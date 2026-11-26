@@ -93,11 +93,17 @@ pub enum Helper {
     /// (title base u64, bytes u32) -> device base u64, or the zero block
     /// when the bytes are not inside one range.
     TranslateRange,
+    /// (title address u64) -> u64: the bytes from it to the end of its
+    /// memory map range (0 in none).
+    RangeLeft,
     /// (device address u64, shape u32) -> uvec4: a typed buffer element
     /// decoded (floats as their bits; missing channels 0, alpha 1).
     Typed,
     /// (V# FORMAT u32) -> the shape `Typed` decodes (a table lookup).
     TypedShape,
+    /// (shape u32, the channel registers uvec4, d16 u32) -> uvec4: a typed
+    /// buffer element encoded (its dwords; emit_typed.rs).
+    TypedPack,
     /// (node device address u64, kind u32, sort u32, extent, origin xyz,
     /// direction xyz, inverse direction xyz) -> uvec4: the ray/node test
     /// of `image_bvh*_intersect_ray` (emit_bvh.rs).

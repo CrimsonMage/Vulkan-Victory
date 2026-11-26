@@ -104,7 +104,12 @@ impl Lift<'_> {
             StageIo::Cs(cs) => u32::from(cs.user_sgprs()),
             _ => 32,
         };
-        if c >= base && c - base < users && c - base < 60 {
+        // a compute program's spilled user-data table (spill.rs): its
+        // entries at index 16 and above arrive in push dwords too
+        let spilled = |k: u32| {
+            k >= 16 && self.native.layout.iter().any(|e| k >= u32::from(e.user_data) && k < u32::from(e.user_data) + e.sgprs)
+        };
+        if c >= base && (c - base < users || spilled(c - base)) && c - base < 60 {
             return self.f.global(Op::Push(push_window(stage) + (c - base)), Ty::U32);
         }
         self.f.konst(Ty::U32, 0)
@@ -125,10 +130,7 @@ impl Lift<'_> {
         let slot: u16 = match e.target {
             Target::Color(n) => u16::from(n),
             Target::Position(0) => OUT_POSITION,
-            Target::Position(_) => {
-                self.approx("clip and cull distances (pos1+ exports) left out");
-                return Ok(());
-            }
+            Target::Position(n) => return self.export_pos_extra(&e, n, off),
             Target::Param { .. } => return self.export_param(&e, off),
             Target::Null | Target::Unread => return Ok(()),
             Target::Depth => return self.export_depth(&e, off),
@@ -136,6 +138,87 @@ impl Lift<'_> {
             Target::PrimitiveParam { .. } => return Err(unsupported(off, "a per-primitive output")),
         };
         self.export_values(&e, slot, off)
+    }
+
+    /// `exp pos1+`: the vectors `PA_CL_VS_OUT_CNTL` enables after the
+    /// position, in order: the misc vector (point size, edge flag, layer
+    /// and viewport index), clip/cull distances 0-3, 4-7. Distance d is
+    /// clip when CLIP_DIST_ENA bit d is set, cull when CULL_DIST_ENA bit d
+    /// is; each kind fills its array in distance order.
+    fn export_pos_extra(&mut self, e: &io::Export, n: u8, off: usize) -> Res<()> {
+        let cntl = match &self.native.io {
+            StageIo::Vs { clip_cntl, .. } => *clip_cntl,
+            StageIo::Ms(m) => m.clip_cntl,
+            _ => 0,
+        };
+        let clip = cntl & 0xFF;
+        let cull = cntl >> 8 & 0xFF;
+        self.iface.clip_cull = (clip.count_ones() as u8, cull.count_ones() as u8);
+        let vectors: Vec<u32> = [21, 22, 23].into_iter().filter(|b| cntl >> b & 1 != 0).collect();
+        let Some(&vector) = vectors.get(usize::from(n) - 1) else {
+            return Err(unsupported(off, "a position export PA_CL_VS_OUT_CNTL does not enable"));
+        };
+        for (c, v) in e.values.iter().enumerate() {
+            let Some(v) = v else { continue };
+            let r = self.value(*v, off)?;
+            let x = self.data(r);
+            let c = c as u32;
+            let outs: Vec<(u16, u32, V)> = if vector == 21 {
+                self.misc_outputs(cntl, c, x)
+            } else {
+                let d = 4 * (vector - 22) + c;
+                let below = (1u32 << d) - 1;
+                let mut o = Vec::new();
+                if clip >> d & 1 != 0 {
+                    o.push((OUT_CLIP, (clip & below).count_ones(), x));
+                }
+                if cull >> d & 1 != 0 {
+                    o.push((OUT_CULL, (cull & below).count_ones(), x));
+                }
+                o
+            };
+            let index = self.mesh_index();
+            for (slot, comp, x) in outs {
+                let mut args = vec![x];
+                args.extend(index);
+                self.emit(Op::Output { slot, comp: comp as u8 }, Ty::VOID, args);
+                self.note_output(slot, comp as u8);
+            }
+        }
+        Ok(())
+    }
+
+    /// Channel `c` of the misc vector: x point size, y edge flag (no
+    /// Vulkan counterpart: dropped), z layer in bits 0-10 and viewport
+    /// index in bits 16-19, each when its USE_VTX bit is set.
+    fn misc_outputs(&mut self, cntl: u32, c: u32, x: V) -> Vec<(u16, u32, V)> {
+        let on = |b: u32| cntl >> b & 1 != 0;
+        match c {
+            0 if on(16) => vec![(OUT_POINT_SIZE, 0, x)],
+            1 if on(17) => {
+                self.approx("a vertex edge flag (misc vector y) left out");
+                vec![]
+            }
+            // a mesh program's layer and viewport index are per primitive
+            2 if self.native.stage == HwStage::Ms && (on(18) || on(19)) => {
+                self.approx("a mesh program's per-vertex layer or viewport index left out");
+                vec![]
+            }
+            2 => {
+                let u = self.u32v(x);
+                let mut o = Vec::new();
+                if on(18) {
+                    let (z, k11) = (self.k32(0), self.k32(11));
+                    o.push((OUT_LAYER, 0, self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[u, z, k11])));
+                }
+                if on(19) {
+                    let (k16, k4) = (self.k32(16), self.k32(4));
+                    o.push((OUT_VIEWPORT, 0, self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[u, k16, k4])));
+                }
+                o
+            }
+            _ => vec![],
+        }
     }
 
     /// Mesh: vertex and primitive n are written by thread n of the group.

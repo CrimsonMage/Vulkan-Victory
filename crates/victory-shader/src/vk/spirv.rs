@@ -222,6 +222,10 @@ pub mod en {
     pub const CAP_STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
     pub const CAP_INT8: u32 = 39;
     pub const CAP_STENCIL_EXPORT: u32 = 5013;
+    pub const CAP_CLIP_DISTANCE: u32 = 32;
+    pub const CAP_CULL_DISTANCE: u32 = 33;
+    pub const CAP_SHADER_LAYER: u32 = 69;
+    pub const CAP_SHADER_VIEWPORT_INDEX: u32 = 70;
     pub const CAP_MESH_SHADING_EXT: u32 = 5283;
     pub const CAP_FRAGMENT_BARYCENTRIC_KHR: u32 = 5284;
     pub const CAP_INT64_ATOMICS: u32 = 12;
@@ -257,7 +261,9 @@ pub mod en {
     pub const DEC_COHERENT: u32 = 23;
 
     pub const BI_POSITION: u32 = 0;
+    pub const BI_POINT_SIZE: u32 = 1;
     pub const BI_CLIP_DISTANCE: u32 = 3;
+    pub const BI_CULL_DISTANCE: u32 = 4;
     pub const BI_PRIMITIVE_ID: u32 = 7;
     pub const BI_LAYER: u32 = 9;
     pub const BI_VIEWPORT_INDEX: u32 = 10;

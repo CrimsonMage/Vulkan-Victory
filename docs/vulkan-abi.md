@@ -179,7 +179,11 @@ check from the V# at run time: with stride 0, the access is in bounds when
 `index < NUM_RECORDS` (and the offset < stride for swizzled forms, not
 used by the title). An out-of-bounds access reads zeros / drops the write
 (whole access, not per dword). Typed loads and stores decode FORMAT in
-the shader.
+the shader. The V#'s bytes are counted up to the end of the memory map
+range its base lies in at most (`Helper::RangeLeft`): a V# larger than
+the memory under it (NUM_RECORDS -1, as the console's BVH builder makes
+for a raw pointer) reaches all of that range, and a base in no range
+reads zeros.
 
 ## 5. Images and samplers
 
@@ -318,7 +322,23 @@ at pipeline creation.
   id. `exp pos0` is `gl_Position`; `exp param<n>` writes the outputs of
   signature row n at their semantics' locations (32-bit float; integer
   values travel as float bits). Outputs carry no interpolation
-  decorations.
+  decorations. `exp pos1+` are the vectors the program's
+  `PA_CL_VS_OUT_CNTL` (in its stage data: vertex E+0x1a0, mesh E+0x194)
+  enables after the position, in order: the misc vector (bit 21: point
+  size x, edge flag y, layer z[10:0] and viewport index z[19:16]), clip
+  and cull distances 0-3 (bit 22) and 4-7 (bit 23). Distance d is a clip
+  distance when CLIP_DIST_ENA bit d is set, a cull distance when
+  CULL_DIST_ENA bit d is; each kind is a `ClipDistance` / `CullDistance`
+  array (per vertex in a mesh program) of as many elements as its enable
+  bits, filled in distance order (`shaderClipDistance`,
+  `shaderCullDistance`; at most 8 together, as on the console). Point
+  size, layer and viewport index go to `PointSize`, `Layer`,
+  `ViewportIndex` (vertex programs: `shaderOutputLayer`,
+  `shaderOutputViewportIndex`); a mesh program's per-vertex layer or
+  viewport index and the edge flag have no Vulkan counterpart and are left
+  out (listed; no program of the title exports the misc vector: its
+  1,804 `pos1` exports are clip distances, 1 to 4, and two vertex
+  programs' four cull distances).
 - **Pixel.** Inputs at their semantics' locations with the interpolation
   the barycentrics say (perspective/linear × center/centroid/sample,
   flat for `v_interp_mov` P0). `exp mrt<n>` is
@@ -380,10 +400,27 @@ are uniform per subgroup, lane masks are per-invocation booleans
 (`OpGroupNonUniformBallot` where the code reads a mask as a number).
 A console wave64 compute or mesh program runs as two subgroups
 ("halves") that exchange whole-wave values (section 9): every scalar value
-is then the same in both. A wave64 vertex or pixel program runs as one
-subgroup standing for the wave; cross-lane operations that reach across
-32 lanes there are taken per half, and the translator lists them
-(`VkShader::approximate`).
+is then the same in both. A wave64 vertex or pixel program (and a wave64
+compute or mesh group of at most 32 threads) runs as one subgroup standing
+for the wave; cross-lane operations that reach across 32 lanes there are
+taken per half, and the translator lists them (`VkShader::approximate`):
+the high dword of a lane mask read as a number reads 0
+(`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, `v_mbcnt_hi` and the rest count
+and search the lower half only), and a `v_readlane` of lane 32 or above
+reads lane `l & 31`. A subgroup is then a console wave whose upper half
+no work item fills (a state the console's partly filled waves are in):
+for a mask made of EXEC and compares the high dword 0 is exactly what
+that half gives. It differs where the program set a mask to every lane
+by a constant and then reads it as a number (the console's upper bits
+are set), and at a `v_readlane` of the upper half unless the value read
+is one a lane of the lower half equals (an idempotent reduction: min,
+max, and, or); a sum or exclusive-or reduction across the halves counts
+the lower half twice. Settling each upper-half read as the constant an
+empty lane holds (tried 2026-11-26, a phantom-lane evaluation over the
+whole program after lifting) settled the reads of 65 of the 915 programs
+listed for masks (24 programs whole) and none of the 736 `v_readlane`
+ones: most reads depend on the path the wave took or on lane data. Not
+kept (too little for its weight).
 
 ## 8. What the translator returns
 
@@ -409,8 +446,6 @@ translation-index --pack <pack>` runs it over a whole dump and writes
 
 Known gaps (the program translates; the result differs from the console):
 
-- Position exports past the first (`exp pos1..3`: clip and cull
-  distances) are dropped.
 - Ray/node tests (`image_bvh*_intersect_ray`) run in software
   (`Helper::BvhRay`, one function per module): the node is read from
   title memory at `(T# base << 8) + (pointer >> 3) * 64` through the map
@@ -419,8 +454,6 @@ Known gaps (the program translates; the result differs from the console):
   as the D3D12 path's tested reference did. Triangles always return the
   barycentric form (T# dword 3 bit 24; the title sets it). Not checked
   on the card yet.
-- Typed buffer stores through a V#'s format are written as 32-bit
-  channels.
 - Wave64 compute and mesh programs run each console wave as two host
   subgroups that exchange one word where a value must be whole-wave:
   64-bit masks read as numbers (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`,
@@ -455,6 +488,15 @@ Known gaps (the program translates; the result differs from the console):
   barrier are not ordered (nor are they in the HLSL the program came from).
 - Cube samples with derivatives or offsets read the faces as a 2D array:
   no filtering across face edges.
+
+Typed buffer loads and stores through a V#'s FORMAT decode and encode
+in the shader (`Helper::Typed`, `Helper::TypedPack`, emit_typed.rs, one
+function each, no branches): 8/16/32-bit unorm, snorm, uint, sint and
+float channels, 1, 2 or 4 of them, and 10_10_10_2 unorm. A store rounds
+floats to nearest even (halves too), clamps unorm and snorm (NaN to 0)
+and rounds to nearest even, clamps integers to the channel's range, and
+writes exactly the element's bytes (1 and 2 by byte stores). A FORMAT
+outside that set reads and writes one 32-bit channel.
 
 Open points:
 

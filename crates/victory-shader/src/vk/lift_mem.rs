@@ -130,13 +130,14 @@ impl Lift<'_> {
         let bytes64 = self.spv(op::I_MUL, Ty::U64, &[nr64, st64]);
         let max = self.f.konst(Ty::U64, 0xFFFF_FFFF);
         let bytes64 = self.gl(glsl::U_MIN, Ty::U64, &[bytes64, max]);
-        let bytes = self.spv(op::U_CONVERT, Ty::U32, &[bytes64]);
-        // the device base, or the zero block when the bytes are in no range
-        let dev = self.emit(Op::Call(Helper::TranslateRange), Ty::U64, vec![base, bytes]);
-        let zero = self.fallback(false);
-        let mapped = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[dev, zero]);
-        let z = self.k32(0);
-        let limit = self.spv(op::SELECT, Ty::U32, &[mapped, bytes, z]);
+        // the device base (the zero block when the base is in no range) and
+        // the bytes up to the end of the base's range at most (a V# larger
+        // than the memory it lies in, such as NUM_RECORDS -1, reaches its
+        // range's end)
+        let dev = self.translate(base);
+        let left = self.emit(Op::Call(Helper::RangeLeft), Ty::U64, vec![base]);
+        let bytes64 = self.gl(glsl::U_MIN, Ty::U64, &[bytes64, left]);
+        let limit = self.spv(op::U_CONVERT, Ty::U32, &[bytes64]);
         let shape = self.typed_shape(w[3]);
         VSharp { shape, dev, limit, stride }
     }
@@ -233,6 +234,9 @@ impl Lift<'_> {
         if let Kind::VFormat(ch, d16) = kind {
             return self.buffer_vformat(inst, &vs, o, reg, ch, d16);
         }
+        if let Kind::VStore(ch, d16) = kind {
+            return self.buffer_vstore(inst, &vs, o, &src, ch, d16);
+        }
         if load {
             let kind = match kind {
                 Kind::Dwords(n) if self.floats(inst, (0..n).map(|k| Reg::V(reg + k as u8))) => Kind::Floats(n),
@@ -324,11 +328,7 @@ impl Lift<'_> {
                 (bytes, Kind::T(kind, ch, d16))
             }
             None if load => (0, Kind::VFormat(ch, d16)),
-            None => {
-                // stores through a V# format: 32-bit channels
-                self.approx("a typed buffer store written as 32-bit channels");
-                (4 * ch, if d16 { Kind::Halves(ch) } else { Kind::Dwords(ch) })
-            }
+            None => (0, Kind::VStore(ch, d16)),
         })
     }
 
@@ -344,6 +344,72 @@ impl Lift<'_> {
             self.def(inst, Reg::V(reg + i as u8), R::D(v));
         }
         Ok(())
+    }
+
+    /// A store in the V#'s format: the channels encoded by a helper, the
+    /// element's bytes written (bounds by its size); a 1- or 2-byte
+    /// element by byte stores, the rest by dwords. Channels the
+    /// instruction lacks are 0.
+    fn buffer_vstore(&mut self, inst: &Inst, vs: &VSharp, o: V, src: &Operand, ch: u32, d16: bool) -> Res<()> {
+        let mut regs = Vec::new();
+        for k in 0..ch as u8 {
+            let x = self.opnd_dw(inst, src, if d16 { k / 2 } else { k }, false)?;
+            let x = self.u32v(x);
+            regs.push(if d16 && k % 2 == 1 {
+                let k16 = self.k32(16);
+                self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[x, k16])
+            } else {
+                x
+            });
+        }
+        regs.resize(4, self.k32(0));
+        let v = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 4), &regs);
+        let flag = self.k32(u32::from(d16));
+        let w = self.emit(Op::Call(Helper::TypedPack), Ty::vec(S::U32, 4), vec![vs.shape, v, flag]);
+        let size = self.typed_size(vs.shape);
+        let a = self.access_addr(vs, o, size, true);
+        let sink = self.fallback(true);
+        let at = |l: &mut Self, k: u32, need: V| -> V {
+            let kk = l.f.konst(Ty::U64, u64::from(k));
+            let ak = l.spv(op::I_ADD, Ty::U64, &[a, kk]);
+            l.spv(op::SELECT, Ty::U64, &[need, ak, sink])
+        };
+        let (k2, k4) = (self.k32(2), self.k32(4));
+        let small = self.spv(op::U_LESS_THAN, Ty::BOOL, &[size, k4]);
+        let pair = self.spv(op::I_EQUAL, Ty::BOOL, &[size, k2]);
+        let w0 = self.extract(w, 0);
+        for (k, need) in [(0, small), (1, pair)] {
+            let sh = self.k32(8 * k);
+            let byte = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[w0, sh]);
+            let byte = self.spv(op::U_CONVERT, Ty::U8, &[byte]);
+            let p = at(self, k, need);
+            self.emit(Op::Store { align: 1 }, Ty::VOID, vec![p, byte]);
+        }
+        for j in 0..4u32 {
+            let need = if j == 0 {
+                self.spv(op::LOGICAL_NOT, Ty::BOOL, &[small])
+            } else {
+                let kj = self.k32(4 * j);
+                self.spv(op::U_GREATER_THAN, Ty::BOOL, &[size, kj])
+            };
+            let x = self.extract(w, j);
+            let p = at(self, 4 * j, need);
+            self.emit(Op::Store { align: 4 }, Ty::VOID, vec![p, x]);
+        }
+        Ok(())
+    }
+
+    /// A typed element's bytes from its shape (emit_typed.rs): components
+    /// times bits, 4 for 10_10_10_2.
+    fn typed_size(&mut self, shape: V) -> V {
+        let (k7, k8, k255, k3, k10, k4) = (self.k32(7), self.k32(8), self.k32(255), self.k32(3), self.k32(10), self.k32(4));
+        let comps = self.spv(op::BITWISE_AND, Ty::U32, &[shape, k7]);
+        let bits = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[shape, k8]);
+        let bits = self.spv(op::BITWISE_AND, Ty::U32, &[bits, k255]);
+        let total = self.spv(op::I_MUL, Ty::U32, &[comps, bits]);
+        let bytes = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[total, k3]);
+        let ten = self.spv(op::I_EQUAL, Ty::BOOL, &[bits, k10]);
+        self.spv(op::SELECT, Ty::U32, &[ten, k4, bytes])
     }
 
     pub(super) fn load_kind(&mut self, a: V, kind: Kind) -> Res<Vec<V>> {
@@ -367,7 +433,7 @@ impl Lift<'_> {
                 let vals = self.typed_load(a, t, ch);
                 if d16 { self.pack_d16(&vals) } else { vals }
             }
-            Kind::VFormat(..) | Kind::Halves(_) => return Err(unsupported(0, "a typed buffer access")),
+            Kind::VFormat(..) | Kind::VStore(..) => return Err(unsupported(0, "a typed buffer access")),
         })
     }
 
@@ -394,18 +460,7 @@ impl Lift<'_> {
                 let v = self.spv(op::U_CONVERT, Ty::U16, &[x]);
                 self.emit(Op::Store { align: 2 }, Ty::VOID, vec![a, v]);
             }
-            Kind::Halves(n) => {
-                // two f16 per data dword, written as 32-bit floats
-                let mut out = Vec::new();
-                for k in 0..n {
-                    let w = self.u32v(vals[(k / 2) as usize]);
-                    let f = self.half_f32(w, k % 2 == 1);
-                    out.push(self.u32v(f));
-                }
-                let v = if n == 1 { out[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, n as u8), &out) };
-                self.emit(Op::Store { align: 4 }, Ty::VOID, vec![a, v]);
-            }
-            Kind::T(..) | Kind::Floats(_) | Kind::VFormat(..) => return Err(unsupported(0, "a typed buffer store")),
+            Kind::T(..) | Kind::Floats(_) | Kind::VFormat(..) | Kind::VStore(..) => return Err(unsupported(0, "a typed buffer store")),
         }
         Ok(())
     }
@@ -523,6 +578,25 @@ impl Lift<'_> {
         Ok(self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]))
     }
 
+    /// `ds_read_*_d16[_hi]`: into one half of the destination; the other
+    /// half stays.
+    fn lds_read_d16(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, name: &'static str, d: u8) -> Res<()> {
+        let base = name.split("_d16").next().unwrap_or(name);
+        let v = self.lds_read_small(inst, addr, o16, base)?;
+        let old = match inst.read(Reg::V(d)) {
+            Some(o) => {
+                let r = self.value(o, inst.machine.offset)?;
+                let x = self.data(r);
+                self.u32v(x)
+            }
+            None => self.k32(0),
+        };
+        let (at, w) = (self.k32(if name.ends_with("_hi") { 16 } else { 0 }), self.k32(16));
+        let r = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[old, v, at, w]);
+        self.def(inst, Reg::V(d), R::D(r));
+        Ok(())
+    }
+
     pub(super) fn ds(&mut self, inst: &Inst, name: &'static str) -> Res<()> {
         let off = inst.machine.offset;
         let Fields::Ds { dst, addr, data, offset0, offset1, gds } = inst.fields.clone() else { unreachable!() };
@@ -573,7 +647,7 @@ impl Lift<'_> {
                 self.def(inst, Reg::V(need_d()?), R::D(v));
             }
             "ds_read_u16_d16" | "ds_read_u16_d16_hi" | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" => {
-                self.lds_read_half(inst, &addr, o16, name, need_d()?)?
+                self.lds_read_d16(inst, &addr, o16, name, need_d()?)?;
             }
             "ds_write_b16" | "ds_write_b8" | "ds_write_b16_d16_hi" | "ds_write_b8_d16_hi" => {
                 self.lds_write_small(inst, &addr, o16, &data[0], name)?
@@ -638,24 +712,6 @@ impl Lift<'_> {
         let width = self.k32(if name.ends_with("16") { 16 } else { 8 });
         let opc = if name.contains("_i") { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
         Ok(self.spv(opc, Ty::U32, &[w, sh, width]))
-    }
-
-    /// A small LDS read into one half of `d`; the other half stays.
-    fn lds_read_half(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, name: &str, d: u8) -> Res<()> {
-        let base = name.split("_d16").next().unwrap_or(name);
-        let v = self.lds_read_small(inst, addr, o16, base)?;
-        let old = match inst.read(Reg::V(d)) {
-            Some(o) => {
-                let r = self.value(o, inst.machine.offset)?;
-                let x = self.data(r);
-                self.u32v(x)
-            }
-            None => self.k32(0),
-        };
-        let (at, w) = (self.k32(if name.ends_with("_hi") { 16 } else { 0 }), self.k32(16));
-        let r = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[old, v, at, w]);
-        self.def(inst, Reg::V(d), R::D(r));
-        Ok(())
     }
 
     /// A half or byte of a dword: clear it, then set it (two atomics, so
@@ -856,8 +912,8 @@ pub(super) struct TFormat {
 pub(super) enum Kind {
     /// A typed load through the V#'s format (channels, d16).
     VFormat(u32, bool),
-    /// d16 typed store data written as 32-bit floats.
-    Halves(u32),
+    /// A typed store through the V#'s format (channels, d16).
+    VStore(u32, bool),
     Dwords(u32),
     Floats(u32),
     Byte(bool),

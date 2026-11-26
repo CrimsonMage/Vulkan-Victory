@@ -46,6 +46,8 @@
 //!     E+0xc8  32 outputs of 6 B: u8 usage, u8 row, u8 parameter (`exp
 //!             param<n>`), u8 row again, u8 slot, u8 flags (bit 0 fp16,
 //!             bit 1 two fp16 values per dword); E+0x188 u32 count
+//!     E+0x198 u32 SPI_VS_OUT_CONFIG, SPI_SHADER_POS_FORMAT,
+//!             PA_CL_VS_OUT_CNTL (which clip and cull distances `pos1+` carry)
 //! CS  E+0x24  u32 COMPUTE_PGM_RSRC2, E+0x28 u32 x3 thread-group size
 //! MS  E+0xc8  outputs as VS, E+0x188 count; the param byte's bit 7 marks a
 //!             per-primitive output (`PSG1` row); the 3 bytes more are the
@@ -119,6 +121,7 @@ const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
+const VS_CLIP_CNTL: usize = 0x1a0;
 const MS_INFO: usize = 0x448;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
@@ -257,6 +260,8 @@ pub enum StageIo {
     Vs {
         inputs: Vec<VsInput>,
         outputs: Vec<VsOutput>,
+        /// `PA_CL_VS_OUT_CNTL`: which clip and cull distances `pos1+` carry.
+        clip_cntl: u32,
     },
     Ps {
         inputs: Vec<PsInput>,
@@ -684,7 +689,8 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             pack2: e[5] & 2 != 0,
         })
         .collect();
-    Ok(StageIo::Vs { inputs, outputs })
+    let clip_cntl = u32_at(data, VS_CLIP_CNTL).unwrap_or(0);
+    Ok(StageIo::Vs { inputs, outputs, clip_cntl })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -826,6 +832,7 @@ mod tests {
                     io: StageIo::Vs {
                         inputs: vec![],
                         outputs: vec![],
+                        clip_cntl: 0,
                     },
                     code: VS_CODE.to_vec()
                 },
