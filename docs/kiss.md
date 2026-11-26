@@ -259,6 +259,21 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: Vulkan run vk19 (b08fedc): the account screen (navy, ACCOUNT
+  PICKER/PLAYER) and the Bink intro video render. Fixes: CBV V# stride 16
+  (Scaleform batch matrices read row 0), rectangle lists drawn, the
+  fingerprint refill reads pool memory through its CPU view (green =
+  YUV(0,0,0)), draws wait up to 2 s a frame for a compiling stage. Warm
+  launch: 303 stages from disk, waits 3.7 s, record 30 ms + fills 9 ms a
+  frame. Fork comparison (7900XTX, XCL, Leonida; notes in
+  scratch-agent/compare/notes.md): ours is the smallest (~148k lines,
+  ~96k after the D3D12 path goes; XCL 168k, Leonida 274k, 7900XTX 301k)
+  and the furthest on this machine. Genericity gaps queued: semantic
+  locations fixed to this pack, cube derivatives (6-layer 2D array), generic
+  DPP, wave64 cross-half ops, T# slot check, missing console list slots,
+  fake queries, slot layout from one signal, 2-plane present, FSR4 with no
+  Vulkan path, no kernelx route, no forwarding of unknown XGameRuntime
+  classes to the PC's own.
 - 2026-11-26: FIRST IMAGE ON VULKAN (run vk16, host f9b0165, translator
   b252e39): the loading art renders through victory's own Vulkan path (no
   vkd3d). Black-screen causes found on the way: separate VkImages per view
