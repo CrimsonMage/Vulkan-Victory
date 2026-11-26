@@ -25,7 +25,7 @@ use crate::{ShaderError, io};
 pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// (row, channel) -> (location, component) for the user-semantic rows of
 /// a signature part (`locs`: each row's location, from the registry).
@@ -69,6 +69,9 @@ pub struct VkShader {
     pub approximate: Vec<&'static str>,
     /// Thread-IR instructions after dead-code removal (statistics).
     pub ir_insts: usize,
+    /// What the loop guard writes to the guard buffer's dword 1 when a
+    /// loop of this program gives up (FNV-1a of the container).
+    pub guard_id: u32,
 }
 
 struct SigRow {
@@ -174,7 +177,16 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
     let user: Vec<&SigRow> = rows.iter().filter(|r| r.sv == 0).collect();
     let names: Vec<(&str, u32)> = user.iter().map(|r| (r.name.as_str(), r.index)).collect();
     let locs = semantics.assign(&names).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
-    let st = emit::Stage { stage: native.stage, local_size, out_types, locs: locations(&user, &locs), mesh, no_sel: Default::default() };
+    let st = emit::Stage {
+        stage: native.stage,
+        local_size,
+        out_types,
+        locs: locations(&user, &locs),
+        mesh,
+        loop_limit: loop_limit(native.stage),
+        guard_id: guard_id(container),
+        no_sel: Default::default(),
+    };
     let e = emit_retrying(&f, &iface, st)?;
     let mut interface = Vec::new();
     if native.stage == HwStage::Vs {
@@ -197,7 +209,22 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         local_size,
         approximate: iface.approximate.clone(),
         ir_insts,
+        guard_id: guard_id(container),
     })
+}
+
+/// Iterations after which a loop gives up: pixel and vertex programs run
+/// far more invocations than compute ones, so they get less.
+fn loop_limit(stage: HwStage) -> u32 {
+    match stage {
+        HwStage::Cs => 1 << 18,
+        _ => 1 << 16,
+    }
+}
+
+/// FNV-1a of the container: the program's id in the guard buffer.
+pub fn guard_id(container: &[u8]) -> u32 {
+    container.iter().fold(0x811C_9DC5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
 }
 
 /// A mesh group's id arrives multiplied by max(threads, vertices,

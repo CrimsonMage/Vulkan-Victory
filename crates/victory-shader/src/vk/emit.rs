@@ -29,6 +29,10 @@ pub struct Stage {
     pub locs: HashMap<(u8, u8), (u8, u8)>,
     /// Mesh: maximum vertices and primitives.
     pub mesh: (u32, u32),
+    /// Iterations after which a loop gives up (the loop guard).
+    pub loop_limit: u32,
+    /// What the loop guard writes to identify the program.
+    pub guard_id: u32,
     /// Branch blocks whose join is placed as a block construct, not a
     /// selection (found by earlier attempts).
     pub no_sel: HashSet<usize>,
@@ -158,6 +162,11 @@ pub struct Emit<'a> {
     picks: HashMap<V, Id>,
     /// Merges of the selections `open_if` opened.
     if_merge: Vec<Id>,
+    /// Per loop continue target: its iteration count (a header phi) and
+    /// the next count (made at the continue target).
+    counters: HashMap<Id, (Id, Id)>,
+    /// The guard function (0: no loop gave up a way to it yet).
+    guard_fn: Id,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -227,6 +236,8 @@ impl<'a> Emit<'a> {
             helpers: HashMap::new(),
             picks: HashMap::new(),
             if_merge: Vec::new(),
+            counters: HashMap::new(),
+            guard_fn: 0,
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -524,6 +535,7 @@ impl<'a> Emit<'a> {
         self.m.body.extend(body);
         self.m.op_void(op::FUNCTION_END, &[]);
         self.write_helpers();
+        self.write_guard_fn();
         // entry point and modes
         let (model, name) = match self.st.stage {
             HwStage::Ps => (en::EXEC_FRAGMENT, "main"),
@@ -579,3 +591,5 @@ mod image;
 mod disp;
 #[path = "emit_ops.rs"]
 mod ops;
+#[path = "emit_guard.rs"]
+mod guard;
