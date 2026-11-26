@@ -501,9 +501,6 @@ impl Module {
         put(&mut self.globals, op::TYPE_ARRAY, &[id, elem, len]);
         id
     }
-    pub fn t_runtime_array(&mut self, elem: Id) -> Id {
-        self.global(op::TYPE_RUNTIME_ARRAY, &[elem])
-    }
     /// A struct type; `tag` keeps otherwise identical structs apart.
     pub fn t_struct(&mut self, members: &[Id], tag: u32) -> Id {
         let mut key = members.to_vec();
@@ -520,11 +517,6 @@ impl Module {
     }
     pub fn t_func(&mut self, ret: Id) -> Id {
         self.global(op::TYPE_FUNCTION, &[ret])
-    }
-    /// OpTypeImage: sampled type, dim, depth 0, arrayed, ms, sampled (1
-    /// sampled, 2 storage), format Unknown.
-    pub fn t_image(&mut self, sampled_ty: Id, dim: u32, arrayed: bool, ms: bool, sampled: u32) -> Id {
-        self.global(op::TYPE_IMAGE, &[sampled_ty, dim, 0, u32::from(arrayed), u32::from(ms), sampled, 0])
     }
     /// OpTypeImage with an explicit depth flag (comparison sampling).
     pub fn t_image_d(&mut self, sampled_ty: Id, dim: u32, depth: bool, arrayed: bool, ms: bool, sampled: u32) -> Id {
