@@ -259,6 +259,14 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: ABI v2 merged (translator 5d4ea8d, host 1f1c2a4): per-title
+  semantic registry beside the stage cache, cube 2D-array views on set 0
+  binding 2, T# check word, generic DPP. Used set 1,527/1,527 translate.
+  Loose imports joined: map ranges 33, refused 0 (was 64/188). Vulkan
+  runs vk23/vk23b: account screen, Bink video, loading art with its navy
+  bars; 0 errors, 0 crash reports. Card memory of ours steady at ~2.8 GB
+  (images 2.56 GB); nvidia-smi per-process 3.9-6.8 GB between runs, a
+  driver-internal gap (likely shader local memory) still to explain.
 - 2026-11-26: Vulkan run vk19 (b08fedc): the account screen (navy, ACCOUNT
   PICKER/PLAYER) and the Bink intro video render. Fixes: CBV V# stride 16
   (Scaleform batch matrices read row 0), rectangle lists drawn, the
