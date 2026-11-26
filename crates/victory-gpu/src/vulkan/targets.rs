@@ -15,8 +15,8 @@ use super::images::{self, Image};
 use super::{Backend, lock};
 
 /// Images a dump holds at most, and its bytes.
-const MOST: usize = 64;
-const ROOM: u64 = 512 << 20;
+const MOST: usize = 220;
+const ROOM: u64 = 1536 << 20;
 
 pub(super) struct Plan {
     /// Its own readback buffer, destroyed after the save.
@@ -134,7 +134,9 @@ fn make(b: &Backend) -> Option<Plan> {
     let (mut items, mut at) = (Vec::new(), 0u64);
     for img in images::card_written_images() {
         let bytes = u64::from(img.extent.width) * u64::from(img.extent.height) * texel(&img);
-        if img.samples > 1 || img.extent.width < 128 || texel(&img) == 0 || at + bytes > ROOM {
+        // shadow maps (D16) are left out: there are dozens, and compute
+        // outputs (no draws: last in the order) must fit
+        if img.samples > 1 || img.extent.width < 128 || texel(&img) == 0 || at + bytes > ROOM || img.format == vk::Format::D16_UNORM {
             continue;
         }
         items.push((img, at));
