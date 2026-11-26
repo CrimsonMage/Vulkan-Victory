@@ -474,7 +474,11 @@ impl Emit<'_> {
         helpers.sort_by_key(|h| h.1);
         if let Some(k) = helpers.iter().position(|h| h.0 == Helper::Typed) {
             let (_, fid) = helpers.remove(k);
-            self.write_typed(fid);
+            if super::typed_switch::switch_mode() {
+                self.write_typed_switch(fid);
+            } else {
+                self.write_typed(fid);
+            }
         }
         if let Some(k) = helpers.iter().position(|h| h.0 == Helper::TypedShape) {
             let (_, fid) = helpers.remove(k);
@@ -505,7 +509,8 @@ impl Emit<'_> {
             self.m.label(entry);
             let map = self.map_ptr();
             let z = self.c32(0);
-            let zero = self.map_load_at(map, q, &[z]);
+            let ssbo = super::ssbo::ssbo_mode();
+            let zero = if ssbo { self.m.c_u64(super::ssbo::UNMAPPED) } else { self.map_load_at(map, q, &[z]) };
             let bytes = if range { self.m.op(op::U_CONVERT, q, &[ps[1]]) } else { 0 };
             // device address and byte limit through range `i` (an id)
             let through = |e: &mut Self, i: Id| -> (Id, Id) {
@@ -523,7 +528,18 @@ impl Emit<'_> {
                     let z = e.c32(0);
                     lim = e.m.op(op::SELECT, u, &[hit, ps[1], z]);
                 }
-                let dev = e.m.op(op::I_ADD, q, &[base, d]);
+                let dev = if ssbo {
+                    // (range id << 32 | byte offset)
+                    let _ = base;
+                    let id = e.m.op(op::U_CONVERT, q, &[i]);
+                    let k32 = e.c32(32);
+                    let id = e.m.op(op::SHIFT_LEFT_LOGICAL, q, &[id, k32]);
+                    let m = e.m.c_u64(0xFFFF_FFFF);
+                    let lo = e.m.op(op::BITWISE_AND, q, &[d, m]);
+                    e.m.op(op::BITWISE_OR, q, &[id, lo])
+                } else {
+                    e.m.op(op::I_ADD, q, &[base, d])
+                };
                 (e.m.op(op::SELECT, q, &[hit, dev, zero]), lim)
             };
             let (lf, ls, lm) = (self.m.id(), self.m.id(), self.m.id());

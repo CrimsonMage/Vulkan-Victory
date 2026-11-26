@@ -189,13 +189,12 @@ impl Emit<'_> {
         let step = self.m.op(op::SELECT, q, &[spill, k4, k0]);
         let a1 = self.m.op(op::I_ADD, q, &[a0, step]);
         let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
-        let d0 = {
-            let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[a0]);
-            self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4])
-        };
-        let d1 = {
-            let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[a1]);
-            self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4])
+        let (d0, d1) = if super::ssbo::ssbo_mode() {
+            (self.ssbo_load_u32(a0), self.ssbo_load_u32(a1))
+        } else {
+            let p0 = self.m.op(op::CONVERT_U_TO_PTR, p, &[a0]);
+            let p1 = self.m.op(op::CONVERT_U_TO_PTR, p, &[a1]);
+            (self.m.op(op::LOAD, u, &[p0, en::MEM_ALIGNED, 4]), self.m.op(op::LOAD, u, &[p1, en::MEM_ALIGNED, 4]))
         };
         let lo = self.m.op(op::U_CONVERT, q, &[d0]);
         let hi = self.m.op(op::U_CONVERT, q, &[d1]);

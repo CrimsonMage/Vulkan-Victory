@@ -168,6 +168,8 @@ pub struct Emit<'a> {
     guard_fn: Id,
     /// The wave64 halves' exchange (emit_xchg.rs).
     xv: xchg::XchgVars,
+    /// Variant e: the range buffers by element type (emit_ssbo.rs).
+    ssbo_vars: HashMap<S, Id>,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -240,6 +242,7 @@ impl<'a> Emit<'a> {
             spent_var: 0,
             guard_fn: 0,
             xv: Default::default(),
+            ssbo_vars: HashMap::new(),
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -316,7 +319,7 @@ impl<'a> Emit<'a> {
             Op::Push(k) => self.push_load(k),
             Op::MapField(k) => {
                 let q = self.t.u64_;
-                self.map_load(q, &[k])
+                if ssbo::ssbo_mode() { self.m.c_u64(ssbo::UNMAPPED) } else { self.map_load(q, &[k]) }
             }
             Op::Builtin(b) => self.builtin(b),
             Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
@@ -521,7 +524,7 @@ impl<'a> Emit<'a> {
         self.xchg_init();
         if self.f.nodes.iter().any(|n| matches!(n.op, Op::Store { .. } | Op::Atomic(_))) {
             let q = self.t.u64_;
-            self.sink = self.map_load(q, &[1]);
+            self.sink = if ssbo::ssbo_mode() { self.m.c_u64(ssbo::UNMAPPED) } else { self.map_load(q, &[1]) };
         }
         // record header labels for continue targets lazily: we need the
         // header of each construct when closing it; keep a map cont -> header
@@ -602,3 +605,7 @@ mod guard;
 mod xchg;
 #[path = "emit_typed.rs"]
 mod typed;
+#[path = "emit_typed_switch.rs"]
+pub(crate) mod typed_switch;
+#[path = "emit_ssbo.rs"]
+pub(crate) mod ssbo;

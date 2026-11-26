@@ -145,6 +145,10 @@ impl Lift<'_> {
     fn typed_shape(&mut self, w3: V) -> V {
         let k12 = self.k32(12);
         let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[w3, k12]);
+        if std::env::var("VICTORY_VK_TYPED").as_deref() == Ok("switch") {
+            let k7f = self.k32(0x7F);
+            return self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
+        }
         self.emit(Op::Call(Helper::TypedShape), Ty::U32, vec![f])
     }
 
@@ -158,53 +162,34 @@ impl Lift<'_> {
         (room, ok)
     }
 
-    /// A store's (or atomic's) device address for `bytes` at byte offset
-    /// `o` of a V#, or the sink block when out of bounds.
-    pub(super) fn buffer_addr(&mut self, vs: &VSharp, o: V, bytes: u32) -> V {
-        let kb = self.k32(bytes);
+    /// The device address for `kb` bytes at byte offset `o` of a V#; out
+    /// of bounds the zero (loads) or sink (stores) block. EXPERIMENT
+    /// (`VICTORY_VK_EXP` f or e): the offset clamped into the V# instead
+    /// (min, no select).
+    pub(super) fn access_addr(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
+        if matches!(std::env::var("VICTORY_VK_EXP").as_deref(), Ok("e" | "f")) {
+            let top = self.gl(glsl::U_MAX, Ty::U32, &[vs.limit, kb]);
+            let lim = self.spv(op::I_SUB, Ty::U32, &[top, kb]);
+            let oc = self.gl(glsl::U_MIN, Ty::U32, &[o, lim]);
+            let o64 = self.spv(op::U_CONVERT, Ty::U64, &[oc]);
+            return self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
+        }
         let (_, ok) = self.in_bounds(vs, o, kb);
         let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
         let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
-        let sink = self.fallback(true);
-        self.spv(op::SELECT, Ty::U64, &[ok, a, sink])
+        let fallback = self.fallback(store);
+        self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
+    }
+
+    /// A store's (or atomic's) address for `bytes` at byte offset `o`.
+    pub(super) fn buffer_addr(&mut self, vs: &VSharp, o: V, bytes: u32) -> V {
+        let kb = self.k32(bytes);
+        self.access_addr(vs, o, kb, true)
     }
 
     pub(super) fn fallback(&mut self, store: bool) -> V {
         // the memory map's zero and sink blocks
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
-    }
-
-    /// A load's device address for `kb` bytes at byte offset `o` of a V#,
-    /// and whether they are in bounds. Out of bounds it reads the V#'s first
-    /// bytes (the zero block when the V# is shorter than the load) and the
-    /// caller makes the value 0 (`zero_unless`): the block is chosen once
-    /// per V#, each access only clamps its offset. Choosing the address
-    /// between two blocks at every access made NVIDIA's compiler 2.5 times
-    /// slower.
-    pub(super) fn buffer_load_addr(&mut self, vs: &VSharp, o: V, kb: V) -> (V, V) {
-        let (room, ok) = self.in_bounds(vs, o, kb);
-        let zero = self.fallback(false);
-        let base = self.spv(op::SELECT, Ty::U64, &[room, vs.dev, zero]);
-        let z = self.k32(0);
-        let oc = self.spv(op::SELECT, Ty::U32, &[ok, o, z]);
-        let o64 = self.spv(op::U_CONVERT, Ty::U64, &[oc]);
-        (self.spv(op::I_ADD, Ty::U64, &[base, o64]), ok)
-    }
-
-    /// `x`, or 0 when not `ok` (each component of a vector).
-    pub(super) fn zero_unless(&mut self, ok: V, x: V) -> V {
-        let t = self.f.ty(x);
-        if t.n > 1 {
-            let parts: Vec<V> = (0..u32::from(t.n))
-                .map(|i| {
-                    let c = self.extract(x, i);
-                    self.zero_unless(ok, c)
-                })
-                .collect();
-            return self.spv(op::COMPOSITE_CONSTRUCT, t, &parts);
-        }
-        let z = self.f.konst(t, 0);
-        self.spv(op::SELECT, t, &[ok, x, z])
     }
 
     /// d16 results: values (f32 bits) as f16, two per dword.
@@ -228,9 +213,8 @@ impl Lift<'_> {
 
     pub(super) fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
         let kb = self.k32(4 * n);
-        let (a, ok) = self.buffer_load_addr(vs, o, kb);
-        let v = self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]);
-        Ok(self.zero_unless(ok, v))
+        let a = self.access_addr(vs, o, kb, false);
+        Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
     }
 
     /// Whether the values `inst` writes to `regs` are read as floats.
@@ -270,10 +254,9 @@ impl Lift<'_> {
                 k => k,
             };
             let kb = self.k32(size);
-            let (a, ok) = self.buffer_load_addr(&vs, o, kb);
+            let a = self.access_addr(&vs, o, kb, false);
             let vals = self.load_kind(a, kind)?;
             for (i, v) in vals.into_iter().enumerate() {
-                let v = self.zero_unless(ok, v);
                 self.def(inst, Reg::V(reg + i as u8), R::D(v));
             }
         } else {
@@ -368,14 +351,9 @@ impl Lift<'_> {
     fn buffer_vformat(&mut self, inst: &Inst, vs: &VSharp, o: V, reg: u8, ch: u32, d16: bool) -> Res<()> {
         let four = self.k32(4);
         let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
-        let (a, ok) = self.buffer_load_addr(vs, o, bytes);
+        let a = self.access_addr(vs, o, bytes, false);
         let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, vs.shape]);
-        let vals: Vec<V> = (0..ch)
-            .map(|i| {
-                let x = self.extract(r, i);
-                self.zero_unless(ok, x)
-            })
-            .collect();
+        let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
         let vals = if d16 { self.pack_d16(&vals) } else { vals };
         for (i, v) in vals.into_iter().enumerate() {
             self.def(inst, Reg::V(reg + i as u8), R::D(v));

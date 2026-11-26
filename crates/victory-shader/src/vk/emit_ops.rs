@@ -17,6 +17,9 @@ impl Emit<'_> {
     /// Title memory through a physical pointer (stores and atomics of the
     /// lanes outside a flat guard go to the sink).
     pub(super) fn memory_op(&mut self, n: &Node, args: &[Id], tid: Id) -> Id {
+        if super::ssbo::ssbo_mode() {
+            return self.ssbo_memory_op(n, args, tid);
+        }
         match n.op {
             Op::Load { align } => {
                 let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, tid);
@@ -44,7 +47,7 @@ impl Emit<'_> {
     }
 
     /// An atomic on a pointer: args[1] the value (args[2] the comparator).
-    fn atomic(&mut self, o: u16, ptr: Id, scope: u32, args: &[Id]) -> Id {
+    pub(super) fn atomic(&mut self, o: u16, ptr: Id, scope: u32, args: &[Id]) -> Id {
         let u = self.t.u32_;
         let (scope, sem) = (self.c32(scope), self.c32(0));
         if o == op::ATOMIC_COMPARE_EXCHANGE {

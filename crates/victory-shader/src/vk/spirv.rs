@@ -501,6 +501,12 @@ impl Module {
         put(&mut self.globals, op::TYPE_ARRAY, &[id, elem, len]);
         id
     }
+    /// A runtime array type of its own (for an explicit layout of its own).
+    pub fn t_runtime_array_plain(&mut self, elem: Id) -> Id {
+        let id = self.id();
+        put(&mut self.globals, op::TYPE_RUNTIME_ARRAY, &[id, elem]);
+        id
+    }
     pub fn t_runtime_array(&mut self, elem: Id) -> Id {
         self.global(op::TYPE_RUNTIME_ARRAY, &[elem])
     }
