@@ -531,7 +531,7 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    super::xmem::kernel_will_write(buffer as usize, len as usize);
     let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
@@ -566,7 +566,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
-            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            super::xmem::kernel_will_write(buffer as usize + done, n);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
