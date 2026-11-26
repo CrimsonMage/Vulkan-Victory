@@ -125,6 +125,8 @@ pub(crate) struct Rec {
     compute: Root,
     heaps: [u64; 2],
     viewports: Vec<vk::Viewport>,
+    /// The first viewport's depth range as the title gave it (diagnostics).
+    raw_depth: (f32, f32),
     scissors: Vec<vk::Rect2D>,
     topology: u32,
     stencil_ref: u32,
@@ -185,6 +187,7 @@ impl Default for Rec {
             compute: Root::default(),
             heaps: [0; 2],
             viewports: Vec::new(),
+            raw_depth: (0.0, 1.0),
             scissors: Vec::new(),
             topology: 4,
             stencil_ref: 0,
@@ -400,6 +403,7 @@ impl Rec {
     }
     pub(crate) fn viewports(&mut self, v: &[D3D12_VIEWPORT]) {
         self.viewports = v.iter().map(d3d_flip).collect();
+        self.raw_depth = v.first().map_or((0.0, 1.0), |v| (v.MinDepth, v.MaxDepth));
     }
     pub(crate) fn scissors(&mut self, r: &[windows::Win32::Foundation::RECT]) {
         self.scissors = r

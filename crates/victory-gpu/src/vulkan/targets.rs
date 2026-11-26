@@ -122,35 +122,24 @@ pub(super) fn save(frame: u64, p: &Plan) {
     tracing::info!(frame, images = p.items.len(), "Vulkan: the card-written images dumped beside the frame");
 }
 
-/// Draws by depth target and depth state (the dump tells the commonest):
-/// (the depth image's address, test, write, compare, viewport min and max
-/// depth bits) -> draws.
-type DepthUse = (u64, bool, bool, i32, u32, u32);
-static DEPTH_USES: Mutex<Option<std::collections::HashMap<DepthUse, u64>>> = Mutex::new(None);
+/// Draws by depth target and the state that decides depth (the dump tells
+/// the commonest): a description -> draws.
+static DEPTH_USES: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
 
-/// A draw into depth image `at` with this depth state (counted while
-/// dumps are asked for).
-pub(super) fn depth_use(at: u64, test: bool, write: bool, compare: i32, viewport: Option<&vk::Viewport>) {
+/// A draw into depth image `at` with this state (counted while dumps are
+/// asked for).
+pub(super) fn depth_use(at: u64, state: impl FnOnce() -> String) {
     if from().is_none() {
         return;
     }
-    let (lo, hi) = viewport.map_or((0, 0), |v| (v.min_depth.to_bits(), v.max_depth.to_bits()));
-    *lock(&DEPTH_USES).get_or_insert_with(Default::default).entry((at, test, write, compare, lo, hi)).or_insert(0) += 1;
+    *lock(&DEPTH_USES).get_or_insert_with(Default::default).entry(format!("{at:#x} {}", state())).or_insert(0) += 1;
 }
 
 fn tell_depth_uses() {
-    let mut uses: Vec<(DepthUse, u64)> = lock(&DEPTH_USES).as_ref().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default();
-    uses.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-    for ((at, test, write, compare, lo, hi), draws) in uses.into_iter().take(24) {
-        tracing::info!(
-            depth_image = format_args!("{at:#x}"),
-            test,
-            write,
-            compare_d3d = compare,
-            viewport_depth = format_args!("{}..{}", f32::from_bits(lo), f32::from_bits(hi)),
-            draws,
-            "Vulkan: draws by depth target and depth state"
-        );
+    let mut uses: Vec<(String, u64)> = lock(&DEPTH_USES).as_ref().map(|m| m.iter().map(|(k, &v)| (k.clone(), v)).collect()).unwrap_or_default();
+    uses.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (state, draws) in uses.into_iter().take(32) {
+        tracing::info!(state, draws, "Vulkan: draws by depth target and depth state");
     }
 }
 

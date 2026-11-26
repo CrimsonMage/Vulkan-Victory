@@ -148,8 +148,21 @@ impl Rec {
             if cfg!(feature = "diagnostics")
                 && let Some(depth) = self.attached.iter().find(|i| i.depth())
             {
-                let z = &gs.depth;
-                super::super::targets::depth_use(depth.key.address, z.DepthEnable.as_bool(), z.DepthEnable.as_bool() && z.DepthWriteMask.0 == 1, z.DepthFunc.0, self.viewports.first());
+                let (z, r) = (&gs.depth, &gs.rasterizer);
+                super::super::targets::depth_use(depth.key.address, || {
+                    format!(
+                        "test={} write={} func={} viewport_depth={:?} clip={} bias=({}, {}, {}) console_bias={:?}",
+                        z.DepthEnable.as_bool(),
+                        z.DepthWriteMask.0,
+                        z.DepthFunc.0,
+                        self.raw_depth,
+                        r.DepthClipEnable.as_bool(),
+                        r.DepthBias,
+                        r.DepthBiasClamp,
+                        r.SlopeScaledDepthBias,
+                        self.console.depth_bias
+                    )
+                });
             }
             d.cmd_set_primitive_topology(cmd, topology);
             let strip = matches!(topology, vk::PrimitiveTopology::LINE_STRIP | vk::PrimitiveTopology::TRIANGLE_STRIP);
