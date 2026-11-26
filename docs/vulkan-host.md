@@ -994,6 +994,31 @@ vk19 or vk19b):
 - Next diagnostic: at a crash, report which xmem kind holds `rcx`'s page
   (view, stand-in, section, region).
 
+**Images climbing in the world load** (vk19b 23,127 and vk20 20,822
+images, 6.7 GiB of card memory).
+- Images were dropped only for memory the title freed or unmapped, and
+  only for keys starting inside the range.
+- 9ba7212 drops every image overlapping a range the title frees, unmaps
+  or maps again in the pool (`title_pages_aliased`, before the memory
+  lock).
+- A 10 s `Vulkan: images` line gives:
+  - live images, made by view or by resource;
+  - dropped by reason: freed, unmapped, remapped, resource;
+  - aliases that did not fit;
+  - the 256 MiB ranges most images were made in.
+- If live images still climb, the line shows whether views of new shapes
+  over the same memory are the source (fix: one image per memory, views
+  by format and mip, the audit's item).
+- Watch `dropped_remapped` against frames: a title that maps the same
+  pages again every frame would remake images every frame.
+
+**ABI v2 (approved, waiting for the translator's commit):**
+- a title-wide semantic registry for `vk::translate`, persisted beside
+  the stage cache, with its version in the cache key;
+- set 0 binding 2 with 2D-array views of cube images (6×N layers);
+- the T# check word WORD6 = WORD7 ^ 0x7A3C5E91;
+- slot 0 a null view on bindings 0–2, never handed out.
+
 **Open, in order** (the coordinator's audit and its comparison list):
 
 1. **One timeline per title queue.** Today `Timeline` is one semaphore on
