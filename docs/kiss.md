@@ -367,6 +367,42 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (night): the shader piece, towards "complete".
+  - **Indexes**: `docs/translation-index.md` (xtask, every container of a
+    pack: coverage, refusals, approximations) and
+    `docs/pipeline-index.md` (`victory bake`: every stage's compile).
+  - **`victory bake`** translates what the title ever used straight from
+    its packs (so a translator change no longer empties it), compiles
+    smallest first, records every outcome, and never hangs: compiles over
+    60 s and modules over the words budget go to a one-at-a-time slow lane.
+    Words compiling at once: 300,000 (1 M took 14 GiB in NVIDIA's compiler
+    and the bake was killed for it).
+  - **The 23-minute compiles** (CS_RaytracingResolve, CS_DummyResolve,
+    decal classification, CS_GatherAlphaVBuffer): NVIDIA analysed the loop
+    guard's constant "+1" counter shared across nested loops. The step is
+    now a value the driver cannot see through (always 1): 0.5 s.
+  - **Loops on correct data**: `ir::without_skips` removed EXEC-empty
+    skips around loops; a wave with no lane walked into a loop it could
+    never leave (culling programs, PS_Textured_Eight). Guard hits in a
+    run: hundreds of thousands -> 1 program.
+  - **Mesh output memory**: every mesh program fits NVIDIA's 32 KiB (ABI
+    v4: split parts, counted barriers).
+  - **Translator coverage** (25,889 containers): refused 218 -> the 195
+    geometry-stage containers the title never requests; invalid 6 -> 0
+    (constant texel offsets as constants, VK_KHR_maintenance8 for the
+    rest). Added: f64 add/mul/convert, packed 16-bit shifts, d16 LDS
+    halves, float atomic min/max as compare-exchanges (NVIDIA lacks the
+    extension), POPS wait (ordering not kept), unreachable blocks.
+  - **Stage cache key** no longer hashes stage_cache.rs itself.
+  - **Images**: a texture made over an older one's memory drops the older
+    image (35,000 live -> 20,000; the ceiling stopped refusing); textures
+    the CPU changes are found by a backoff schedule, not 256 a present in
+    turn (new glyphs showed as stale boxes for a hundred presents).
+  - **Open (shader side)**: 64-bit image atomics (679 alpha prepass
+    programs run on the low dword only), clip/cull distances (1,804),
+    typed buffer stores as 32-bit channels (1,096), wave64 mask leftovers.
+  - **Open (world)**: the frame is flat grey; ~2 fps (direct queue 440 ms
+    of GPU a frame, record 1.4 s of CPU a frame).
 - 2026-11-26 (evening): Vulkan only (D3D12 removed, ~77k lines). Found
   and fixed on the way to the world: xmem treated 1,348 fresh pool pages
   as zero "fillers" (the title's recurring null-pointer crash and stale
