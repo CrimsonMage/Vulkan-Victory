@@ -41,6 +41,7 @@ use victory_vk::timeline::{Recording, Timeline};
 mod compose;
 mod descriptors;
 mod gpu_stats;
+mod loose;
 mod present;
 mod rect;
 mod images;
@@ -132,6 +133,9 @@ struct Region {
     import: Option<Imported>,
     refused: bool,
     wanted: bool,
+    /// Loose memory (no `XMemVirtualAlloc` region): joined with loose
+    /// neighbours when the pages between are committed.
+    loose: bool,
 }
 
 struct Section {
@@ -336,6 +340,7 @@ pub(crate) fn title_region(at: usize, len: usize) {
                 import: None,
                 refused: false,
                 wanted: false,
+                loose: false,
             },
         );
     }
@@ -1102,7 +1107,7 @@ impl Memory {
             return false;
         }
         // Loose memory: the run of committed read-write pages around it.
-        let Some((base, len)) = committed_run(at) else {
+        let Some((base, len)) = loose::committed_run(at) else {
             static UNKNOWN: AtomicU64 = AtomicU64::new(0);
             if UNKNOWN.fetch_add(1, Ordering::Relaxed) < 24 {
                 tracing::warn!(at = format_args!("{at:#x}"), "Vulkan: an address the card reads is in no title memory the host knows");
@@ -1112,6 +1117,7 @@ impl Memory {
         // Over loose memory imported before (the allocation has grown, or
         // was touched first at a higher address): one region of the union;
         // the old imports go once the card is done with them.
+        let (base, len) = self.join_neighbours(base, len);
         let (base, len) = self.merge_loose(base, len);
         tracing::info!(at = format_args!("{at:#x}"), base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
         self.regions.insert(
@@ -1121,70 +1127,11 @@ impl Memory {
                 import: None,
                 refused: false,
                 wanted: true,
+                loose: true,
             },
         );
         true
     }
-}
-
-/// The committed read-write run of pages holding `at` (one allocation).
-impl Memory {
-    /// Takes the regions overlapping `[base, base + len)` out (their
-    /// imports retired); the union.
-    fn merge_loose(&mut self, base: usize, len: usize) -> (usize, usize) {
-        let (mut lo, mut hi) = (base, base + len);
-        let over: Vec<usize> = self
-            .regions
-            .range(..hi)
-            .filter(|&(&a, r)| a + r.len > lo)
-            .map(|(&a, _)| a)
-            .collect();
-        for a in over {
-            if let Some(r) = self.regions.remove(&a) {
-                lo = lo.min(a);
-                hi = hi.max(a + r.len);
-                if let Some(i) = r.import {
-                    self.retired.push(i);
-                }
-            }
-        }
-        (lo, hi - lo)
-    }
-}
-
-/// From the allocation's base, so that an address below one touched
-/// earlier in the same allocation is in it too.
-fn committed_run(at: u64) -> Option<(usize, usize)> {
-    let at = at as usize;
-    let here = page_info(at).filter(usable)?;
-    let base = here.AllocationBase as usize;
-    let (mut p, mut start) = (base, None);
-    while let Some(i) = page_info(p).filter(|i| i.AllocationBase as usize == base) {
-        let (lo, hi) = (i.BaseAddress as usize, i.BaseAddress as usize + i.RegionSize);
-        if usable(&i) {
-            start.get_or_insert(lo);
-        } else if hi <= at {
-            start = None;
-        } else {
-            break;
-        }
-        p = hi;
-    }
-    start.map(|s| (s, p - s))
-}
-
-type PageInfo = windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
-
-fn page_info(p: usize) -> Option<PageInfo> {
-    // SAFETY: plain data, filled by the query.
-    let mut info: PageInfo = unsafe { std::mem::zeroed() };
-    // SAFETY: a query into our own structure.
-    let ok = unsafe { windows_sys::Win32::System::Memory::VirtualQuery(p as *const _, &mut info, size_of::<PageInfo>()) } != 0;
-    ok.then_some(info)
-}
-
-fn usable(i: &PageInfo) -> bool {
-    i.State == windows_sys::Win32::System::Memory::MEM_COMMIT && matches!(i.Protect & 0x1ff, 0x04 | 0x40)
 }
 
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
