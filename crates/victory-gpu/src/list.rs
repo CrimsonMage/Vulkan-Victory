@@ -697,8 +697,7 @@ extern "system" fn list_release(this: This) -> u32 {
     thin::release(this);
     #[cfg(windows)]
     if crate::vulkan::on() && object::references(this) <= 1 {
-        crate::vulkan::list_reset(this);
-        crate::vulkan::record::forget(this);
+        crate::vulkan::list_released(this);
     }
     object::release_boxed::<List>(this)
 }

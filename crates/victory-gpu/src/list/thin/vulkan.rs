@@ -114,8 +114,10 @@ fn plain_work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool 
         rec.copy_memory(b, u(0), u(1), u(2));
     } else if is(Plain::RESOLVE) {
         rec.resolve(b, u(0) as This, u(1) as u32, u(2) as This, u(3) as u32);
-    } else if is(Plain::EXECUTE_INDIRECT) || is(Plain::RESOLVE_QUERIES) {
-        rec.not_yet();
+    } else if is(Plain::EXECUTE_INDIRECT) {
+        rec.not_yet(record::NotYet::Indirect);
+    } else if is(Plain::RESOLVE_QUERIES) {
+        rec.not_yet(record::NotYet::Queries);
     } else {
         if is(Plain::WAIT_VALUE) || is(Plain::WAIT_VALUE64) {
             // What was recorded so far goes before the wait.
@@ -183,11 +185,11 @@ fn work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool {
         // Vulkan lists this way yet).
         OWN => drop(*unsafe { Box::from_raw(c.u(0) as *mut Own) }),
         BARRIER | BARRIER_GROUPS => rec.barrier(b),
-        CLEAR_RTV => {
-            record::rects_ignored(c.items::<Rect>(1 + RECORD + 2, n));
-            rec.clear_color(b, &c.read::<RtvRecord>(1), c.read::<[f32; 4]>(1 + RECORD));
+        CLEAR_RTV => rec.clear_color(b, &c.read::<RtvRecord>(1), c.read::<[f32; 4]>(1 + RECORD), c.items::<Rect>(1 + RECORD + 2, n)),
+        CLEAR_DSV => {
+            let rects = c.items::<Rect>(3 + RECORD, n);
+            rec.clear_depth(b, &c.read::<RtvRecord>(3), c.u(1) as u32, f32::unword(c.u(2)), (c.u(1) >> 32) as u8, rects);
         }
-        CLEAR_DSV => rec.clear_depth(b, &c.read::<RtvRecord>(3), c.u(1) as u32, f32::unword(c.u(2)), (c.u(1) >> 32) as u8),
         COPY_TEXTURE => {
             let step = size_of::<CopyLocation>().div_ceil(8);
             let boxed = ((c.u(1) >> 32) != 0).then(|| c.read::<[u32; 6]>(2 + 2 * step));

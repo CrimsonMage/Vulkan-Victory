@@ -760,6 +760,12 @@ pub(crate) fn list_wait(list: This, wait: ValueWait) {
     }
 }
 
+/// A list goes: what it recorded and did not submit goes with it.
+pub(crate) fn list_released(list: This) {
+    list_reset(list);
+    record::forget(list);
+}
+
 /// A list's recorded command buffer, into its current part (at a cut or
 /// its close).
 pub(crate) fn part_commands(list: This, rec: Recording) {

@@ -429,37 +429,27 @@ impl Rec {
         }
     }
 
-    pub(crate) fn clear_color(&mut self, b: &'static Backend, r: &RtvRecord, color: [f32; 4]) {
-        self.end_pass(b);
-        let Some((image, view, format, _)) = target_view(b, r, false) else { return };
-        let _ = view;
-        let Some(cmd) = self.cmd(b) else { return };
+    /// A clear of a target view, of `rects` (none: all of it), as D3D12
+    /// clears: only the view's mip and slice, only the rectangles.
+    pub(crate) fn clear_color(&mut self, b: &'static Backend, r: &RtvRecord, color: [f32; 4], rects: &[Rect]) {
+        let Some((image, view, format, extent)) = target_view(b, r, false) else { return };
         let value = if victory_vk::gfx10::is_integer(format) {
             vk::ClearColorValue { uint32: color.map(|c| c as u32) }
         } else {
             vk::ClearColorValue { float32: color }
         };
-        let range = vk::ImageSubresourceRange {
+        let clear = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer: 0,
-            layer_count: vk::REMAINING_ARRAY_LAYERS,
+            color_attachment: 0,
+            clear_value: vk::ClearValue { color: value },
         };
-        // SAFETY: outside rendering; the image is in GENERAL.
-        unsafe {
-            images::full_barrier(&b.host.device, cmd);
-            b.host.device.cmd_clear_color_image(cmd, image.image, vk::ImageLayout::GENERAL, &value, &[range]);
-            images::full_barrier(&b.host.device, cmd);
-        }
+        self.clear_view(b, view, extent, None, clear, rects);
         image.written[1].fetch_add(1, Ordering::Relaxed);
         self.keep.push(image);
     }
 
-    pub(crate) fn clear_depth(&mut self, b: &'static Backend, r: &RtvRecord, flags: u32, depth: f32, stencil: u8) {
-        self.end_pass(b);
-        let Some((image, ..)) = target_view(b, r, true) else { return };
-        let Some(cmd) = self.cmd(b) else { return };
+    pub(crate) fn clear_depth(&mut self, b: &'static Backend, r: &RtvRecord, flags: u32, depth: f32, stencil: u8, rects: &[Rect]) {
+        let Some((image, view, _, extent)) = target_view(b, r, true) else { return };
         let mut aspect = vk::ImageAspectFlags::empty();
         if flags & 1 != 0 {
             aspect |= vk::ImageAspectFlags::DEPTH;
@@ -471,26 +461,47 @@ impl Rec {
         if aspect.is_empty() {
             return;
         }
-        let range = vk::ImageSubresourceRange {
+        let clear = vk::ClearAttachment {
             aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer: 0,
-            layer_count: vk::REMAINING_ARRAY_LAYERS,
+            color_attachment: 0,
+            clear_value: vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth, stencil: u32::from(stencil) } },
         };
-        // SAFETY: outside rendering; the image is in GENERAL.
-        unsafe {
-            images::full_barrier(&b.host.device, cmd);
-            b.host.device.cmd_clear_depth_stencil_image(
-                cmd,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearDepthStencilValue { depth, stencil: u32::from(stencil) },
-                &[range],
-            );
-            images::full_barrier(&b.host.device, cmd);
-        }
+        self.clear_view(b, view, extent, Some(image.aspect()), clear, rects);
         self.keep.push(image);
+    }
+
+    /// Clears `view` (a colour view, or a depth view of `depth` aspects) in
+    /// a rendering of its own.
+    fn clear_view(&mut self, b: &'static Backend, view: vk::ImageView, extent: (u32, u32), depth: Option<vk::ImageAspectFlags>, clear: vk::ClearAttachment, rects: &[Rect]) {
+        self.end_pass(b);
+        let Some(cmd) = self.cmd(b) else { return };
+        let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: extent.0, height: extent.1 } };
+        let rects: Vec<vk::ClearRect> = if rects.is_empty() {
+            vec![vk::ClearRect { rect: area, base_array_layer: 0, layer_count: 1 }]
+        } else {
+            rects.iter().filter_map(|r| clip_rect(r, extent)).map(|rect| vk::ClearRect { rect, base_array_layer: 0, layer_count: 1 }).collect()
+        };
+        let attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let mut info = vk::RenderingInfo::default().render_area(area).layer_count(1);
+        info = match depth {
+            None => info.color_attachments(&attachment),
+            Some(a) if a.contains(vk::ImageAspectFlags::STENCIL) => info.depth_attachment(&attachment[0]).stencil_attachment(&attachment[0]),
+            Some(_) => info.depth_attachment(&attachment[0]),
+        };
+        // SAFETY: outside rendering in our command buffer; a view of a live
+        // image in GENERAL.
+        unsafe {
+            b.host.device.cmd_begin_rendering(cmd, &info);
+            if !rects.is_empty() {
+                b.host.device.cmd_clear_attachments(cmd, &[clear], &rects);
+            }
+            b.host.device.cmd_end_rendering(cmd);
+        }
+        self.targets_changed = true;
     }
 
     /// Opens rendering on the bound targets if it is not open on them.
@@ -612,45 +623,14 @@ impl Rec {
             skipped(false);
             return None;
         };
-        // Stages the backend does not link yet (tessellation, geometry,
-        // amplification): counted.
-        if shaders.iter().any(|s| matches!(s.stage, "hull" | "domain" | "geometry" | "amplification")) {
-            STATS[4].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let pre = match stage_of(b, shaders, if mesh { "mesh" } else { "vertex" }) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                skipped(false);
-                return None;
-            }
-            Err(waiting) => {
-                skipped(waiting);
-                return None;
-            }
-        };
-        let pixel = match stage_of(b, shaders, "pixel") {
-            Ok(s) => s,
-            Err(waiting) => {
-                skipped(waiting);
-                return None;
-            }
-        };
+        let (pre, pixel) = draw_stages(b, shaders, mesh)?;
         if gs.samples.Count > 1 {
-            STATS[4].fetch_add(1, Ordering::Relaxed);
+            not_yet(NotYet::Msaa);
             return None;
         }
-        let topology = match self.topology {
-            1 => vk::PrimitiveTopology::POINT_LIST,
-            2 => vk::PrimitiveTopology::LINE_LIST,
-            3 => vk::PrimitiveTopology::LINE_STRIP,
-            4 => vk::PrimitiveTopology::TRIANGLE_LIST,
-            5 => vk::PrimitiveTopology::TRIANGLE_STRIP,
-            _ if mesh => vk::PrimitiveTopology::TRIANGLE_LIST,
-            _ => {
-                STATS[4].fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
+        let Some(topology) = topology(self.topology, mesh) else {
+            not_yet(NotYet::Topology);
+            return None;
         };
         let cmd = self.cmd(b)?;
         if let Some(h) = super::descriptors::heaps(b) {
@@ -881,17 +861,75 @@ impl Rec {
         STATS[1].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn not_yet(&mut self) {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn not_yet(&mut self, why: NotYet) {
+        not_yet(why);
     }
 
 }
 
-/// Clear rectangles are not taken yet (the whole view is cleared).
-pub(crate) fn rects_ignored(rects: &[Rect]) {
-    if !rects.is_empty() {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
+/// What the recording does not do yet (counted by kind in the 10 s line).
+#[derive(Clone, Copy)]
+pub(crate) enum NotYet {
+    Indirect,
+    Queries,
+    Msaa,
+    /// Tessellation, geometry and amplification stages.
+    Stages,
+    Topology,
+}
+
+static NOT_YET: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+impl NotYet {
+    fn text() -> String {
+        let n = |i: usize| NOT_YET[i].load(Ordering::Relaxed);
+        format!("indirect={} queries={} msaa={} stages={} topology={}", n(0), n(1), n(2), n(3), n(4))
     }
+}
+
+fn not_yet(why: NotYet) {
+    STATS[4].fetch_add(1, Ordering::Relaxed);
+    NOT_YET[why as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A D3D topology as Vulkan's (mesh programs draw triangles).
+fn topology(t: u32, mesh: bool) -> Option<vk::PrimitiveTopology> {
+    use vk::PrimitiveTopology as P;
+    Some(match t {
+        1 => P::POINT_LIST,
+        2 => P::LINE_LIST,
+        3 => P::LINE_STRIP,
+        4 => P::TRIANGLE_LIST,
+        5 => P::TRIANGLE_STRIP,
+        _ if mesh => P::TRIANGLE_LIST,
+        _ => return None,
+    })
+}
+
+/// The pre-rasterisation and pixel stages of a draw, ready; `None` (counted)
+/// if the draw is skipped.
+fn draw_stages(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], mesh: bool) -> Option<(Arc<Stage>, Option<Arc<Stage>>)> {
+    if shaders.iter().any(|s| matches!(s.stage, "hull" | "domain" | "geometry" | "amplification")) {
+        not_yet(NotYet::Stages);
+        return None;
+    }
+    let pre = stage_of(b, shaders, if mesh { "mesh" } else { "vertex" }).map_err(skipped).ok()?;
+    let Some(pre) = pre else {
+        skipped(false);
+        return None;
+    };
+    let pixel = stage_of(b, shaders, "pixel").map_err(skipped).ok()?;
+    Some((pre, pixel))
+}
+
+/// A D3D12 rectangle cut to `extent`, if anything of it is left.
+fn clip_rect(r: &Rect, extent: (u32, u32)) -> Option<vk::Rect2D> {
+    let (l, t) = (r.left.max(0), r.top.max(0));
+    let (rt, bt) = (r.right.min(extent.0 as i32), r.bottom.min(extent.1 as i32));
+    (rt > l && bt > t).then(|| vk::Rect2D {
+        offset: vk::Offset2D { x: l, y: t },
+        extent: vk::Extent2D { width: (rt - l) as u32, height: (bt - t) as u32 },
+    })
 }
 
 /// The recording's part of the 10 s line.
@@ -905,6 +943,7 @@ pub(crate) fn report() {
         skipped_not_ready = s[2],
         skipped_no_pipeline = s[3],
         not_yet = s[4],
+        not_yet_reasons = %NotYet::text(),
         command_buffers = s[5],
         links = s[6],
         maps_rebound = s[7],
