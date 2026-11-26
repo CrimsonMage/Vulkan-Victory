@@ -205,7 +205,7 @@ console code builds from constants): the translator lists their words
 of binding 0** (compute, vertex and mesh programs) **or binding 1** (pixel
 programs): per-pipeline arrays of immutable samplers the host builds from
 the words (`StaticSampler::from_words`, already in `emit/sampler.rs`). A
-stage with no immediate sampler declares nothing in set 1.
+stage with no immediate sampler declares nothing in set 2.
 
 ## 6. Stage interface
 
