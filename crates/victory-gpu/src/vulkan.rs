@@ -2,16 +2,12 @@
 //! milestone M2a). The D3D12 host is not made at all ([`crate::host::host`]
 //! answers `None`); in its place:
 //!
-//! - **Queues and fences.** Each title queue keeps a line of items: waits
-//!   for fences, submitted lists (cut at their waits for memory values into
-//!   parts), signals. A part whose waits memory meets, or a write in the
-//!   air will meet, goes to the one host queue behind everything before it
-//!   and signals the next value of the timeline semaphore
-//!   ([`victory_vk::timeline`]). A landing thread follows the timeline: as
-//!   each part's value is reached, its bottom-of-pipe writes are done and
-//!   the fence signals behind it are set, then every queue's line runs on.
-//!   M2a parts carry no draws or dispatches yet (M2b): only their order,
-//!   writes and signals.
+//! - **Queues and fences** (`engine.rs`). Each title queue keeps a line
+//!   of items (fence waits, parts of submitted lists, signals) and has a
+//!   timeline semaphore of its own ([`victory_vk::timeline`]). Fences
+//!   between queues become semaphore waits; bottom-of-pipe writes are made
+//!   by the card (`writes.rs`); a landing thread sets fences as the
+//!   lines' values are reached.
 //! - **Title memory.** Regions, sections, views and page reservations are
 //!   noted as `xmem` announces them. The pool's GPU view (the reservation
 //!   `CopyPageMappingsBatchX` maps into) is a sparse buffer of card pages
@@ -25,7 +21,7 @@
 //!   queues gave. Planes are not composed yet: their images are drawn by
 //!   the title's draws, which run from M2b on.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -36,10 +32,12 @@ use victory_vk::map::{MemoryMap, Range};
 use victory_vk::memory::Imported;
 use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 use victory_vk::swapchain::Swapchain;
-use victory_vk::timeline::{Recording, Timeline};
+use victory_vk::timeline::Timeline;
 
+mod bound;
 mod compose;
 mod descriptors;
+mod engine;
 mod gpu_stats;
 mod loose;
 mod present;
@@ -48,11 +46,9 @@ mod images;
 pub(crate) mod record;
 mod stage_cache;
 mod stages;
+mod writes;
 
-use crate::list::ValueWait;
 use crate::memory::GpuPage;
-use crate::object::This;
-use crate::queue::Written;
 
 /// Whether the Vulkan backend runs (`VICTORY_GPU=vulkan`; `d3d12` or unset:
 /// the D3D12 path).
@@ -76,7 +72,7 @@ pub(crate) struct Backend {
     host: Host,
     timeline: Timeline,
     memory: Mutex<Memory>,
-    engine: Mutex<Engine>,
+    engine: Mutex<engine::Engine>,
     /// Woken when a flight lands or work is given.
     changed: Condvar,
     present: Mutex<Option<Swapchain>>,
@@ -92,7 +88,7 @@ fn backend() -> Option<&'static Backend> {
                     host,
                     timeline,
                     memory: Mutex::new(Memory::default()),
-                    engine: Mutex::new(Engine::default()),
+                    engine: Mutex::new(engine::Engine::default()),
                     changed: Condvar::new(),
                     present: Mutex::new(None),
                 })
@@ -105,6 +101,7 @@ fn backend() -> Option<&'static Backend> {
                         driver = %c.driver,
                         descriptor_buffer = c.descriptor_buffer,
                         pipeline_library = c.pipeline_library,
+                        queues = b.host.queues.lanes.len(),
                         "Vulkan device made"
                     );
                     for (need, name, purpose) in c.missing() {
@@ -693,273 +690,15 @@ pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader
 }
 
 // ---------------------------------------------------------------------------
-// Queues and fences
+// Queues and fences (`engine.rs`)
 
-#[derive(Default)]
-struct Part {
-    waits: Vec<ValueWait>,
-    writes: Vec<(u64, Written, usize)>,
-    /// The part's recorded command buffers (M2b).
-    cmds: Vec<Recording>,
-}
+pub(crate) use engine::{execute, fence_signalled, list_released, list_reset, list_wait, list_write, part_commands, signal, wait, wait_for_fence};
+pub(crate) use writes::timestamp_frequency;
+use engine::{engine, lost_once, start_landing};
 
-enum Item {
-    Wait(usize, u64),
-    Run(VecDeque<Part>),
-    Signal(usize, u64),
-}
-
-struct Flight {
-    value: u64,
-    writes: Vec<(u64, Written, usize)>,
-    signals: Vec<(usize, u64)>,
-}
-
-#[derive(Default)]
-struct Engine {
-    queues: HashMap<usize, VecDeque<Item>>,
-    flights: VecDeque<Flight>,
-    /// What each title list recorded since its reset.
-    lists: HashMap<usize, Vec<Part>>,
-}
-
-static FORCED: AtomicU64 = AtomicU64::new(0);
 /// Ranges the memory map could not take (full, or overlapping another
 /// way), counted for the 10 s line.
 static MAP_REFUSED: AtomicU64 = AtomicU64::new(0);
-
-impl Engine {
-    fn signalled(&self, fence: usize, value: u64) -> bool {
-        crate::fence::completed(fence as This) >= value
-            || self
-                .flights
-                .iter()
-                .any(|f| f.signals.iter().any(|&(x, v)| x == fence && v >= value))
-    }
-
-    fn met(&self, wait: &ValueWait) -> bool {
-        if wait.met() {
-            return true;
-        }
-        let (at, _) = wait.place();
-        // The last write in the air at that address decides.
-        self.flights
-            .iter()
-            .flat_map(|f| f.writes.iter())
-            .rev()
-            .find(|(a, ..)| *a as usize == at)
-            .is_some_and(|(_, what, _)| matches!(what, Written::Value(v) if wait.holds_for(*v)))
-    }
-
-    /// Runs every queue's line as far as it can; `force` passes waits that
-    /// are not met (at a present, as the D3D12 path does).
-    fn pump(&mut self, b: &Backend, force: bool) {
-        loop {
-            let keys: Vec<usize> = self.queues.keys().copied().collect();
-            let mut moved = false;
-            for q in keys {
-                moved |= self.run_line(b, q, force);
-            }
-            if !moved {
-                break;
-            }
-        }
-        self.queues.retain(|_, l| !l.is_empty());
-    }
-
-    /// Runs queue `q`'s line as far as it can; whether anything moved.
-    fn run_line(&mut self, b: &Backend, q: usize, force: bool) -> bool {
-        let mut moved = false;
-        while let Some(front) = self.queues.get_mut(&q).and_then(|l| l.pop_front()) {
-            if let Some(held) = self.run_item(b, front, force) {
-                self.queues.get_mut(&q).expect("queue").push_front(held);
-                break;
-            }
-            moved = true;
-        }
-        moved
-    }
-
-    /// Runs one item of a line; what is left of it if it must wait.
-    fn run_item(&mut self, b: &Backend, item: Item, force: bool) -> Option<Item> {
-        match item {
-            Item::Wait(fence, value) => {
-                let signalled = self.signalled(fence, value);
-                if !signalled && !force {
-                    return Some(Item::Wait(fence, value));
-                }
-                if !signalled {
-                    FORCED.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Item::Signal(fence, value) => match self.flights.back_mut() {
-                Some(f) => f.signals.push((fence, value)),
-                None => crate::fence::set(fence as This, value),
-            },
-            Item::Run(mut parts) => {
-                while let Some(part) = parts.pop_front() {
-                    let ready = part.waits.iter().all(|w| self.met(w));
-                    if !ready && !force {
-                        parts.push_front(part);
-                        return Some(Item::Run(parts));
-                    }
-                    if !ready {
-                        FORCED.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.submit_part(b, part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Submits a part's commands (or a marker for its writes) behind
-    /// everything before it.
-    fn submit_part(&mut self, b: &Backend, part: Part) {
-        // A part with neither commands nor writes has nothing to run.
-        if part.writes.is_empty() && part.cmds.is_empty() {
-            return;
-        }
-        let submitted = if part.cmds.is_empty() {
-            b.timeline.submit(&b.host, &[])
-        } else {
-            images::flush(b);
-            b.timeline.submit_recordings(&b.host, part.cmds)
-        };
-        match submitted {
-            Ok(value) => self.flights.push_back(Flight {
-                value,
-                writes: part.writes,
-                signals: Vec::new(),
-            }),
-            Err(e) => {
-                if b.timeline.lost() {
-                    lost_once();
-                } else {
-                    tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
-                }
-                for (at, what, bytes) in part.writes {
-                    write_now(b, at, what, bytes);
-                }
-            }
-        }
-    }
-}
-
-/// A bottom-of-pipe write, done by the CPU when its part has run: into the
-/// title's memory, or for the pool's GPU view into the page's home and
-/// then the page's card copy.
-fn write_now(b: &Backend, at: u64, what: Written, bytes: usize) {
-    let target = memory(b).cpu_of(at);
-    match target {
-        Some((cpu, pool)) => {
-            what.write(cpu as *mut u8, bytes);
-            if pool.is_some() {
-                title_memory_written(at as usize, bytes);
-            }
-        }
-        None => {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    at = format_args!("{at:#x}"),
-                    "Vulkan: a write into a page of the pool's GPU view nothing shows was dropped"
-                )
-            });
-        }
-    }
-}
-
-fn engine(b: &Backend) -> MutexGuard<'_, Engine> {
-    lock(&b.engine)
-}
-
-/// A list's wait for a memory value: what it records next is behind it.
-pub(crate) fn list_wait(list: This, wait: ValueWait) {
-    let Some(b) = backend() else { return };
-    let mut e = engine(b);
-    let parts = e.lists.entry(list as usize).or_default();
-    match parts.last_mut() {
-        Some(p) if p.writes.is_empty() && p.cmds.is_empty() => p.waits.push(wait),
-        _ => parts.push(Part {
-            waits: vec![wait],
-            ..Part::default()
-        }),
-    }
-}
-
-/// A list goes: what it recorded and did not submit goes with it.
-pub(crate) fn list_released(list: This) {
-    list_reset(list);
-    record::forget(list);
-}
-
-/// A list's recorded command buffer, into its current part (at a cut or
-/// its close).
-pub(crate) fn part_commands(list: This, rec: Recording) {
-    let Some(b) = backend() else { return };
-    let mut e = engine(b);
-    let parts = e.lists.entry(list as usize).or_default();
-    if parts.is_empty() {
-        parts.push(Part::default());
-    }
-    parts.last_mut().expect("part").cmds.push(rec);
-}
-
-/// A list's bottom-of-pipe write.
-pub(crate) fn list_write(list: This, at: u64, what: Written, bytes: usize) {
-    let Some(b) = backend() else { return };
-    let mut e = engine(b);
-    let parts = e.lists.entry(list as usize).or_default();
-    if parts.is_empty() {
-        parts.push(Part::default());
-    }
-    parts
-        .last_mut()
-        .expect("part")
-        .writes
-        .push((at, what, bytes));
-}
-
-/// A list's reset (or release): what it recorded and did not submit goes.
-pub(crate) fn list_reset(list: This) {
-    if let Some(b) = backend() {
-        let parts = engine(b).lists.remove(&(list as usize));
-        for part in parts.into_iter().flatten() {
-            for rec in part.cmds {
-                b.timeline.abandon(&b.host, rec);
-            }
-        }
-    }
-}
-
-pub(crate) fn execute(queue: This, lists: &[This]) {
-    let Some(b) = backend() else { return };
-    // What the title's threads wrote down into them is recorded first.
-    let t = Instant::now();
-    crate::list::join(lists);
-    split(Split::Join, t);
-    let mut e = engine(b);
-    let mut parts = VecDeque::new();
-    for &l in lists {
-        match e.lists.remove(&(l as usize)) {
-            Some(p) => parts.extend(p),
-            // A list with nothing to wait for or write still runs, in order.
-            None => parts.push_back(Part::default()),
-        }
-    }
-    e.queues
-        .entry(queue as usize)
-        .or_default()
-        .push_back(Item::Run(parts));
-    let t = Instant::now();
-    images::flush(b);
-    split(Split::Flush, t);
-    let t = Instant::now();
-    e.pump(b, false);
-    split(Split::Submit, t);
-    b.changed.notify_all();
-}
 
 /// Where the title's submitting and presenting threads, the list workers
 /// and the view-creating threads spend time (the 10 s line, per frame).
@@ -1040,6 +779,14 @@ fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
         m.rebuild_map();
     }
     m.buffer_of(title)
+}
+
+/// The device address of title memory `[title, title + len)`, if one
+/// range of the memory map holds it all (imported now if it must be).
+fn device_of(b: &Backend, title: u64, len: u64) -> Option<u64> {
+    buffer_of(b, title)?;
+    let r = memory(b).map.range_of(title)?;
+    (title + len <= r.title_start + r.title_size).then(|| r.device_base + (title - r.title_start))
 }
 
 /// An API call named title address `at`: the region holding it is imported
@@ -1188,122 +935,6 @@ pub(crate) fn save_cache() {
     }
 }
 
-pub(crate) fn signal(queue: This, fence: This, value: u64) {
-    let Some(b) = backend() else {
-        crate::fence::set(fence, value);
-        return;
-    };
-    let mut e = engine(b);
-    e.queues
-        .entry(queue as usize)
-        .or_default()
-        .push_back(Item::Signal(fence as usize, value));
-    e.pump(b, false);
-    b.changed.notify_all();
-}
-
-pub(crate) fn wait(queue: This, fence: This, value: u64) {
-    let Some(b) = backend() else { return };
-    let mut e = engine(b);
-    e.queues
-        .entry(queue as usize)
-        .or_default()
-        .push_back(Item::Wait(fence as usize, value));
-    e.pump(b, false);
-}
-
-/// A fence was signalled by the CPU: lines waiting for it run on.
-pub(crate) fn fence_signalled() {
-    let Some(b) = backend() else { return };
-    engine(b).pump(b, false);
-    b.changed.notify_all();
-}
-
-/// A CPU wait for a fence with no event: blocks until it is reached, or
-/// until nothing given can reach it (then `false`).
-pub(crate) fn wait_for_fence(fence: This, value: u64) -> bool {
-    let Some(b) = backend() else { return false };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut e = engine(b);
-    loop {
-        if crate::fence::completed(fence) >= value {
-            return true;
-        }
-        if e.flights.is_empty() && e.queues.is_empty() {
-            return false;
-        }
-        if Instant::now() > deadline {
-            tracing::warn!(value, "Vulkan: a fence wait gave up after 10 s");
-            return false;
-        }
-        e = b
-            .changed
-            .wait_timeout(e, Duration::from_millis(50))
-            .unwrap_or_else(|p| p.into_inner())
-            .0;
-    }
-}
-
-fn start_landing() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        let _ = std::thread::Builder::new()
-            .name("victory-vk-landing".into())
-            .spawn(landing);
-    });
-}
-
-/// Says once, loudly, that the device was lost.
-fn lost_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::error!(
-            "Vulkan: the device was lost; the run goes on without the card (bottom-of-pipe writes and fence signals on the CPU, no presents)"
-        )
-    });
-}
-
-/// Follows the timeline: lands flights in order (their writes, then their
-/// signals) and runs the queues' lines on.
-fn landing() {
-    let Some(b) = backend() else { return };
-    loop {
-        let next = {
-            let e = engine(b);
-            let next = e.flights.front().map(|f| f.value);
-            if next.is_none() {
-                let _ = b.changed.wait_timeout(e, Duration::from_millis(100));
-                continue;
-            }
-            next
-        };
-        let Some(value) = next else { continue };
-        // A lost device reaches nothing: what is in the air lands now, so
-        // that the title's fences still move (its writes and signals on
-        // the CPU, as without a card).
-        let lost = b.timeline.lost();
-        if lost {
-            lost_once();
-        } else if !b.timeline.wait(&b.host, value, 100_000_000) {
-            continue;
-        }
-        let value = if lost { u64::MAX } else { value };
-        let mut e = engine(b);
-        while e.flights.front().is_some_and(|f| f.value <= value) {
-            let f = e.flights.pop_front().expect("flight");
-            for (at, what, bytes) in f.writes {
-                write_now(b, at, what, bytes);
-            }
-            for (fence, v) in f.signals {
-                crate::fence::set(fence as This, v);
-            }
-        }
-        e.pump(b, false);
-        drop(e);
-        b.changed.notify_all();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Presentation
 
@@ -1328,7 +959,8 @@ fn start_reports() {
     });
 }
 
-/// One line every 10 s: the queues, the timeline, title memory.
+/// One line every 10 s: the queues and their lines (GPU busy time per
+/// frame and share of the wall clock), the timeline, title memory.
 fn report(b: &Backend, frame: u64) {
     // Per frame since the last line, in ms.
     static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
@@ -1345,13 +977,7 @@ fn report(b: &Backend, frame: u64) {
         views_ms = format_args!("{:.1}", ms[5]),
         "Vulkan: frame time split (ms a frame; record and views summed over threads)"
     );
-    let (flights, held) = {
-        let e = engine(b);
-        (
-            e.flights.len(),
-            e.queues.values().map(VecDeque::len).sum::<usize>(),
-        )
-    };
+    let (flights, held, lines) = engine::report_text(b, frames);
     let m = memory(b);
     let imported: u64 = m
         .sections
@@ -1377,7 +1003,8 @@ fn report(b: &Backend, frame: u64) {
         reached = b.timeline.completed(&b.host),
         flights,
         held,
-        forced_waits = FORCED.load(Ordering::Relaxed),
+        forced_waits = engine::FORCED.load(Ordering::Relaxed),
+        lines = %lines,
         presents_with_planes = PLANES_SHOWN.load(Ordering::Relaxed),
         regions = m.regions.len(),
         sections = m.sections.len(),

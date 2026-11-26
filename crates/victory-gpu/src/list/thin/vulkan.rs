@@ -115,7 +115,7 @@ fn plain_work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool 
     } else if is(Plain::RESOLVE) {
         rec.resolve(b, u(0) as This, u(1) as u32, u(2) as This, u(3) as u32);
     } else if is(Plain::EXECUTE_INDIRECT) {
-        rec.not_yet(record::NotYet::Indirect);
+        rec.execute_indirect(b, u(0) as This, u(1) as u32, (u(2) as This, u(3)), (u(4) as This, u(5)));
     } else if is(Plain::RESOLVE_QUERIES) {
         rec.resolve_queries(b, list, u(0) as This, u(1) as u32, u(2) as u32, u(3) as u32, u(4) as This, u(5));
     } else {

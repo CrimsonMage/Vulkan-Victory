@@ -19,6 +19,8 @@ impl Rec {
         };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // It may write indirect records: no window holds.
+        self.indirect.clear();
         // SAFETY: outside rendering; title buffers.
         unsafe {
             images::full_barrier(&b.host.device, cmd);
