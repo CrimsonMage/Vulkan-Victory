@@ -28,47 +28,46 @@ impl Lift<'_> {
         let so = self.u32v(so);
         let k = self.k32(offset as u32);
         let o = self.spv(op::I_ADD, Ty::U32, &[so, k]);
-        let words: Vec<V> = if name.starts_with("s_buffer_") {
+        let words = if name.starts_with("s_buffer_") {
             let vs = self.vsharp(inst, &base)?;
-            let mut out = Vec::new();
-            let mut at = 0u32;
-            while at < u32::from(n) {
-                let m = (u32::from(n) - at).min(4);
-                let ka = self.k32(at * 4);
-                let oo = self.spv(op::I_ADD, Ty::U32, &[o, ka]);
-                let fl = self.floats(inst, (at..at + m).map(|k| Reg::S(d + k as u8)));
-                let v = self.buffer_load_raw(&vs, oo, m, fl)?;
-                for i in 0..m {
-                    out.push(if m == 1 { v } else { self.extract(v, i) });
-                }
-                at += m;
-            }
-            out
+            self.smem_words(inst, d, n, |l, at, m, fl| {
+                let ka = l.k32(at * 4);
+                let oo = l.spv(op::I_ADD, Ty::U32, &[o, ka]);
+                l.buffer_load_raw(&vs, oo, m, fl)
+            })?
         } else {
             let a = self.opnd_u64(inst, &base)?;
             let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
             let addr = self.spv(op::I_ADD, Ty::U64, &[a, o64]);
-            let mut out = Vec::new();
-            let mut at = 0u32;
-            while at < u32::from(n) {
-                let m = (u32::from(n) - at).min(4);
-                let ka = self.f.konst(Ty::U64, u64::from(at * 4));
-                let aa = self.spv(op::I_ADD, Ty::U64, &[addr, ka]);
-                let dev = self.translate(aa);
-                let fl = self.floats(inst, (at..at + m).map(|k| Reg::S(d + k as u8)));
+            self.smem_words(inst, d, n, |l, at, m, fl| {
+                let ka = l.f.konst(Ty::U64, u64::from(at * 4));
+                let aa = l.spv(op::I_ADD, Ty::U64, &[addr, ka]);
+                let dev = l.translate(aa);
                 let ty = Ty::vec(if fl { S::F32 } else { S::U32 }, m as u8);
-                let v = self.emit(Op::Load { align: 4 }, ty, vec![dev]);
-                for i in 0..m {
-                    out.push(if m == 1 { v } else { self.extract(v, i) });
-                }
-                at += m;
-            }
-            out
+                Ok(l.emit(Op::Load { align: 4 }, ty, vec![dev]))
+            })?
         };
         for (i, w) in words.into_iter().enumerate() {
             self.def(inst, Reg::S(d + i as u8), R::D(w));
         }
         Ok(())
+    }
+
+    /// `n` dwords for s[d..] in loads of up to four (`load(at, count,
+    /// floats)`), floats where the registers are read as such.
+    fn smem_words(&mut self, inst: &Inst, d: u8, n: u8, mut load: impl FnMut(&mut Self, u32, u32, bool) -> Res<V>) -> Res<Vec<V>> {
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        while at < u32::from(n) {
+            let m = (u32::from(n) - at).min(4);
+            let fl = self.floats(inst, (at..at + m).map(|k| Reg::S(d + k as u8)));
+            let v = load(self, at, m, fl)?;
+            for i in 0..m {
+                out.push(if m == 1 { v } else { self.extract(v, i) });
+            }
+            at += m;
+        }
+        Ok(out)
     }
 
     /// A V#'s parts: device base (u64), byte limit, stride.

@@ -257,95 +257,27 @@ impl Lift<'_> {
     }
 
     /// A DPP source: the source lane of each lane, and whether it reads.
+    /// DPP: src0 is read from another lane of its row (DPP16) or group of
+    /// eight (DPP8), then the instruction is lowered as usual with that
+    /// value; the row and bank masks (and an invalid source without
+    /// bound_ctrl) keep the destination.
     pub(super) fn dpp(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
         let lane = self.lane();
-        let (from, valid, row_mask, bank_mask, bound_ctrl, fi) = match v.dpp.unwrap() {
-            Dpp::Lanes { sel, fi } => {
-                let k7 = self.k32(7);
-                let i = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k7]);
-                let three = self.k32(3);
-                let sh = self.spv(op::I_MUL, Ty::U32, &[i, three]);
-                let ks = self.k32(sel);
-                let s = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[ks, sh]);
-                let s = self.spv(op::BITWISE_AND, Ty::U32, &[s, k7]);
-                let nb = self.k32(!7);
-                let b = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nb]);
-                let from = self.spv(op::BITWISE_OR, Ty::U32, &[b, s]);
-                (from, None, 0xF, 0xF, false, fi)
-            }
+        let (from, valid, masks, bound_ctrl, fi) = match v.dpp.unwrap() {
+            Dpp::Lanes { sel, fi } => (self.dpp8_source(lane, sel), None, (0xF, 0xF), false, fi),
             Dpp::Row { ctrl, row_mask, bank_mask, bound_ctrl, fi } => {
-                let c = u32::from(ctrl);
-                let k15 = self.k32(15);
-                let i = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k15]);
-                let nrow = self.k32(!15);
-                let rowb = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nrow]);
-                let (from, valid) = match c {
-                    0x000..=0x0FF => {
-                        // quad_perm
-                        let k3 = self.k32(3);
-                        let q = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k3]);
-                        let one = self.k32(1);
-                        let q2 = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[q, one]);
-                        let kc = self.k32(c);
-                        let s = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[kc, q2]);
-                        let s = self.spv(op::BITWISE_AND, Ty::U32, &[s, k3]);
-                        let nq = self.k32(!3);
-                        let b = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nq]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[b, s]), None)
-                    }
-                    0x101..=0x10F | 0x111..=0x11F => {
-                        // row_shl / row_shr
-                        let n = c & 0xF;
-                        let kn = self.k32(n);
-                        let (j, ok) = if c < 0x110 {
-                            let j = self.spv(op::I_ADD, Ty::U32, &[i, kn]);
-                            let ok = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[j, k15]);
-                            (j, ok)
-                        } else {
-                            let ok = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[i, kn]);
-                            (self.spv(op::I_SUB, Ty::U32, &[i, kn]), ok)
-                        };
-                        let j = self.spv(op::BITWISE_AND, Ty::U32, &[j, k15]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]), Some(ok))
-                    }
-                    0x121..=0x12F => {
-                        // row_ror
-                        let kn = self.k32(c & 0xF);
-                        let j = self.spv(op::I_ADD, Ty::U32, &[i, kn]);
-                        let j = self.spv(op::BITWISE_AND, Ty::U32, &[j, k15]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]), None)
-                    }
-                    0x140 => {
-                        let j = self.spv(op::BITWISE_XOR, Ty::U32, &[i, k15]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]), None)
-                    }
-                    0x141 => {
-                        let k7 = self.k32(7);
-                        let j = self.spv(op::BITWISE_XOR, Ty::U32, &[i, k7]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]), None)
-                    }
-                    0x150..=0x15F => {
-                        // row_share: lane n of the row
-                        let kn = self.k32(c & 0xF);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, kn]), None)
-                    }
-                    0x160..=0x16F => {
-                        // row_xmask
-                        let kn = self.k32(c & 0xF);
-                        let j = self.spv(op::BITWISE_XOR, Ty::U32, &[i, kn]);
-                        (self.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]), None)
-                    }
-                    _ => return Err(unsupported(off, "a DPP control")),
-                };
-                (from, valid, row_mask, bank_mask, bound_ctrl, fi)
+                let (from, valid) = self.dpp16_source(lane, u32::from(ctrl)).ok_or(unsupported(off, "a DPP control"))?;
+                (from, valid, (row_mask, bank_mask), bound_ctrl, fi)
             }
         };
         let k31 = self.k32(31);
         let from = self.spv(op::BITWISE_AND, Ty::U32, &[from, k31]);
-        let x = self.usrc(inst, v, 0)?;
+        let src = *v.src.first().ok_or(unsupported(off, name))?;
+        let x = self.opnd(inst, &src)?;
+        let x = self.u32v(x);
         let shuffled = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, from]);
-        // an inactive source lane (fi clear) or an invalid one reads 0 (bound_ctrl) or skips
+        // an inactive source lane (fi clear) or an invalid one reads 0
         let mut ok = valid.unwrap_or_else(|| self.kb(true));
         if !fi && self.f.as_const(a_exec) != Some(1) {
             let sa = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::BOOL, vec![a_exec, from]);
@@ -353,70 +285,135 @@ impl Lift<'_> {
         }
         let z = self.k32(0);
         let src0 = self.spv(op::SELECT, Ty::U32, &[ok, shuffled, z]);
-        // write enable: row/bank masks; a lane whose source is invalid without bound_ctrl keeps dst
-        let mut we = self.kb(true);
-        if row_mask != 0xF || bank_mask != 0xF {
-            let k4 = self.k32(4);
-            let row = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[lane, k4]);
-            let k3 = self.k32(3);
-            let row = self.spv(op::BITWISE_AND, Ty::U32, &[row, k3]);
-            let rm = self.k32(u32::from(row_mask));
-            let rb = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[rm, row]);
-            let k2 = self.k32(2);
-            let bank = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[lane, k2]);
-            let bank = self.spv(op::BITWISE_AND, Ty::U32, &[bank, k3]);
-            let bm = self.k32(u32::from(bank_mask));
-            let bb = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[bm, bank]);
-            let both = self.spv(op::BITWISE_AND, Ty::U32, &[rb, bb]);
-            let one = self.k32(1);
-            let bit = self.spv(op::BITWISE_AND, Ty::U32, &[both, one]);
-            we = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[bit, z]);
-        }
+        let mut we = self.dpp_masks(lane, masks.0, masks.1);
         if !bound_ctrl {
             we = self.spv(op::LOGICAL_AND, Ty::BOOL, &[we, ok]);
         }
-        // compute the operation with src0 replaced
-        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err(unsupported(off, name)) };
-        let old = self.val(inst, Reg::V(reg))?;
-        let old = self.data(old);
-        let old = self.u32v(old);
-        let res = match name {
-            "v_mov_b32" => src0,
-            _ => {
-                let b = self.usrc(inst, v, 1)?;
-                let a = src0;
-                match name {
-                    "v_or_b32" => self.spv(op::BITWISE_OR, Ty::U32, &[a, b]),
-                    "v_and_b32" => self.spv(op::BITWISE_AND, Ty::U32, &[a, b]),
-                    "v_xor_b32" => self.spv(op::BITWISE_XOR, Ty::U32, &[a, b]),
-                    "v_add_nc_u32" => self.spv(op::I_ADD, Ty::U32, &[a, b]),
-                    "v_max_u32" => self.gl(glsl::U_MAX, Ty::U32, &[a, b]),
-                    "v_min_u32" => self.gl(glsl::U_MIN, Ty::U32, &[a, b]),
-                    "v_max_i32" => self.gl(glsl::S_MAX, Ty::U32, &[a, b]),
-                    "v_min_i32" => self.gl(glsl::S_MIN, Ty::U32, &[a, b]),
-                    "v_add_f32" | "v_max_f32" | "v_min_f32" | "v_mul_f32" => {
-                        let mut af = self.f32v(a);
-                        if v.abs & 1 != 0 {
-                            af = self.gl(glsl::F_ABS, Ty::F32, &[af]);
-                        }
-                        if v.neg & 1 != 0 {
-                            af = self.spv(op::F_NEGATE, Ty::F32, &[af]);
-                        }
-                        let bf = self.fsrc(inst, v, 1)?;
-                        let r = match name {
-                            "v_add_f32" => self.spv(op::F_ADD, Ty::F32, &[af, bf]),
-                            "v_mul_f32" => self.spv(op::F_MUL, Ty::F32, &[af, bf]),
-                            "v_max_f32" => self.gl(glsl::N_MAX, Ty::F32, &[af, bf]),
-                            _ => self.gl(glsl::N_MIN, Ty::F32, &[af, bf]),
-                        };
-                        self.u32v(r)
-                    }
-                    _ => return Err(unsupported(off, "a DPP operation")),
-                }
+        // the instruction again, src0 a register no operand names
+        let free = (0..=255u8).rev().find(|&r| !inst.reads.iter().chain(&inst.writes).any(|e| e.0 == Reg::V(r)));
+        let free = free.ok_or(unsupported(off, name))?;
+        let mut inst2 = inst.clone();
+        inst2.reads.push((Reg::V(free), DPP_SRC0));
+        let mut v2 = v.clone();
+        v2.dpp = None;
+        v2.src[0] = Operand::Vector { reg: free, dwords: 1 };
+        self.vals.insert(DPP_SRC0, R::D(src0));
+        let a = self.spv(op::LOGICAL_AND, Ty::BOOL, &[a_exec, we]);
+        let sel = std::mem::replace(&mut self.sel, Some(a));
+        let r = self.valu_op(&inst2, name, &v2, a);
+        self.sel = sel;
+        self.vals.remove(&DPP_SRC0);
+        r
+    }
+
+    /// DPP8: lane i of each group of eight reads lane sel[i].
+    fn dpp8_source(&mut self, lane: V, sel: u32) -> V {
+        let k7 = self.k32(7);
+        let i = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k7]);
+        let three = self.k32(3);
+        let sh = self.spv(op::I_MUL, Ty::U32, &[i, three]);
+        let ks = self.k32(sel);
+        let s = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[ks, sh]);
+        let s = self.spv(op::BITWISE_AND, Ty::U32, &[s, k7]);
+        let nb = self.k32(!7);
+        let b = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nb]);
+        self.spv(op::BITWISE_OR, Ty::U32, &[b, s])
+    }
+
+    /// DPP16: the source lane of a control, and whether it is in the row
+    /// (shifts); none for a control GFX10 does not have.
+    fn dpp16_source(&mut self, lane: V, c: u32) -> Option<(V, Option<V>)> {
+        let k15 = self.k32(15);
+        let i = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k15]);
+        let nrow = self.k32(!15);
+        let rowb = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nrow]);
+        let in_row = |l: &mut Self, j: V| l.spv(op::BITWISE_OR, Ty::U32, &[rowb, j]);
+        Some(match c {
+            0x000..=0x0FF => (self.quad_perm(lane, c), None),
+            0x101..=0x10F | 0x111..=0x11F => {
+                // row_shl / row_shr
+                let kn = self.k32(c & 0xF);
+                let (j, ok) = if c < 0x110 {
+                    let j = self.spv(op::I_ADD, Ty::U32, &[i, kn]);
+                    (j, self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[j, k15]))
+                } else {
+                    let ok = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[i, kn]);
+                    (self.spv(op::I_SUB, Ty::U32, &[i, kn]), ok)
+                };
+                let j = self.spv(op::BITWISE_AND, Ty::U32, &[j, k15]);
+                (in_row(self, j), Some(ok))
             }
-        };
-        let x = self.spv(op::SELECT, Ty::U32, &[we, res, old]);
-        self.def(inst, Reg::V(reg), R::D(x));
-        Ok(())
+            0x121..=0x12F => {
+                // row_ror
+                let kn = self.k32(c & 0xF);
+                let j = self.spv(op::I_ADD, Ty::U32, &[i, kn]);
+                let j = self.spv(op::BITWISE_AND, Ty::U32, &[j, k15]);
+                (in_row(self, j), None)
+            }
+            // row_mirror, row_half_mirror, row_xmask
+            0x140 | 0x141 | 0x160..=0x16F => {
+                let m = match c {
+                    0x140 => 15,
+                    0x141 => 7,
+                    _ => c & 0xF,
+                };
+                let km = self.k32(m);
+                let j = self.spv(op::BITWISE_XOR, Ty::U32, &[i, km]);
+                (in_row(self, j), None)
+            }
+            // row_share: lane n of the row
+            0x150..=0x15F => {
+                let kn = self.k32(c & 0xF);
+                (in_row(self, kn), None)
+            }
+            _ => return None,
+        })
+    }
+
+    /// quad_perm: lane q of each quad reads lane c[2q+1:2q].
+    fn quad_perm(&mut self, lane: V, c: u32) -> V {
+        let k3 = self.k32(3);
+        let q = self.spv(op::BITWISE_AND, Ty::U32, &[lane, k3]);
+        let one = self.k32(1);
+        let q2 = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[q, one]);
+        let kc = self.k32(c);
+        let s = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[kc, q2]);
+        let s = self.spv(op::BITWISE_AND, Ty::U32, &[s, k3]);
+        let nq = self.k32(!3);
+        let b = self.spv(op::BITWISE_AND, Ty::U32, &[lane, nq]);
+        self.spv(op::BITWISE_OR, Ty::U32, &[b, s])
+    }
+
+    /// The row and bank masks: whether this lane writes. Rows count in the
+    /// console wave (a wave64's upper half is rows 2 and 3).
+    fn dpp_masks(&mut self, lane: V, row_mask: u8, bank_mask: u8) -> V {
+        if row_mask == 0xF && bank_mask == 0xF {
+            return self.kb(true);
+        }
+        let (k2, k3, k4) = (self.k32(2), self.k32(3), self.k32(4));
+        let mut row = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[lane, k4]);
+        if self.wave64 {
+            // the subgroup's half of the console wave
+            let sg = self.f.global(Op::Builtin(Builtin::SubgroupId), Ty::U32);
+            let one = self.k32(1);
+            let half = self.spv(op::BITWISE_AND, Ty::U32, &[sg, one]);
+            let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[half, one]);
+            row = self.spv(op::BITWISE_OR, Ty::U32, &[row, hi]);
+        }
+        let row = self.spv(op::BITWISE_AND, Ty::U32, &[row, k3]);
+        let rm = self.k32(u32::from(row_mask));
+        let rb = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[rm, row]);
+        let bank = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[lane, k2]);
+        let bank = self.spv(op::BITWISE_AND, Ty::U32, &[bank, k3]);
+        let bm = self.k32(u32::from(bank_mask));
+        let bb = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[bm, bank]);
+        let both = self.spv(op::BITWISE_AND, Ty::U32, &[rb, bb]);
+        let one = self.k32(1);
+        let bit = self.spv(op::BITWISE_AND, Ty::U32, &[both, one]);
+        let z = self.k32(0);
+        self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[bit, z])
     }
 }
+
+/// The value a DPP instruction's src0 reads from another lane.
+const DPP_SRC0: Value = Value(u32::MAX - 2);

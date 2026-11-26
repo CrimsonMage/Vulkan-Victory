@@ -33,9 +33,7 @@ impl Lift<'_> {
         let Operand::Vector { reg: dreg, .. } = data else { return Err(unsupported(off, name)) };
         let (sdim, arrayed, ms, coords) = dim_class(dim);
         let rest = name.trim_start_matches("image_");
-        // T# word 7 (slot and flags)
-        let tw = self.opnd_dw(inst, &rsrc, 7, false)?;
-        let tw = self.u32v(tw);
+        let tw = self.t_word7(inst, &rsrc)?;
         self.a16 = false;
         self.a16_vals.clear();
         let addr = if a16 { self.a16_addr(inst, &addr, rest, sdim, coords, ms)? } else { addr };
@@ -47,7 +45,7 @@ impl Lift<'_> {
             k: 0,
             args: vec![tw],
             flags: 0,
-            class: ImageClass { dim: sdim, arrayed, ms, uint: false, storage: false, dynamic: false },
+            class: ImageClass { dim: sdim, arrayed, ms, uint: false, storage: false, dynamic: false, cube_layers: false },
             coords,
             dreg,
             dmask,
@@ -177,9 +175,8 @@ impl Lift<'_> {
         if md.coarse {
             return Err(unsupported(off, "coarse derivatives"));
         }
-        if md.grad && m.class.dim == 3 {
-            return Err(unsupported(off, "cube derivatives"));
-        }
+        // a cube with derivatives or offsets: its faces as a 2D array
+        let layers = m.class.dim == 3 && (md.grad || md.offset);
         let s = self.image_sampler(m)?;
         let off_v = if md.offset { Some(self.next_u(m)?) } else { None };
         let bias_v = if md.bias { Some(self.next_f(m)?) } else { None };
@@ -188,7 +185,7 @@ impl Lift<'_> {
         let grad_v = if md.grad { Some((self.next_vec(m, dims, true)?, self.next_vec(m, dims, true)?)) } else { None };
         let coord = if m.class.dim == 3 {
             let c = self.next_vec(m, 3, true)?;
-            self.cube_dir(c)
+            if layers { self.cube_layer(c) } else { self.cube_dir(c) }
         } else {
             self.next_vec(m, m.coords, true)?
         };
@@ -205,6 +202,9 @@ impl Lift<'_> {
         if let Some((dx, dy)) = grad_v {
             m.flags |= img::GRAD;
             m.args.extend([dx, dy]);
+        }
+        if layers {
+            m.class = ImageClass { dim: 1, arrayed: true, cube_layers: true, ..m.class };
         }
         let offs = off_v.map(|o| self.sample_offset(o, dims, m.class.dim, off)).transpose()?;
         Self::push_opt(m, img::OFFSET, offs);
@@ -385,6 +385,41 @@ impl Lift<'_> {
 
     /// (s, t, face) as the console's cube instructions give them, to a
     /// direction.
+    /// T# word 7 (slot and flags) if word 6 vouches for it (WORD6 = WORD7 ^
+    /// T_CHECK, as the host writes its views); else 0: slot 0, the null
+    /// image, float and sampled.
+    fn t_word7(&mut self, inst: &Inst, rsrc: &Operand) -> Res<V> {
+        let w7 = self.opnd_dw(inst, rsrc, 7, false)?;
+        let w7 = self.u32v(w7);
+        let w6 = self.opnd_dw(inst, rsrc, 6, false)?;
+        let w6 = self.u32v(w6);
+        let x = self.spv(op::BITWISE_XOR, Ty::U32, &[w6, w7]);
+        let k = self.k32(T_CHECK);
+        let ok = self.spv(op::I_EQUAL, Ty::BOOL, &[x, k]);
+        let z = self.k32(0);
+        Ok(self.spv(op::SELECT, Ty::U32, &[ok, w7, z]))
+    }
+
+    /// (s, t, face) as the console's cube instructions give them (s and t
+    /// in [1, 2], face = slice * 8 + face) to a point of the six-layer 2D
+    /// array: (s - 1, t - 1, slice * 6 + face).
+    pub(super) fn cube_layer(&mut self, c: V) -> V {
+        let s = self.extract(c, 0);
+        let t = self.extract(c, 1);
+        let face = self.extract(c, 2);
+        let one = self.kf(1.0);
+        let x = self.spv(op::F_SUB, Ty::F32, &[s, one]);
+        let y = self.spv(op::F_SUB, Ty::F32, &[t, one]);
+        let fi = self.spv(op::CONVERT_F_TO_U, Ty::U32, &[face]);
+        let (k3, k7, k6) = (self.k32(3), self.k32(7), self.k32(6));
+        let slice = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[fi, k3]);
+        let f = self.spv(op::BITWISE_AND, Ty::U32, &[fi, k7]);
+        let base = self.spv(op::I_MUL, Ty::U32, &[slice, k6]);
+        let layer = self.spv(op::I_ADD, Ty::U32, &[base, f]);
+        let layer = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[layer]);
+        self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, 3), &[x, y, layer])
+    }
+
     pub(super) fn cube_dir(&mut self, c: V) -> V {
         let s = self.extract(c, 0);
         let t = self.extract(c, 1);
@@ -498,10 +533,14 @@ fn dim_class(dim: u8) -> (u8, bool, bool, usize) {
 }
 
 /// Derivative components per direction.
+/// Derivative components per direction: a cube's are its faces' (s, t).
 fn grad_dims(sdim: u8) -> usize {
     match sdim {
         0 => 1,
-        2 | 3 => 3,
+        2 => 3,
         _ => 2,
     }
 }
+
+/// WORD6 of a host T# is WORD7 ^ this (docs/vulkan-abi.md 5.2).
+pub const T_CHECK: u32 = 0x7A3C_5E91;
