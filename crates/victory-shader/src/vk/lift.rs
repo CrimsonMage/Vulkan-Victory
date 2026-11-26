@@ -187,6 +187,15 @@ pub struct Lift<'a> {
     wave64: bool,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The current image address as 16-bit components (a16).
+    a16: bool,
+    a16_vals: Vec<V>,
+    /// 16-bit interface rows: (row, half) -> (row, column) ([`super::pack16`]).
+    pub halves: HashMap<(u8, u8), (u8, u8)>,
+    /// Mesh: the row of the parameter entry the compiler left unnamed.
+    pub unnamed_row: Option<u8>,
+    /// Vertex inputs: whether each input-signature row is a float.
+    pub vs_float: HashMap<u8, bool>,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -252,6 +261,11 @@ impl<'a> Lift<'a> {
             site: (0, 0),
             wave64: p.wave64,
             mesh_stride: 0,
+            a16: false,
+            a16_vals: Vec::new(),
+            halves: HashMap::new(),
+            unnamed_row: None,
+            vs_float: HashMap::new(),
         };
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
@@ -478,7 +492,10 @@ impl<'a> Lift<'a> {
             if self.f.ty(n.args[0]) == ty {
                 return Some(n.args[0]);
             }
-            if let Op::Const(bits) = src.op {
+            if let Op::Const(bits) = src.op
+                && ty.n == 1
+                && self.f.ty(n.args[0]).n == 1
+            {
                 return Some(self.f.konst(ty, bits));
             }
             if src.op == Op::Spv(op::BITCAST) && self.f.ty(src.args[0]) == ty {
@@ -638,6 +655,12 @@ impl<'a> Lift<'a> {
             let u = |l: &mut Self, b| l.f.global(Op::Builtin(b), Ty::U32);
             let x = match input {
                 Input::VertexId => u(self, Builtin::VertexIndex),
+                // A vertex attribute the console's fetch shader loads: a
+                // vertex input at the location of its signature row.
+                Input::Attribute { row, channel } => {
+                    let ty = if self.vs_float.get(&row).copied().unwrap_or(true) { Ty::F32 } else { Ty::U32 };
+                    self.f.global(Op::Input { loc: row, comp: channel, interp: Interp::Flat }, ty)
+                }
                 Input::InstanceId => {
                     let i = u(self, Builtin::InstanceIndex);
                     let b = u(self, Builtin::BaseInstance);
@@ -1636,6 +1659,9 @@ impl<'a> Lift<'a> {
                 self.sdst(inst, dst, 1, R::D(z));
                 Ok(())
             }
+            // the call of the vertex fetch shader: its results are inputs;
+            // a far jump (the block's exit already goes there)
+            "swappc" | "setpc" => Ok(()),
             "setreg" | "setreg_imm32" | "setprio" | "version" | "waitcnt_vscnt" | "waitcnt_vmcnt" | "waitcnt_expcnt"
             | "waitcnt_lgkmcnt" => Ok(()),
             "getreg" => {
@@ -2099,6 +2125,37 @@ impl<'a> Lift<'a> {
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
     }
 
+    /// As [`buffer_addr`](Self::buffer_addr) with a computed size.
+    fn buffer_addr_dyn(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
+        let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
+        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
+        let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
+        let ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le]);
+        let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
+        let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
+        let fallback = self.fallback(store);
+        self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
+    }
+
+    /// d16 results: values (f32 bits) as f16, two per dword.
+    fn pack_d16(&mut self, vals: &[V]) -> Vec<V> {
+        vals.chunks(2)
+            .map(|pair| {
+                let mut h = Vec::new();
+                for &x in pair {
+                    let f = self.f32v(x);
+                    let hf = self.spv(op::F_CONVERT, Ty::F16, &[f]);
+                    h.push(hf);
+                }
+                if h.len() == 1 {
+                    h.push(self.f.konst(Ty::F16, 0));
+                }
+                let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F16, 2), &h);
+                self.spv(op::BITCAST, Ty::U32, &[v2])
+            })
+            .collect()
+    }
+
     fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
         let a = self.buffer_addr(vs, o, 4 * n, false);
         Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
@@ -2173,16 +2230,23 @@ impl<'a> Lift<'a> {
             let d16 = name.contains("_d16_");
             match fmt {
                 Some(f) => {
-                    let (bytes, kind) = tformat(f).ok_or(unsupported(off, "a typed buffer format"))?;
+                    let Some((bytes, kind)) = tformat(f) else {
+                        if std::env::var_os("VK_FMT").is_some() {
+                            eprintln!("typed buffer format {f} ({name})");
+                        }
+                        return Err(unsupported(off, "a typed buffer format"));
+                    };
                     (bytes, Kind::T(kind, ch, d16))
                 }
+                None if load => (0, Kind::VFormat(ch, d16)),
                 None => {
-                    // V# format: v0 reads 32-bit channels.
-                    self.approx("a typed buffer access read as 32-bit channels");
+                    // stores through a V# format: 32-bit channels
+                    self.approx("a typed buffer store written as 32-bit channels");
                     if d16 {
-                        return Err(unsupported(off, "a d16 typed buffer access"));
+                        (4 * ch, Kind::Halves(ch))
+                    } else {
+                        (4 * ch, Kind::Dwords(ch))
                     }
-                    (4 * ch, Kind::Dwords(ch))
                 }
             }
         } else if name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_byte") {
@@ -2194,6 +2258,23 @@ impl<'a> Lift<'a> {
         } else {
             (4 * n, Kind::Dwords(n))
         };
+        if let Kind::VFormat(ch, d16) = kind {
+            // the format from the V#, decoded by a helper; bounds by the stride
+            let four = self.k32(4);
+            let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
+            let a = self.buffer_addr_dyn(&vs, o, bytes, false);
+            let k12 = self.k32(12);
+            let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[vs.w3, k12]);
+            let k7f = self.k32(0x7F);
+            let f = self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
+            let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, f]);
+            let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
+            let vals = if d16 { self.pack_d16(&vals) } else { vals };
+            for (i, v) in vals.into_iter().enumerate() {
+                self.def(inst, Reg::V(reg + i as u8), R::D(v));
+            }
+            return Ok(());
+        }
         if load {
             let a = self.buffer_addr(&vs, o, size, false);
             let kind = match kind {
@@ -2231,11 +2312,10 @@ impl<'a> Lift<'a> {
                 vec![self.spv(o, Ty::U32, &[v])]
             }
             Kind::T(t, ch, d16) => {
-                if d16 {
-                    return Err(unsupported(0, "a d16 typed buffer load"));
-                }
-                self.typed_load(a, t, ch)
+                let vals = self.typed_load(a, t, ch);
+                if d16 { self.pack_d16(&vals) } else { vals }
             }
+            Kind::VFormat(..) | Kind::Halves(_) => return Err(unsupported(0, "a typed buffer access")),
         })
     }
 
@@ -2262,13 +2342,27 @@ impl<'a> Lift<'a> {
                 let v = self.spv(op::U_CONVERT, Ty::U16, &[x]);
                 self.emit(Op::Store { align: 2 }, Ty::VOID, vec![a, v]);
             }
-            Kind::T(..) | Kind::Floats(_) => return Err(unsupported(0, "a typed buffer store")),
+            Kind::Halves(n) => {
+                // two f16 per data dword, written as 32-bit floats
+                let mut out = Vec::new();
+                for k in 0..n {
+                    let w = self.u32v(vals[(k / 2) as usize]);
+                    let f = self.half_f32(w, k % 2 == 1);
+                    out.push(self.u32v(f));
+                }
+                let v = if n == 1 { out[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, n as u8), &out) };
+                self.emit(Op::Store { align: 4 }, Ty::VOID, vec![a, v]);
+            }
+            Kind::T(..) | Kind::Floats(_) | Kind::VFormat(..) => return Err(unsupported(0, "a typed buffer store")),
         }
         Ok(())
     }
 
     /// A typed element read from its bytes (the format in the instruction).
     fn typed_load(&mut self, a: V, t: TFormat, ch: u32) -> Vec<V> {
+        if t.bits == 0 {
+            return self.packed_load(a, t, ch);
+        }
         let (comps, bits, num) = (t.comps, t.bits, t.num);
         let mut out = Vec::new();
         let raw: Vec<V> = match bits {
@@ -2332,6 +2426,43 @@ impl<'a> Lift<'a> {
                     }
                 } else {
                     self.k32(0)
+                }
+            };
+            out.push(x);
+        }
+        out
+    }
+
+    /// A 2_10_10_10 element (x in the low bits): one dword.
+    fn packed_load(&mut self, a: V, t: TFormat, ch: u32) -> Vec<V> {
+        let w = self.emit(Op::Load { align: 4 }, Ty::U32, vec![a]);
+        let widths = [10u32, 10, 10, 2];
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        for (c, &bits) in widths.iter().enumerate() {
+            let (o, wv) = (self.k32(at), self.k32(bits));
+            at += bits;
+            if c as u32 >= ch {
+                continue;
+            }
+            let signed = matches!(t.num, Num::Snorm | Num::Sint);
+            let opc = if signed { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
+            let r = self.spv(opc, Ty::U32, &[w, o, wv]);
+            let x = match t.num {
+                Num::Uint | Num::Sint => r,
+                Num::Unorm => {
+                    let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
+                    let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
+                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                    self.u32v(m)
+                }
+                _ => {
+                    let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
+                    let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
+                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                    let lo = self.kf(-1.0);
+                    let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
+                    self.u32v(c)
                 }
             };
             out.push(x);
@@ -2447,7 +2578,31 @@ impl<'a> Lift<'a> {
                 self.def(inst, Reg::V(d), R::D(v));
             }
             "ds_write_b16" | "ds_write_b8" => {
-                return Err(unsupported(off, name));
+                // a half or byte of a dword: clear it, then set it (two
+                // atomics, so lanes writing the other bytes are kept)
+                let a = match &addr {
+                    Some(o) => {
+                        let x = self.opnd(inst, o)?;
+                        self.u32v(x)
+                    }
+                    None => self.k32(0),
+                };
+                let k = self.k32(o16);
+                let b = self.spv(op::I_ADD, Ty::U32, &[a, k]);
+                let two = self.k32(2);
+                let i = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]);
+                let three = self.k32(3);
+                let bo = self.spv(op::BITWISE_AND, Ty::U32, &[b, three]);
+                let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[bo, three]);
+                let m = self.k32(if name.ends_with("16") { 0xFFFF } else { 0xFF });
+                let x = self.opnd_dw(inst, &data[0], 0, false)?;
+                let x = self.u32v(x);
+                let x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
+                let xs = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[x, sh]);
+                let ms = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[m, sh]);
+                let keep = self.spv(op::NOT, Ty::U32, &[ms]);
+                self.emit(Op::LdsAtomic(op::ATOMIC_AND), Ty::U32, vec![i, keep]);
+                self.emit(Op::LdsAtomic(op::ATOMIC_OR), Ty::U32, vec![i, xs]);
             }
             _ if name.starts_with("ds_") && atomic_op(name).is_some() => {
                 let opc = atomic_op(name).unwrap();
@@ -2652,6 +2807,32 @@ impl<'a> Lift<'a> {
         // mesh: vertex and primitive n are written by thread n of the group
         let index = (self.native.stage == HwStage::Ms)
             .then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32));
+        let slot = match e.target {
+            Target::Param { usage: crate::native::Usage::Other(0), .. } if self.native.stage == HwStage::Ms => {
+                u16::from(self.unnamed_row.ok_or(unsupported(off, "a mesh parameter without a row"))?)
+            }
+            _ => slot,
+        };
+        // 16-bit outputs: each dword carries two halves, each a column of a row
+        if matches!(e.target, Target::Param { .. }) && self.halves.keys().any(|k| u16::from(k.0) == slot) {
+            for (c, v) in e.values.iter().enumerate() {
+                let Some(v) = v else { continue };
+                let r = self.value(*v, off)?;
+                let x = self.data(r);
+                let x = self.u32v(x);
+                for high in [false, true] {
+                    let Some(&(row, col)) = self.halves.get(&(slot as u8, 2 * c as u8 + u8::from(high))) else {
+                        continue;
+                    };
+                    let f = self.half_f32(x, high);
+                    let mut args = vec![f];
+                    args.extend(index);
+                    self.emit(Op::Output { slot: u16::from(row), comp: col }, Ty::VOID, args);
+                    self.note_output(u16::from(row), col);
+                }
+            }
+            return Ok(());
+        }
         for (c, v) in e.values.iter().enumerate() {
             if let Some(v) = v {
                 let r = self.value(*v, off)?;
@@ -2704,10 +2885,18 @@ impl<'a> Lift<'a> {
             io::Interp::Vertex { attribute, vertex: 2 } => (*attribute, Interp::Flat),
             _ => return Err(unsupported(off, "an interpolation of vertex values")),
         };
-        if attr.high {
-            return Err(unsupported(off, "an f16 high-half interpolation"));
-        }
-        let loc = attr.row;
+        let name = inst.name();
+        let f16 = name.contains("f16");
+        // A 16-bit value: half 2c (+1 high) of a packed parameter, one
+        // column of one signature row.
+        let (loc, comp) = if f16 {
+            let h = 2 * attr.channel + u8::from(attr.high);
+            *self.halves.get(&(attr.row, h)).ok_or(unsupported(off, "a 16-bit read of a 32-bit input"))?
+        } else if attr.high {
+            return Err(unsupported(off, "a high half of a 32-bit input"));
+        } else {
+            (attr.row, attr.channel)
+        };
         if let Some(e) = self.iface.inputs.iter().find(|e| e.0 == loc) {
             if e.1 != mode {
                 return Err(unsupported(off, "one attribute interpolated two ways"));
@@ -2715,16 +2904,19 @@ impl<'a> Lift<'a> {
         } else {
             self.iface.inputs.push((loc, mode));
         }
-        let x = self.f.global(Op::Input { loc, comp: attr.channel, interp: mode }, Ty::F32);
-        let name = inst.name();
-        let x = if name.contains("f16") {
-            // f16 result in the low half
+        let x = self.f.global(Op::Input { loc, comp, interp: mode }, Ty::F32);
+        if f16 {
+            // an f16 result into a half of the destination
             let h = self.spv(op::F_CONVERT, Ty::F16, &[x]);
+            if let Fields::Valu(v) = &inst.fields {
+                let v = v.clone();
+                return self.write_half(inst, &v, h);
+            }
             let hb = self.spv(op::BITCAST, Ty::U16, &[h]);
-            self.spv(op::U_CONVERT, Ty::U32, &[hb])
-        } else {
-            x
-        };
+            let x = self.spv(op::U_CONVERT, Ty::U32, &[hb]);
+            self.def(inst, Reg::V(reg), R::D(x));
+            return Ok(());
+        }
         self.def(inst, Reg::V(reg), R::D(x));
         Ok(())
     }
@@ -2735,7 +2927,6 @@ struct VSharp {
     dev: V,
     limit: V,
     stride: V,
-    #[allow(dead_code)]
     w3: V,
 }
 
@@ -2751,12 +2942,17 @@ enum Num {
 #[derive(Debug, Clone, Copy)]
 struct TFormat {
     comps: u8,
+    /// Bits per component; 0: a packed 2_10_10_10 dword.
     bits: u8,
     num: Num,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
+    /// A typed load through the V#'s format (channels, d16).
+    VFormat(u32, bool),
+    /// d16 typed store data written as 32-bit floats.
+    Halves(u32),
     Dwords(u32),
     Floats(u32),
     Byte(bool),
@@ -2769,7 +2965,12 @@ enum Kind {
 fn tformat(f: u8) -> Option<(u32, TFormat)> {
     use Num::*;
     let t = |comps, bits, num| Some((u32::from(comps) * u32::from(bits) / 8, TFormat { comps, bits, num }));
+    let packed = |num| Some((4, TFormat { comps: 4, bits: 0, num }));
     match f {
+        50 => packed(Unorm),
+        51 => packed(Snorm),
+        54 => packed(Uint),
+        55 => packed(Sint),
         1 => t(1, 8, Unorm),
         2 => t(1, 8, Snorm),
         5 => t(1, 8, Uint),

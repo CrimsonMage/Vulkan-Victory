@@ -232,8 +232,16 @@ at pipeline creation.
   semantic is a vec4 at its location, components as the console
   signature's mask columns. No module is rewritten per vertex/pixel pair;
   a pixel input no vertex output writes reads an undefined value.
-- **Vertex.** No vertex input bindings: the title's code fetches its
-  vertices with buffer loads. `gl_VertexIndex` is the console's vertex id
+- **Vertex.** Most vertex programs fetch their vertices themselves with
+  buffer loads (no vertex input bindings). A vertex program that calls a
+  console fetch shader (`s_swappc_b64` at its start) instead reads
+  **vertex attributes as `Input` variables at `Location` = the
+  attribute's input-signature row**, a vec4 of 32-bit floats or unsigned
+  integers (the signature's component type; signed integers as unsigned
+  bits). `VkShader::interface` lists them (`input: true`, semantic,
+  index, location); the host makes the vertex input state from the
+  title's input layout, matching its elements by semantic name and
+  index. `gl_VertexIndex` is the console's vertex id
   (index + base vertex), `gl_InstanceIndex - gl_BaseInstance` its instance
   id. `exp pos0` is `gl_Position`; `exp param<n>` writes the outputs of
   signature row n at their semantics' locations (32-bit float; integer

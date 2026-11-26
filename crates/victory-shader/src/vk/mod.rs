@@ -10,6 +10,7 @@
 
 pub mod emit;
 pub mod lift;
+pub mod pack16;
 pub mod spirv;
 pub mod tir;
 
@@ -127,6 +128,8 @@ struct SigRow {
     comp: u32,
     reg: u32,
     mask: u8,
+    /// 16-bit (minimum precision or a native 16-bit type).
+    half: bool,
 }
 
 fn signature(part: &[u8]) -> Result<Vec<SigRow>, ShaderError> {
@@ -148,6 +151,7 @@ fn signature(part: &[u8]) -> Result<Vec<SigRow>, ShaderError> {
             comp: u32_at(part, at + 16)?,
             reg: u32_at(part, at + 20)?,
             mask: *part.get(at + 24).ok_or(ShaderError::Malformed("truncated signature"))?,
+            half: matches!(u32_at(part, at + 16)?, 4..=6) || u32_at(part, at + 28)? != 0,
         });
     }
     Ok(out)
@@ -185,8 +189,28 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         }
         _ => 0,
     };
+    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let elems = |rows: &[SigRow]| -> Vec<pack16::Elem> {
+        rows.iter()
+            .filter(|r| r.reg < 32)
+            .map(|r| pack16::Elem {
+                row: r.reg as u8,
+                col: r.mask.trailing_zeros().min(3) as u8,
+                cols: r.mask.count_ones().max(1) as u8,
+                half: r.half,
+                user: r.sv == 0,
+            })
+            .collect()
+    };
+    let iface_elems = if native.stage == HwStage::Ps { elems(&isg) } else { elems(&osg) };
     let mut lift = lift::Lift::new(&p, &native, &io);
     lift.mesh_stride = mesh_stride;
+    lift.halves = pack16::halves(&native.io, &iface_elems);
+    lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
+    if native.stage == HwStage::Vs {
+        lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
+    }
     let (mut f, iface) = lift.run()?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {
         tir::dump(&f);
@@ -196,8 +220,6 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         tir::dump(&f);
     }
     let ir_insts = f.count();
-    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
-    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let mut out_types = HashMap::new();
     if native.stage == HwStage::Ps {
         for r in &osg {
@@ -236,6 +258,21 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     }
     // interface (information only: locations are fixed per semantic)
     let mut interface = Vec::new();
+    // vertex attributes (a vertex program with a fetch shader): Location =
+    // the input-signature row; the host matches its input layout by semantic
+    if native.stage == HwStage::Vs {
+        for r in isg.iter().filter(|r| r.sv == 0 && r.reg < 32) {
+            if e.vertex_inputs.contains(&(r.reg as u8)) {
+                interface.push(Interface {
+                    semantic: r.name.clone(),
+                    index: r.index,
+                    location: r.reg as u8,
+                    input: true,
+                    word: None,
+                });
+            }
+        }
+    }
     let rows = if native.stage == HwStage::Ps { &isg } else { &osg };
     for r in rows.iter().filter(|r| r.sv == 0) {
         interface.push(Interface {

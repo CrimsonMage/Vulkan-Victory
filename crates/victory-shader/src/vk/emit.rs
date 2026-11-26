@@ -33,6 +33,8 @@ pub struct Stage {
 
 pub struct Emitted {
     pub words: Vec<u32>,
+    /// Vertex programs: the input rows read as vertex attributes.
+    pub vertex_inputs: Vec<u8>,
     /// (location, word index of the Location literal) of pixel inputs.
     pub input_locations: Vec<(u8, usize)>,
 }
@@ -211,7 +213,7 @@ pub struct Emit<'a> {
     /// Blocks that pass a jump on into a construct's merge (no value).
     pass_in: HashMap<Id, Vec<Id>>,
     jmp: Id,
-    images: HashMap<(u8, bool, bool, bool, bool, bool), Id>,
+    images: HashMap<(u8, bool, bool, bool, bool, bool, u32), Id>,
     samplers: Id,
     spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,
@@ -476,7 +478,10 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn input(&mut self, row: u8, chan: u8, interp: Interp) -> Id {
+    fn input(&mut self, row: u8, chan: u8, interp: Interp, ty: Ty) -> Id {
+        if self.st.stage == HwStage::Vs {
+            return self.vertex_input(row, chan, ty);
+        }
         let (loc, comp) = self.st.locs.get(&(row, chan)).copied().unwrap_or((31, chan));
         let f = self.t.f32_;
         let var = if let Some(&v) = self.inputs.get(&loc) {
@@ -583,6 +588,27 @@ impl<'a> Emit<'a> {
         }
     }
 
+    /// A vertex attribute: Location = its input-signature row, a vec4 of
+    /// floats or unsigned integers.
+    fn vertex_input(&mut self, row: u8, chan: u8, ty: Ty) -> Id {
+        let e = if ty == Ty::F32 { self.t.f32_ } else { self.t.u32_ };
+        let var = if let Some(&v) = self.inputs.get(&row) {
+            v
+        } else {
+            let v4 = self.m.t_vec(e, 4);
+            let p = self.m.t_ptr(en::SC_INPUT, v4);
+            let v = self.m.variable(p, en::SC_INPUT);
+            self.m.decorate(v, en::DEC_LOCATION, &[u32::from(row)]);
+            self.interface.push(v);
+            self.inputs.insert(row, v);
+            v
+        };
+        let p = self.m.t_ptr(en::SC_INPUT, e);
+        let k = self.c32(u32::from(chan));
+        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, k]);
+        self.m.op(op::LOAD, e, &[ptr])
+    }
+
     fn output(&mut self, slot: u16) -> (Id, Id) {
         if self.st.stage == HwStage::Ms {
             return self.mesh_output(slot);
@@ -640,11 +666,16 @@ impl<'a> Emit<'a> {
 
     /// The image array variable for a class; `depth` for comparisons.
     fn image_var(&mut self, c: ImageClass, uint: bool, storage: bool, depth: bool) -> (Id, Id) {
+        self.image_var_f(c, uint, storage, depth, 0)
+    }
+
+    /// The same with an image format (R32ui = 33 for atomics).
+    fn image_var_f(&mut self, c: ImageClass, uint: bool, storage: bool, depth: bool, format: u32) -> (Id, Id) {
         // cube images cannot be fetched or stored: as 2D arrays then
         let (dim, arrayed) = if c.dim == 3 && (storage || !c.storage && c.dynamic) { (1, true) } else { (c.dim, c.arrayed) };
-        let key = (dim, arrayed, c.ms, uint, storage, depth);
+        let key = (dim, arrayed, c.ms, uint, storage, depth, format);
         let sty = if uint { self.t.u32_ } else { self.t.f32_ };
-        let ity = self.m.t_image_d(sty, u32::from(dim), depth, arrayed, c.ms, if storage { 2 } else { 1 });
+        let ity = self.m.t_image_df(sty, u32::from(dim), depth, arrayed, c.ms, if storage { 2 } else { 1 }, format);
         if let Some(&v) = self.images.get(&key) {
             return (v, ity);
         }
@@ -728,7 +759,11 @@ impl<'a> Emit<'a> {
 
     /// Writes the helper functions' bodies (after main).
     fn write_helpers(&mut self) {
-        let helpers: Vec<(Helper, Id)> = self.helpers.iter().map(|(h, i)| (*h, *i)).collect();
+        let mut helpers: Vec<(Helper, Id)> = self.helpers.iter().map(|(h, i)| (*h, *i)).collect();
+        if let Some(k) = helpers.iter().position(|h| h.0 == Helper::Typed) {
+            let (_, fid) = helpers.remove(k);
+            self.write_typed(fid);
+        }
         if helpers.is_empty() {
             return;
         }
@@ -833,6 +868,165 @@ impl<'a> Emit<'a> {
         }
     }
 
+    /// The typed-buffer decoder: a switch over the GFX10 FORMAT codes the
+    /// title's views use; others read one 32-bit channel.
+    fn write_typed(&mut self, fid: Id) {
+        let (u, q, f) = (self.t.u32_, self.t.u64_, self.t.f32_);
+        let v4 = self.m.t_vec(u, 4);
+        let fty = self.m.global_fn_type(v4, &[q, u]);
+        self.m.op_to(op::FUNCTION, v4, fid, &[0, fty]);
+        let (addr, fmt) = (self.m.id(), self.m.id());
+        self.m.op_to(55, q, addr, &[]);
+        self.m.op_to(55, u, fmt, &[]);
+        let entry = self.m.id();
+        self.m.label(entry);
+        // (codes, components, bits, num: 0 float 1 unorm 2 snorm 3 uint 4 sint)
+        let table: &[(&[u32], u32, u32, u32)] = &[
+            (&[22], 1, 32, 0),
+            (&[20, 21], 1, 32, 3),
+            (&[64], 2, 32, 0),
+            (&[62, 63], 2, 32, 3),
+            (&[74], 3, 32, 0),
+            (&[72, 73], 3, 32, 3),
+            (&[77], 4, 32, 0),
+            (&[75, 76], 4, 32, 3),
+            (&[13], 1, 16, 0),
+            (&[29], 2, 16, 0),
+            (&[71], 4, 16, 0),
+            (&[7], 1, 16, 1),
+            (&[23], 2, 16, 1),
+            (&[65], 4, 16, 1),
+            (&[8], 1, 16, 2),
+            (&[24], 2, 16, 2),
+            (&[66], 4, 16, 2),
+            (&[11], 1, 16, 3),
+            (&[27], 2, 16, 3),
+            (&[69], 4, 16, 3),
+            (&[12], 1, 16, 4),
+            (&[28], 2, 16, 4),
+            (&[70], 4, 16, 4),
+            (&[1], 1, 8, 1),
+            (&[14], 2, 8, 1),
+            (&[56], 4, 8, 1),
+            (&[2], 1, 8, 2),
+            (&[15], 2, 8, 2),
+            (&[57], 4, 8, 2),
+            (&[5], 1, 8, 3),
+            (&[18], 2, 8, 3),
+            (&[60], 4, 8, 3),
+            (&[6], 1, 8, 4),
+            (&[19], 2, 8, 4),
+            (&[61], 4, 8, 4),
+            (&[50], 4, 0, 1),
+        ];
+        let merge = self.m.id();
+        let default = self.m.id();
+        let labels: Vec<Id> = table.iter().map(|_| self.m.id()).collect();
+        let mut sw = vec![fmt, default];
+        for (i, e) in table.iter().enumerate() {
+            for &c in e.0 {
+                sw.push(c);
+                sw.push(labels[i]);
+            }
+        }
+        self.m.op_void(op::SELECTION_MERGE, &[merge, 0]);
+        self.m.op_void(251, &sw); // OpSwitch
+        let one_f = self.m.c_u32(1.0f32.to_bits());
+        let one_i = self.c32(1);
+        let z = self.c32(0);
+        let mut incoming = Vec::new();
+        for (i, &(_, comps, bits, num)) in table.iter().enumerate() {
+            self.m.label(labels[i]);
+            let mut ch = Vec::new();
+            if bits == 0 {
+                let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
+                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+                let w = self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4]);
+                let mut at = 0;
+                for width in [10u32, 10, 10, 2] {
+                    let (o, wv) = (self.c32(at), self.c32(width));
+                    at += width;
+                    let r = self.m.op(op::BIT_FIELD_U_EXTRACT, u, &[w, o, wv]);
+                    let fl = self.m.op(op::CONVERT_U_TO_F, f, &[r]);
+                    let k = self.m.c_f32((1.0 / ((1u64 << width) - 1) as f32).to_bits());
+                    let m = self.m.op(op::F_MUL, f, &[fl, k]);
+                    ch.push(self.m.op(op::BITCAST, u, &[m]));
+                }
+            } else {
+                let st = match bits {
+                    32 => S::U32,
+                    16 => S::U16,
+                    _ => S::U8,
+                };
+                let et = self.scalar(st);
+                let lt = self.m.t_vec(et, comps);
+                let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, lt);
+                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+                let v = self.m.op(op::LOAD, lt, &[ptr, en::MEM_ALIGNED, (bits / 8).max(1)]);
+                for c in 0..comps {
+                    let e = if comps == 1 { v } else { self.m.op(op::COMPOSITE_EXTRACT, et, &[v, c]) };
+                    let x = match (bits, num) {
+                        (32, _) => e,
+                        (16, 0) => {
+                            let h = self.scalar(S::F16);
+                            let hf = self.m.op(op::BITCAST, h, &[e]);
+                            let fl = self.m.op(op::F_CONVERT, f, &[hf]);
+                            self.m.op(op::BITCAST, u, &[fl])
+                        }
+                        (_, 1) => {
+                            let i = self.m.op(op::U_CONVERT, u, &[e]);
+                            let fl = self.m.op(op::CONVERT_U_TO_F, f, &[i]);
+                            let k = self.m.c_f32((1.0 / ((1u64 << bits) - 1) as f32).to_bits());
+                            let m = self.m.op(op::F_MUL, f, &[fl, k]);
+                            self.m.op(op::BITCAST, u, &[m])
+                        }
+                        (_, 2) => {
+                            let i = self.m.op(op::S_CONVERT, u, &[e]);
+                            let fl = self.m.op(op::CONVERT_S_TO_F, f, &[i]);
+                            let k = self.m.c_f32((1.0 / ((1u64 << (bits - 1)) - 1) as f32).to_bits());
+                            let m = self.m.op(op::F_MUL, f, &[fl, k]);
+                            let lo = self.m.c_f32((-1.0f32).to_bits());
+                            let c = self.m.ext(glsl::N_MAX, f, &[m, lo]);
+                            self.m.op(op::BITCAST, u, &[c])
+                        }
+                        (_, 3) => self.m.op(op::U_CONVERT, u, &[e]),
+                        _ => self.m.op(op::S_CONVERT, u, &[e]),
+                    };
+                    ch.push(x);
+                }
+                while ch.len() < 4 {
+                    let alpha = ch.len() == 3;
+                    ch.push(if !alpha {
+                        z
+                    } else if num >= 3 {
+                        one_i
+                    } else {
+                        one_f
+                    });
+                }
+            }
+            let r = self.m.op(op::COMPOSITE_CONSTRUCT, v4, &ch);
+            incoming.push((r, labels[i]));
+            self.m.op_void(op::BRANCH, &[merge]);
+        }
+        self.m.label(default);
+        let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
+        let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+        let w = self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4]);
+        let r = self.m.op(op::COMPOSITE_CONSTRUCT, v4, &[w, z, z, one_f]);
+        incoming.push((r, default));
+        self.m.op_void(op::BRANCH, &[merge]);
+        self.m.label(merge);
+        let mut ops = Vec::new();
+        for (r, l) in incoming {
+            ops.push(r);
+            ops.push(l);
+        }
+        let res = self.m.op(op::PHI, v4, &ops);
+        self.m.op_void(254, &[res]);
+        self.m.op_void(op::FUNCTION_END, &[]);
+    }
+
     // ---- values ----
 
     fn emit_node(&mut self, v: V) {
@@ -856,7 +1050,7 @@ impl<'a> Emit<'a> {
                 self.map_load(q, &[k])
             }
             Op::Builtin(b) => self.builtin(b),
-            Op::Input { loc, comp, interp } => self.input(loc, comp, interp),
+            Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
             Op::Spv(o) => {
                 let mut ops = args.clone();
                 ops.extend_from_slice(&n.imm);
@@ -1238,7 +1432,9 @@ impl<'a> Emit<'a> {
                 let mut incoming = Vec::new();
                 // a chain of selections: if (storage) { if (int) A else B } else { ... }
                 let emit_variant = |e: &mut Self, storage: bool, int: bool| -> Id {
-                    let (im, _) = e.load_image(class, int, storage, false, tw);
+                    // a size query keeps a cube a cube (loads read it as an array)
+                    let c = if size && !storage { ImageClass { dynamic: false, ..class } } else { class };
+                    let (im, _) = e.load_image(c, int, storage, false, tw);
                     if size {
                         e.m.capability(en::CAP_IMAGE_QUERY);
                         if storage || class.ms {
@@ -1326,11 +1522,16 @@ impl<'a> Emit<'a> {
                 if class.ms {
                     return self.c32(1);
                 }
-                let (im, _) = self.load_image(class, false, false, false, tw);
+                let c = ImageClass { dynamic: false, ..class };
+                let (im, _) = self.load_image(c, false, false, false, tw);
                 self.m.op(op::IMAGE_QUERY_LEVELS, u, &[im])
             }
             ImageKind::Atomic(o) => {
-                let (_, ptr) = self.load_image(class, true, true, false, tw);
+                let (var, ity) = self.image_var_f(class, true, true, false, 33);
+                let k = self.c32(0xFF_FFFF);
+                let slot = self.m.op(op::BITWISE_AND, u, &[tw, k]);
+                let pi = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, ity);
+                let ptr = self.m.op(op::ACCESS_CHAIN, pi, &[var, slot]);
                 let pt = self.m.t_ptr(11, u); // StorageClass Image
                 let s = sample.unwrap_or_else(|| self.c32(0));
                 let tp = self.m.op(60, pt, &[ptr, coord, s]); // OpImageTexelPointer
@@ -1866,7 +2067,8 @@ impl<'a> Emit<'a> {
         }
         let (words, at) = self.m.finish();
         let input_locations = self.input_locations.iter().map(|&(l, w)| (l, at + w)).collect();
-        Ok(Emitted { words, input_locations })
+        let vertex_inputs = if self.st.stage == HwStage::Vs { self.inputs.keys().copied().collect() } else { Vec::new() };
+        Ok(Emitted { words, input_locations, vertex_inputs })
     }
 
     fn tree_root(&mut self) {
