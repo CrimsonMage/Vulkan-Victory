@@ -252,6 +252,17 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: the D3D12 bake measured the real problem: 2,024 used
+  pipelines took 1,110 s on 14 threads (~7.7 s of NVIDIA compile each,
+  4.3 CPU-hours, 6 GB peak). Bake stopped (user): the translator is the
+  cause. Focus: the KISS SPIR-V translator, target <=0.1 s a pipeline.
+  `victory vkprobe` under Proton: 11/11 (host-pointer imports with device
+  addresses, coherent section aliases, descriptor buffer, descriptor heap
+  in title memory, pipeline libraries: fast link 0.004 ms). Imported host
+  memory cannot back a sparse buffer, so: a 64-range map over imports for
+  CPU-written memory; the pool's GPU view as a sparse buffer of card pages
+  bound per page-mapping call and filled on announced writes (console's
+  own design). Display mode now the PC's screen (was 4K).
 - 2026-11-25: runs p21-p28. Pipeline waits (500 ms a frame) removed:
   menus ~26 fps. The physical-vs-DXGI card gap (~2.2 GB) was NVIDIA local
   memory for per-lane code-constant tables (up to 21 KB a lane x 55k
