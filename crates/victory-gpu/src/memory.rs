@@ -603,20 +603,6 @@ pub(crate) fn ready(
     Some(Ready { base: run.base })
 }
 
-/// A buffer of 64 KiB of zeros in the card's memory: what a root constant
-/// buffer view over pool memory is bound to (its shader reads it by
-/// directory, and this way at offset 0 only).
-pub(crate) fn stand_in() -> Option<u64> {
-    static GPU: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *GPU.get_or_init(|| {
-        let buffer = host()?.uav_buffer(64 << 10)?;
-        // SAFETY: a live buffer, kept for the process's life below.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        std::mem::forget(buffer);
-        Some(gpu)
-    })
-}
-
 /// The host view heap at `key` goes: out of the runs before it is freed.
 pub(crate) fn heap_gone(key: usize) {
     if let Some(m) = memory().as_mut() {

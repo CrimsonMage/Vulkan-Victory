@@ -498,9 +498,8 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
     lies in a page reservation (`xmem`'s placeholders,
     `victory_gpu::title_page_reservation`) gets a null host descriptor
     and an entry in its heap's **pool table** (title address | flag,
-    bytes; `descriptor/host.rs` `make_slot`). Root views over pool memory
-    likewise, through a dynamic slot's entry named by the user-data word
-    `USER_ROOT_POOL` (root CBVs are bound to a 64 KiB stand-in). The
+    bytes; `descriptor/host.rs` `make_slot`). Root views are read by
+    directory at the address in user data (section 14). The
     translator lowers every raw, structured and constant buffer access
     twice: the view's way (read at offset 0 where the flag is set), and
     under a branch on the flag (uniform where the descriptor is) the

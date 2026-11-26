@@ -1451,18 +1451,6 @@ impl HostHeap {
         make(view, self.cpu(index))
     }
 
-    /// Makes dynamic slot `index` stand for a root view over pool memory at
-    /// `address` (`bytes` from it): a null raw view (`uav`: unordered) and
-    /// its pool table entry. False if there is no table.
-    pub(crate) fn pool_root_at(&self, index: u32, address: u64, bytes: u64, uav: bool) -> bool {
-        if uav {
-            self.null_raw_uav_at(index);
-        } else {
-            self.null_raw_at(index);
-        }
-        self.pool_entry(index, Some((address, bytes)))
-    }
-
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
     /// draw read it through the table and brought what it views up to
     /// date, so the slot leaves the queue of textures picked by index; the

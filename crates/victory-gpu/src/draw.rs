@@ -157,14 +157,6 @@ pub(crate) struct State {
     root_srv_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
-    /// Root views over pool memory in this list (`crate::memory`): (title
-    /// heap, title address) → the dynamic slot standing for them (a null
-    /// view whose pool table entry holds the address).
-    root_pool_slots: crate::fast::FastMap<(usize, u64), u32>,
-    /// Of the binding under way: the root views over pool memory its
-    /// shaders read by directory, (compute, root slot, dynamic slot)
-    /// (`victory_shader::emit::USER_ROOT_POOL`).
-    root_pools: Vec<(bool, u8, u32)>,
     /// The memory run's base in the view heap of the last whole binding
     /// (`crate::memory`), for a dispatch whose constants alone changed.
     memory_base: u32,
@@ -272,7 +264,6 @@ impl State {
         self.ready_slots.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
-        self.root_pool_slots.clear();
         self.chunk = (0, 0, 0);
         self.tables_gone = true;
     }
@@ -727,18 +718,11 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_POOL, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             // (A dispatch whose constants alone changed: the run its last
             // whole binding found.)
             return memory.map_or(self.memory_base, |m| m.base);
-        }
-        if kind == USER_ROOT_POOL {
-            return self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map_or(victory_shader::emit::POOL_SLOTS - 1, |r| r.2);
-        }
-        if kind == USER_VIEW_BIAS && self.root_pools.iter().any(|r| r.0 == compute && r.1 == slot) {
-            // By directory: from the title's address itself.
-            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1065,10 +1049,6 @@ impl State {
             } else {
                 None
             };
-            if !self.root_pool_views(list, &t.host, compute) {
-                self.made = made;
-                return false;
-            }
             if t.stores {
                 self.root_memory_writes(list, &t.host.root_memory, compute);
             }
@@ -1099,24 +1079,6 @@ impl State {
                         continue;
                     }
                     let tabled = srv;
-                    // Over pool memory, read by directory: the slot standing
-                    // for it (a null view), or for a constant buffer a
-                    // stand-in the shader reads nothing from.
-                    if let Some(index) = self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map(|r| r.2) {
-                        let host = crate::descriptor::heap(self.heaps[0] as This).host();
-                        // SAFETY: an open list; the slot is in the bound view
-                        // heap, the stand-in lives as long as the process.
-                        unsafe {
-                            match (srv, host, crate::memory::stand_in()) {
-                                (true, Some(host), _) if compute => l.SetComputeRootDescriptorTable(param, host.gpu_handle(index)),
-                                (true, Some(host), _) => l.SetGraphicsRootDescriptorTable(param, host.gpu_handle(index)),
-                                (false, _, Some(gpu)) if compute => l.SetComputeRootConstantBufferView(param, gpu),
-                                (false, _, Some(gpu)) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                                _ => {}
-                            }
-                        }
-                        continue;
-                    }
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -1163,20 +1125,6 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
-                if let Some(index) = self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map(|r| r.2) {
-                    if let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() {
-                        let handle = host.gpu_handle(index);
-                        // SAFETY: an open list; the slot is in the bound view heap.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootDescriptorTable(param, handle);
-                            } else {
-                                l.SetGraphicsRootDescriptorTable(param, handle);
-                            }
-                        }
-                    }
-                    continue;
-                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
@@ -1430,61 +1378,6 @@ impl State {
         if !compute {
             let tested = if self.depth_state == DEPTH_READ { self.depth } else { 0 };
             TESTED_DEPTH.set((tested, read));
-        }
-        true
-    }
-
-    /// The root views over pool memory that the shader `t` reads by
-    /// directory (`victory_shader::emit::USER_ROOT_POOL`): each gets a
-    /// dynamic slot of the bound view heap standing for it (a null view of
-    /// its kind, its pool table entry holding the title address), once per
-    /// address per list, noted in [`State::root_pools`] for the user data
-    /// and the root bindings. False if the draw must be dropped (no view
-    /// heap, no slot).
-    fn root_pool_views(&mut self, list: &HostList, t: &victory_shader::emit::HostShader, compute: bool) -> bool {
-        use victory_shader::emit::USER_ROOT_POOL;
-        self.root_pools.retain(|r| r.0 != compute);
-        for u in &t.user_data {
-            if u.root != RootType::Other(USER_ROOT_POOL) {
-                continue;
-            }
-            let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            if !crate::memory::covers(address) {
-                continue;
-            }
-            let heap = match self.heaps[0] {
-                0 => None,
-                h => Some(crate::descriptor::heap(h as This)),
-            };
-            let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
-                once!("a root view over pool memory without a bound view heap: the draw is dropped");
-                return false;
-            };
-            let uav = t.root_uavs.contains(&u.slot);
-            let key = (std::ptr::from_ref(heap) as usize, address);
-            let reach = crate::memory::root_reach(address);
-            let index = match self.root_pool_slots.get(&key) {
-                Some(&index) => index,
-                None => {
-                    let Some(index) = self.take_slots(key.0, host, 1) else {
-                        return false;
-                    };
-                    if !host.pool_root_at(index, address, reach, uav) {
-                        // No pool table: its window, as before.
-                        continue;
-                    }
-                    self.root_pool_slots.insert(key, index);
-                    index
-                }
-            };
-            let writes = uav && STORES.get();
-            crate::memory::named_root(list, address, reach, writes);
-            if writes {
-                note_write(list, address, reach, Cause::RootUav);
-            }
-            self.root_pools.push((compute, u.slot, index));
         }
         true
     }

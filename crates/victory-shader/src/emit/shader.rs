@@ -74,12 +74,6 @@ pub const POOL_FLAG: u32 = 1 << 31;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of copy 0 of the memory run ([`MEMORY_RUN_POOL`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
-/// `RootType::Other` code of a user-data dword the host computes: the heap
-/// slot whose pool table entry describes the root view of root parameter
-/// `slot` ([`POOL_SLOTS`] - 1, whose entry is never a pool view, for none;
-/// [`MEMORY_RUN_POOL`]). A root view over the page
-/// pool is read through the directory as a pool view in the heap is.
-pub const USER_ROOT_POOL: u32 = 0x104;
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
 /// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:

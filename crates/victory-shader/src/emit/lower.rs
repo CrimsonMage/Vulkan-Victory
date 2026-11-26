@@ -2923,22 +2923,10 @@ impl<'a> Lower<'a> {
                 self.s.m.select(self.cur, cond, set, clear)
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => self.lane_heap_index(src, false)?,
-            Source::Built { address, .. } => {
-                use super::shader::USER_ROOT_POOL;
-                if address.param == CODE {
-                    return Ok(None);
-                }
-                let Some(rp) = self.x.native.layout.get(address.param).copied() else {
-                    return Ok(None);
-                };
-                // A spilled program's root arguments fill the host's root
-                // signature already (`user_first`): its root views keep
-                // their windows.
-                if rp.root != RootType::Descriptor || crate::spill::is_spilled(self.x.native) {
-                    return Ok(None);
-                }
-                self.host_word(RootType::Other(USER_ROOT_POOL), rp.slot, 0)
-            }
+            // A root view is read through the directory alone
+            // (`direct_root`), or, in a spilled program or the fallback
+            // (`with_root_windows`), through the view the host binds.
+            Source::Built { .. } => return Ok(None),
             Source::Constant(_) => return Ok(None),
         }))
     }
