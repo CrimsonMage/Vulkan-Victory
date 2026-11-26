@@ -138,6 +138,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// Shaders translated so far whose root views (if any) are read by
+/// directory, and those with root views the host binds per draw.
+#[cfg(windows)]
+pub(crate) static ROOT_VIEW_SHADERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -157,13 +162,34 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        // Root views the host binds per draw, where the
+                        // directory's way could not read them (the
+                        // translator's fallback), against those shaders
+                        // read by directory.
+                        let bound = t.host.root_cbvs.len()
+                            + t.host.root_srvs.iter().filter(|&&s| s != victory_shader::emit::SLOT_STRIDES).count()
+                            + t.host.root_uavs.len();
+                        let n = ROOT_VIEW_SHADERS[usize::from(bound > 0)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if bound > 0 {
+                            tracing::warn!(
+                                stage = self.stage,
+                                hash = %self.hash,
+                                bound,
+                                shaders = n,
+                                "root views bound by the host per draw: the directory's way cannot read them (fallback)"
+                            );
+                        }
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            root_views_by_directory = t.host.root_memory.len(),
+                            root_views_bound = bound,
+                            "shader translated"
+                        )
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

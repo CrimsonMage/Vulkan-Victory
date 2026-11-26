@@ -150,7 +150,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -229,6 +229,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.root_memory.len() as u32);
+    for &(slot, writes) in &s.root_memory {
+        out.extend([slot, u8::from(writes)]);
+    }
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -299,6 +303,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let n = r.word()? as usize;
+    let root_memory = r.take(2 * n)?.chunks(2).map(|p| (p[0], p[1] != 0)).collect();
+    let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
         root_indexed_views.push(RootIndexedView {
@@ -318,6 +324,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_memory,
         root_indexed_views,
     })
 }
@@ -346,6 +353,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            root_memory: vec![(4, false), (5, true)],
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,

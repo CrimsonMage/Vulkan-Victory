@@ -177,6 +177,14 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Root views read through the directory of title memory alone
+    /// ([`USER_MEMORY_BASE`]): (title root parameter, whether the shader
+    /// writes through it). The shader takes the view's title address from
+    /// user data (the root argument's two dwords, `RootType::Descriptor`)
+    /// and the host binds nothing else for it; such a slot is in none of
+    /// the three lists above unless an access the directory cannot lower
+    /// binds it there as well.
+    pub root_memory: Vec<(u8, bool)>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -256,8 +264,33 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran. Its root views are
+/// read through the directory of title memory; a program the directory's
+/// way cannot lower that for (a typed access through a root view, say) is
+/// emitted again with root views the host binds
+/// ([`lower::with_root_windows`]).
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let direct = emit_forms(c, native, p, st, io, res);
+    let has_root_views = native.layout.iter().any(|r| r.root == RootType::Descriptor);
+    match &direct {
+        Err(ShaderError::Unsupported { .. }) if has_root_views => {
+            let windows = lower::with_root_windows(|| emit_forms(c, native, p, st, io, res));
+            if windows.is_ok() { windows } else { direct }
+        }
+        _ => direct,
+    }
+}
+
+/// [`emit`] in one way of reading root views: the program, and the other
+/// forms of it tried when it does not translate.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -461,6 +494,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+
+        root_memory: l.root_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -814,6 +849,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+
+            root_memory: Vec::new(),
             root_indexed_views: Vec::new(),
         };
         let vs = super::host::stub_vs(&ps).unwrap();
@@ -1105,6 +1142,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+
+                root_memory: l.root_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

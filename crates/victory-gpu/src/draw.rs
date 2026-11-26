@@ -388,6 +388,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// The bytes from a root view's address that shaders reading it by
+/// directory may reach (a root view has no size; mesh vertex streams reach
+/// past a megabyte): their pages get directory entries before the draw.
+const ROOT_VIEW_REACH: u64 = 16 << 20;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -673,6 +678,11 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // A root view read through the directory: the title's address
+            // (`HostShader::root_memory`).
+            (Some(&Root::View(address)), RootType::Descriptor) => {
+                if dword == 0 { address as u32 } else { (address >> 32) as u32 }
+            }
             // The host's own ([`Self::host_word`]): no root argument.
             (_, RootType::Other(_)) => 0,
             _ => {
@@ -747,11 +757,36 @@ impl State {
     /// ([`crate::memory`]): the memory run of the bound view heap; for one
     /// that reads by raw address (`by_address`) also the pages its root
     /// views and constants name made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, by_address: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+        by_address: bool,
+        roots: &[(u8, bool)],
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
+        if !by_address && !roots.is_empty() {
+            // Root views read through the directory: their pages given
+            // entries (without a lock once seen to), the faults read once
+            // a frame, buffer copies the directory names kept up to date.
+            thread_local! {
+                static ADDRESSES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            return ADDRESSES.with_borrow_mut(|addresses| {
+                addresses.clear();
+                for &(slot, _) in roots {
+                    if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
+                        crate::memory::reach(address, ROOT_VIEW_REACH);
+                        addresses.push(address);
+                    }
+                }
+                crate::memory::ready(list, heap, Some((addresses, &[], false)))
+            });
+        }
         if !by_address {
             return crate::memory::ready(list, heap, None);
         }
@@ -987,7 +1022,7 @@ impl State {
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.reads_memory() {
                 let at = crate::fast::ticks();
-                let Some(ready) = self.memory_ready(list, compute, writes, t.host.reads_by_address()) else {
+                let Some(ready) = self.memory_ready(list, compute, writes, t.host.reads_by_address(), &t.host.root_memory) else {
                     once!("a shader that reads title memory by directory without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1007,6 +1042,9 @@ impl State {
             if !self.root_pool_views(list, &t.host, compute) {
                 self.made = made;
                 return false;
+            }
+            if t.stores {
+                self.root_memory_writes(list, &t.host.root_memory, compute);
             }
             self.user_data(list, stage, &made, memory.as_ref(), compute);
             self.made = made;
@@ -1386,6 +1424,25 @@ impl State {
             self.root_pools.push((compute, u.slot, index));
         }
         true
+    }
+
+    /// What a shader writes through root views it reads by directory
+    /// (`HostShader::root_memory`), declared written: from the view's
+    /// address to the end of its buffer (of its page reservation, at most
+    /// [`ROOT_VIEW_REACH`], for pool memory), as root UAVs were.
+    fn root_memory_writes(&self, list: &HostList, roots: &[(u8, bool)], compute: bool) {
+        for &(slot, writes) in roots {
+            let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)).filter(|_| writes) else {
+                continue;
+            };
+            let reach = if crate::memory::covers(address) {
+                crate::memory::root_reach(address)
+            } else {
+                crate::shadow::find(address, 1).map_or(1 << 16, |s| s.left(address)).min(ROOT_VIEW_REACH)
+            };
+            crate::memory::named(list, address, reach, true);
+            note_write(list, address, reach, Cause::RootUav);
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's

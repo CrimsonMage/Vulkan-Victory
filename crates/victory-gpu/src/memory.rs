@@ -85,6 +85,11 @@ enum Copy {
     /// whole heap once opened (`None` until then; refused sections stay
     /// `None` and read zeros).
     Section(usize, Option<ID3D12Resource>, bool),
+    /// A chunk ([`crate::unified::CHUNK`]) of a region's heap, by region
+    /// and chunk number, with the buffer over it once opened, as sections
+    /// are: the title's root views and buffer views over its regions (its
+    /// constants, its streams) by address, every byte at home.
+    Chunk(crate::unified::Home, u64, Option<ID3D12Resource>, bool),
     /// A buffer of title memory (raw-address code's regions and buffers).
     Shadow(Arc<Shadow>),
     /// A block of the card's page cache (`cache.rs`); `None` once given
@@ -119,6 +124,8 @@ struct Memory {
     unmade: bool,
     /// Sections by handle: their copy number.
     sections: HashMap<usize, u32>,
+    /// Region chunks: their copy number.
+    chunks: HashMap<(crate::unified::Home, u64), u32>,
     /// Per host view heap (by address): its run. A heap that goes says so
     /// ([`heap_gone`]) before it is freed.
     heaps: HashMap<usize, Run>,
@@ -168,6 +175,7 @@ impl Memory {
             copies: Vec::new(),
             unmade: false,
             sections: HashMap::new(),
+            chunks: HashMap::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: HashSet::new(),
@@ -239,13 +247,38 @@ impl Memory {
         Some(n)
     }
 
+    /// The copy number of chunk `chunk` of region `home`, numbered now if
+    /// it has none.
+    fn chunk(&mut self, home: crate::unified::Home, chunk: u64) -> Option<u32> {
+        if let Some(&n) = self.chunks.get(&(home, chunk)) {
+            return Some(n);
+        }
+        if self.copies.len() >= COPIES as usize {
+            return None;
+        }
+        self.copies.push(Copy::Chunk(home, chunk, None, false));
+        self.unmade = true;
+        let n = self.copies.len() as u32;
+        self.chunks.insert((home, chunk), n);
+        Some(n)
+    }
+
     /// The entry of the title page at `address` as the runtime maps it now:
-    /// a page of the GPU view of the pool, or a view of a section; 0 for
-    /// memory that is neither.
+    /// a page of the GPU view of the pool, a view of a section, or a page
+    /// of a region (its chunk); 0 for memory that is none of these.
     fn entry_now(&mut self, address: u64) -> u64 {
         let found = gpu_page(address)
             .map(|p| (p.section, p.offset))
             .or_else(|| crate::views::section_page(address as usize));
+        if found.is_none()
+            && let Some((home @ crate::unified::Home::Region(_), offset)) = crate::unified::source(address & !(PAGE - 1))
+        {
+            let chunk = offset / crate::unified::CHUNK;
+            return match self.chunk(home, chunk) {
+                Some(n) => u64::from(n) | (offset % crate::unified::CHUNK) << 32,
+                None => 0,
+            };
+        }
         match found.and_then(|(section, offset)| Some((self.section(section)?, offset))) {
             Some((n, offset)) => u64::from(n) | offset << 32,
             None => 0,
@@ -275,10 +308,21 @@ impl Memory {
         }
         self.unmade = false;
         for copy in &mut self.copies {
-            if let Copy::Section(handle, buffer @ None, tried @ false) = copy {
-                *tried = true;
-                *buffer = crate::unified::section_buffer(*handle);
-                STATS[if buffer.is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+            match copy {
+                Copy::Section(handle, buffer @ None, tried @ false) => {
+                    *tried = true;
+                    *buffer = crate::unified::section_buffer(*handle);
+                    STATS[if buffer.is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+                }
+                Copy::Chunk(home, chunk, buffer @ None, tried @ false) => {
+                    *tried = true;
+                    *buffer = crate::unified::span_buffer(*home, *chunk * crate::unified::CHUNK).map(|(b, _)| b);
+                    STATS[if buffer.is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+                    if buffer.is_none() {
+                        tracing::warn!(?home, chunk, "title memory by directory: a region's chunk did not open; its pages read zeros");
+                    }
+                }
+                _ => {}
             }
         }
         let heaps: Vec<(usize, Run)> = self.heaps.iter().map(|(&k, &r)| (k, r)).collect();
@@ -304,9 +348,14 @@ impl Memory {
                     // The largest raw view: 2^27 dwords, a whole section.
                     heap.raw_uav_at(slot, buffer, 0, width.min(512 << 20));
                 }
+                Copy::Chunk(_, _, Some(buffer), _) => {
+                    // SAFETY: a live buffer.
+                    let width = unsafe { buffer.GetDesc() }.Width;
+                    heap.raw_uav_at(slot, buffer, 0, width.min(512 << 20));
+                }
                 // Not opened (yet): reads zeros until it is.
-                Copy::Section(_, None, false) => break,
-                Copy::Section(_, None, true) | Copy::Card(None) => heap.null_raw_uav_at(slot),
+                Copy::Section(_, None, false) | Copy::Chunk(_, _, None, false) => break,
+                Copy::Section(_, None, true) | Copy::Chunk(_, _, None, true) | Copy::Card(None) => heap.null_raw_uav_at(slot),
                 Copy::Card(Some(buffer)) => heap.raw_uav_at(slot, buffer, 0, cache::BLOCK_BYTES),
                 Copy::Shadow(shadow) => {
                     let (first, len) = shadow.span();
@@ -336,6 +385,13 @@ impl Memory {
             return;
         }
         let start = page * PAGE;
+        // A region's page: its chunk.
+        let entry = self.entry_now(start);
+        if entry != 0 {
+            self.demand(page as usize);
+            self.set(page as usize, entry);
+            return;
+        }
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
@@ -836,6 +892,70 @@ pub(crate) fn views_changed(at: u64, len: u64) {
 /// follow what the title maps there from now on.
 pub(crate) fn demand(address: u64, len: u64) {
     with(|m| m.demand_range(address, len));
+}
+
+/// Pages [`reach`] has seen to (one bit each), read without the lock.
+static REACHED: [AtomicU64; MEMORY_PAGES as usize / 64] = [const { AtomicU64::new(0) }; MEMORY_PAGES as usize / 64];
+
+fn reached(page: u64) -> bool {
+    REACHED[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64) & 1 != 0
+}
+
+/// Shaders read and write `[address, address + len)` by directory (a root
+/// view, a buffer view read by address): its pages get entries where the
+/// memory is the title's (pool pages follow the runtime's mappings, region
+/// pages name their chunk), and the page at `address` a copy of the buffer
+/// there if it is in neither. Without the lock where every page was seen
+/// to before: a draw asks this of every root view it reads. A page found
+/// empty later is noted by the compute shaders that read it (the faults);
+/// graphics shaders read zeros there.
+pub(crate) fn reach(address: u64, len: u64) {
+    let last = u64::from(MEMORY_PAGES) - 1;
+    let (first, end) = (address / PAGE, address.saturating_add(len.max(1)).div_ceil(PAGE).min(last));
+    if (first..end).all(reached) {
+        return;
+    }
+    with(|m| {
+        m.demand_range(first * PAGE, (end - first) * PAGE);
+        if first < end && m.mirror[first as usize] == 0 {
+            m.map(address);
+        }
+    });
+    for page in first..end {
+        REACHED[(page / 64) as usize].fetch_or(1 << (page % 64), Ordering::Relaxed);
+    }
+}
+
+/// The title freed region `[at, at + len)` (`crate::unified::released`):
+/// the entries naming its chunks read zeros from the next submission on,
+/// and [`reach`] sees to its pages again.
+pub(crate) fn region_released(at: u64, len: u64) {
+    let mut guard = memory();
+    let Some(m) = guard.as_mut() else {
+        return;
+    };
+    let home = crate::unified::Home::Region(at as usize);
+    let gone: Vec<u32> = m.chunks.iter().filter(|((h, _), _)| *h == home).map(|(_, &n)| n).collect();
+    if gone.is_empty() {
+        return;
+    }
+    m.chunks.retain(|(h, _), _| *h != home);
+    for &n in &gone {
+        if let Some(Copy::Chunk(_, _, buffer, tried)) = m.copies.get_mut(n as usize - 1) {
+            // Its view stays until a heap's run is made again; the buffer
+            // holds the heap until then.
+            *tried = true;
+            let _ = buffer;
+        }
+    }
+    let last = u64::from(MEMORY_PAGES) - 1;
+    for page in at / PAGE..(at + len).div_ceil(PAGE).min(last) {
+        let entry = m.mirror[page as usize];
+        if gone.contains(&(entry as u32)) {
+            m.set(page as usize, 0);
+        }
+        REACHED[(page / 64) as usize].fetch_and(!(1 << (page % 64)), Ordering::Relaxed);
+    }
 }
 
 /// A root view at `address` over pool memory: the bytes it names (to the

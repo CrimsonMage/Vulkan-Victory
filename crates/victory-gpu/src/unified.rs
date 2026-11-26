@@ -195,9 +195,11 @@ pub(crate) fn released(at: usize, len: usize) {
         .filter(|(base, unit)| **base + unit.len as usize <= end)
         .map(|(base, _)| *base)
         .collect();
+    let mut freed = Vec::new();
     for base in gone {
         u.chunks.retain(|(home, _), _| *home != Home::Region(base));
         if let Some(unit) = u.regions.remove(&base) {
+            freed.push((base as u64, unit.len));
             let_go(&unit, 0);
         }
     }
@@ -210,6 +212,11 @@ pub(crate) fn released(at: usize, len: usize) {
         }
     }
     u.loose_refused.retain(|&lo, _| lo < at as u64 || lo >= end as u64);
+    drop(u);
+    // (The directory's lock comes before the units'.)
+    for (base, len) in freed {
+        crate::memory::region_released(base, len);
+    }
 }
 
 /// A buffer placed over title memory.

@@ -187,6 +187,8 @@ fn build(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+
+        root_memory: lowered.root_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

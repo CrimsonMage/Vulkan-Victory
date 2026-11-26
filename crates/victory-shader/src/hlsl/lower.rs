@@ -4273,6 +4273,8 @@ impl<'a> L<'a> {
             root_cbvs: self.root_cbvs.iter().copied().collect(),
             root_srvs: self.root_srvs.iter().copied().collect(),
             root_uavs: self.root_uavs.iter().copied().collect(),
+
+            root_memory: Vec::new(),
             root_indexed_views: self.res.root_indexed_views.clone(),
         };
         let enable_16bit =

@@ -55,6 +55,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// Root views read through the directory alone: (title root parameter,
+    /// written).
+    pub root_memory: Vec<(u8, bool)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -182,6 +185,10 @@ fn half_shift(width: u32) -> u32 {
 struct PoolView {
     /// The view is a pool view: read through the directory.
     on: V,
+    /// The view is a root view of the title's, read through the directory
+    /// alone from the address its root argument holds (user data): no
+    /// view's way, no host view ([`Lower::direct_root`]).
+    only: bool,
     /// Its title address, low dword and bits 32 to 39.
     lo: V,
     hi: V,
@@ -226,6 +233,15 @@ struct Lower<'a> {
     pools: HashMap<(usize, Site, u8), PoolView>,
     /// The program reads title memory by raw address (`resource::MEMORY`).
     by_address: bool,
+    /// Root views read through the directory alone ([`Lower::direct_root`]):
+    /// title root parameter → whether the program writes through it.
+    direct: BTreeMap<u8, bool>,
+    /// While a root view is read through the directory: a page found
+    /// without a copy is noted for the host ([`Lower::lookup`]).
+    fault_reads: bool,
+    /// While [`Lower::buffer_view`] runs for a root view read through the
+    /// directory alone: it stops once the byte the access reads is known.
+    pool_only: bool,
     /// While a buffer access that may be a pool view is lowered its view's
     /// way ([`Self::buffer`]): the register writes, held back until the
     /// directory's way joins them; whether the view is a pool view (the
@@ -937,7 +953,27 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_root_windows`].
+    static ROOT_WINDOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Runs `f` (a translation) with the title's root views read as before
+/// the directory took them over: bound by the host as root views of their
+/// own (`b`/`t`/`u` in `ROOT_CBV_SPACE`, which the host makes per draw),
+/// for the programs whose root views the directory's way cannot read
+/// ([`ROOT_REFUSED`]: typed or d16 accesses, an indexed access of no
+/// known stride).
+pub(super) fn with_root_windows<R>(f: impl FnOnce() -> R) -> R {
+    let was = ROOT_WINDOWS.replace(true);
+    let r = f();
+    ROOT_WINDOWS.set(was);
+    r
+}
+
+/// The refusal of an access through a root view that the directory's way
+/// cannot lower: the program is translated again with its root views
+/// bound by the host ([`with_root_windows`]).
+pub(super) const ROOT_REFUSED: &str = "a root view access the directory cannot read";
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
 /// and every lane read and write taken per host wave too: the program runs
@@ -1387,6 +1423,9 @@ impl<'a> Lower<'a> {
             strides: HashMap::new(),
             pools: HashMap::new(),
             by_address: false,
+            direct: BTreeMap::new(),
+            fault_reads: false,
+            pool_only: false,
             held: None,
             pool_on: None,
             pool_byte: None,
@@ -2129,6 +2168,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let root_memory = self.direct.iter().map(|(&slot, &writes)| (slot, writes)).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2137,6 +2177,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            root_memory,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2464,6 +2505,9 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // The title's address, which the host puts in user data for
+            // root views read through the directory (`direct_root`).
+            RootType::Descriptor if self.root_direct_ok() => {}
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword - self.user_first();
@@ -2692,7 +2736,30 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        if faults {
+        if faults && self.fault_reads {
+            // A root view read through the directory: the page's number
+            // is stored only where it has no copy (a store per access
+            // otherwise), at a place by the number.
+            let zero = k(self, 0);
+            let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+            if let Some(g) = guard {
+                missing = self.s.m.bin(c, Bin::And, missing, g);
+            }
+            let at = self.begin_guarded(Some(missing));
+            let b = self.cur;
+            let places = k(self, MEMORY_FAULTS - 1);
+            let place = self.s.m.bin(b, Bin::URem, page, places);
+            let one = k(self, 1);
+            let place = self.s.m.bin(b, Bin::Add, place, one);
+            let k2 = k(self, 2);
+            let place = self.s.m.bin(b, Bin::Shl, place, k2);
+            let slot = self.memory_run(MEMORY_RUN_FAULTS);
+            let faults = self.s.heap_handle(b, slot, false, false, (11 | 0x1000, 0));
+            let void = self.s.t.void;
+            let mask = self.s.m.i8(1);
+            self.s.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, page, iu, iu, iu, mask, align]);
+            self.end_guarded(at, &[]);
+        } else if faults {
             // A page without a copy: its number, at a place by the number,
             // or at the sink for lanes that do not run and pages that have
             // one.
@@ -2721,6 +2788,8 @@ impl<'a> Lower<'a> {
                 &[faults, place, iu, page, iu, iu, iu, mask, align],
             );
         }
+        // (The conditional note above ends in a block of its own.)
+        let c = self.cur;
         let base = self.memory_run(0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let k64k = k(self, 0xFFFF);
@@ -2743,7 +2812,8 @@ impl<'a> Lower<'a> {
     /// a pool view ([`Self::pool_view`]): its page has a directory entry
     /// whenever the title maps it, so no fault is noted.
     fn pool_dword(&mut self, lo: V, hi: V) -> (V, V) {
-        let (slot, byte) = self.lookup(lo, hi, None, false);
+        let faults = self.fault_reads;
+        let (slot, byte) = self.lookup(lo, hi, None, faults);
         let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
         (h, byte)
     }
@@ -2879,6 +2949,9 @@ impl<'a> Lower<'a> {
     /// one.
     fn pool_view(&mut self, site: Site, src: &Source) -> Option<PoolView> {
         use super::shader::{MEMORY_RUN_POOL, POOL_ENTRY_BYTES, POOL_FLAG, POOL_SLOTS};
+        if self.direct_root(src).is_some() {
+            return self.direct_view(src);
+        }
         // By the descriptor load where there is one: every access through
         // it in the block reads the same entry.
         let key = match src {
@@ -2910,9 +2983,47 @@ impl<'a> Lower<'a> {
         let on = self.s.m.cmp(c, pred::NE, set, zero);
         let k8 = self.s.m.i32(0xFF);
         let hi = self.s.m.bin(c, Bin::And, hi, k8);
-        let p = PoolView { on, lo, hi, bytes };
+        let p = PoolView { on, only: false, lo, hi, bytes };
         self.pools.insert(key, p);
         Some(p)
+    }
+
+    /// Whether the program's root views are read through the directory
+    /// alone (not a program with a spilled user-data table, whose root
+    /// arguments fill the host's root signature already, and not a retry
+    /// with root windows, [`with_root_windows`]).
+    fn root_direct_ok(&self) -> bool {
+        !ROOT_WINDOWS.get() && !crate::spill::is_spilled(self.x.native)
+    }
+
+    /// The root parameter of a descriptor the code builds around a root
+    /// view's address, if the program reads its root views through the
+    /// directory alone ([`Self::root_direct_ok`]): the shader takes the
+    /// title's address from its user data (the host puts the root
+    /// argument there) and finds the bytes in the directory, as the
+    /// console's code reads them at that address. The host binds no view
+    /// and resolves nothing for it per draw.
+    fn direct_root(&self, src: &Source) -> Option<(usize, crate::native::RootParam)> {
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        if address.param == CODE || address.param == MEMORY || !self.root_direct_ok() {
+            return None;
+        }
+        let rp = *self.x.native.layout.get(address.param)?;
+        (rp.root == RootType::Descriptor).then_some((address.param, rp))
+    }
+
+    /// The directory's way of a root view read through the directory alone
+    /// ([`Self::direct_root`]): its address from user data.
+    fn direct_view(&mut self, src: &Source) -> Option<PoolView> {
+        let (param, _) = self.direct_root(src)?;
+        let (Val::I32(lo), Val::I32(hi)) = (self.user(param, 0), self.user(param, 1)) else {
+            return None;
+        };
+        let on = self.s.m.bool(true);
+        let bytes = self.s.m.i32(u32::MAX);
+        Some(PoolView { on, only: true, lo, hi, bytes })
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -5537,6 +5648,28 @@ impl<'a> Lower<'a> {
         // then the directory's under a branch on the pool table's flag. A
         // root view's stand-in (64 KiB, a constant buffer's most) is read at
         // its start where the offset is computed.
+        if let Some(p) = self.pool_view(site, src).filter(|p| p.only) {
+            // A root view read through the directory alone: no view's way.
+            if let Some(Source::Built { address, .. }) = Some(src)
+                && let Some(rp) = self.x.native.layout.get(address.param)
+            {
+                self.direct.entry(rp.slot).or_default();
+            }
+            self.fault_reads = self.x.native.stage == HwStage::Cs;
+            let mut got = Vec::new();
+            for first in (0..count).step_by(4) {
+                let n = (count - first).min(4);
+                let k = self.s.m.i32(4 * first);
+                let off = self.s.m.bin(self.cur, Bin::Add, addr, k);
+                let (lo, hi) = self.address_add(p.lo, p.hi, off);
+                got.extend(self.pool_load(lo, hi, n));
+            }
+            self.fault_reads = false;
+            for (k, x) in got.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         if let Some(p) = self.pool_view(site, src) {
             self.held = Some(Vec::new());
             let view_addr = if matches!(src, Source::Built { .. }) && !matches!(addr, V::Const(_)) {
@@ -6297,7 +6430,7 @@ impl<'a> Lower<'a> {
     fn root_bias(&mut self, param: usize) -> Option<V> {
         use super::shader::USER_VIEW_BIAS;
         let rp = *self.x.native.layout.get(param)?;
-        if rp.root != RootType::Descriptor {
+        if rp.root != RootType::Descriptor || self.root_direct_ok() {
             return None;
         }
         let kind = self
@@ -10273,6 +10406,18 @@ impl<'a> Lower<'a> {
     /// the host keeps their windows.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let pool = self.buffer_pool(inst, (b, i));
+        if let Some(p) = pool.filter(|p| p.only) {
+            return self.buffer_direct(inst, b, i, p);
+        }
+        // A root view read through the directory alone that this access
+        // cannot be lowered for (typed, d16): the program again, with root
+        // views of the host's.
+        if pool.is_none()
+            && !inst.name().ends_with("_inv")
+            && self.descriptors.get(&((b, i), false)).is_some_and(|src| self.direct_root(src).is_some())
+        {
+            return Err(ROOT_REFUSED);
+        }
         self.pool_on = pool.map(|p| p.on);
         self.pool_byte = None;
         self.held = pool.map(|_| Vec::new());
@@ -10287,6 +10432,46 @@ impl<'a> Lower<'a> {
         };
         for (&(reg, _, guard), x) in held.iter().zip(joined) {
             self.write(inst, reg, x, guard);
+        }
+        Ok(())
+    }
+
+    /// A buffer access through a root view read through the directory
+    /// alone ([`Self::direct_root`]): the byte it reads as the view's way
+    /// computes it ([`Self::buffer_view`] stops there), then the
+    /// directory's way, written straight to the registers.
+    fn buffer_direct(&mut self, inst: &Inst, b: usize, i: usize, p: PoolView) -> Result<(), Why> {
+        self.pool_on = Some(p.on);
+        self.pool_byte = None;
+        self.pool_only = true;
+        let done = self.buffer_view(inst, b, i);
+        self.pool_only = false;
+        self.pool_on = None;
+        done?;
+        let byte = self.pool_byte.take().ok_or(ROOT_REFUSED)?;
+        let name = inst.name();
+        let writes = name.starts_with("buffer_store_") || name.starts_with("buffer_atomic_");
+        if let Some(Source::Built { address, .. }) = self.descriptors.get(&((b, i), false)).copied()
+            && let Some(rp) = self.x.native.layout.get(address.param)
+        {
+            *self.direct.entry(rp.slot).or_default() |= writes;
+        }
+        self.fault_reads = self.x.native.stage == HwStage::Cs;
+        let got = self.buffer_by_directory(inst, b, i, p, byte, &[]);
+        self.fault_reads = false;
+        let got = got?;
+        let Fields::Buffer { data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        if got.is_empty() {
+            return Ok(());
+        }
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
+        let guard = self.guard(b, i)?;
+        for (k, x) in got.into_iter().enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
     }
@@ -10335,7 +10520,9 @@ impl<'a> Lower<'a> {
         {
             on = self.s.m.bin(self.cur, Bin::And, on, g);
         }
-        let at = self.begin_guarded(Some(on));
+        // A root view read through the directory alone: only the lanes that
+        // run (their loads note pages without a copy for the host).
+        let at = if p.only { self.begin_guarded(guard) } else { self.begin_guarded(Some(on)) };
         let (lo, hi) = self.address_add(p.lo, p.hi, byte);
         let narrow = match name {
             "buffer_load_ubyte" | "buffer_store_byte" => Some((8, false)),
@@ -10452,6 +10639,11 @@ impl<'a> Lower<'a> {
             let n = count(name.strip_prefix("buffer_load_").ok_or(name)?)?;
             self.pool_load(lo, hi, n)
         };
+        if p.only {
+            let zero = self.s.m.i32(0);
+            let pairs: Vec<(V, V)> = inside.into_iter().map(|x| (x, zero)).collect();
+            return Ok(self.end_guarded(at, &pairs));
+        }
         if inside.len() != held.len() {
             return Err("a pool view access whose two ways differ");
         }
@@ -10616,6 +10808,11 @@ impl<'a> Lower<'a> {
                 }
                 Some(_) => None,
             };
+            if self.pool_only {
+                // The directory's way alone ([`Self::buffer_direct`]).
+                self.pool_byte = byte;
+                return Ok(());
+            }
             if let Some(byte) = byte {
                 self.pool_byte = Some(byte);
                 let zero = self.s.m.i32(0);
