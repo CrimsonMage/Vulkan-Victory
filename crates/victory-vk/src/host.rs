@@ -83,9 +83,9 @@ pub const EXTENSIONS: &[Extension] = &[
         "pixel programs that export stencil (SPV_EXT_shader_stencil_export; without it those programs are refused)",
     ),
     ext(
-        ext::shader_atomic_float2::NAME,
+        MAINTENANCE8,
         Need::Wanted,
-        "float atomic min/max on title memory (global_atomic_fmin/fmax; SPV_EXT_shader_atomic_float_min_max)",
+        "samples with a texel offset that is not a constant (image_sample_*_o under a guard)",
     ),
     ext(
         ext::extended_dynamic_state3::NAME,
@@ -388,6 +388,30 @@ fn chain_features<'a, T: vk::ExtendsPhysicalDeviceFeatures2 + ?Sized>(
     if on { f2.push_next(s) } else { f2 }
 }
 
+/// `VkPhysicalDeviceMaintenance8FeaturesKHR` (newer than the bindings):
+/// with it a sample takes a texel offset that is not a constant, as the
+/// console's `image_sample_*_o` does (plain SPIR-V allows that on gathers
+/// only).
+#[repr(C)]
+struct Maintenance8 {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    maintenance8: vk::Bool32,
+}
+
+const MAINTENANCE8: &CStr = c"VK_KHR_maintenance8";
+
+impl Default for Maintenance8 {
+    fn default() -> Self {
+        Self { s_type: vk::StructureType::from_raw(1_000_574_000), p_next: std::ptr::null_mut(), maintenance8: vk::FALSE }
+    }
+}
+
+// SAFETY: laid out as the Vulkan structure of that type.
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for Maintenance8 {}
+// SAFETY: as above.
+unsafe impl vk::ExtendsDeviceCreateInfo for Maintenance8 {}
+
 /// `info` with `s` chained when `on`.
 fn chain_device<'a, T: vk::ExtendsDeviceCreateInfo + ?Sized>(info: vk::DeviceCreateInfo<'a>, on: bool, s: &'a mut T) -> vk::DeviceCreateInfo<'a> {
     if on { info.push_next(s) } else { info }
@@ -522,7 +546,7 @@ impl Host {
         let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
-        let mut float2 = vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT::default();
+        let mut m8 = Maintenance8::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -561,11 +585,12 @@ impl Host {
             }
             f2 = chain_features(f2, on(khr::fragment_shader_barycentric::NAME), &mut bary);
             f2 = chain_features(f2, on(ext::conditional_rendering::NAME), &mut conditional);
-            f2 = chain_features(f2, on(ext::shader_atomic_float2::NAME), &mut float2);
+            f2 = chain_features(f2, on(MAINTENANCE8), &mut m8);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
         let null = std::ptr::null_mut();
+        m8.p_next = null;
         v11.p_next = null;
         v12.p_next = null;
         v13.p_next = null;
@@ -705,7 +730,7 @@ impl Host {
             }
             info = chain_device(info, has(khr::fragment_shader_barycentric::NAME), &mut bary);
             info = chain_device(info, has(ext::conditional_rendering::NAME), &mut conditional);
-            info = chain_device(info, has(ext::shader_atomic_float2::NAME), &mut float2);
+            info = chain_device(info, has(MAINTENANCE8), &mut m8);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 

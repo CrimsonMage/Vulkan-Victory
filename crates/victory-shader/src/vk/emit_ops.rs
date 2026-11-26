@@ -57,17 +57,25 @@ impl Emit<'_> {
         }
     }
 
-    /// A float min/max atomic on a u32 pointer: the pointer and value are
-    /// reinterpreted as f32 and the old value returned as its u32 bits.
+    /// A float min/max atomic on a u32 pointer, as compare-exchanges (the
+    /// float min/max atomics are an extension NVIDIA lacks): four attempts
+    /// in a row, each computing the wanted value from what the last one
+    /// read. An attempt after a successful one stores the same value again,
+    /// so no attempt needs a branch; a value that lost four races in a row
+    /// is dropped. Returns the first value read.
     fn atomic_float(&mut self, o: u16, ptr: Id, scope: Id, sem: Id, x: Id) -> Id {
         let (u, f) = (self.t.u32_, self.t.f32_);
-        self.m.extension("SPV_EXT_shader_atomic_float_min_max");
-        self.m.capability(en::CAP_ATOMIC_FLOAT32_MIN_MAX_EXT);
-        let fp = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, f);
-        let fptr = self.m.op(op::BITCAST, fp, &[ptr]);
+        let pick = if o == op::ATOMIC_F_MIN_EXT { glsl::N_MIN } else { glsl::N_MAX };
         let fx = self.m.op(op::BITCAST, f, &[x]);
-        let old = self.m.op(o, f, &[fptr, scope, sem, fx]);
-        self.m.op(op::BITCAST, u, &[old])
+        let first = self.m.op(op::ATOMIC_LOAD, u, &[ptr, scope, sem]);
+        let mut seen = first;
+        for _ in 0..4 {
+            let was = self.m.op(op::BITCAST, f, &[seen]);
+            let want = self.m.ext(pick, f, &[was, fx]);
+            let want = self.m.op(op::BITCAST, u, &[want]);
+            seen = self.m.op(op::ATOMIC_COMPARE_EXCHANGE, u, &[ptr, scope, sem, sem, want, seen]);
+        }
+        first
     }
 
     /// LDS dwords (the index clamped; the lanes outside a flat guard write

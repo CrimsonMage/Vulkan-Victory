@@ -306,10 +306,12 @@ impl Lift<'_> {
 
     fn image_atomic(&mut self, m: &mut Mimg) -> Res<()> {
         let opc = atomic_op(m.name).ok_or(unsupported(m.inst.machine.offset, m.name))?;
-        if !m.rest.contains("cmpswap") && m.dmask.count_ones() > 1 {
-            // two data dwords: one 64-bit texel (needs an R64 view and
-            // 64-bit image atomics on the host; one weather program uses it)
-            return Err(unsupported(m.inst.machine.offset, "a 64-bit image atomic"));
+        let wide = !m.rest.contains("cmpswap") && m.dmask.count_ones() > 1;
+        if wide {
+            // two data dwords: one 64-bit texel (the alpha prepass programs'
+            // depth-and-payload maximum). Only the low dword takes part
+            // until the host gives such images a 64-bit view.
+            self.approx("a 64-bit image atomic works on the texel's low dword only");
         }
         let coord = self.next_vec(m, m.coords, false)?;
         m.args.push(coord);
@@ -326,6 +328,11 @@ impl Lift<'_> {
         let r = self.emit(Op::Image { kind: ImageKind::Atomic(opc), class, sampler: Sampler::None, flags: m.flags }, Ty::U32, args);
         if m.glc {
             self.def(m.inst, Reg::V(m.dreg), R::D(r));
+            if wide {
+                // the old texel's high dword: not read (see above)
+                let z = self.k32(0);
+                self.def(m.inst, Reg::V(m.dreg + 1), R::D(z));
+            }
         }
         Ok(())
     }

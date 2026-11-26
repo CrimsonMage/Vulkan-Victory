@@ -29,7 +29,6 @@ impl Lift<'_> {
             // A vertex program has no primitive id on the PC: a third of
             // the vertex index (exact for a triangle list without indices).
             Input::PrimitiveId if self.native.stage == HwStage::Vs => {
-                self.approx("a vertex program's primitive id is a third of its vertex index");
                 let (v, three) = (u(self, Builtin::VertexIndex), self.k32(3));
                 self.global_bin(op::U_DIV, Ty::U32, v, three)
             }

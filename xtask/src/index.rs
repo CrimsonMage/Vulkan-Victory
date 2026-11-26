@@ -252,7 +252,7 @@ fn spirv_val_present() -> bool {
 /// complaint, or `None` when the module is valid.
 fn validate(words: &[u32]) -> Option<String> {
     let child = Command::new("spirv-val")
-        .args(["--target-env", "vulkan1.3", "--scalar-block-layout", "-"])
+        .args(["--target-env", "vulkan1.3", "--scalar-block-layout", "--allow-offset-texture-operand", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
