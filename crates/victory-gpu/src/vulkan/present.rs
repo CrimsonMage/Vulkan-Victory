@@ -49,6 +49,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::S
     super::follow_budget(b);
     let presented = Instant::now();
     memory(b).tick = frame;
+    super::remap::each_frame(b);
     let mut sc = lock(&b.present);
     if sc.is_none() {
         *sc = make_swapchain(b, size);

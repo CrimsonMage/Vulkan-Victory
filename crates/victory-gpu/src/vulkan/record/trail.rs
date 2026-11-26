@@ -108,5 +108,24 @@ impl Rec {
             user_data_map = %self.last_user,
             "Vulkan: a culling dispatch (diagnostics)"
         );
+        // What the card reads there: the table, the batch records and the
+        // tables the program reads at +0xac0, +0xb20 and +0x780 of it.
+        let table = u64::from(ud[0]);
+        let mut targets = vec![("descriptor table".to_string(), table)];
+        for (what, off) in [("records", 0u64), ("batch", 0xac0), ("planes/48-byte table", 0xb20), ("classes", 0x780)] {
+            if off != 0 {
+                targets.push((format!("table+{off:#x}"), table + off));
+            }
+            if let Ok(v) = read_title(b, table + off, 16) {
+                let base = u64::from(u32::from_le_bytes([v[0], v[1], v[2], v[3]])) | u64::from(u16::from_le_bytes([v[4], v[5]])) << 32;
+                if base != 0 {
+                    targets.push((what.to_string(), base));
+                }
+            }
+        }
+        super::super::probe::remember(&targets);
+        if let Some(cmd) = self.cmd.as_ref().map(|r| r.cmd) {
+            super::super::probe::record(b, cmd, targets);
+        }
     }
 }

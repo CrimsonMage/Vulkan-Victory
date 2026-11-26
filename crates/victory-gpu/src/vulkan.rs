@@ -41,6 +41,8 @@ mod gpu_stats;
 mod guard;
 mod loose;
 mod paging;
+mod probe;
+mod remap;
 mod present;
 mod rect;
 mod images;
@@ -155,6 +157,12 @@ struct Memory {
     /// Imports replaced by larger ones: kept for the run (recorded command
     /// buffers not yet submitted may bind maps that name them).
     retired: Vec<Imported>,
+    /// Loose imports over pages the title mapped anew (`remap.rs`): freed
+    /// some frames later, once the card is past them (frame, ticket,
+    /// import); and their ranges, to import again once every page there is
+    /// usable (base, bytes, frame).
+    dying: Vec<(u64, u64, Imported)>,
+    rejoin: Vec<(usize, usize, u64)>,
     /// The frame, for the pool view's least-recently-touched eviction.
     tick: u64,
     warned: u32,
@@ -403,11 +411,12 @@ pub fn title_section_gone(handle: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    if len < BIG_VIEW {
-        return;
-    }
     if let Some(b) = backend() {
         let mut m = memory(b);
+        m.rejoin_over(at, len);
+        if len < BIG_VIEW {
+            return;
+        }
         m.views
             .retain(|&a, &mut (l, ..)| a + l <= at || a >= at + len);
         m.views.insert(at, (len, section, offset));
@@ -425,6 +434,7 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
     let end = at + len;
     let before = m.views.len();
     m.views.retain(|&a, &mut (l, ..)| a + l <= at || a >= end);
+    let remapped = m.drop_stale_loose(b, at, end);
     let gone: Vec<usize> = m.regions.range(..end).filter(|&(&a, r)| a + r.len > at && a >= at && a + r.len <= end).map(|(&a, _)| a).collect();
     let mut imports = Vec::new();
     for a in gone {
@@ -436,7 +446,7 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
         std::mem::take(&mut m.retired).into_iter().partition(|i| i.title_base >= at as u64 && i.title_base + i.len <= end as u64);
     m.retired = kept;
     imports.extend(stale);
-    if m.views.len() == before && imports.is_empty() {
+    if m.views.len() == before && imports.is_empty() && !remapped {
         return;
     }
     m.rebuild_map();

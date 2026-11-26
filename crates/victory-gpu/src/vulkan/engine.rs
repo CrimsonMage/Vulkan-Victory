@@ -419,7 +419,9 @@ impl Engine {
         }
         if super::guard::check(b) {
             self.report_guard_hit(b, &lines);
+            super::probe::describe_last(b);
         }
+        super::probe::check(b);
     }
 }
 

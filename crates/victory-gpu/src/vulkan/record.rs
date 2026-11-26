@@ -801,12 +801,12 @@ impl Rec {
 
     pub(crate) fn dispatch(&mut self, b: &'static Backend, x: u32, y: u32, z: u32) {
         if let Some(cmd) = self.prepare_dispatch(b) {
+            self.watch_cull(b, Some([x, y, z]), None);
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
             STATS[1].fetch_add(1, Ordering::Relaxed);
             let ud = [self.last_push[9], self.last_push[10], self.last_push[11], self.last_push[12]];
             self.note_as(|| format!("dispatch {x}x{y}x{z} ud5-8={:08x} {:08x} {:08x} {:08x}", ud[0], ud[1], ud[2], ud[3]), true);
-            self.watch_cull(b, Some([x, y, z]), None);
         }
     }
 

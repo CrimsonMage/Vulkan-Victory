@@ -63,7 +63,7 @@ impl Memory {
 const JOIN_GAP: usize = 16 << 20;
 
 /// Whether every page of `[lo, hi)` is committed read-write memory.
-fn all_usable(lo: usize, hi: usize) -> bool {
+pub(super) fn all_usable(lo: usize, hi: usize) -> bool {
     let mut p = lo;
     while p < hi {
         let Some(i) = page_info(p).filter(usable) else { return false };
