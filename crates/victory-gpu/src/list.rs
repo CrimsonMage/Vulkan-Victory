@@ -670,7 +670,10 @@ fn new_list(
     // The stream names the list by its address, which stays from here on.
     #[cfg(windows)]
     {
-        list.thin = thin::Front::new(std::ptr::from_ref::<List>(&list) as usize);
+        let at = std::ptr::from_ref::<List>(&list) as usize;
+        list.thin = thin::Front::new(at);
+        let (older, newer) = if thin { (&thin::TABLE, &thin::NEWER_TABLE) } else { (&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS) };
+        crate::layout::born(at, older.0.as_ptr(), newer.0.as_ptr());
     }
     #[cfg(not(windows))]
     let _ = (pipeline, thin);
@@ -700,6 +703,9 @@ extern "system" fn list_release(this: This) -> u32 {
     #[cfg(windows)]
     if crate::vulkan::on() && object::references(this) <= 1 {
         crate::vulkan::list_released(this);
+    }
+    if object::references(this) <= 1 {
+        crate::layout::gone(this as usize);
     }
     object::release_boxed::<List>(this)
 }

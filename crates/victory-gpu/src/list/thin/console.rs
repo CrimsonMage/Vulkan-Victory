@@ -25,11 +25,11 @@ pub(super) const METHODS: [(usize, *const ()); 14] = [
     (29, end_query as *const ()),
     (53, clear_uav_uint as *const ()),
     (54, clear_uav_float as *const ()),
-    (61, fill32 as *const ()),
+    (61, fill32_or_indirect as *const ()),
     (62, fill64 as *const ()),
     (63, fill128 as *const ()),
     (81, draw_indexed_x as *const ()),
-    (85, set_predication as *const ()),
+    (85, predication_or_copy as *const ()),
     (88, write32_top as *const ()),
     (89, write64_top as *const ()),
     (90, write32_bottom_of_shader as *const ()),
@@ -90,6 +90,35 @@ extern "system" fn fill128(this: This, address: u64, size: u64, value: *const [u
     if let Some(&value) = unsafe { value.as_ref() } {
         fill(this, address, size, value, 16);
     }
+}
+
+/// The older layout's slot 61, or the newer's `ExecuteIndirect(signature,
+/// max, arguments, offset, count, count offset)`: a command signature first
+/// tells (`crate::layout`).
+#[allow(clippy::too_many_arguments)] // the newer method's arguments
+extern "system" fn fill32_or_indirect(this: This, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) {
+    if !crate::layout::decided() && crate::layout::names(a, crate::signature::is_signature) {
+        crate::layout::shown(true, "a command signature passed to list slot 61");
+        return super::execute_indirect(this, a as This, b as u32, c as This, d, e as This, f);
+    }
+    fill32(this, a, b, c as u32);
+}
+
+/// The older layout's slot 85, or the newer's `CopyTextureRegionX(dst, x,
+/// y, z, src, box, flags)`: a copy location of a resource first tells.
+#[allow(clippy::too_many_arguments)] // the newer method's arguments
+extern "system" fn predication_or_copy(this: This, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64) {
+    let location = |p: This| {
+        // SAFETY: readable (checked by `names`), at least 16 bytes.
+        let resource = unsafe { p.cast::<u64>().read_unaligned() };
+        crate::layout::names(resource, crate::resource::is_resource)
+    };
+    if !crate::layout::decided() && crate::layout::names(a, location) {
+        crate::layout::shown(true, "a copy location passed to list slot 85");
+        let (dst, src) = (a as *const CopyLocation, e as *const CopyLocation);
+        return super::copy_texture_region_x(this, dst, b as u32, c as u32, d as u32, src, f as *const [u32; 6], g as u32);
+    }
+    set_predication(this, a as *const u64);
 }
 
 extern "system" fn draw_indexed_x(this: This, address: u64, format: u32, count: u32, _flags: u32) {

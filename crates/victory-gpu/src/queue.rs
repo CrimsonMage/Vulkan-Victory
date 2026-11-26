@@ -284,6 +284,7 @@ pub(crate) extern "system" fn create(
         #[cfg(windows)]
         held: Default::default(),
     });
+    crate::layout::born(std::ptr::from_ref::<Queue>(&queue) as usize, FUNCTIONS.0.as_ptr(), NEWER_FUNCTIONS.0.as_ptr());
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
 
@@ -329,6 +330,9 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    if object::references(this) <= 1 {
+        crate::layout::gone(this as usize);
+    }
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
@@ -429,7 +433,7 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+pub(crate) extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -459,7 +463,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// reached is nothing; otherwise what the queue is given next is held
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
-extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+pub(crate) extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -514,7 +518,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
-extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
+pub(crate) extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -883,6 +887,15 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
         let (slot, method) = METHODS[i];
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
+    }
+    // The slots whose calls tell the layouts apart (`crate::layout`).
+    #[cfg(windows)]
+    if newer {
+        f[14] = crate::layout::queue_14 as *const ();
+        f[15] = crate::layout::queue_15 as *const ();
+    } else {
+        f[16] = crate::layout::queue_16 as *const ();
+        f[17] = crate::layout::queue_17 as *const ();
     }
     f
 }
