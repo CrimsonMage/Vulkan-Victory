@@ -567,6 +567,12 @@ impl Module {
         let t = self.t_bool();
         self.constant(if v { op::CONSTANT_TRUE } else { op::CONSTANT_FALSE }, t, &[])
     }
+    /// OpSpecConstantTrue (not deduplicated: each gets its own SpecId).
+    pub fn spec_true(&mut self, ty: Id) -> Id {
+        let id = self.id();
+        put(&mut self.globals, 48, &[ty, id]);
+        id
+    }
     pub fn c_null(&mut self, ty: Id) -> Id {
         self.constant(op::CONSTANT_NULL, ty, &[])
     }

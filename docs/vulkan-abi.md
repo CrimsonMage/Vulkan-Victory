@@ -106,10 +106,13 @@ struct MemoryMap {            // at push dwords 0-1 (device address), 16-byte al
 ```
 
 `device = range.device_base + (title - range.title_start)` for the range
-with `title - title_start < title_size` (unsigned). With `count == 1`
-(the host's title window: `title_start` 0, `device_base` the window) the
-translator does exactly that, one compare and add; otherwise a binary
-search over the sorted ranges (6 steps). An address in no range reads
+with `title - title_start < title_size` (unsigned). **Specialization
+constant 0** (bool, default true) says the map has one range (the host's
+title window: `title_start` 0, `device_base` the window): the translator
+then does exactly that with `range[0]`, one compare and add. A host that
+writes several ranges sets it false at pipeline creation; the module then
+does a binary search over the sorted ranges (6 steps). (`count` is read
+only then.) An address in no range reads
 zeros from `zero` and writes into `sink`; so does any access that is out
 of bounds of its V# (section 4). The map must stay valid and unchanged
 while any submitted work can read it; a new map is a new block.

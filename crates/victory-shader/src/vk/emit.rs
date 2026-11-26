@@ -188,6 +188,9 @@ pub struct Emit<'a> {
     inputs: HashMap<u8, Id>,
     outputs: HashMap<u16, (Id, Id)>,
     lds: Id,
+    /// Inside a flat guard: its condition (effects go to the sink).
+    pred: Option<Id>,
+    sink: Id,
     /// Values a forward edge / back edge gives a block's phis, and the
     /// SPIR-V block it comes from.
     fwd: HashMap<usize, Vec<(Vec<Id>, Id)>>,
@@ -248,6 +251,8 @@ impl<'a> Emit<'a> {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             lds: 0,
+            pred: None,
+            sink: 0,
             fwd: HashMap::new(),
             back: HashMap::new(),
             pending: HashMap::new(),
@@ -337,39 +342,63 @@ impl<'a> Emit<'a> {
         self.push
     }
 
-    fn map_var(&mut self) -> Id {
+    /// The memory map's struct type (`docs/vulkan-abi.md` section 3), read
+    /// only, behind a PhysicalStorageBuffer pointer.
+    fn map_type(&mut self) -> Id {
         if self.map == 0 {
             let (u, q) = (self.t.u32_, self.t.u64_);
             let range = self.m.t_struct(&[q, q, q, q], 3);
             for (k, o) in [0u32, 8, 16, 24].iter().enumerate() {
                 self.m.member_decorate(range, k as u32, en::DEC_OFFSET, &[*o]);
+                self.m.member_decorate(range, k as u32, 24, &[]); // NonWritable
             }
-            let arr = self.m.t_array(range, 4);
+            let arr = self.m.t_array(range, 64);
             self.m.decorate(arr, en::DEC_ARRAY_STRIDE, &[32]);
-            let s = self.m.t_struct(&[q, q, u, arr], 4);
+            let st = self.m.t_struct(&[q, q, u, arr], 4);
             for (k, o) in [0u32, 8, 16, 32].iter().enumerate() {
-                self.m.member_decorate(s, k as u32, en::DEC_OFFSET, &[*o]);
+                self.m.member_decorate(st, k as u32, en::DEC_OFFSET, &[*o]);
+                self.m.member_decorate(st, k as u32, 24, &[]);
             }
-            self.m.decorate(s, en::DEC_BLOCK, &[]);
-            let p = self.m.t_ptr(en::SC_UNIFORM, s);
-            self.map = self.m.variable(p, en::SC_UNIFORM);
-            self.m.decorate(self.map, en::DEC_DESCRIPTOR_SET, &[0]);
-            self.m.decorate(self.map, en::DEC_BINDING, &[3]);
-            self.interface.push(self.map);
+            self.m.decorate(st, en::DEC_BLOCK, &[]);
+            self.map = st;
         }
         self.map
     }
 
-    /// Loads a member of the memory map (u64 or u32 by `ty`).
-    fn map_load(&mut self, ty: Id, path: &[u32]) -> Id {
-        let map = self.map_var();
-        let p = self.m.t_ptr(en::SC_UNIFORM, ty);
+    /// A pointer to the memory map (push dwords 0-1), made here.
+    fn map_ptr(&mut self) -> Id {
+        let st = self.map_type();
+        let var = self.push_var();
+        let u = self.t.u32_;
+        let p = self.m.t_ptr(en::SC_PUSH_CONSTANT, u);
+        let z = self.c32(0);
+        let one = self.c32(1);
+        let a = self.m.op(op::ACCESS_CHAIN, p, &[var, z, z]);
+        let b = self.m.op(op::ACCESS_CHAIN, p, &[var, z, one]);
+        let lo = self.m.op(op::LOAD, u, &[a]);
+        let hi = self.m.op(op::LOAD, u, &[b]);
+        let v2 = self.m.t_vec(u, 2);
+        let pair = self.m.op(op::COMPOSITE_CONSTRUCT, v2, &[lo, hi]);
+        let q = self.t.u64_;
+        let addr = self.m.op(op::BITCAST, q, &[pair]);
+        let pt = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, st);
+        self.m.op(op::CONVERT_U_TO_PTR, pt, &[addr])
+    }
+
+    /// Loads a member of the memory map (u64 or u32 by `ty`); `path` ids.
+    fn map_load_at(&mut self, map: Id, ty: Id, path: &[Id]) -> Id {
+        let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, ty);
         let mut ops = vec![map];
-        for &k in path {
-            ops.push(self.c32(k));
-        }
+        ops.extend_from_slice(path);
         let ptr = self.m.op(op::ACCESS_CHAIN, p, &ops);
-        self.m.op(op::LOAD, ty, &[ptr])
+        let align = if ty == self.t.u64_ { 8 } else { 4 };
+        self.m.op(op::LOAD, ty, &[ptr, en::MEM_ALIGNED, align])
+    }
+
+    fn map_load(&mut self, ty: Id, path: &[u32]) -> Id {
+        let map = self.map_ptr();
+        let ids: Vec<Id> = path.iter().map(|&k| self.c32(k)).collect();
+        self.map_load_at(map, ty, &ids)
     }
 
     fn builtin(&mut self, b: Builtin) -> Id {
@@ -521,7 +550,7 @@ impl<'a> Emit<'a> {
     fn lds_var(&mut self) -> Id {
         if self.lds == 0 {
             let u = self.t.u32_;
-            let arr = self.m.t_array(u, self.iface.lds_dwords.max(1));
+            let arr = self.m.t_array(u, self.iface.lds_dwords.max(1) + 1);
             let p = self.m.t_ptr(en::SC_WORKGROUP, arr);
             self.lds = self.m.variable(p, en::SC_WORKGROUP);
             self.interface.push(self.lds);
@@ -625,13 +654,18 @@ impl<'a> Emit<'a> {
     /// Writes the helper functions' bodies (after main).
     fn write_helpers(&mut self) {
         let helpers: Vec<(Helper, Id)> = self.helpers.iter().map(|(h, i)| (*h, *i)).collect();
+        if helpers.is_empty() {
+            return;
+        }
+        // Specialization constant 0: the map has one range (the default).
+        let b = self.t.bool_;
+        let one_range = self.m.spec_true(b);
+        self.m.decorate(one_range, en::DEC_SPEC_ID, &[0]);
         for (h, fid) in helpers {
-            let (u, q, b) = (self.t.u32_, self.t.u64_, self.t.bool_);
+            let (u, q) = (self.t.u32_, self.t.u64_);
             let v3 = self.m.t_vec(u, 3);
-            let (ret, params): (Id, Vec<Id>) = match h {
-                Helper::Translate => (q, vec![q]),
-                Helper::TranslateRange => (v3, vec![q, u]),
-            };
+            let range = h == Helper::TranslateRange;
+            let (ret, params): (Id, Vec<Id>) = if range { (v3, vec![q, u]) } else { (q, vec![q]) };
             let fty = self.m.global_fn_type(ret, &params);
             self.m.op_to(op::FUNCTION, ret, fid, &[0, fty]);
             let ps: Vec<Id> = params
@@ -642,40 +676,67 @@ impl<'a> Emit<'a> {
                     id
                 })
                 .collect();
-            let l = self.m.id();
-            self.m.label(l);
-            let count = self.map_load(u, &[2]);
-            let zero = self.map_load(q, &[0]);
-            let mut res = zero;
-            let mut lim = self.c32(0);
-            for i in (0..4u32).rev() {
-                let start = self.map_load(q, &[3, i, 0]);
-                let size = self.map_load(q, &[3, i, 1]);
-                let base = self.map_load(q, &[3, i, 2]);
-                let d = self.m.op(op::I_SUB, q, &[ps[0], start]);
-                let inr = self.m.op(op::U_LESS_THAN, b, &[d, size]);
-                let ki = self.c32(i);
-                let used = self.m.op(op::U_LESS_THAN, b, &[ki, count]);
-                let mut hit = self.m.op(op::LOGICAL_AND, b, &[inr, used]);
-                if h == Helper::TranslateRange {
-                    let left = self.m.op(op::I_SUB, q, &[size, d]);
-                    let bytes = self.m.op(op::U_CONVERT, q, &[ps[1]]);
-                    let fits = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[left, bytes]);
-                    hit = self.m.op(op::LOGICAL_AND, b, &[hit, fits]);
-                    lim = self.m.op(op::SELECT, u, &[hit, ps[1], lim]);
+            let entry = self.m.id();
+            self.m.label(entry);
+            let map = self.map_ptr();
+            let z = self.c32(0);
+            let zero = self.map_load_at(map, q, &[z]);
+            let bytes = if range { self.m.op(op::U_CONVERT, q, &[ps[1]]) } else { 0 };
+            // device address and byte limit through range `i` (an id)
+            let through = |e: &mut Self, i: Id| -> (Id, Id) {
+                let (k3, k0, k1, k2) = (e.c32(3), e.c32(0), e.c32(1), e.c32(2));
+                let start = e.map_load_at(map, q, &[k3, i, k0]);
+                let size = e.map_load_at(map, q, &[k3, i, k1]);
+                let base = e.map_load_at(map, q, &[k3, i, k2]);
+                let d = e.m.op(op::I_SUB, q, &[ps[0], start]);
+                let mut hit = e.m.op(op::U_LESS_THAN, b, &[d, size]);
+                let mut lim = 0;
+                if range {
+                    let left = e.m.op(op::I_SUB, q, &[size, d]);
+                    let fits = e.m.op(op::U_GREATER_THAN_EQUAL, b, &[left, bytes]);
+                    hit = e.m.op(op::LOGICAL_AND, b, &[hit, fits]);
+                    let z = e.c32(0);
+                    lim = e.m.op(op::SELECT, u, &[hit, ps[1], z]);
                 }
-                let dev = self.m.op(op::I_ADD, q, &[base, d]);
-                res = self.m.op(op::SELECT, q, &[hit, dev, res]);
+                let dev = e.m.op(op::I_ADD, q, &[base, d]);
+                (e.m.op(op::SELECT, q, &[hit, dev, zero]), lim)
+            };
+            let (lf, ls, lm) = (self.m.id(), self.m.id(), self.m.id());
+            self.m.op_void(op::SELECTION_MERGE, &[lm, 0]);
+            self.m.op_void(op::BRANCH_CONDITIONAL, &[one_range, lf, ls]);
+            self.m.label(lf);
+            let r0 = through(self, z);
+            self.m.op_void(op::BRANCH, &[lm]);
+            self.m.label(ls);
+            // binary search over the sorted ranges
+            let k2 = self.c32(2);
+            let count = self.map_load_at(map, u, &[k2]);
+            let mut lo = self.c32(0);
+            for step in [32u32, 16, 8, 4, 2, 1] {
+                let ks = self.c32(step);
+                let mid = self.m.op(op::I_ADD, u, &[lo, ks]);
+                let inside = self.m.op(op::U_LESS_THAN, b, &[mid, count]);
+                let k3 = self.c32(3);
+                let k63 = self.c32(63);
+                let midc = self.m.ext(glsl::U_MIN, u, &[mid, k63]);
+                let start = self.map_load_at(map, q, &[k3, midc, z]);
+                let le = self.m.op(op::U_LESS_THAN_EQUAL, b, &[start, ps[0]]);
+                let ok = self.m.op(op::LOGICAL_AND, b, &[inside, le]);
+                lo = self.m.op(op::SELECT, u, &[ok, mid, lo]);
             }
-            let out = match h {
-                Helper::Translate => res,
-                Helper::TranslateRange => {
-                    let v2 = self.m.t_vec(u, 2);
-                    let pair = self.m.op(op::BITCAST, v2, &[res]);
-                    let lo = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 0]);
-                    let hi = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 1]);
-                    self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[lo, hi, lim])
-                }
+            let r1 = through(self, lo);
+            self.m.op_void(op::BRANCH, &[lm]);
+            self.m.label(lm);
+            let res = self.m.op(op::PHI, q, &[r0.0, lf, r1.0, ls]);
+            let out = if range {
+                let lim = self.m.op(op::PHI, u, &[r0.1, lf, r1.1, ls]);
+                let v2 = self.m.t_vec(u, 2);
+                let pair = self.m.op(op::BITCAST, v2, &[res]);
+                let lo = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 0]);
+                let hi = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 1]);
+                self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[lo, hi, lim])
+            } else {
+                res
             };
             self.m.op_void(254, &[out]); // OpReturnValue
             self.m.op_void(op::FUNCTION_END, &[]);
@@ -734,14 +795,16 @@ impl<'a> Emit<'a> {
                 let vt = self.f.ty(n.args[1]);
                 let vtid = self.ty(vt);
                 let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, vtid);
-                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[args[0]]);
+                let a = self.predicated_addr(args[0]);
+                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[a]);
                 self.m.op_void(op::STORE, &[ptr, args[1], en::MEM_ALIGNED, align]);
                 0
             }
             Op::Atomic(o) => {
                 let u = self.t.u32_;
                 let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
-                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[args[0]]);
+                let a = self.predicated_addr(args[0]);
+                let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[a]);
                 let (scope, sem) = (self.c32(en::SCOPE_DEVICE), self.c32(0));
                 if o == op::ATOMIC_COMPARE_EXCHANGE {
                     self.m.op(o, u, &[ptr, scope, sem, sem, args[1], args[2]])
@@ -754,7 +817,14 @@ impl<'a> Emit<'a> {
                 let u = self.t.u32_;
                 let p = self.m.t_ptr(en::SC_WORKGROUP, u);
                 let max = self.c32(self.iface.lds_dwords.max(1) - 1);
-                let idx = self.m.ext(glsl::U_MIN, u, &[args[0], max]);
+                let mut idx = self.m.ext(glsl::U_MIN, u, &[args[0], max]);
+                if let Some(c) = self.pred
+                    && n.op != Op::LdsLoad
+                {
+                    // the lanes outside a flat guard write the spare dword
+                    let spare = self.c32(self.iface.lds_dwords.max(1));
+                    idx = self.m.op(op::SELECT, u, &[c, idx, spare]);
+                }
                 let ptr = self.m.op(op::ACCESS_CHAIN, p, &[lds, idx]);
                 match n.op {
                     Op::LdsLoad => self.m.op(op::LOAD, u, &[ptr]),
@@ -1142,6 +1212,26 @@ impl<'a> Emit<'a> {
         for it in list {
             match it {
                 Item::N(v) => self.emit_node(*v),
+                Item::Guard { cond, body, phis } if self.predicable(body) => {
+                    // flat: the body runs for every lane, selects keep the
+                    // old values of the lanes outside the guard
+                    let c = self.id(*cond);
+                    let outer = self.pred;
+                    self.pred = Some(match outer {
+                        Some(o) => self.m.op(op::LOGICAL_AND, self.t.bool_, &[o, c]),
+                        None => c,
+                    });
+                    self.items(body);
+                    self.pred = outer;
+                    for &p in phis {
+                        let n = self.f.node(p);
+                        let (inner, outer) = (n.args[0], n.args[1]);
+                        let t = self.ty(n.ty);
+                        let (a, b) = (self.id(inner), self.id(outer));
+                        let id = self.m.op(op::SELECT, t, &[c, a, b]);
+                        self.ids[p as usize] = id;
+                    }
+                }
                 Item::Guard { cond, body, phis } => {
                     let c = self.id(*cond);
                     let (then, merge) = (self.m.id(), self.m.id());
@@ -1165,6 +1255,34 @@ impl<'a> Emit<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// A guard whose body has no effects and is small enough is emitted
+    /// flat (`VICTORY_VK_PRED`-free policy: every such guard; the experiment
+    /// switch `VK_PRED=n` caps its size, 0 keeps every guard a branch).
+    fn predicable(&self, body: &[Item]) -> bool {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cap = *CAP.get_or_init(|| std::env::var("VK_PRED").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX));
+        body.len() <= cap
+            && body.iter().all(|it| {
+                matches!(it, Item::N(v) if {
+                    let op = &self.f.node(*v).op;
+                    (op.removable() && *op != Op::Phi)
+                        || matches!(op, Op::Store { .. } | Op::Atomic(_) | Op::LdsStore | Op::LdsAtomic(_))
+                })
+            })
+    }
+
+    /// A store's address: the sink where the lanes outside a flat guard
+    /// write.
+    fn predicated_addr(&mut self, a: Id) -> Id {
+        match self.pred {
+            Some(c) => {
+                let q = self.t.u64_;
+                self.m.op(op::SELECT, q, &[c, a, self.sink])
+            }
+            None => a,
         }
     }
 
@@ -1550,6 +1668,10 @@ impl<'a> Emit<'a> {
         }
         for v in self.f.prelude.clone() {
             self.emit_node(v);
+        }
+        if self.f.nodes.iter().any(|n| matches!(n.op, Op::Store { .. } | Op::Atomic(_))) {
+            let q = self.t.u64_;
+            self.sink = self.map_load(q, &[1]);
         }
         // record header labels for continue targets lazily: we need the
         // header of each construct when closing it; keep a map cont -> header
