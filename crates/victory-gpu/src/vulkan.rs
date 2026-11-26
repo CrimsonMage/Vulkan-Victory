@@ -416,6 +416,31 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
     }
 }
 
+/// The live budget: every 60 frames each pool view may take what the
+/// card's budget leaves beside everything else in use now (images,
+/// imports, the swapchain, other programs), less 512 MiB of room; at least
+/// 512 MiB. Without `VK_EXT_memory_budget` the start's figure stays.
+fn follow_budget(b: &Backend, frame: u64) {
+    if frame % 60 != 0 || !b.host.caps.memory_budget {
+        return;
+    }
+    let Some((budget, usage)) = b
+        .host
+        .heaps()
+        .iter()
+        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .filter_map(|(_, bu)| *bu)
+        .max_by_key(|(budget, _)| *budget)
+    else {
+        return;
+    };
+    let mut m = memory(b);
+    for p in &mut m.pools {
+        let others = usage.saturating_sub(p.card_bytes());
+        p.budget = budget.saturating_sub(others).saturating_sub(512 << 20).max(512 << 20);
+    }
+}
+
 /// Bytes of card memory the pool's GPU view may take: the card's budget
 /// less 2 GiB for render targets, textures and the swapchain, at least
 /// 512 MiB.
@@ -549,6 +574,15 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     }
 }
 
+/// The title released a texture resource (its last reference).
+pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDesc) {
+    if on()
+        && let Some(b) = backend()
+    {
+        images::resource_gone(b, address, desc);
+    }
+}
+
 pub(crate) fn title_memory_released(at: usize, len: usize) {
     let Some(b) = backend() else { return };
     images::released(b, at as u64, len as u64);
@@ -588,10 +622,17 @@ pub(crate) fn title_memory_released(at: usize, len: usize) {
 pub(crate) fn read(src: u64, dst: &mut [u8]) -> Option<bool> {
     let b = backend()?;
     let m = memory(b);
-    let (cpu, pool) = m.cpu_of(src)?;
-    pool?;
-    // SAFETY: a page of a section's whole view, mapped while it lives.
-    unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, dst.as_mut_ptr(), dst.len()) };
+    m.cpu_of(src)?.1?;
+    // Page by page: the pool's pages lie apart in their sections.
+    let mut done = 0usize;
+    while done < dst.len() {
+        let here = src + done as u64;
+        let n = ((PAGE - here % PAGE) as usize).min(dst.len() - done);
+        let Some((cpu, Some(_))) = m.cpu_of(here) else { return Some(false) };
+        // SAFETY: a page of a section's whole view, mapped while it lives.
+        unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, dst.as_mut_ptr().add(done), n) };
+        done += n;
+    }
     Some(true)
 }
 

@@ -2313,6 +2313,7 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
+            crate::vulkan::resource_released(self.data() as u64, &self.desc);
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -2357,10 +2358,7 @@ impl Drop for Resource {
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
-                std::ptr::from_ref::<Resource>(self) as usize,
-                self.data() as u64,
-            );
+            crate::shadow::unregister(std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
         }
     }
 }

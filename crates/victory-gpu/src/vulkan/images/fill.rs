@@ -302,6 +302,9 @@ fn detile(b: &Backend, img: &Image, subs: &[Sub], linear: &mut [u8], base: u64) 
     let texture = crate::resource::texture_layout(&img.desc).ok_or_else(|| anyhow::anyhow!("no layout"))?;
     let layout = &texture.planes[0].layout;
     let tiled = super::super::read_title(b, img.key.address, layout.size)?;
+    // The baseline the fingerprint check compares with (a first check
+    // would only store it, missing a change made before it).
+    img.hash.store(fingerprint(b, img.key.address, img.bytes).unwrap_or(0), Ordering::Relaxed);
     let mut regions = Vec::new();
     let mut at = 0usize;
     for s in subs {

@@ -265,6 +265,20 @@ fn registry() -> std::sync::MutexGuard<'static, Option<Registry>> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The title released a texture resource: its image goes once the card is
+/// done with it (its card memory when no alias uses it any more). A later
+/// resource of the same shape at the address gets an image of its own,
+/// filled, not this one's stale contents.
+pub(crate) fn resource_gone(b: &Backend, address: u64, desc: &ResourceDesc) {
+    let Some(key) = key_of(address, desc) else { return };
+    let mut guard = registry();
+    let Some(r) = guard.as_mut() else { return };
+    if let Some(img) = r.images.remove(&key) {
+        super::descriptors::image_gone(img.id);
+        r.dropped.push((b.timeline.last(), img));
+    }
+}
+
 // ---- making ----
 
 fn key_of(address: u64, desc: &ResourceDesc) -> Option<Key> {

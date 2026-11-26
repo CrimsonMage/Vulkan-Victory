@@ -24,6 +24,72 @@ pub(super) struct LinkKey {
 }
 
 static LINKS: Mutex<Option<HashMap<LinkKey, vk::Pipeline>>> = Mutex::new(None);
+
+/// What picks a draw's pipeline in a recording: the title's pipeline, the
+/// pass's formats, rectangles or not, mesh or not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::vulkan) struct DrawKey {
+    pub(super) pipeline: usize,
+    pub(super) formats: [vk::Format; 8],
+    pub(super) count: u32,
+    pub(super) depth: vk::Format,
+    pub(super) rect: bool,
+    pub(super) mesh: bool,
+}
+
+/// A draw's linked pipeline, its vertex attributes, and the bindings they
+/// name in order of first use.
+pub(in crate::vulkan) struct Linked {
+    pub(super) pipeline: vk::Pipeline,
+    pub(super) inputs: Vec<(u32, u32, vk::Format, u32)>,
+    pub(super) bindings: Vec<u32>,
+}
+
+/// The pipeline of a draw with the stages `pre` and `pixel` (made: the
+/// parts and the link, each cached), `None` if a part is missing.
+pub(super) fn linked(b: &'static Backend, pre: &Stage, pixel: Option<&Stage>, gs: &crate::pipeline::host::GraphicsState, k: DrawKey) -> Option<Linked> {
+    let inputs = attributes(pre, gs);
+    let fragment = match pixel {
+        _ if draw_test() >= 2 => solid_fragment(b)?,
+        Some(p) => p.part?,
+        None => empty_fragment(b)?,
+    };
+    let output = part(b, &[], k.formats, k.count, k.depth, true)?;
+    let vertex_input = if k.mesh { None } else { Some(part(b, &inputs, [vk::Format::UNDEFINED; 8], 0, vk::Format::UNDEFINED, false)?) };
+    let key = LinkKey {
+        pre: pre_part(b, pre, k.rect, k.mesh)?,
+        fragment,
+        colors: k.formats,
+        count: k.count,
+        depth: k.depth,
+        inputs: inputs.clone(),
+    };
+    let pipeline = link(b, key, vertex_input, output)?;
+    let mut bindings: Vec<u32> = Vec::new();
+    for &(_, binding, _, _) in &inputs {
+        if !bindings.contains(&(binding & 0xff)) {
+            bindings.push(binding & 0xff);
+        }
+    }
+    Some(Linked { pipeline, inputs, bindings })
+}
+
+/// The pre-rasterisation part of a draw: the vertex or mesh program's,
+/// the rectangle part for rectangle lists, the test's full-screen
+/// triangle under `VICTORY_VK_DRAW_TEST=3`.
+fn pre_part(b: &'static Backend, pre: &Stage, rect: bool, mesh: bool) -> Option<vk::Pipeline> {
+    if draw_test() >= 3 && !mesh {
+        return fullscreen_vertex(b);
+    }
+    if rect && !mesh {
+        let part = pre.rect_part(b);
+        if part.is_none() {
+            super::not_yet(super::NotYet::Topology);
+        }
+        return part;
+    }
+    pre.part
+}
 static PARTS: Mutex<Option<HashMap<(Vec<(u32, u32, vk::Format, u32)>, [vk::Format; 8], u32, vk::Format, bool), vk::Pipeline>>> =
     Mutex::new(None);
 

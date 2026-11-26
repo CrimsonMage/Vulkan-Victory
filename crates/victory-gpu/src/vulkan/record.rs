@@ -43,7 +43,7 @@ mod state;
 
 use state::d3d_flip;
 
-use link::{LinkKey, attributes, draw_test, empty_fragment, fullscreen_vertex, layout_text, link, part, solid_fragment, stage_of};
+use link::{DrawKey, Linked, draw_test, layout_text, linked, stage_of};
 
 /// Counters for the 10 s line: draws recorded, dispatches, skipped (stage
 /// not ready), skipped (stage failed or no pipeline), skipped (other:
@@ -130,6 +130,13 @@ pub(crate) struct Rec {
     bound_compute: vk::Pipeline,
     /// Images the recording names (kept alive until the list is reset).
     keep: Vec<Arc<Image>>,
+    /// Draw pipelines found this recording, by pipeline and pass formats
+    /// (the stage lookups, attributes and link done once each).
+    links: HashMap<DrawKey, Arc<Linked>>,
+    /// The dynamic state set in the command buffer (a digest of what sets
+    /// it), and whether `last_push` is pushed there: set again only on change.
+    state_set: Option<u64>,
+    pushed: bool,
     /// The open pass's attachment images (draws are counted on them).
     attached: Vec<Arc<Image>>,
     /// Diagnostics: the last push constants, and the last draw's vertex
@@ -171,6 +178,9 @@ impl Default for Rec {
             bound: vk::Pipeline::null(),
             bound_compute: vk::Pipeline::null(),
             keep: Vec::new(),
+            links: HashMap::new(),
+            state_set: None,
+            pushed: false,
             attached: Vec::new(),
             last_push: [0; 64],
             last_inputs: (0, 0),
@@ -277,6 +287,8 @@ impl Rec {
             self.bound = vk::Pipeline::null();
             self.bound_compute = vk::Pipeline::null();
             self.pass = None;
+            self.state_set = None;
+            self.pushed = false;
         }
         self.cmd.as_ref().map(|r| r.cmd)
     }
@@ -601,7 +613,11 @@ impl Rec {
                 };
             }
         }
+        if self.pushed && words == self.last_push {
+            return;
+        }
         self.last_push = words;
+        self.pushed = true;
         if cfg!(feature = "diagnostics") {
             self.last_user = stages
                 .iter()
@@ -640,63 +656,61 @@ impl Rec {
         self.refresh_map(b, cmd);
         self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
-        let inputs = attributes(&pre, gs);
-        if cfg!(feature = "diagnostics") {
-            self.last_layout = layout_text(&pre, gs, &inputs);
-        }
-        let fragment = match &pixel {
-            _ if draw_test() >= 2 => solid_fragment(b)?,
-            Some(p) => p.part?,
-            None => empty_fragment(b)?,
-        };
-        let output = part(b, &[], formats, count, depth, true)?;
-        let vertex_input = if mesh { None } else { Some(part(b, &inputs, [vk::Format::UNDEFINED; 8], 0, vk::Format::UNDEFINED, false)?) };
-        let key = LinkKey {
-            pre: pre_part(b, &pre, self.topology, mesh)?,
-            fragment,
-            colors: formats,
-            count,
-            depth,
-            inputs: inputs.clone(),
-        };
-        let Some(pipeline) = link(b, key, vertex_input, output) else {
-            skipped(false);
-            return None;
+        let key = DrawKey { pipeline: self.pipeline as usize, formats, count, depth, rect: self.topology == RECTANGLES, mesh };
+        let made = match self.links.get(&key) {
+            Some(l) => l.clone(),
+            None => {
+                let Some(l) = linked(b, &pre, pixel.as_deref(), gs, key) else {
+                    skipped(false);
+                    return None;
+                };
+                if cfg!(feature = "diagnostics") {
+                    self.last_layout = layout_text(&pre, gs, &l.inputs);
+                }
+                let l = Arc::new(l);
+                self.links.insert(key, l.clone());
+                l
+            }
         };
         let d = &b.host.device;
         // SAFETY: recording into our command buffer, rendering open.
         unsafe {
-            if self.bound != pipeline {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                self.bound = pipeline;
+            if self.bound != made.pipeline {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, made.pipeline);
+                self.bound = made.pipeline;
             }
             let mut list: Vec<&Stage> = vec![&pre];
             if let Some(p) = &pixel {
                 list.push(p);
             }
             self.push(b, cmd, &list, false);
-            self.dynamic(b, cmd, gs, topology, count);
-            // Each binding the attributes name, in order of first use.
-            let mut order: Vec<u32> = Vec::new();
-            for &(_, binding, _, _) in &inputs {
-                if !order.contains(&(binding & 0xff)) {
-                    order.push(binding & 0xff);
-                }
+            let state = self.state_key(gs, topology, count);
+            if self.state_set != Some(state) {
+                self.dynamic(b, cmd, gs, topology, count);
+                self.state_set = Some(state);
             }
-            let mut found = 0;
-            let wanted = order.len();
-            for slot in order {
-                let v = self.vertex.get(slot as usize).copied().flatten();
-                if let Some(v) = v
-                    && let Some((buf, off)) = super::buffer_of(b, v.address)
-                {
-                    d.cmd_bind_vertex_buffers2(cmd, slot, &[buf], &[off], Some(&[u64::from(v.size)]), Some(&[u64::from(v.stride)]));
-                    found += 1;
-                }
-            }
-            self.last_inputs = (inputs.len() + 1000 * wanted, found);
+            self.bind_vertices(b, cmd, &made);
         }
         Some(cmd)
+    }
+
+    /// Binds the vertex buffers the draw's attributes name.
+    ///
+    /// # Safety
+    /// Recording into `cmd`.
+    unsafe fn bind_vertices(&mut self, b: &'static Backend, cmd: vk::CommandBuffer, made: &Linked) {
+        let mut found = 0;
+        for &slot in &made.bindings {
+            let v = self.vertex.get(slot as usize).copied().flatten();
+            if let Some(v) = v
+                && let Some((buf, off)) = super::buffer_of(b, v.address)
+            {
+                // SAFETY: as the caller says; a title buffer.
+                unsafe { b.host.device.cmd_bind_vertex_buffers2(cmd, slot, &[buf], &[off], Some(&[u64::from(v.size)]), Some(&[u64::from(v.stride)])) };
+                found += 1;
+            }
+        }
+        self.last_inputs = (made.inputs.len() + 1000 * made.bindings.len(), found);
     }
 
     /// Diagnostics: the descriptor the first table of the vertex program
@@ -925,22 +939,6 @@ fn once_topology(t: u32) {
     }
 }
 
-/// The pre-rasterisation part of a draw: the vertex or mesh program's,
-/// the rectangle part for rectangle lists, the test's full-screen
-/// triangle under `VICTORY_VK_DRAW_TEST=3`.
-fn pre_part(b: &'static Backend, pre: &Stage, topology: u32, mesh: bool) -> Option<vk::Pipeline> {
-    if draw_test() >= 3 && !mesh {
-        return fullscreen_vertex(b);
-    }
-    if topology == RECTANGLES && !mesh {
-        let part = pre.rect_part(b);
-        if part.is_none() {
-            not_yet(NotYet::Topology);
-        }
-        return part;
-    }
-    pre.part
-}
 
 /// The pre-rasterisation and pixel stages of a draw, ready; `None` (counted)
 /// if the draw is skipped.
