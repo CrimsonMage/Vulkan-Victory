@@ -35,8 +35,8 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
+1. **The builder programs translate** (all 52; the title creates every one,
+   53 pipelines). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
@@ -103,10 +103,19 @@ shaders and emulates the one instruction.
   `RayQuery`, with each program's outputs (hit distance, instance, primitive,
   barycentrics) mapped back to its registers, and the static structures
   decoded from console nodes into host geometry. Weeks of work.
-- The 35 builder programs the title creates all translate (49 of 52 in the
-  DLL; the 3 that do not are wave64 programs it does not use); none needs
-  64-bit image atomics, and none keeps 64-lane waves on a 32-lane host. The
-  builder stays off only because of `VICTORY_BVH_BUILDER`'s default.
+- The builder programs all translate (52 of 52), and none keeps 64-lane
+  waves on a 32-lane host; none needs 64-bit image atomics. The title creates
+  all of them (53 pipelines). The last 3 (77360df21e12ea43,
+  39321a95223001ed, 9fc111d3be79364f: wave64 groups of 512 or 256 threads,
+  the scan of each group's per-element counts into offsets) end with a sum
+  over the group's waves: each wave's total goes to LDS, then a loop, run
+  only by the waves after the first, adds the earlier waves' totals and
+  passes the running sum on with `v_readfirstlane`. The loop's lanes all load
+  the same LDS dword, so the first lane's value is every lane's own
+  (`lane_uniform` in `emit/lower.rs` counts plain LDS loads at an address
+  every lane holds alike); before, the translator asked the other host wave
+  for it, which it can only do where every lane runs. The builder stays off
+  only because of `VICTORY_BVH_BUILDER`'s default.
 - The title has non-ray-traced variants of most passes
   (`CS_ScreenProbes_TraceRays_Fallback`/`_Voxels`, `CS_DeferredGather_Fallback`,
   `CS_Primary_Gather_Fallback`, `CS_PPR_RaytraceFallback`,
@@ -118,9 +127,9 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder stayed off in earlier runs: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- With `VICTORY_BVH_BUILDER=1` the builder stayed off in earlier runs
+  (`missing=3 of=53`): three of its programs did not translate. They do now;
+  not yet run.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).

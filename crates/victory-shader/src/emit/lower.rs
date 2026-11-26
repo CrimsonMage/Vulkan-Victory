@@ -405,7 +405,7 @@ pub(super) fn needs_every_lane(what: &str) -> bool {
 
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
+/// constants and such values; or loaded from LDS at an address made of them. The compiler keeps
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
@@ -431,6 +431,18 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                         && !name.contains("lane") =>
                 {
                     v.src.clone()
+                }
+                // A plain LDS load: one instruction reads one dword for every lane at the same
+                // address, so lanes that give it the same address get the same value. (Each
+                // lane's value is what the lowering of the load gives it; the two host waves of
+                // a console wave read the one LDS of the group.) Not `addtid` (the lane's own
+                // dword), not `d16` (merges into the old register).
+                Fields::Ds { addr: Some(addr), gds: false, .. }
+                    if name.starts_with("ds_read")
+                        && !name.contains("addtid")
+                        && !name.contains("d16") =>
+                {
+                    vec![*addr]
                 }
                 _ => continue,
             };
@@ -11603,5 +11615,99 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A first-lane read of what every lane loaded from one LDS address, inside a branch on
+    /// the console wave's number (so not every lane of the group runs it), in a wave64 program
+    /// whose two host waves exchange (a lane read crosses the halves): the lanes hold the same
+    /// value, so the first lane's is the lane's own and nothing is asked of the other half.
+    /// The structure builder's prefix sums over a group's waves (`XboxBvhBuilder.dll`
+    /// 77360df21e12ea43 and 39321a95223001ed at 0x1d4, 9fc111d3be79364f at 0x1ec) read the
+    /// waves' totals that way.
+    #[test]
+    fn a_first_lane_read_of_an_lds_load_at_one_address_needs_no_other_half() {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0: the UAV's descriptor
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0: the console wave's number
+            0xD760_0006,
+            0x0001_3F00, // v_readlane_b32 s6, v0, 31
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0x7E12_0206, // v_mov_b32 v9, s6
+            0xD834_0000,
+            0x0000_0908, // ds_write_b32 v8, v9
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7: the second console wave only
+            0,           // s_cbranch_execz to the end (filled in below)
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0xD8D8_0000,
+            0x0800_0008, // ds_read_b32 v8, v8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E0C_0508, // v_readfirstlane_b32 s6, v8
+            0x7E12_0206, // v_mov_b32 v9, s6
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xE070_1000,
+            0x8002_0901, // buffer_store_dword v9, v1, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        words[13] = 0xBF88_0000 | (words.len() as u32 - 15);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        let text: Vec<String> = decoded.iter().map(|i| i.text(true).trim().to_owned()).collect();
+        for want in [
+            "v_readlane_b32 s6, v0, 31",
+            "v_cmpx_ne_u32 exec, 0, v7",
+            "ds_read_b32 v8, v8",
+            "v_readfirstlane_b32 s6, v8",
+            "buffer_store_dword v9, v1, s[8:11], 0 offen",
+        ] {
+            assert!(text.iter().any(|t| t == want), "{want} not in {text:#?}");
+        }
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) },
+                root(RootType::Table, 4, 1),
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                // s0..s4, 512 bytes of LDS
+                rsrc2: 1 << 15 | 5 << 1,
+                threads: [128, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("lowers");
+        assert_eq!(lowered.wave_size, Some(32), "two host waves of 32 per console wave");
     }
 }
