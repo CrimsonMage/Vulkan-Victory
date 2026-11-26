@@ -29,9 +29,53 @@ use crate::pipeline::Shader;
 /// The ABI version the host binds for (`docs/vulkan-abi.md`).
 pub(crate) const HOST_ABI: u32 = 3;
 
-/// Stage workers: few and in the background (the machine's load is kept
-/// low; the title's own threads come first).
-const WORKERS: usize = 4;
+/// Stage workers: half the logical processors, 4 to 8, below the title's
+/// threads (`SetThreadPriority` below normal): draws wait for their stages.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(4, 8)
+}
+
+/// SPIR-V words compiling at once at most (the driver's memory for a
+/// compile grows with the module; a module bigger than this compiles
+/// alone).
+const WORDS_IN_FLIGHT: u64 = 1_000_000;
+static IN_FLIGHT: Mutex<u64> = Mutex::new(0);
+static ROOM: Condvar = Condvar::new();
+
+/// Waits until `words` more may compile; hands them back on drop.
+struct Flight(u64);
+
+impl Flight {
+    fn take(words: u64) -> Flight {
+        let mut n = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 && *n + words > WORDS_IN_FLIGHT {
+            n = ROOM.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += words;
+        Flight(words)
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        *IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) -= self.0;
+        ROOM.notify_all();
+    }
+}
+
+/// CPU time of the calling thread, in µs (the driver compiles on it: CPU
+/// time against wall time tells a slow compile from a starved one).
+fn thread_cpu_us() -> u64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let (mut a, mut b, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: a plain query of our own thread.
+    if unsafe { GetThreadTimes(GetCurrentThread(), &mut a, &mut b, &mut k, &mut u) }.is_err() {
+        return 0;
+    }
+    let t = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) / 10;
+    t(k) + t(u)
+}
 
 /// Images and samplers the global descriptor sets hold (ABI v1).
 const IMAGE_SLOTS: u32 = 1 << 20;
@@ -298,9 +342,27 @@ pub(crate) fn save_cache(b: &Backend) {
     }
     // SAFETY: a live cache.
     if let (Ok(data), Some(f)) = (unsafe { b.host.device.get_pipeline_cache_data(c) }, cache_file(b)) {
-        let _ = std::fs::write(f, &data);
-        tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache saved");
+        let tmp = f.with_extension("tmp");
+        if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &f).is_ok() {
+            tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache saved");
+        }
     }
+}
+
+/// Every 60 s, when parts were compiled since the last save: the pipeline
+/// cache is saved (runs end by being killed, so the save at the end is
+/// rarely reached).
+pub(crate) fn save_cache_now_and_then(b: &Backend) {
+    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    let parts = STATS[4].load(Ordering::Relaxed);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (when, saved) = *last.get_or_insert((Instant::now(), parts));
+    if when.elapsed() < std::time::Duration::from_secs(60) || parts == saved {
+        return;
+    }
+    *last = Some((Instant::now(), parts));
+    drop(last);
+    save_cache(b);
 }
 
 struct Queue {
@@ -460,7 +522,9 @@ fn hash_hex(full: &[u8; 32]) -> String {
 }
 
 fn start(b: &'static Backend) {
-    for i in 0..WORKERS {
+    let n = workers();
+    tracing::info!(workers = n, words_in_flight = WORDS_IN_FLIGHT, "Vulkan: stage workers");
+    for i in 0..n {
         let _ = std::thread::Builder::new()
             .name(format!("victory-vk-stage-{i}"))
             .spawn(move || worker(b));
@@ -468,6 +532,11 @@ fn start(b: &'static Backend) {
 }
 
 fn worker(b: &'static Backend) {
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
     loop {
         let shader = {
             let mut q = queue();
@@ -581,13 +650,17 @@ fn make(b: &Backend, shader: &Shader) -> State {
             use std::io::Write;
             let _ = std::io::stderr().flush();
         }
-        let t = Instant::now();
+        let flight = Flight::take(vs.spirv.len() as u64);
+        let (t, cpu) = (Instant::now(), thread_cpu_us());
         let p = compile(b, vs.stage, module, &vs.samplers, None);
+        let cpu_ms = thread_cpu_us().saturating_sub(cpu) / 1000;
+        drop(flight);
         if cfg!(feature = "diagnostics") {
             tracing::info!(
                 stage = ?vs.stage,
                 hash = %hash,
                 ms = t.elapsed().as_millis() as u64,
+                cpu_ms,
                 ok = p.is_ok(),
                 "Vulkan part: compiled"
             );
@@ -647,11 +720,16 @@ pub(crate) static IMMEDIATE: Mutex<Vec<[u32; 4]>> = Mutex::new(Vec::new());
 /// sampler itself is written into set 1 when descriptors are made, step
 /// (a)). Past 256 distinct ones the last slot is shared (logged once).
 fn immediate_slot(words: [u32; 4]) -> u32 {
+    static LOADED: std::sync::Once = std::sync::Once::new();
     let mut list = IMMEDIATE.lock().unwrap_or_else(|e| e.into_inner());
+    // The slots of earlier runs first, so that a stage's specialisation
+    // (and the driver's cached pipeline) is the same in every run.
+    LOADED.call_once(|| *list = super::stage_cache::load_immediates());
     let at = match list.iter().position(|w| *w == words) {
         Some(i) => i,
         None if list.len() < 256 => {
             list.push(words);
+            super::stage_cache::save_immediates(&list);
             list.len() - 1
         }
         None => {
