@@ -141,9 +141,28 @@ pub(crate) fn count(stat: Stat) {
     STATS[stat as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+/// The regions by first address: their bytes, and whether they were
+/// refused (they read zeros by directory). Read without the units' lock
+/// (held while a unit opens) by every buffer view the title writes
+/// ([`region_holds`]).
+static REGIONS: std::sync::RwLock<BTreeMap<usize, (u64, bool)>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// Whether `[at, at + len)` lies in one region that was not refused: the
+/// directory reaches it (`crate::memory`, region chunks).
+pub(crate) fn region_holds(at: u64, len: u64) -> bool {
+    if !on() || at >= TIB {
+        return false;
+    }
+    let r = REGIONS.read().unwrap_or_else(|e| e.into_inner());
+    r.range(..=at as usize)
+        .next_back()
+        .is_some_and(|(&base, &(bytes, refused))| !refused && at.saturating_add(len) <= base as u64 + bytes)
+}
+
 /// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
 /// of 64 KiB), with a committed canary page of its own right after it.
 pub fn title_region(at: usize, len: usize) {
+    REGIONS.write().unwrap_or_else(|e| e.into_inner()).insert(at, (len as u64, false));
     let old = units().regions.insert(at, Unit { len: len as u64, state: State::Untried });
     if let Some(old) = old {
         let_go(&old, 0);
@@ -198,6 +217,7 @@ pub(crate) fn released(at: usize, len: usize) {
     let mut freed = Vec::new();
     for base in gone {
         u.chunks.retain(|(home, _), _| *home != Home::Region(base));
+        REGIONS.write().unwrap_or_else(|e| e.into_inner()).remove(&base);
         if let Some(unit) = u.regions.remove(&base) {
             freed.push((base as u64, unit.len));
             let_go(&unit, 0);
@@ -420,6 +440,11 @@ fn open(device: &ID3D12Device, rig: &mut Option<Rig>, unit: &mut Unit, home: Hom
             }
             Err(why) => {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
+                if let Home::Region(base) = home
+                    && let Some(r) = REGIONS.write().unwrap_or_else(|e| e.into_inner()).get_mut(&base)
+                {
+                    r.1 = true;
+                }
                 tracing::warn!(what, at = format_args!("{at:#x}"), mb = unit.len >> 20, why, "unified: title memory NOT opened; its buffers are buffers of their own, filled at each submission");
                 State::Refused
             }

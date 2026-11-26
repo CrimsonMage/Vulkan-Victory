@@ -48,7 +48,7 @@ static WAITS: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(
 
 /// Plain sums ([`Sum`]).
 static SUMS: [AtomicU64; SUMS_N] = [const { AtomicU64::new(0) }; SUMS_N];
-const SUMS_N: usize = 14;
+const SUMS_N: usize = 17;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Sum {
@@ -85,6 +85,15 @@ pub(crate) enum Sum {
     /// Nanoseconds the copy-queue workers spent detiling first uploads
     /// (`crate::texture::ahead`), outside any submission.
     AheadNs,
+    /// Buffer views draws and dispatches read through tables: by directory
+    /// (made when the title wrote them, nothing done per call), and made
+    /// and brought up to date by the host per call (the fallback: typed
+    /// views, memory the directory does not reach).
+    TableDirectory,
+    TableHost,
+    /// Root views draws and dispatches read by directory (their address in
+    /// user data, nothing else bound).
+    RootDirectory,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
@@ -802,7 +811,8 @@ pub(crate) fn frame() {
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; {lists}; translation into our lists {:.1} ms (summed; {calls}); \
          in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms; first uploads detiled by the copy-queue workers {:.1} ms, {ahead}), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, pool by directory {:.0} MB, windows {:.0} MB (the fallback, \
-         copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {cache}; {dispatch}; {indirect}; {pipes}",
+         copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {cache}; \
+         table buffer views read by directory {:.0}/frame, made by the host per call {:.0}/frame; root views read by directory {:.0}/frame; {dispatch}; {indirect}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
@@ -819,5 +829,8 @@ pub(crate) fn frame() {
         sums[Sum::GatherBytes as usize] as f64 / frames / 1e6,
         sums[Sum::CopyBytes as usize] as f64 / frames / 1e6,
         sums[Sum::DirectoryBlocks as usize] as f64 / frames,
+        sums[Sum::TableDirectory as usize] as f64 / frames,
+        sums[Sum::TableHost as usize] as f64 / frames,
+        sums[Sum::RootDirectory as usize] as f64 / frames,
     );
 }

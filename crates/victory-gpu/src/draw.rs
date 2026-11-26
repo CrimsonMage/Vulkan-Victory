@@ -778,6 +778,7 @@ impl State {
             }
             return ADDRESSES.with_borrow_mut(|addresses| {
                 addresses.clear();
+                crate::frametime::add(crate::frametime::Sum::RootDirectory, roots.len() as u64);
                 for &(slot, _) in roots {
                     if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                         crate::memory::reach(address, ROOT_VIEW_REACH);
@@ -2575,7 +2576,21 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        // A buffer view shaders read by directory, made when the title wrote
+        // it: nothing to make or copy; what a shader writes through it is
+        // declared written.
+        if let Some((address, len)) = host.by_directory(index, handle) {
+            crate::frametime::add(crate::frametime::Sum::TableDirectory, 1);
+            if u.kind == ResourceType::Uav && STORES.get() {
+                crate::memory::named(list, address, len, true);
+                note_write(list, address, len, Cause::TableUav);
+            }
+            return;
+        }
         if let Some(view) = host.mirror(index, handle, true) {
+            if crate::descriptor::host::is_buffer_view(&view) {
+                crate::frametime::add(crate::frametime::Sum::TableHost, 1);
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2627,10 +2642,19 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
+            let host_of = self.heap_of(table).and_then(|h| Some((h, h.host()?)));
             let readable = used.iter().filter(tables).filter(|u| u.slot == slot && u.kind == ResourceType::Cbv).all(|u| {
-                match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
-                    // Pool memory: by directory from the title's slot.
-                    Some(View::Constant(address, _)) if crate::memory::covers(address) => true,
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                // Read by directory from the title's slot (made when the
+                // title wrote it, or now).
+                if let Some((heap, host)) = host_of
+                    && let Some(index) = heap.index(handle)
+                    && host.by_directory(index, handle).is_some()
+                {
+                    return true;
+                }
+                match crate::descriptor::view(handle) {
+                    Some(view @ View::Constant(..)) if crate::descriptor::host::pool_range(&view).is_some() => true,
                     Some(View::Constant(address, size)) => {
                         address % 256 == 0
                             && crate::shadow::find(address, u64::from(size).max(1)).is_some_and(|s| {

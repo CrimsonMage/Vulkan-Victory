@@ -1436,7 +1436,7 @@ impl HostHeap {
         if let Some((address, bytes)) = pool_range(view)
             && self.pool_entry(index, Some((address, bytes)))
         {
-            crate::memory::demand(address, bytes);
+            crate::memory::reach(address, bytes);
             null_for(view, self.cpu(index));
             return Some(None);
         }
@@ -1963,7 +1963,11 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            // A buffer view the directory reaches is made at once: its slot
+            // is a null view and its pool table entry, read by the shaders
+            // as the console's code reads the descriptor, and no draw has
+            // anything to do for it (`pool_range`, [`HostHeap::by_directory`]).
+            let later = !for_draw && ((view.is_buffer() && pool_range(&view).is_none()) || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -2000,6 +2004,31 @@ impl HostHeap {
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
+    }
+
+    /// The title memory (address, bytes) of the buffer view at slot `index`
+    /// if the slot was made from the record at `handle` as it is now and
+    /// shaders read and write the view by directory (its pool table entry
+    /// holds the address): nothing to make or bring up to date for a draw
+    /// that reads it. Without a lock.
+    pub(crate) fn by_directory(&self, index: u32, handle: u64) -> Option<(u64, u64)> {
+        use victory_shader::emit::{POOL_ENTRY_BYTES, POOL_FLAG, POOL_SLOTS};
+        if index >= self.count || index >= POOL_SLOTS - 1 {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag != VIEW_TAG || self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) != key {
+            return None;
+        }
+        let (_, data) = self.pool.get()?.as_ref()?;
+        // SAFETY: inside the table's mapping.
+        let words: [u32; 3] = unsafe {
+            let at = (*data as *const u32).add(index as usize * (POOL_ENTRY_BYTES as usize / 4));
+            [at.read_volatile(), at.add(1).read_volatile(), at.add(2).read_volatile()]
+        };
+        (words[1] & POOL_FLAG != 0).then(|| (u64::from(words[0]) | u64::from(words[1] & 0xFF) << 32, u64::from(words[2])))
     }
 
     /// Makes slot `index` again from the record at `handle`, if the slot
@@ -2167,7 +2196,18 @@ pub(crate) fn pool_range(view: &View) -> Option<(u64, u64)> {
         }
         _ => return None,
     };
-    (range.1 > 0 && crate::memory::covers(range.0)).then_some(range)
+    (range.1 > 0 && (crate::memory::covers(range.0) || crate::unified::region_holds(range.0, range.1))).then_some(range)
+}
+
+/// Whether `view` is a buffer view: a constant buffer view, or a shader
+/// resource or unordered access view of a buffer object or placed buffer.
+pub(crate) fn is_buffer_view(view: &View) -> bool {
+    match view {
+        View::Constant(..) => true,
+        View::Placed(_, resource, _) => resource[0] == 1,
+        View::Shader(r, _) | View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
+        _ => false,
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
