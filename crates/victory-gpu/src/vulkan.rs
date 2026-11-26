@@ -597,10 +597,17 @@ pub(crate) fn title_memory_released(at: usize, len: usize) {
 pub(crate) fn read(src: u64, dst: &mut [u8]) -> Option<bool> {
     let b = backend()?;
     let m = memory(b);
-    let (cpu, pool) = m.cpu_of(src)?;
-    pool?;
-    // SAFETY: a page of a section's whole view, mapped while it lives.
-    unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, dst.as_mut_ptr(), dst.len()) };
+    m.cpu_of(src)?.1?;
+    // Page by page: the pool's pages lie apart in their sections.
+    let mut done = 0usize;
+    while done < dst.len() {
+        let here = src + done as u64;
+        let n = ((PAGE - here % PAGE) as usize).min(dst.len() - done);
+        let Some((cpu, Some(_))) = m.cpu_of(here) else { return Some(false) };
+        // SAFETY: a page of a section's whole view, mapped while it lives.
+        unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, dst.as_mut_ptr().add(done), n) };
+        done += n;
+    }
     Some(true)
 }
 
