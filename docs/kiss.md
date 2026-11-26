@@ -118,6 +118,7 @@ driver errors and no new crash, and the captures look no worse.
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 24 | Thin recording (after VIctory-7900XTX `VICTORY_THIN`, GPL-3.0): the title's threads only write list calls down (`list/thin.rs`), a worker per fast core translates them, `ExecuteCommandLists` waits for its lists; first uploads of title-filled textures on a copy queue of their own, detiled by its workers, slots show a 1x1 grey fallback until the queue's fence (`texture/ahead.rs`, after their `VICTORY_UPLOAD_AHEAD`/`VICTORY_SHOW_AFTER`) | subagent | built, not yet run |
 | 25 | Card page cache for the pool (`memory/cache.rs`): each physical pool page a list names gets one copy in 64 MiB blocks of card memory (a directory copy per block, every alias's entry names it), taken in at first naming or announced change (DirectStorage, file reads, CPU title copies, page mappings), shader writes copied back after each list word by word against a twin (only changed words, never over CPU writes), heap-picked writes held off the cache, LRU eviction by frame inside 90% of memcap's ceiling (idle texture copies let go first for room), naming lock-free once per view and list and off while the cache has no block; frame line `pool page cache: …` | subagent | p21: never opened (gated on the falling system budget), naming cost ~900 ms/frame of workers; fixed, built, not yet run |
+| 26 | Pipelines like a PC game: a catalog of every pipeline a run drew with (shaders by hash, graphics state, frame of first use; dropped after 5 unused launches) beside the library; baked as the title starts (4 workers, lowest priority, compiles in flight under 1 GiB, made to fill the caches and let go) or before it (`victory bake [--title] [--jobs]`, its own device, half the CPUs, 3 GiB); the title's creation of a catalog pipeline jumps the queue; a draw waits for its pipeline up to 2 s a frame, then drops; a repeat bake skips what was made with the same translator, driver and layer; translated-shader cache keyed by the container's hash; progress lines `compiling shaders: k of n, ETA` | subagent | built, not yet run |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
@@ -277,3 +278,21 @@ driver errors and no new crash, and the captures look no worse.
   which ended a device loss every ~15 min there). Not taken: their async
   submit thread and joined parts, relay, compares, card steps (mirroring
   machinery this tree deleted).
+- 2026-11-25: pipelines baked like a PC game's shader compile (workstream
+  26): only pipelines earlier runs drew with (about 3,000; the title
+  creates tens of thousands), in first-use order, from the pipeline
+  catalog; the title's own data gives the shader containers
+  (`shaders.rpf`) but not the pipelines (which shaders pair, what state):
+  the title builds those in code at run time, and only the AMD upscaler
+  deserializes ready pipelines (ACO code, untranslatable). Draws wait up
+  to 2 s a frame for a pipeline (dropping after 3 ms, efa4886, left the
+  world black). `CS_DefragHeap_ComputeRelocations`,
+  `CS_AlphTransmissionPrefilterMip` and `CS_Visibility` are refused
+  (E_INVALIDARG) because their translations declare `WaveSize(64)`,
+  which vkd3d-proton refuses on a card of 32-lane waves: wave64 programs
+  that share LDS within the console wave inside lane branches (a read
+  and a write in one branch region, e.g. one lane updating a counter the
+  next loop pass of the whole wave reads) cannot be split into two host
+  waves ordered by group barriers. Needs the translator to order the two
+  halves of a console wave without the group (pair meetings in
+  wave-uniform code); not yet done.

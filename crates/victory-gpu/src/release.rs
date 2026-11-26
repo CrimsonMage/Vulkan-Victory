@@ -131,6 +131,24 @@ pub(crate) fn watch_process_memory() {
     });
 }
 
+/// This process's resident memory and its peak in bytes, as Linux counts
+/// them (`VmRSS`, `VmHWM` of `/proc/<pid>/status` through Wine's `Z:`);
+/// `None` where that cannot be read.
+pub(crate) fn resident() -> Option<(u64, u64)> {
+    static PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let pid = (*PID.get_or_init(unix_pid))?;
+    let status = std::fs::read_to_string(format!(r"Z:\proc\{pid}\status")).ok()?;
+    let kb = |field: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v << 10)
+    };
+    Some((kb("VmRSS:")?, kb("VmHWM:")?))
+}
+
 /// This process's Linux pid: the process under `/proc` (Wine's `Z:`) that
 /// maps our own executable over the address of our own code. (`/proc/self`
 /// read from the Windows side named another, small process in run p8: 34

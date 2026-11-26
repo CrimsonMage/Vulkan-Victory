@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod bake;
 mod census;
 mod inspect;
 mod run;
@@ -118,6 +119,21 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Compile the title's shaders before it runs ("compiling shaders"):
+    /// every pipeline earlier runs used, from the pipeline catalog, into
+    /// the caches the game reads (translated shaders, the host's pipeline
+    /// library, the driver's disk cache). Needs no running title; a
+    /// repeat takes seconds.
+    Bake {
+        /// The title's executable or folder, to translate shaders the
+        /// cache lacks from its files (default: the configured game
+        /// folder).
+        #[arg(long)]
+        title: Option<PathBuf>,
+        /// Compiler threads (default: half the logical processors).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -183,6 +199,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Bake { title, jobs } => bake::run(title, jobs),
         Command::Config => show_config(),
     }
 }

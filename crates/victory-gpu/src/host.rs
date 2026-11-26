@@ -56,7 +56,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
-    adapter: Option<IDXGIAdapter3>,
+    pub(crate) adapter: Option<IDXGIAdapter3>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are

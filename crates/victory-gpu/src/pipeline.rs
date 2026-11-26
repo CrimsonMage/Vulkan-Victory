@@ -3,9 +3,12 @@
 //! carry the rest of the graphics state as subobjects of the standard
 //! types.
 //!
-//! Host pipelines are made on a pipeline's first draw, not at creation:
-//! The title creates some 60,000 pipelines in its first 20
-//! seconds and draws with a few dozen (decision 0007, step 3). Shader
+//! Host pipelines are not made at every creation: the title creates some
+//! 60,000 pipelines in its first 20 seconds and draws with a few thousand
+//! (decision 0007, step 3). Those an earlier run drew with are listed in
+//! the catalog (`catalog`) and baked as the title starts (`bake`) or
+//! before (`victory bake`); the title's creation of one queues it ahead of
+//! the bake, and any other is made at its first draw (`make`). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
@@ -60,6 +63,10 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// Its whole BLAKE3: what the translated-shader cache and the pipeline
+    /// catalog know it by.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) full: [u8; 32],
     /// The program's name, if its container tells (`CS_SkyMain`,
     /// `CS_TransmissionVolumetrics_Tiled`; see
     /// [`program_name`]); empty otherwise. Logged beside the hash so a log
@@ -145,7 +152,7 @@ pub(crate) fn lock_waited(since: std::time::Instant) {
     w[1].fetch_add(1, Relaxed);
 }
 
-/// Takes one of the pipeline locks (queue, early list, containers,
+/// Takes one of the pipeline locks (queue, catalog, containers,
 /// builder), counting the time a thread stood waiting for another holder.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match m.try_lock() {
@@ -179,6 +186,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                full: *full.as_bytes(),
                 name: program_name(bytes),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
@@ -209,6 +217,26 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// A shader known only by its description in the pipeline catalog, for
+    /// the bake: its translation from the cache, without the title's
+    /// container (none is kept). Never one of the title's pipelines' (those
+    /// are in [`SHADERS`]); what is made of it is let go.
+    pub(crate) fn baked(stage: &'static str, full: [u8; 32], name: String, host: victory_shader::emit::HostShader) -> Shader {
+        Shader {
+            stage,
+            hash: blake3::Hash::from_bytes(full).to_hex()[..16].to_owned(),
+            full,
+            name,
+            container: Vec::new(),
+            translated: OnceLock::from(Some(Translated {
+                host,
+                used: Vec::new(),
+                stores: true,
+            })),
+            resolves_light: false,
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -506,7 +534,7 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    make::created(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -698,6 +726,22 @@ mod library;
 #[cfg(windows)]
 mod make;
 
+#[cfg(windows)]
+mod catalog;
+
+#[cfg(windows)]
+mod bake;
+
+#[cfg(windows)]
+pub use bake::{Baked, missing_shaders as bake_missing_shaders, standalone as bake};
+
+/// The title starts: the catalog's pipelines are baked in the background
+/// (`bake::start_background`).
+#[cfg(windows)]
+pub(crate) fn start_bake() {
+    bake::start_background();
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]
@@ -713,7 +757,8 @@ pub(crate) fn library_removal_note() -> String {
 }
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
-/// early, in `dir` (a folder of the cache) across runs.
+/// early (the catalog the bake makes them from), in `dir` (a folder of
+/// the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
