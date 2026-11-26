@@ -190,6 +190,7 @@ fn build(
 
         root_memory: lowered.root_memory,
         root_indexed_views: res.root_indexed_views.clone(),
+        local_bytes: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

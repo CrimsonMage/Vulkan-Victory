@@ -361,6 +361,25 @@ impl Module {
         g
     }
 
+    /// The bytes of the internal constant tables: arrays each lane of the
+    /// host keeps (private memory, which NVIDIA holds in local memory).
+    pub fn table_bytes(&self) -> u32 {
+        fn bytes(types: &[TypeDef], t: Ty) -> u32 {
+            match &types[t.0 as usize] {
+                TypeDef::Int(bits) => bits.div_ceil(8),
+                TypeDef::Float => 4,
+                TypeDef::Double => 8,
+                TypeDef::Array(n, e) => n * bytes(types, *e),
+                TypeDef::Struct(_, f) => f.iter().map(|&e| bytes(types, e)).sum(),
+                _ => 0,
+            }
+        }
+        self.globals
+            .iter()
+            .filter_map(|g| g.init.map(|_| bytes(&self.types, g.ty)))
+            .sum()
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1

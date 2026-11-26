@@ -591,6 +591,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 
         root_memory: Vec::new(),
         root_indexed_views: Vec::new(),
+        local_bytes: 0,
     }
 }
 

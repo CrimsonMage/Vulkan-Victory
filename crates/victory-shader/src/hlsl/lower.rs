@@ -4276,6 +4276,7 @@ impl<'a> L<'a> {
 
             root_memory: Vec::new(),
             root_indexed_views: self.res.root_indexed_views.clone(),
+            local_bytes: 0,
         };
         let enable_16bit =
             self.half_io && self.inputs.iter().chain(&self.outputs).chain(self.mesh.iter().flat_map(|m| &m.prims)).any(|e| e.native16);

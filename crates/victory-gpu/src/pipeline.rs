@@ -241,6 +241,8 @@ impl Shader {
                             samplers = t.host.samplers.len(),
                             root_views_by_directory = t.host.root_memory.len(),
                             root_views_bound = bound,
+                            local_array_bytes = t.host.local_bytes,
+                            dxil_kb = t.host.dxil.len() >> 10,
                             "shader translated"
                         )
                     }

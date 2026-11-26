@@ -150,7 +150,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -245,6 +245,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.local_bytes);
     out
 }
 
@@ -315,6 +316,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let local_bytes = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -326,6 +328,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_memory,
         root_indexed_views,
+        local_bytes,
     })
 }
 
@@ -361,6 +364,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            local_bytes: 632,
         }
     }
 

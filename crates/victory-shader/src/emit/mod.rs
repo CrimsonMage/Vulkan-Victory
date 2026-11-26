@@ -193,6 +193,10 @@ pub struct HostShader {
     pub root_memory: Vec<(u8, bool)>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Bytes of arrays each host lane keeps (constant tables from the
+    /// console code: private memory, which NVIDIA holds in local memory
+    /// sized for every lane the card can run at once). 0 for most shaders.
+    pub local_bytes: u32,
 }
 
 impl HostShader {
@@ -503,6 +507,7 @@ fn emit_program(
 
         root_memory: l.root_memory,
         root_indexed_views: res.root_indexed_views.clone(),
+        local_bytes: l.local_bytes,
     };
     Ok((shader, wave_size))
 }
@@ -858,6 +863,7 @@ mod tests {
 
             root_memory: Vec::new(),
             root_indexed_views: Vec::new(),
+            local_bytes: 0,
         };
         let vs = super::host::stub_vs(&ps).unwrap();
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1151,6 +1157,7 @@ mod tests {
 
                 root_memory: l.root_memory,
                 root_indexed_views: Vec::new(),
+                local_bytes: 0,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

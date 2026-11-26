@@ -595,6 +595,24 @@ impl Module {
                     _ => None,
                 }
             }
+            Op::Load(V::Inst(p)) => {
+                // A constant table read at a constant index: the element
+                // (a table no read is left of is dropped with the dead code).
+                let Op::Gep(_, V::Global(g), ref idx) = self.insts[p as usize].op else {
+                    return None;
+                };
+                let init = self.globals[g as usize].init?;
+                let [first, at] = idx[..] else { return None };
+                if self.int_k(first)?.1 != 0 {
+                    return None;
+                }
+                let at = usize::try_from(self.int_k(at)?.1).ok()?;
+                let Const::Aggregate(ids) = &self.consts[init as usize].1 else {
+                    return None;
+                };
+                let e = *ids.get(at)?;
+                (self.consts[e as usize].0 == ty).then_some(V::Const(e))
+            }
             _ => None,
         }
     }
@@ -1252,6 +1270,34 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A constant table read at a constant index is its element, and a
+    /// table only such reads used leaves the module (it would otherwise be
+    /// an array every host lane keeps).
+    #[test]
+    fn constant_table_reads_at_constant_indices_fold() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let i32t = m.int(32);
+        let elems = [m.i32(10), m.i32(20), m.i32(30)];
+        let arr = m.array(3, i32t);
+        let init = m.aggregate(arr, &elems);
+        let table = m.constant_global("code", init);
+        let (one, two) = (m.i32(1), m.i32(2));
+        // index (1 + 1) - 1 = 1 after folding
+        let at = m.bin(b, Bin::Add, one, one);
+        let at = m.bin(b, Bin::Sub, at, one);
+        let p = m.element(b, table, at);
+        let x = m.load(b, p);
+        m.call(b, writes, vec![x, two]);
+        m.terminate(b, Term::Ret);
+        assert_eq!(m.table_bytes(), 12);
+        m.optimise(ALL);
+        assert_eq!(stores(&m, b), [vec![elems[1], two]]);
+        assert_eq!(m.table_bytes(), 0, "the table is dropped");
+        m.write();
     }
 
     #[test]

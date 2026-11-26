@@ -476,13 +476,20 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_with_tables().0
+    }
+
+    /// The finished container, and the bytes of constant tables each host
+    /// lane keeps after the clean-up ([`super::bitcode::Module::table_bytes`]).
+    pub fn finish_with_tables(mut self) -> (Vec<u8>, u32) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
         self.m.optimise(super::bitcode::opt::ALL);
+        let tables = self.m.table_bytes();
         let used = self.m.usage();
         for (flag, used) in [
             (flags::WAVE_OPS, used.wave_ops),
@@ -867,7 +874,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        (container::build(&parts), tables)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

@@ -399,6 +399,22 @@ fn workers() -> bool {
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
+/// Host pipelines made (or loaded) with per-lane arrays since the start,
+/// and the largest such array in bytes a lane. NVIDIA keeps these in local
+/// memory reserved for every lane the card can hold at once (36 SMs x 1,536
+/// lanes on the RTX 5060 Ti: 18 KiB a lane is about 1 GB), outside the
+/// card memory the budget counts.
+static LOCAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A host pipeline was made whose largest stage keeps `local_array_bytes`
+/// a lane ([`LOCAL`]).
+pub(crate) fn made_with(local_array_bytes: u32) {
+    if local_array_bytes > 0 {
+        LOCAL[0].fetch_add(1, Ordering::Relaxed);
+        LOCAL[1].fetch_max(u64::from(local_array_bytes), Ordering::Relaxed);
+    }
+}
+
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
@@ -437,7 +453,8 @@ pub(crate) fn frame_text(frames: f64) -> String {
          {made} compiled by the driver and {loaded} loaded from the library since the last line; \
          frame threads waited for pipelines {waited_ms:.1} ms/frame ({waits:.2} waits), for pipeline locks {:.2} ms/frame ({:.2}); \
          workers waited for pipeline locks {:.2} ms/frame ({:.2}); \
-         draws and dispatches dropped without a host pipeline: {being_made:.1}/frame still being made, {refused:.1}/frame with none",
+         draws and dispatches dropped without a host pipeline: {being_made:.1}/frame still being made, {refused:.1}/frame with none; \
+         made with per-lane arrays (local memory): {} pipelines, the largest {} bytes a lane",
         WAITING.load(Ordering::Relaxed),
         NOW_QUEUED.load(Ordering::Relaxed),
         EARLY_QUEUED.load(Ordering::Relaxed),
@@ -453,6 +470,8 @@ pub(crate) fn frame_text(frames: f64) -> String {
         frame_locks.1,
         worker_locks.0,
         worker_locks.1,
+        LOCAL[0].load(Ordering::Relaxed),
+        LOCAL[1].load(Ordering::Relaxed),
     )
 }
 

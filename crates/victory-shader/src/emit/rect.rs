@@ -417,6 +417,7 @@ mod tests {
 
             root_memory: Vec::new(),
             root_indexed_views: Vec::new(),
+            local_bytes: 0,
         };
         (
             host(crate::native::HwStage::Vs, vs),

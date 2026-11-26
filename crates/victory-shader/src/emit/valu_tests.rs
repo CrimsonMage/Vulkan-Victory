@@ -183,6 +183,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 
         root_memory: lowered.root_memory,
         root_indexed_views: res.root_indexed_views,
+        local_bytes: 0,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1572,6 +1573,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
         root_memory: lowered.root_memory,
         root_indexed_views: Vec::new(),
+        local_bytes: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

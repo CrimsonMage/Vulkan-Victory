@@ -48,6 +48,41 @@ enum Val {
     Missing(Why),
 }
 
+/// The byte of the first code word at or after `from` that no instruction
+/// reachable from the entry covers, past alignment padding between
+/// instructions (`s_nop`, `s_code_end`): where data the code reads as a
+/// table can start (data is never an instruction the program runs). `from`
+/// when the code does not decode or every word from there is an
+/// instruction.
+fn code_data_start(code: &[u8], from: u32) -> u32 {
+    let Ok(insts) = crate::gfx10::decode(code) else {
+        return from;
+    };
+    let words: Vec<u32> = code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let mut covered = vec![false; words.len()];
+    for i in &insts {
+        for w in i.offset / 4..(i.offset / 4 + i.words.len()).min(covered.len()) {
+            covered[w] = true;
+        }
+    }
+    let padding = |w: u32| (0xBF80_0000..=0xBF80_000F).contains(&w) || w == 0xBF9F_0000;
+    let mut w = from as usize / 4;
+    while w < words.len() {
+        if covered[w] {
+            w += 1;
+            continue;
+        }
+        // An uncovered run: padding when only padding words lie between
+        // instructions; else the data.
+        let end = (w..words.len()).find(|&k| covered[k]).unwrap_or(words.len());
+        if end == words.len() || !words[w..end].iter().all(|&x| padding(x)) {
+            return (w * 4) as u32;
+        }
+        w = end;
+    }
+    from
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -62,6 +97,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// Bytes of constant tables each host lane keeps (`HostShader::local_bytes`).
+    pub local_bytes: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1488,13 +1525,20 @@ impl<'a> Lower<'a> {
 
     /// The dword of the program's code at byte `byte` (a constant table
     /// the compiler appends to the code), as an internal constant array.
+    /// The array is per lane on the host (a private array, which NVIDIA
+    /// keeps in local memory sized for every lane the card holds), so it
+    /// holds only the data: from the first code word no instruction covers
+    /// (or a fixed read's offset, if lower). Tables reached through a join
+    /// of `s_getpc_b64` paths start at offset 0, and were the whole program
+    /// (up to 21 KiB a lane) before.
     // shortcut: an index outside the table reads its last dword (the
-    // console would read whatever memory follows the code).
+    // console would read whatever memory follows the code, or its own
+    // instructions below the data).
     fn code_dword(&mut self, byte: V) -> Result<V, Why> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<_> = self
                     .x
                     .res
                     .scalar
@@ -1507,9 +1551,10 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let fixed = addresses.iter().filter(|a| a.dynamic.is_none()).map(|a| a.offset & !3).min();
+                let first = code_data_start(&self.x.native.code, lowest).min(fixed.unwrap_or(u32::MAX));
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -2171,18 +2216,22 @@ impl<'a> Lower<'a> {
         let root_memory = self.direct.iter().map(|(&slot, &writes)| (slot, writes)).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let (nonuniform_handles, wave_ops) = (self.s.nonuniform_handles, self.s.flags & flags::WAVE_OPS != 0);
+        let (dxil, local_bytes) = self.s.finish_with_tables();
         Ok(Lowered {
             wave_size,
+            local_bytes,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
             root_memory,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            dxil,
             user_data,
             samplers: self.samplers,
         })
@@ -11811,6 +11860,25 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A table in the code holds only the words after the instructions:
+    /// alignment padding between instructions is skipped, data that looks
+    /// like padding after them is kept.
+    #[test]
+    fn code_tables_start_at_the_data() {
+        let words = [
+            0xBF82_0001_u32, // s_branch over the padding
+            0xBF80_0000,     // s_nop: alignment padding
+            S_ENDPGM,
+            0xBF80_0000, // data: -1.0
+            0x3F80_0000, // data: 1.0
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(super::code_data_start(&code, 0), 12);
+        assert_eq!(super::code_data_start(&code, 16), 16);
+        // Undecodable code: the table starts where the reads do.
+        assert_eq!(super::code_data_start(&code[..6], 0), 0);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

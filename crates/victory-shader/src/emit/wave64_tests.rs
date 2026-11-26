@@ -102,6 +102,7 @@ fn lowered_on(native: &NativeProgram, p: &ir::Program, host_wave: u32) -> Result
 
         root_memory: lowered.root_memory,
         root_indexed_views: res.root_indexed_views,
+        local_bytes: 0,
     })
 }
 

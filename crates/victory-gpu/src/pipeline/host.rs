@@ -371,6 +371,13 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // What the driver's compiler gets: the largest stage's per-lane
+        // arrays (local memory on NVIDIA, reserved for every lane the card
+        // holds) and the DXIL size, logged with the pipeline and summed in
+        // the frame line's `pipelines:` part.
+        let translated = || stages.iter().filter_map(|(s, _)| s.translated());
+        let local_array_bytes = translated().map(|t| t.host.local_bytes).max().unwrap_or(0);
+        let dxil_kb = translated().map(|t| t.host.dxil.len()).sum::<usize>() >> 10;
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
@@ -531,7 +538,8 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            super::make::made_with(local_array_bytes);
+            tracing::info!(?shaders, local_array_bytes, dxil_kb, "host pipeline");
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -583,7 +591,8 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            super::make::made_with(local_array_bytes);
+            tracing::info!(?shaders, local_array_bytes, dxil_kb, "host mesh pipeline");
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -688,7 +697,8 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        super::make::made_with(local_array_bytes);
+        tracing::info!(?shaders, local_array_bytes, dxil_kb, "host pipeline");
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
