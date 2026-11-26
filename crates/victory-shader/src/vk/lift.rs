@@ -2113,6 +2113,37 @@ impl<'a> Lift<'a> {
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
     }
 
+    /// As [`buffer_addr`](Self::buffer_addr) with a computed size.
+    fn buffer_addr_dyn(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
+        let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
+        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
+        let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
+        let ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le]);
+        let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
+        let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
+        let fallback = self.fallback(store);
+        self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
+    }
+
+    /// d16 results: values (f32 bits) as f16, two per dword.
+    fn pack_d16(&mut self, vals: &[V]) -> Vec<V> {
+        vals.chunks(2)
+            .map(|pair| {
+                let mut h = Vec::new();
+                for &x in pair {
+                    let f = self.f32v(x);
+                    let hf = self.spv(op::F_CONVERT, Ty::F16, &[f]);
+                    h.push(hf);
+                }
+                if h.len() == 1 {
+                    h.push(self.f.konst(Ty::F16, 0));
+                }
+                let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F16, 2), &h);
+                self.spv(op::BITCAST, Ty::U32, &[v2])
+            })
+            .collect()
+    }
+
     fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
         let a = self.buffer_addr(vs, o, 4 * n, false);
         Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
@@ -2195,13 +2226,15 @@ impl<'a> Lift<'a> {
                     };
                     (bytes, Kind::T(kind, ch, d16))
                 }
+                None if load => (0, Kind::VFormat(ch, d16)),
                 None => {
-                    // V# format: v0 reads 32-bit channels.
-                    self.approx("a typed buffer access read as 32-bit channels");
+                    // stores through a V# format: 32-bit channels
+                    self.approx("a typed buffer store written as 32-bit channels");
                     if d16 {
-                        return Err(unsupported(off, "a d16 typed buffer access"));
+                        (4 * ch, Kind::Halves(ch))
+                    } else {
+                        (4 * ch, Kind::Dwords(ch))
                     }
-                    (4 * ch, Kind::Dwords(ch))
                 }
             }
         } else if name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_byte") {
@@ -2213,6 +2246,23 @@ impl<'a> Lift<'a> {
         } else {
             (4 * n, Kind::Dwords(n))
         };
+        if let Kind::VFormat(ch, d16) = kind {
+            // the format from the V#, decoded by a helper; bounds by the stride
+            let four = self.k32(4);
+            let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
+            let a = self.buffer_addr_dyn(&vs, o, bytes, false);
+            let k12 = self.k32(12);
+            let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[vs.w3, k12]);
+            let k7f = self.k32(0x7F);
+            let f = self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
+            let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, f]);
+            let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
+            let vals = if d16 { self.pack_d16(&vals) } else { vals };
+            for (i, v) in vals.into_iter().enumerate() {
+                self.def(inst, Reg::V(reg + i as u8), R::D(v));
+            }
+            return Ok(());
+        }
         if load {
             let a = self.buffer_addr(&vs, o, size, false);
             let kind = match kind {
@@ -2250,11 +2300,10 @@ impl<'a> Lift<'a> {
                 vec![self.spv(o, Ty::U32, &[v])]
             }
             Kind::T(t, ch, d16) => {
-                if d16 {
-                    return Err(unsupported(0, "a d16 typed buffer load"));
-                }
-                self.typed_load(a, t, ch)
+                let vals = self.typed_load(a, t, ch);
+                if d16 { self.pack_d16(&vals) } else { vals }
             }
+            Kind::VFormat(..) | Kind::Halves(_) => return Err(unsupported(0, "a typed buffer access")),
         })
     }
 
@@ -2281,13 +2330,27 @@ impl<'a> Lift<'a> {
                 let v = self.spv(op::U_CONVERT, Ty::U16, &[x]);
                 self.emit(Op::Store { align: 2 }, Ty::VOID, vec![a, v]);
             }
-            Kind::T(..) | Kind::Floats(_) => return Err(unsupported(0, "a typed buffer store")),
+            Kind::Halves(n) => {
+                // two f16 per data dword, written as 32-bit floats
+                let mut out = Vec::new();
+                for k in 0..n {
+                    let w = self.u32v(vals[(k / 2) as usize]);
+                    let f = self.half_f32(w, k % 2 == 1);
+                    out.push(self.u32v(f));
+                }
+                let v = if n == 1 { out[0] } else { self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, n as u8), &out) };
+                self.emit(Op::Store { align: 4 }, Ty::VOID, vec![a, v]);
+            }
+            Kind::T(..) | Kind::Floats(_) | Kind::VFormat(..) => return Err(unsupported(0, "a typed buffer store")),
         }
         Ok(())
     }
 
     /// A typed element read from its bytes (the format in the instruction).
     fn typed_load(&mut self, a: V, t: TFormat, ch: u32) -> Vec<V> {
+        if t.bits == 0 {
+            return self.packed_load(a, t, ch);
+        }
         let (comps, bits, num) = (t.comps, t.bits, t.num);
         let mut out = Vec::new();
         let raw: Vec<V> = match bits {
@@ -2351,6 +2414,43 @@ impl<'a> Lift<'a> {
                     }
                 } else {
                     self.k32(0)
+                }
+            };
+            out.push(x);
+        }
+        out
+    }
+
+    /// A 2_10_10_10 element (x in the low bits): one dword.
+    fn packed_load(&mut self, a: V, t: TFormat, ch: u32) -> Vec<V> {
+        let w = self.emit(Op::Load { align: 4 }, Ty::U32, vec![a]);
+        let widths = [10u32, 10, 10, 2];
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        for (c, &bits) in widths.iter().enumerate() {
+            let (o, wv) = (self.k32(at), self.k32(bits));
+            at += bits;
+            if c as u32 >= ch {
+                continue;
+            }
+            let signed = matches!(t.num, Num::Snorm | Num::Sint);
+            let opc = if signed { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
+            let r = self.spv(opc, Ty::U32, &[w, o, wv]);
+            let x = match t.num {
+                Num::Uint | Num::Sint => r,
+                Num::Unorm => {
+                    let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
+                    let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
+                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                    self.u32v(m)
+                }
+                _ => {
+                    let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
+                    let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
+                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
+                    let lo = self.kf(-1.0);
+                    let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
+                    self.u32v(c)
                 }
             };
             out.push(x);
@@ -2791,7 +2891,6 @@ struct VSharp {
     dev: V,
     limit: V,
     stride: V,
-    #[allow(dead_code)]
     w3: V,
 }
 
@@ -2807,12 +2906,17 @@ enum Num {
 #[derive(Debug, Clone, Copy)]
 struct TFormat {
     comps: u8,
+    /// Bits per component; 0: a packed 2_10_10_10 dword.
     bits: u8,
     num: Num,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
+    /// A typed load through the V#'s format (channels, d16).
+    VFormat(u32, bool),
+    /// d16 typed store data written as 32-bit floats.
+    Halves(u32),
     Dwords(u32),
     Floats(u32),
     Byte(bool),
@@ -2825,7 +2929,12 @@ enum Kind {
 fn tformat(f: u8) -> Option<(u32, TFormat)> {
     use Num::*;
     let t = |comps, bits, num| Some((u32::from(comps) * u32::from(bits) / 8, TFormat { comps, bits, num }));
+    let packed = |num| Some((4, TFormat { comps: 4, bits: 0, num }));
     match f {
+        50 => packed(Unorm),
+        51 => packed(Snorm),
+        54 => packed(Uint),
+        55 => packed(Sint),
         1 => t(1, 8, Unorm),
         2 => t(1, 8, Snorm),
         5 => t(1, 8, Uint),

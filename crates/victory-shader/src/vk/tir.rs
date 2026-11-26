@@ -89,6 +89,9 @@ pub enum Helper {
     /// (title base u64, bytes u32) -> vec2: device base (as two u32), byte
     /// limit (0 when not fully inside one range).
     TranslateRange,
+    /// (device address u64, V# FORMAT u32) -> uvec4: a typed buffer
+    /// element decoded (floats as their bits; missing channels 0, alpha 1).
+    Typed,
 }
 
 /// Image access kinds.
