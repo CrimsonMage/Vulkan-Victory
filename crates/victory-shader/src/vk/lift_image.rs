@@ -4,7 +4,7 @@ use super::*;
 use crate::vk::tir::{Sampler, img};
 
 impl Lift<'_> {
-    fn addr_dw(&mut self, inst: &Inst, addr: &[Operand], k: usize) -> Res<V> {
+    pub(super) fn addr_dw(&mut self, inst: &Inst, addr: &[Operand], k: usize) -> Res<V> {
         if self.a16 {
             return self.a16_vals.get(k).copied().ok_or(unsupported(inst.machine.offset, "an image address"));
         }
@@ -418,7 +418,7 @@ impl Lift<'_> {
     }
 
     /// Writes image results to consecutive VGPRs (d16: two per dword).
-    fn write_result(&mut self, inst: &Inst, dreg: u8, vals: &[V], d16: bool) -> Res<()> {
+    pub(super) fn write_result(&mut self, inst: &Inst, dreg: u8, vals: &[V], d16: bool) -> Res<()> {
         if d16 {
             for (i, pair) in vals.chunks(2).enumerate() {
                 let mut halves = Vec::new();
@@ -449,7 +449,7 @@ impl Lift<'_> {
 
     /// (s, t, face) as the console's cube instructions give them, to a
     /// direction.
-    fn cube_dir(&mut self, c: V) -> V {
+    pub(super) fn cube_dir(&mut self, c: V) -> V {
         let s = self.extract(c, 0);
         let t = self.extract(c, 1);
         let face = self.extract(c, 2);
@@ -481,7 +481,7 @@ impl Lift<'_> {
 
     /// The ray/node test misses every node (as `VICTORY_BVH_MISS`): a box
     /// node returns no child (all lanes 0xFFFFFFFF), a triangle a miss.
-    fn bvh_miss(&mut self, inst: &Inst, data: &Operand) -> Res<()> {
+    pub(super) fn bvh_miss(&mut self, inst: &Inst, data: &Operand) -> Res<()> {
         self.approx("ray/node tests miss every node (no BVH yet)");
         let Operand::Vector { reg, dwords } = *data else {
             return Err(unsupported(inst.machine.offset, "a BVH test"));
