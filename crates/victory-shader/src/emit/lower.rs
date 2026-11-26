@@ -231,6 +231,55 @@ struct PoolView {
     hi: V,
     /// Its bytes.
     bytes: V,
+    /// The heap slot of the view's host descriptor (none for a root view
+    /// read through the directory alone).
+    view: Option<V>,
+}
+
+/// The two 64 KiB pages the first 64 KiB of a pool view lie on
+/// ([`Lower::view_pages`]).
+#[derive(Debug, Clone, Copy)]
+struct Pages {
+    /// The heap slot of the raw view of the copy holding the view's first
+    /// page, and the byte there where the page begins.
+    a: V,
+    a_at: V,
+    /// The same for the next page (its byte less 64 KiB).
+    b: V,
+    b_at: V,
+    /// The view's first byte within its first page.
+    within: V,
+}
+
+/// The IR block (none for an access every lane makes alike), the view
+/// (descriptor load and dword, or the access) and the dynamic offset
+/// operands (index, offset, scalar offset) of a buffer access
+/// ([`Lower::shares`]).
+type ReachKey = (usize, Site, u8, [Option<Value>; 3]);
+
+/// How a buffer access to a view that may be a pool view reaches its
+/// bytes ([`Lower::reach`]).
+#[derive(Debug, Clone, Copy)]
+struct Reach {
+    /// The pages around the address the access's dynamic part gives.
+    pages: Pages,
+    /// The access's first byte past that address.
+    rel: V,
+    /// The access's first byte in the view.
+    byte: V,
+    /// The view's bytes: an access that begins at or past them reads zeros
+    /// and its writes are dropped (none: no bounds of its own).
+    limit: Option<V>,
+    /// The pool table's flag.
+    on: V,
+    /// The view's own slot, taken where the flag is clear (none: the
+    /// directory's way alone).
+    view: Option<V>,
+    /// Pieces of 16 bytes cannot cross a page edge (a constant view, which
+    /// begins on 256 bytes, at a constant byte).
+    blocks: bool,
+    /// Lanes may pick different slots.
+    nonuniform: bool,
 }
 
 struct Lower<'a> {
@@ -268,6 +317,17 @@ struct Lower<'a> {
     strides: HashMap<(usize, Site, u8), V>,
     /// Pool table entries read ([`Self::pool_view`]), by block and site.
     pools: HashMap<(usize, Site, u8), PoolView>,
+    /// Pages of pool views looked up ([`Self::view_pages`]), as `pools`, by
+    /// dynamic offset and the lanes noting pages without a copy.
+    pages: HashMap<(usize, Site, u8, Option<V>, Option<V>, bool), Pages>,
+    /// Sums and products of offsets made once ([`Self::shared`]).
+    shared: HashMap<(usize, u8, V, V), V>,
+    /// Buffer accesses by IR block, view and dynamic offset operands
+    /// ([`Self::shares`]), counted once.
+    reaches: Option<HashMap<ReachKey, u32>>,
+    /// Guarded code open ([`Self::begin_guarded`]): 0 while the current
+    /// block dominates the rest of the IR block's code.
+    depth: u32,
     /// The program reads title memory by raw address (`resource::MEMORY`).
     by_address: bool,
     /// Root views read through the directory alone ([`Lower::direct_root`]):
@@ -276,23 +336,24 @@ struct Lower<'a> {
     /// While a root view is read through the directory: a page found
     /// without a copy is noted for the host ([`Lower::lookup`]).
     fault_reads: bool,
-    /// While [`Lower::buffer_view`] runs for a root view read through the
-    /// directory alone: it stops once the byte the access reads is known.
-    pool_only: bool,
-    /// While a buffer access that may be a pool view is lowered its view's
-    /// way ([`Self::buffer`]): the register writes, held back until the
-    /// directory's way joins them; whether the view is a pool view (the
-    /// view's way then reads at offset 0); and the byte offset into the
-    /// view the access reads, for the directory's way.
+    /// While a scalar buffer load of a constant view that may be a pool
+    /// view is lowered its view's way ([`Self::smem`]): the register
+    /// writes, held back until the directory's way joins them.
     held: Option<Vec<(Reg, V, Option<V>)>>,
-    pool_on: Option<V>,
-    pool_byte: Option<V>,
+    /// While [`Lower::buffer_view`] runs for a view that may be a pool view
+    /// ([`Self::buffer`]): it stops once the byte the access reads is known
+    /// and leaves it in `pool_byte` (none: an element of a size it cannot
+    /// tell), its dynamic part and its constant part.
+    byte_only: bool,
+    pool_byte: Option<(Option<V>, u32)>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
+    /// Immediate dominator per IR block (the entry's itself).
+    idom: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
@@ -1459,16 +1520,20 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             strides: HashMap::new(),
             pools: HashMap::new(),
+            pages: HashMap::new(),
+            shared: HashMap::new(),
+            reaches: None,
+            depth: 0,
             by_address: false,
             direct: BTreeMap::new(),
             fault_reads: false,
-            pool_only: false,
             held: None,
-            pool_on: None,
+            byte_only: false,
             pool_byte: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            idom: Vec::new(),
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -2132,6 +2197,7 @@ impl<'a> Lower<'a> {
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        self.idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
         for (n, &b) in order.iter().enumerate() {
             self.block[b] = Some(if n == 0 {
                 self.s.entry
@@ -2161,6 +2227,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.depth = 0;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -2755,6 +2822,14 @@ impl<'a> Lower<'a> {
     /// base. With `faults`, its number is left for the host, for lanes that
     /// run (`guard`). No control flow: the current block stays.
     fn lookup(&mut self, lo: V, hi: V, guard: Option<V>, faults: bool) -> (V, V) {
+        let (slot, byte, _) = self.lookup_pair(lo, hi, guard, faults, false);
+        (slot, byte)
+    }
+
+    /// [`Self::lookup`], and with `pair` the next page's entry from the
+    /// same load (the entries lie side by side): the slot of the raw view
+    /// of its copy and the byte there where the page begins.
+    fn lookup_pair(&mut self, lo: V, hi: V, guard: Option<V>, faults: bool, pair: bool) -> (V, V, Option<(V, V)>) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_RUN_DIRECTORY, MEMORY_RUN_FAULTS};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2774,7 +2849,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let slot = self.memory_run(MEMORY_RUN_DIRECTORY);
         let directory = self.s.heap_handle(c, slot, false, false, (11, 0));
-        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(if pair { 15 } else { 3 }), k(self, 4));
         let entry = self.s.op(
             c,
             "rawBufferLoad.f32",
@@ -2785,11 +2860,23 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
+        let next = pair.then(|| {
+            let (copy, start) = (self.s.m.extract(c, entry, 2), self.s.m.extract(c, entry, 3));
+            (self.as_int(copy), self.as_int(start))
+        });
         if faults && self.fault_reads {
             // A root view read through the directory: the page's number
             // is stored only where it has no copy (a store per access
-            // otherwise), at a place by the number.
+            // otherwise), at a place by the number; the next page's too
+            // where its entry came along.
             let zero = k(self, 0);
+            let mut notes = vec![(copy, page)];
+            if let Some((copy, _)) = next {
+                let one = k(self, 1);
+                notes.push((copy, self.s.m.bin(c, Bin::Add, page, one)));
+            }
+            for (copy, page) in notes {
+            let c = self.cur;
             let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
             if let Some(g) = guard {
                 missing = self.s.m.bin(c, Bin::And, missing, g);
@@ -2808,6 +2895,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i8(1);
             self.s.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, page, iu, iu, iu, mask, align]);
             self.end_guarded(at, &[]);
+            }
         } else if faults {
             // A page without a copy: its number, at a place by the number,
             // or at the sink for lanes that do not run and pages that have
@@ -2844,7 +2932,8 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (slot, byte)
+        let next = next.map(|(copy, start)| (self.s.m.bin(c, Bin::Add, base, copy), start));
+        (slot, byte, next)
     }
 
     /// Title memory at the 40-bit address `lo`, `hi` by raw address
@@ -2857,137 +2946,277 @@ impl<'a> Lower<'a> {
         (h, byte)
     }
 
-    /// The handle and byte of the dword of title memory at `lo`, `hi`, for
-    /// a pool view ([`Self::pool_view`]): its page has a directory entry
-    /// whenever the title maps it, so no fault is noted.
-    fn pool_dword(&mut self, lo: V, hi: V) -> (V, V) {
-        let faults = self.fault_reads;
-        let (slot, byte) = self.lookup(lo, hi, None, faults);
-        let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
-        (h, byte)
+    /// `n` dwords (1 to 4) of raw view `h` from byte `byte`, in one load.
+    fn raw_load(&mut self, h: V, byte: V, n: u32) -> Vec<V> {
+        let c = self.cur;
+        let (iu, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8((1u8 << n) - 1);
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
+        (0..n)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, k);
+                self.as_int(x)
+            })
+            .collect()
     }
 
-    /// `n` dwords (1 to 4) of title memory from `lo`, `hi` (4-byte
-    /// aligned) through the directory: one load, and where they cross a
-    /// 64 KiB page edge (the next page lies anywhere) one more of the
-    /// next page's first `n - 1` dwords, from which the dwords past the
-    /// edge are taken. (One lookup of the next page, not one per dword: the
-    /// split was about 30% of the translated code of the shaders a run
-    /// uses.)
-    fn pool_load(&mut self, lo: V, hi: V, n: u32) -> Vec<V> {
-        let load = |l: &mut Self, lo: V, hi: V, n: u32| -> Vec<V> {
-            let (h, byte) = l.pool_dword(lo, hi);
-            let c = l.cur;
-            let (iu, align) = (l.s.m.undef(l.s.t.i32), l.s.m.i32(4));
-            let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
-            (0..n)
-                .map(|k| {
-                    let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
-                })
-                .collect()
-        };
-        let whole = load(self, lo, hi, n);
-        if n == 1 {
-            return whole;
-        }
-        let cross = self.page_cross(lo, n);
-        let at = self.begin_guarded(Some(cross));
-        // The edge (the next page's first byte), with the carry.
-        let c = self.cur;
-        let page = self.s.m.i32(0xFFFF_0000);
-        let base = self.s.m.bin(c, Bin::And, lo, page);
-        let (elo, ehi) = self.address_plus(base, hi, 0x1_0000);
-        let next = load(self, elo, ehi, n - 1);
-        // `d` dwords lie before the edge (1 to n - 1 here): dword k >= d
-        // is the next page's dword k - d.
-        let c = self.cur;
-        let k64k = self.s.m.i32(0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let room = self.s.m.i32(0x1_0000);
-        let left = self.s.m.bin(c, Bin::Sub, room, within);
-        let two = self.s.m.i32(2);
-        let d = self.s.m.bin(c, Bin::LShr, left, two);
-        let mut pairs = Vec::new();
-        for k in 1..n {
-            let mut x = whole[k as usize];
-            for dk in 1..=k {
-                let at_d = self.s.m.i32(dk);
-                let is = self.s.m.cmp(c, pred::EQ, d, at_d);
-                x = self.s.m.select(c, is, next[(k - dk) as usize], x);
-            }
-            pairs.push((x, whole[k as usize]));
-        }
-        let joined = self.end_guarded(at, &pairs);
-        std::iter::once(whole[0]).chain(joined).collect()
-    }
-
-    /// Whether `n` dwords from the address whose low dword is `lo` cross a
-    /// 64 KiB page edge.
-    fn page_cross(&mut self, lo: V, n: u32) -> V {
-        let c = self.cur;
-        let k64k = self.s.m.i32(0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let room = self.s.m.i32(0x1_0000 - 4 * n);
-        self.s.m.cmp(c, pred::IUGT, within, room)
-    }
-
-    /// Stores `vals` (1 to 4 dwords) to title memory from `lo`, `hi`
-    /// through the directory, split at a 64 KiB page edge as
-    /// [`Self::pool_load`].
-    fn pool_store(&mut self, lo: V, hi: V, vals: &[V]) {
-        let store = |l: &mut Self, lo: V, hi: V, vals: &[V]| {
-            let (h, byte) = l.pool_dword(lo, hi);
-            let iu = l.s.m.undef(l.s.t.i32);
-            let mut args = vec![h, byte, iu];
-            args.extend(vals);
-            args.resize(3 + 4, iu);
-            args.push(l.s.m.i8((1u8 << vals.len()) - 1));
-            args.push(l.s.m.i32(4));
-            let void = l.s.t.void;
-            l.s.op(l.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
-        };
-        if vals.len() == 1 {
-            store(self, lo, hi, vals);
-            return;
-        }
-        let cross = self.page_cross(lo, vals.len() as u32);
-        let t = self.s.m.bool(true);
-        let whole = self.s.m.bin(self.cur, Bin::Xor, cross, t);
-        let at = self.begin_guarded(Some(whole));
-        store(self, lo, hi, vals);
-        self.end_guarded(at, &[]);
-        // Across the edge: this page and the next looked up once each, and
-        // each dword stored where it lies.
-        let at = self.begin_guarded(Some(cross));
-        let faults = self.fault_reads;
-        let (slot_a, byte_a) = self.lookup(lo, hi, None, faults);
-        let c = self.cur;
-        let page = self.s.m.i32(0xFFFF_0000);
-        let base = self.s.m.bin(c, Bin::And, lo, page);
-        let (elo, ehi) = self.address_plus(base, hi, 0x1_0000);
-        let (slot_b, byte_b) = self.lookup(elo, ehi, None, faults);
-        let c = self.cur;
-        let k64k = self.s.m.i32(0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+    /// Stores `vals` (1 to 4 dwords) to raw view slot `slot` at `byte`.
+    fn raw_store(&mut self, slot: V, byte: V, vals: &[V], nonuniform: bool) {
+        let h = self.s.heap_handle(self.cur, slot, false, nonuniform, (11 | 0x1000, 0));
         let iu = self.s.m.undef(self.s.t.i32);
-        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
-        for (k, &x) in vals.iter().enumerate() {
-            let k4 = self.s.m.i32(4 * k as u32);
-            let on_a = self.s.m.bin(c, Bin::Add, byte_a, k4);
-            // within + 4k - 64 KiB bytes into the next page
-            let past = self.s.m.bin(c, Bin::Add, within, k4);
-            let edge = self.s.m.i32(0x1_0000);
-            let is_b = self.s.m.cmp(c, pred::IUGE, past, edge);
-            let past = self.s.m.bin(c, Bin::Sub, past, edge);
-            let on_b = self.s.m.bin(c, Bin::Add, byte_b, past);
-            let slot = self.s.m.select(c, is_b, slot_b, slot_a);
-            let byte = self.s.m.select(c, is_b, on_b, on_a);
-            let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
-            self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, iu, x, iu, iu, iu, mask, align]);
+        let mut args = vec![h, byte, iu];
+        args.extend(vals);
+        args.resize(3 + 4, iu);
+        args.push(self.s.m.i8((1u8 << vals.len()) - 1));
+        args.push(self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+    }
+
+    /// The key values made in the current block are kept by: the rest of
+    /// the IR block where no guarded code is open (the block dominates the
+    /// rest), else the block.
+    fn dom(&self) -> usize {
+        if self.depth == 0 { usize::MAX - self.cur_ir } else { self.cur }
+    }
+
+    /// `a + b` (`op` 0) or `a * b` (1), made once where it is kept
+    /// ([`Self::dom`]) for the same operands: the accesses through the
+    /// same dynamic offset get the same value, and so share the pages
+    /// looked up for it ([`Self::view_pages`]).
+    fn shared(&mut self, op: u8, a: V, b: V) -> V {
+        let here = (self.dom(), op, a, b);
+        let block = (self.cur, op, a, b);
+        if let Some(&v) = self.shared.get(&here).or_else(|| self.shared.get(&block)) {
+            return v;
         }
-        self.end_guarded(at, &[]);
+        let v = self.s.m.bin(self.cur, if op == 0 { Bin::Add } else { Bin::Mul }, a, b);
+        self.shared.insert(here, v);
+        v
+    }
+
+    /// `a + b`, `a` none: `b` ([`Self::shared`]).
+    fn shared_sum(&mut self, a: Option<V>, b: V) -> V {
+        match a {
+            Some(a) => self.shared(0, a, b),
+            None => b,
+        }
+    }
+
+    /// The [`ReachKey`] of the buffer access at `site`, if it is one; a
+    /// constant view's dynamic operands are left out (its pages are the
+    /// view's whatever the offset).
+    fn reach_key(&self, site: Site) -> Option<ReachKey> {
+        let src = self.descriptors.get(&(site, false))?;
+        let (load, first) = match src {
+            Source::Loaded { load, first } => (*load, *first),
+            _ => (site, u8::MAX),
+        };
+        let inst = &self.x.p.blocks[site.0].insts[site.1];
+        let scalar = |o: &Operand| match *o {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            _ => None,
+        };
+        let mut uniform = !self.per_lane(src);
+        let mut operands = match &inst.fields {
+            Fields::Buffer {
+                addr,
+                soffset,
+                offen,
+                idxen,
+                ..
+            } => {
+                let Operand::Vector { reg, .. } = *addr else {
+                    return None;
+                };
+                let index = if *idxen { inst.read(Reg::V(reg)) } else { None };
+                let offset = if *offen { inst.read(Reg::V(reg + u8::from(*idxen))) } else { None };
+                uniform &= !*idxen && !*offen;
+                [index, offset, scalar(soffset)]
+            }
+            Fields::Smem { soffset, .. } if inst.name().starts_with("s_buffer_load_dword") => [None, None, scalar(soffset)],
+            _ => return None,
+        };
+        if self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv) {
+            operands = [None; 3];
+        }
+        Some((if uniform { usize::MAX } else { site.0 }, load, first, operands))
+    }
+
+    /// Whether the buffer access at `site` shares its view and dynamic
+    /// offset with another of its IR block, or of the program for one
+    /// every lane makes alike ([`Self::reach`]): they then share the pages
+    /// looked up for them, else it looks its own page up at its byte.
+    fn shares(&mut self, site: Site) -> bool {
+        if self.reaches.is_none() {
+            let mut counts = HashMap::new();
+            for (b, block) in self.x.p.blocks.iter().enumerate() {
+                for i in 0..block.insts.len() {
+                    if let Some(k) = self.reach_key((b, i)) {
+                        *counts.entry(k).or_insert(0u32) += 1;
+                    }
+                }
+            }
+            self.reaches = Some(counts);
+        }
+        let Some(k) = self.reach_key(site) else {
+            return false;
+        };
+        self.reaches.as_ref().and_then(|r| r.get(&k)).is_some_and(|&n| n > 1)
+    }
+
+    /// How a buffer access to a view that may be a pool view reaches its
+    /// bytes ([`Reach`]): `dynamic` + `konst` bytes into view `p` (named by
+    /// `src` at `site`), `n` dwords. Its pages ([`Self::view_pages`]) are
+    /// those of the view's address plus the dynamic part, shared by the
+    /// accesses through the same dynamic part in the IR block, and the
+    /// constant part (below 64 KiB, or it joins the dynamic part) says
+    /// where in them the access lies: no directory lookup per access. A
+    /// constant view's (at most 64 KiB) pages are the view's own whatever
+    /// the offset. `view`: the view's own slot where the pool table's flag
+    /// is clear (else the directory's way alone, reading zeros for a view
+    /// that is not a pool view). `guard`: the lanes that run, for the
+    /// pages a root view's code notes without a copy. Without `share` (no
+    /// other access of the IR block through the same view and dynamic
+    /// part, [`Self::shares`]) the pages are those of the access's own
+    /// byte.
+    #[allow(clippy::too_many_arguments)]
+    fn reach(
+        &mut self,
+        site: Site,
+        src: &Source,
+        p: PoolView,
+        dynamic: Option<V>,
+        konst: u32,
+        n: u32,
+        view: bool,
+        guard: Option<V>,
+        nonuniform: bool,
+        share: bool,
+    ) -> Reach {
+        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        let k = self.s.m.i32(konst);
+        let byte = match dynamic {
+            Some(d) if konst == 0 => d,
+            Some(d) => self.shared(0, d, k),
+            None => k,
+        };
+        let zero = self.s.m.i32(0);
+        let (at, rel) = if !share {
+            (Some(byte), zero)
+        } else if cbv {
+            (None, byte)
+        } else if konst <= 0x1_0000 - 4 * n {
+            (dynamic, k)
+        } else {
+            (Some(byte), zero)
+        };
+        let pair = share || n > 1;
+        let pages = self.view_pages(site, src, p, at, guard, pair, !nonuniform);
+        let limit = if cbv {
+            let most = self.s.m.i32(0x1_0000);
+            Some(if p.only {
+                most
+            } else {
+                self.s.op(self.cur, "binary.i32", Attr::ReadNone, self.s.t.i32, 40, &[p.bytes, most])
+            })
+        } else if p.only {
+            None
+        } else {
+            Some(p.bytes)
+        };
+        let blocks = cbv && self.s.m.int_value(byte).is_some_and(|b| b % 4 == 0);
+        let view = if view && !p.only { p.view } else { None };
+        Reach {
+            pages,
+            rel,
+            byte,
+            limit,
+            on: p.on,
+            view,
+            blocks,
+            nonuniform,
+        }
+    }
+
+    /// The slot and byte of dword `k` of access `r` ([`Self::reach`]): on
+    /// the first page or the next by a select, the null view at the memory
+    /// run's base where it begins at or past the view's bytes, the view's
+    /// own slot and byte where the pool table's flag is clear. Also where
+    /// it lies past the pages' address (`w`: on the next page from 64 KiB).
+    fn reach_slot(&mut self, r: &Reach, k: u32) -> (V, V, V) {
+        let c = self.cur;
+        let plus = |l: &mut Self, v: V| match (k, l.s.m.int_value(v)) {
+            (0, _) => v,
+            (_, Some(x)) => l.s.m.i32((x as u32).wrapping_add(4 * k)),
+            _ => {
+                let k4 = l.s.m.i32(4 * k);
+                l.s.m.bin(c, Bin::Add, v, k4)
+            }
+        };
+        let rel = plus(self, r.rel);
+        let w = match self.s.m.int_value(r.pages.within) {
+            Some(0) => rel,
+            _ => self.s.m.bin(c, Bin::Add, r.pages.within, rel),
+        };
+        let (mut slot, at) = if self.s.m.int_value(rel) == Some(0) {
+            // At the pages' address: the first page.
+            (r.pages.a, r.pages.a_at)
+        } else {
+            let edge = self.s.m.i32(0x1_0000);
+            let is_b = self.s.m.cmp(c, pred::IUGE, w, edge);
+            let slot = self.s.m.select(c, is_b, r.pages.b, r.pages.a);
+            (slot, self.s.m.select(c, is_b, r.pages.b_at, r.pages.a_at))
+        };
+        let mut at = self.s.m.bin(c, Bin::Add, at, w);
+        let byte = plus(self, r.byte);
+        if let Some(limit) = r.limit {
+            let past = self.s.m.cmp(c, pred::IUGE, byte, limit);
+            let null = self.memory_run(0);
+            slot = self.s.m.select(c, past, null, slot);
+        }
+        if let Some(v) = r.view {
+            slot = self.s.m.select(c, r.on, slot, v);
+            at = self.s.m.select(c, r.on, at, byte);
+        }
+        (slot, at, w)
+    }
+
+    /// `n` dwords (1 to 16) of access `r` ([`Self::reach`]): a raw load
+    /// per dword, each on the page it lies on (the next page lies
+    /// anywhere), or, for a constant view at a constant byte, per 16
+    /// bytes, which cannot cross a page edge.
+    fn reach_load(&mut self, r: &Reach, n: u32) -> Vec<V> {
+        let props = 11 | 0x1000;
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < n {
+            let m = match self.s.m.int_value(r.byte) {
+                Some(at) if r.blocks => ((16 - (at as u32 + 4 * k) % 16) / 4).min(n - k),
+                _ => 1,
+            };
+            let (slot, at, _) = self.reach_slot(r, k);
+            let h = self.s.heap_handle(self.cur, slot, false, r.nonuniform, (props, 0));
+            out.extend(self.raw_load(h, at, m));
+            k += m;
+        }
+        out
+    }
+
+    /// Stores `vals` (1 to 4 dwords) for access `r` ([`Self::reach`]) in
+    /// the lanes where `guard` holds: a raw store per dword, each on the
+    /// page it lies on.
+    fn reach_store(&mut self, r: &Reach, vals: &[V], guard: Option<V>) {
+        let mut at = Vec::new();
+        for k in 0..vals.len() as u32 {
+            let (slot, byte, _) = self.reach_slot(r, k);
+            at.push((slot, byte));
+        }
+        let g = self.begin_guarded(guard);
+        for (&(slot, byte), &x) in at.iter().zip(vals) {
+            self.raw_store(slot, byte, &[x], r.nonuniform);
+        }
+        self.end_guarded(g, &[]);
     }
 
     /// A 64-bit title address plus a byte offset computed in the shader.
@@ -3038,19 +3267,24 @@ impl<'a> Lower<'a> {
             return self.direct_view(src);
         }
         // By the descriptor load where there is one: every access through
-        // it in the block reads the same entry.
-        let key = match src {
-            Source::Loaded { load, first } => (self.cur, *load, *first),
-            _ => (self.cur, site, u8::MAX),
-        };
+        // it reads the same entry, in the rest of the IR block where it was
+        // read outside guarded code (that block dominates the rest), else
+        // in the block.
+        let (whole, key) = self.pool_keys(site, src);
+        for b in self.scopes(!self.per_lane(src)) {
+            if let Some(&p) = self.pools.get(&(usize::MAX - b, whole.1, whole.2)) {
+                return Some(p);
+            }
+        }
         if let Some(&p) = self.pools.get(&key) {
             return Some(p);
         }
-        let slot = self.descriptor_slot(src).ok().flatten()?;
+        let key = if self.depth == 0 { whole } else { key };
+        let view = self.descriptor_slot(src).ok().flatten()?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let last = self.s.m.i32(POOL_SLOTS - 1);
-        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[view, last]);
         let k = self.s.m.i32(POOL_ENTRY_BYTES);
         let at = self.s.m.bin(c, Bin::Mul, slot, k);
         let table = self.memory_run(MEMORY_RUN_POOL);
@@ -3068,9 +3302,80 @@ impl<'a> Lower<'a> {
         let on = self.s.m.cmp(c, pred::NE, set, zero);
         let k8 = self.s.m.i32(0xFF);
         let hi = self.s.m.bin(c, Bin::And, hi, k8);
-        let p = PoolView { on, only: false, lo, hi, bytes };
+        let p = PoolView { on, only: false, lo, hi, bytes, view: Some(view) };
         self.pools.insert(key, p);
         Some(p)
+    }
+
+    /// The IR blocks whose values made outside guarded code the current
+    /// block may use: its own, and with `uniform` those dominating it (a
+    /// value every lane holds alike is kept once for the whole wave, in
+    /// the card's uniform registers, so keeping it longer costs little).
+    fn scopes(&self, uniform: bool) -> Vec<usize> {
+        let mut out = vec![self.cur_ir];
+        let mut d = self.cur_ir;
+        while uniform && let Some(&up) = self.idom.get(d) {
+            if up == d || up == usize::MAX {
+                break;
+            }
+            out.push(up);
+            d = up;
+        }
+        out
+    }
+
+    /// The keys a pool table entry read for `src` at `site` is kept by
+    /// ([`Self::pool_view`]): for the rest of the IR block, and for the
+    /// current block.
+    fn pool_keys(&self, site: Site, src: &Source) -> ((usize, Site, u8), (usize, Site, u8)) {
+        let (load, first) = match src {
+            Source::Loaded { load, first } => (*load, *first),
+            _ => (site, u8::MAX),
+        };
+        ((usize::MAX - site.0, load, first), (self.cur, load, first))
+    }
+
+    /// The pages around the address `at` bytes into pool view `p` (named by
+    /// `src` at `site`; none: the view's address): the page holding it and
+    /// the next, from one load of the directory's two entries, once per IR
+    /// block for the same view and dynamic offset (as [`Self::pool_view`];
+    /// with `uniform`, once for the blocks it dominates), not once per
+    /// access. A view that is not a pool view gets whatever
+    /// the directory holds at its zero address: its accesses go to the null
+    /// view by its bytes (0), or to the view's own slot. A root view read
+    /// through the directory alone notes the pages without a copy for the
+    /// host, in the lanes `guard` names.
+    #[allow(clippy::too_many_arguments)]
+    fn view_pages(&mut self, site: Site, src: &Source, p: PoolView, at: Option<V>, guard: Option<V>, pair: bool, uniform: bool) -> Pages {
+        let ((wb, wl, wf), (kb, kl, kf)) = self.pool_keys(site, src);
+        let guard = guard.filter(|_| self.fault_reads);
+        let whole = (wb, wl, wf, at, guard, pair);
+        let key = (kb, kl, kf, at, guard, pair);
+        for b in self.scopes(uniform) {
+            if let Some(&g) = self.pages.get(&(usize::MAX - b, wl, wf, at, guard, pair)) {
+                return g;
+            }
+        }
+        if let Some(&g) = self.pages.get(&key) {
+            return g;
+        }
+        let key = if self.depth == 0 { whole } else { key };
+        let (lo, hi) = match at {
+            Some(at) => self.address_add(p.lo, p.hi, at),
+            None => (p.lo, p.hi),
+        };
+        let c = self.cur;
+        let (k64k, page) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let base = self.s.m.bin(c, Bin::And, lo, page);
+        let faults = self.fault_reads;
+        let (a, a_at, next) = self.lookup_pair(base, hi, guard, faults, pair);
+        let (b, b_at) = next.unwrap_or((a, a_at));
+        let edge = self.s.m.i32(0x1_0000);
+        let b_at = self.s.m.bin(self.cur, Bin::Sub, b_at, edge);
+        let g = Pages { a, a_at, b, b_at, within };
+        self.pages.insert(key, g);
+        g
     }
 
     /// Whether the program's root views are read through the directory
@@ -3108,7 +3413,7 @@ impl<'a> Lower<'a> {
         };
         let on = self.s.m.bool(true);
         let bytes = self.s.m.i32(u32::MAX);
-        Some(PoolView { on, only: true, lo, hi, bytes })
+        Some(PoolView { on, only: true, lo, hi, bytes, view: None })
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -4255,6 +4560,7 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
         self.cur = then;
+        self.depth += 1;
         Some((head, join))
     }
 
@@ -4266,6 +4572,7 @@ impl<'a> Lower<'a> {
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
+        self.depth = self.depth.saturating_sub(1);
         values
             .iter()
             .map(|&(inside, outside)| {
@@ -5712,12 +6019,18 @@ impl<'a> Lower<'a> {
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
         let mut addr = self.s.m.i32(*offset as u32);
+        // Its dynamic part and constant part ([`Self::reach`]).
+        let (mut dynamic, mut konst) = (extra, *offset as u32);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
+            match self.s.m.int_value(so) {
+                Some(k) => konst = konst.wrapping_add(k as u32),
+                None => dynamic = Some(self.shared_sum(dynamic, so)),
+            }
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
@@ -5729,57 +6042,54 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A view that may be a pool view (`Self::buffer`): the view's way,
-        // then the directory's under a branch on the pool table's flag. A
-        // root view's stand-in (64 KiB, a constant buffer's most) is read at
-        // its start where the offset is computed.
-        if let Some(p) = self.pool_view(site, src).filter(|p| p.only) {
-            // A root view read through the directory alone: no view's way.
-            if let Some(Source::Built { address, .. }) = Some(src)
-                && let Some(rp) = self.x.native.layout.get(address.param)
-            {
-                self.direct.entry(rp.slot).or_default();
-            }
-            self.fault_reads = self.x.native.stage == HwStage::Cs;
-            let mut got = Vec::new();
-            for first in (0..count).step_by(4) {
-                let n = (count - first).min(4);
-                let k = self.s.m.i32(4 * first);
-                let off = self.s.m.bin(self.cur, Bin::Add, addr, k);
-                let (lo, hi) = self.address_add(p.lo, p.hi, off);
-                got.extend(self.pool_load(lo, hi, n));
-            }
-            self.fault_reads = false;
-            for (k, x) in got.into_iter().enumerate() {
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
-            return Ok(());
-        }
+        // A view that may be a pool view (`Self::buffer`): one load at the
+        // place the view or the directory gives ([`Self::reach`]). A
+        // constant view's way reads its rows (a constant buffer view is not
+        // read raw): what the directory's way reads is picked by the pool
+        // table's flag. Views the program picks from the heap (raw or
+        // constant) keep the view's way and take the directory's under a
+        // branch on the flag.
         if let Some(p) = self.pool_view(site, src) {
+            let nonuniform = self.per_lane(src);
+            let kind = self.used_kind(src).map(|u| u.kind);
+            if p.only {
+                // A root view read through the directory alone.
+                if let Source::Built { address, .. } = src
+                    && let Some(rp) = self.x.native.layout.get(address.param)
+                {
+                    self.direct.entry(rp.slot).or_default();
+                }
+                self.fault_reads = self.x.native.stage == HwStage::Cs;
+            }
+            if p.only || kind == Some(ResourceType::Srv) {
+                let share = self.shares(site);
+                let r = self.reach(site, src, p, dynamic, konst, count, true, None, nonuniform, share);
+                let got = self.reach_load(&r, count);
+                self.fault_reads = false;
+                for (k, x) in got.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             self.held = Some(Vec::new());
-            let view_addr = if matches!(src, Source::Built { .. }) && !matches!(addr, V::Const(_)) {
-                let zero = self.s.m.i32(0);
-                self.s.m.select(self.cur, p.on, zero, addr)
-            } else {
-                addr
-            };
-            let done = self.smem_view(inst, site, src, view_addr, *offset, extra, *soffset, count, code);
+            let done = self.smem_view(inst, site, src, addr, *offset, extra, *soffset, count, code);
             let held = self.held.take().unwrap_or_default();
             done?;
-            let at = self.begin_guarded(Some(p.on));
-            let mut inside = Vec::new();
-            for first in (0..count).step_by(4) {
-                let n = (count - first).min(4);
-                let k = self.s.m.i32(4 * first);
-                let off = self.s.m.bin(self.cur, Bin::Add, addr, k);
-                let (lo, hi) = self.address_add(p.lo, p.hi, off);
-                inside.extend(self.pool_load(lo, hi, n));
-            }
-            if inside.len() != held.len() {
+            // A constant view: its rows, or what the directory gives.
+            let picked = kind.is_none() && self.heap_picked(src);
+            let g = if picked { self.begin_guarded(Some(p.on)) } else { None };
+            let share = self.shares(site);
+            let r = self.reach(site, src, p, dynamic, konst, count, false, None, nonuniform, share);
+            let raw = self.reach_load(&r, count);
+            if raw.len() != held.len() {
                 return Err("a pool view access whose two ways differ");
             }
-            let pairs: Vec<(V, V)> = inside.into_iter().zip(held.iter().map(|w| w.1)).collect();
-            let joined = self.end_guarded(at, &pairs);
+            let pairs: Vec<(V, V)> = raw.into_iter().zip(held.iter().map(|w| w.1)).collect();
+            let joined = if picked {
+                self.end_guarded(g, &pairs)
+            } else {
+                pairs.iter().map(|&(x, row)| self.s.m.select(self.cur, p.on, x, row)).collect()
+            };
             for (&(reg, _, guard), x) in held.iter().zip(joined) {
                 self.write(inst, reg, x, guard);
             }
@@ -10511,18 +10821,14 @@ impl<'a> Lower<'a> {
 
     /// A buffer access (`buffer_*`, `tbuffer_*`). Raw, structured and
     /// constant views may be pool views (`shader.rs` `MEMORY_RUN_POOL`):
-    /// the access is then lowered twice, the view's way (whose host
-    /// descriptor is null for a pool view, read at the view's start) and,
-    /// under a branch on the pool table's flag (uniform where the
-    /// descriptor is), the directory's way at the view's title address plus
-    /// the access's byte. What they read joins where the branch ends.
+    /// the access is then lowered once, as a raw access at the place
+    /// [`Self::reach`] picks: the view's own slot and byte, or, where the
+    /// pool table's flag is set, the directory's copy and byte for the
+    /// view's title address plus the access's byte ([`Self::buffer_placed`]).
     /// Typed views (`buffer_*_format_*`, d16) keep the view's way alone:
     /// the host keeps their windows.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let pool = self.buffer_pool(inst, (b, i));
-        if let Some(p) = pool.filter(|p| p.only) {
-            return self.buffer_direct(inst, b, i, p);
-        }
         // A root view read through the directory alone that this access
         // cannot be lowered for (typed, d16): the program again, with root
         // views of the host's.
@@ -10532,62 +10838,37 @@ impl<'a> Lower<'a> {
         {
             return Err(ROOT_REFUSED);
         }
-        self.pool_on = pool.map(|p| p.on);
-        self.pool_byte = None;
-        self.held = pool.map(|_| Vec::new());
-        let done = self.buffer_view(inst, b, i);
-        let held = self.held.take().unwrap_or_default();
-        self.pool_on = None;
-        let byte = self.pool_byte.take();
-        done?;
-        let joined = match (pool, byte) {
-            (Some(p), Some(byte)) => self.buffer_by_directory(inst, b, i, p, byte, &held)?,
-            _ => held.iter().map(|w| w.1).collect(),
+        let Some(p) = pool else {
+            return self.buffer_view(inst, b, i);
         };
-        for (&(reg, _, guard), x) in held.iter().zip(joined) {
-            self.write(inst, reg, x, guard);
-        }
-        Ok(())
-    }
-
-    /// A buffer access through a root view read through the directory
-    /// alone ([`Self::direct_root`]): the byte it reads as the view's way
-    /// computes it ([`Self::buffer_view`] stops there), then the
-    /// directory's way, written straight to the registers.
-    fn buffer_direct(&mut self, inst: &Inst, b: usize, i: usize, p: PoolView) -> Result<(), Why> {
-        self.pool_on = Some(p.on);
+        // The byte into the view the access reads, as the view's way
+        // computes it ([`Self::buffer_view`] stops there).
+        self.byte_only = true;
         self.pool_byte = None;
-        self.pool_only = true;
         let done = self.buffer_view(inst, b, i);
-        self.pool_only = false;
-        self.pool_on = None;
+        self.byte_only = false;
         done?;
-        let byte = self.pool_byte.take().ok_or(ROOT_REFUSED)?;
-        let name = inst.name();
-        let writes = name.starts_with("buffer_store_") || name.starts_with("buffer_atomic_");
-        if let Some(Source::Built { address, .. }) = self.descriptors.get(&((b, i), false)).copied()
-            && let Some(rp) = self.x.native.layout.get(address.param)
-        {
-            *self.direct.entry(rp.slot).or_default() |= writes;
+        let Some((dynamic, konst)) = self.pool_byte.take() else {
+            // An element of a size the byte cannot be told from: the view's
+            // way alone.
+            if p.only {
+                return Err(ROOT_REFUSED);
+            }
+            return self.buffer_view(inst, b, i);
+        };
+        if p.only {
+            let name = inst.name();
+            let writes = name.starts_with("buffer_store_") || name.starts_with("buffer_atomic_");
+            if let Some(Source::Built { address, .. }) = self.descriptors.get(&((b, i), false)).copied()
+                && let Some(rp) = self.x.native.layout.get(address.param)
+            {
+                *self.direct.entry(rp.slot).or_default() |= writes;
+            }
+            self.fault_reads = self.x.native.stage == HwStage::Cs;
         }
-        self.fault_reads = self.x.native.stage == HwStage::Cs;
-        let got = self.buffer_by_directory(inst, b, i, p, byte, &[]);
+        let done = self.buffer_placed(inst, b, i, p, dynamic, konst);
         self.fault_reads = false;
-        let got = got?;
-        let Fields::Buffer { data, .. } = &inst.fields else {
-            unreachable!()
-        };
-        if got.is_empty() {
-            return Ok(());
-        }
-        let Some(Operand::Vector { reg, .. }) = *data else {
-            return Err("a buffer result");
-        };
-        let guard = self.guard(b, i)?;
-        for (k, x) in got.into_iter().enumerate() {
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
-        }
-        Ok(())
+        done
     }
 
     /// The pool table entry of the view a buffer access names, if the
@@ -10608,36 +10889,130 @@ impl<'a> Lower<'a> {
         self.pool_view(site, src)
     }
 
-    /// The directory's way of a buffer access to a pool view `p`, `byte`
-    /// bytes into it, under a branch on its flag (and, for stores and
-    /// atomics, the lane guard); returns the values joined with those the
-    /// view's way wrote (`held`, in order).
-    fn buffer_by_directory(
+    /// Whether the program picks the view `src` names from the view heap
+    /// at an index it computes (root type `ResourceHeap`).
+    fn heap_picked(&self, src: &Source) -> bool {
+        let Source::Loaded { load, .. } = src else {
+            return false;
+        };
+        self.scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap)
+    }
+
+    /// Whether lanes may hold different descriptors for `src` (a
+    /// waterfall loop's, or one each lane has its own of).
+    fn per_lane(&self, src: &Source) -> bool {
+        match src {
+            Source::Loaded { load, .. } => self.x.res.waterfall.loads.contains(load),
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// A buffer access to a view that may be a pool view `p`, `dynamic` +
+    /// `konst` bytes into it ([`Self::buffer`]): one raw access at the
+    /// place [`Self::reach`] picks. Every such access is annotated as a
+    /// raw unordered access view, as the directory's copies are (a raw view
+    /// of either kind is the same storage buffer descriptor on the host).
+    /// A constant view's way reads its rows (a constant buffer view is not
+    /// read raw): what the directory's way reads is picked by the flag.
+    fn buffer_placed(&mut self, inst: &Inst, b: usize, i: usize, p: PoolView, dynamic: Option<V>, konst: u32) -> Result<(), Why> {
+        let Fields::Buffer {
+            data,
+            format,
+            cache,
+            offen,
+            idxen,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let site = (b, i);
+        let guard = self.guard(b, i)?;
+        let src = self.descriptors.get(&(site, false)).copied().ok_or("an untracked buffer")?;
+        let store = name.starts_with("buffer_store_");
+        let atomic = name.starts_with("buffer_atomic_");
+        let nonuniform = *offen || *idxen || self.per_lane(src);
+        let reg = match *data {
+            Some(Operand::Vector { reg, .. }) => Some(reg),
+            _ => None,
+        };
+        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        if cbv && !p.only && format.is_none() && !store && !atomic {
+            // shortcut: as the view's way below a pool view, a constant
+            // buffer's byte and 16-bit loads read the dword at the byte.
+            let n = match name.strip_prefix("buffer_load_") {
+                Some("dwordx2") => 2,
+                Some("dwordx3") => 3,
+                Some("dwordx4") => 4,
+                _ => 1,
+            };
+            let k = self.s.m.i32(konst);
+            let byte = self.shared_sum(dynamic, k);
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let mut rows = Vec::new();
+            for k in 0..n {
+                let four = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(self.cur, Bin::Add, byte, four);
+                rows.push(self.cbuffer_dword(h, a));
+            }
+            let raw = self.placed(inst, site, src, p, dynamic, konst, false, nonuniform)?;
+            if raw.len() != rows.len() {
+                return Err("a pool view access whose two ways differ");
+            }
+            let reg = reg.ok_or("a buffer result")?;
+            for (k, (x, row)) in raw.into_iter().zip(rows).enumerate() {
+                let x = self.s.m.select(self.cur, p.on, x, row);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        let got = self.placed(inst, site, src, p, dynamic, konst, true, nonuniform)?;
+        if got.is_empty() {
+            return Ok(());
+        }
+        let reg = reg.ok_or("a buffer result")?;
+        if atomic {
+            // (The register's own value in lanes that do not run.)
+            if cache.glc {
+                self.write(inst, Reg::V(reg), got[0], None);
+            }
+            return Ok(());
+        }
+        for (k, x) in got.into_iter().enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
+    /// The raw access of [`Self::buffer_placed`] ([`Self::reach`]; `view`:
+    /// the view's own slot where the flag is clear, else the directory's
+    /// way alone), writes and atomics in the lanes that run: what a load or
+    /// returning atomic reads.
+    #[allow(clippy::too_many_arguments)]
+    fn placed(
         &mut self,
         inst: &Inst,
-        b: usize,
-        i: usize,
+        site: Site,
+        src: &Source,
         p: PoolView,
-        byte: V,
-        held: &[(Reg, V, Option<V>)],
+        dynamic: Option<V>,
+        konst: u32,
+        view: bool,
+        nonuniform: bool,
     ) -> Result<Vec<V>, Why> {
         let Fields::Buffer { data, format, cache, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
-        let guard = self.guard(b, i)?;
+        let guard = self.guard(site.0, site.1)?;
+        let props = 11 | 0x1000;
         let store = name.starts_with("buffer_store_");
         let atomic = name.strip_prefix("buffer_atomic_");
-        let mut on = p.on;
-        if let Some(g) = guard
-            && (store || atomic.is_some())
-        {
-            on = self.s.m.bin(self.cur, Bin::And, on, g);
-        }
-        // A root view read through the directory alone: only the lanes that
-        // run (their loads note pages without a copy for the host).
-        let at = if p.only { self.begin_guarded(guard) } else { self.begin_guarded(Some(on)) };
-        let (lo, hi) = self.address_add(p.lo, p.hi, byte);
         let narrow = match name {
             "buffer_load_ubyte" | "buffer_store_byte" => Some((8, false)),
             "buffer_load_sbyte" => Some((8, true)),
@@ -10652,7 +11027,13 @@ impl<'a> Lower<'a> {
             "dwordx4" | "format_xyzw" => Ok(4),
             _ => Err(name),
         };
-        let inside: Vec<V> = if let Some(op) = atomic {
+        // A root view's pages without a copy are noted in the lanes that
+        // run.
+        let lanes = guard.filter(|_| p.only);
+        let share = self.shares(site);
+        let k = self.s.m.i32(konst);
+        let byte = self.shared_sum(dynamic, k);
+        if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 } else { 1 })?;
             let code = match op {
@@ -10668,9 +11049,21 @@ impl<'a> Lower<'a> {
                 "cmpswap" => u32::MAX,
                 _ => return Err(name),
             };
-            let (h, at) = self.pool_dword(lo, hi);
+            // The old value where the access returns it, the register's
+            // own in lanes that do not run.
+            let old = match (cache.glc, data.as_ref().and_then(|d| match *d {
+                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+                _ => None,
+            })) {
+                (true, Some(v)) => self.i32_of(v)?,
+                _ => self.s.m.i32(0),
+            };
+            let r = self.reach(site, src, p, dynamic, konst, 1, view, lanes, nonuniform, share);
+            let (slot, at, _) = self.reach_slot(&r, 0);
+            let h = self.s.heap_handle(self.cur, slot, false, nonuniform, (props, 0));
+            let g = self.begin_guarded(guard);
             let (iu, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.i32);
-            let r = if code == u32::MAX {
+            let x = if code == u32::MAX {
                 let args = [h, at, iu, iu, vals[1], vals[0]];
                 self.s.op(self.cur, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79, &args)
             } else {
@@ -10678,20 +11071,25 @@ impl<'a> Lower<'a> {
                 let args = [h, code, at, iu, iu, vals[0]];
                 self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
-            if cache.glc { vec![r] } else { Vec::new() }
-        } else if let Some((bits, signed)) = narrow {
-            // As the view's way: the dword holding the value, and the next
-            // for a 16-bit value at a dword's last byte (each looked up on
-            // its own: the next may lie on the next page).
+            let x = self.end_guarded(g, &[(x, old)]);
+            return Ok(if cache.glc { x } else { Vec::new() });
+        }
+        if let Some((bits, signed)) = narrow {
+            // Raw views are read and written in dwords on 4 bytes: the
+            // dword holding the value is read and shifted, or changed with
+            // two atomic operations that touch only the value's own bits
+            // (other lanes may write the rest of the dword at the same
+            // time). A 16-bit value at a dword's last byte continues in the
+            // next dword (which may lie on the next page).
             let c = self.cur;
             let k3 = self.s.m.i32(3);
-            let within = self.s.m.bin(c, Bin::And, lo, k3);
-            let alo = self.s.m.bin(c, Bin::Sub, lo, within);
+            let within = self.s.m.bin(c, Bin::And, byte, k3);
+            let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
             let shift = self.s.m.bin(c, Bin::Shl, within, k3);
-            let (nlo, nhi) = self.address_plus(alo, hi, 4);
             let ones = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
             let k8 = self.s.m.i32(8);
             let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
+            let r = self.reach(site, src, p, Some(aligned), 0, 2, view, lanes, nonuniform, false);
             if store {
                 let d = data.as_ref().ok_or("buffer store data")?;
                 let v = self.vgprs(inst, d, 1)?[0];
@@ -10704,65 +11102,60 @@ impl<'a> Lower<'a> {
                 let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
                 let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
                 let (iu, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.i32);
-                let (h, at) = self.pool_dword(alo, hi);
+                let (slot, at, _) = self.reach_slot(&r, 0);
+                let h = self.s.heap_handle(self.cur, slot, false, nonuniform, (props, 0));
+                let g = self.begin_guarded(guard);
                 for (op, x) in [(and, keep), (or, set)] {
                     self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, iu, iu, x]);
                 }
                 if bits == 16 {
                     let second = self.begin_guarded(Some(straddles));
-                    let (h, at) = self.pool_dword(nlo, nhi);
+                    let (slot, at, _) = self.reach_slot(&r, 1);
+                    let h = self.s.heap_handle(self.cur, slot, false, nonuniform, (props, 0));
                     for (op, x) in [(and, keep_next), (or, set_next)] {
                         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, iu, iu, x]);
                     }
                     self.end_guarded(second, &[]);
                 }
-                Vec::new()
-            } else {
-                let low = self.pool_load(alo, hi, 1)[0];
-                let high = (bits == 16).then(|| self.pool_load(nlo, nhi, 1)[0]);
-                let c = self.cur;
-                let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
-                if let Some(high) = high {
-                    let zero = self.s.m.i32(0);
-                    let high = self.s.m.bin(c, Bin::Shl, high, k8);
-                    let high = self.s.m.select(c, straddles, high, zero);
-                    x = self.s.m.bin(c, Bin::Or, x, high);
-                }
-                x = self.s.m.bin(c, Bin::And, x, ones);
-                if signed {
-                    let up = self.s.m.i32(32 - bits);
-                    x = self.s.m.bin(c, Bin::Shl, x, up);
-                    x = self.s.m.bin(c, Bin::AShr, x, up);
-                }
-                vec![x]
+                self.end_guarded(g, &[]);
+                return Ok(Vec::new());
             }
-        } else if store {
+            let words = self.reach_load(&r, if bits == 16 { 2 } else { 1 });
+            let c = self.cur;
+            let mut x = self.s.m.bin(c, Bin::LShr, words[0], shift);
+            if bits == 16 {
+                let zero = self.s.m.i32(0);
+                let high = self.s.m.bin(c, Bin::Shl, words[1], k8);
+                let high = self.s.m.select(c, straddles, high, zero);
+                x = self.s.m.bin(c, Bin::Or, x, high);
+            }
+            x = self.s.m.bin(c, Bin::And, x, ones);
+            if signed {
+                let up = self.s.m.i32(32 - bits);
+                x = self.s.m.bin(c, Bin::Shl, x, up);
+                x = self.s.m.bin(c, Bin::AShr, x, up);
+            }
+            return Ok(vec![x]);
+        }
+        if store {
             let n = count(name.strip_prefix("buffer_store_").unwrap_or(""))?;
             let d = data.as_ref().ok_or("buffer store data")?;
             let vals = self.vgprs(inst, d, n as u8)?;
-            self.pool_store(lo, hi, &vals);
-            Vec::new()
-        } else if let Some(f) = *format {
+            let r = self.reach(site, src, p, dynamic, konst, n, view, lanes, nonuniform, share);
+            self.reach_store(&r, &vals, guard);
+            return Ok(Vec::new());
+        }
+        if let Some(f) = *format {
             let n = count(name.strip_prefix("tbuffer_load_").unwrap_or(""))?;
             let mut load = |l: &mut Self, at: V, n: u32| {
-                let (alo, ahi) = l.address_add(p.lo, p.hi, at);
-                l.pool_load(alo, ahi, n)
+                let r = l.reach(site, src, p, Some(at), 0, n, view, lanes, nonuniform, false);
+                l.reach_load(&r, n)
             };
-            self.format_from(byte, f, n, &mut load)?
-        } else {
-            let n = count(name.strip_prefix("buffer_load_").ok_or(name)?)?;
-            self.pool_load(lo, hi, n)
-        };
-        if p.only {
-            let zero = self.s.m.i32(0);
-            let pairs: Vec<(V, V)> = inside.into_iter().map(|x| (x, zero)).collect();
-            return Ok(self.end_guarded(at, &pairs));
+            return self.format_from(byte, f, n, &mut load);
         }
-        if inside.len() != held.len() {
-            return Err("a pool view access whose two ways differ");
-        }
-        let pairs: Vec<(V, V)> = inside.into_iter().zip(held.iter().map(|w| w.1)).collect();
-        Ok(self.end_guarded(at, &pairs))
+        let n = count(name.strip_prefix("buffer_load_").ok_or(name)?)?;
+        let r = self.reach(site, src, p, dynamic, konst, n, view, lanes, nonuniform, share);
+        Ok(self.reach_load(&r, n))
     }
 
     fn buffer_view(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -10850,9 +11243,13 @@ impl<'a> Lower<'a> {
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
+        // For a view that may be a pool view ([`Self::buffer`]): the byte's
+        // dynamic part and constant part ([`Self::reach`]).
+        let (mut dynamic, mut konst) = (None, u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
+            dynamic = Some(o);
         }
         if !matches!(
             soffset,
@@ -10860,6 +11257,11 @@ impl<'a> Lower<'a> {
         ) {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
+            match self.s.m.int_value(so) {
+                Some(k) => konst = konst.wrapping_add(k as u32),
+                None if self.byte_only => dynamic = Some(self.shared_sum(dynamic, so)),
+                None => {}
+            }
         }
         let src = self
             .descriptors
@@ -10871,9 +11273,13 @@ impl<'a> Lower<'a> {
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
+            konst = konst.wrapping_add(base);
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+            if self.byte_only {
+                dynamic = Some(self.shared_sum(dynamic, x));
+            }
         }
         // A buffer the program picks from the view heap by an index it
         // computes: no used-resource entry gives its stride, the host's
@@ -10889,6 +11295,10 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
+            if self.byte_only {
+                let at = self.shared(1, element, stride);
+                dynamic = Some(self.shared_sum(dynamic, at));
+            }
         }
         // A structured buffer by its used-resource entry's stride: raw
         // bytes too. The host makes its buffer views raw (a raw read
@@ -10904,35 +11314,28 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
+            if self.byte_only {
+                let at = self.shared(1, element, k);
+                dynamic = Some(self.shared_sum(dynamic, at));
+            }
         }
         // A view that may be a pool view ([`Self::buffer`]): the byte into
-        // the view the access reads, for the directory's way; this way then
-        // reads at the view's start (its host descriptor is null, a root
-        // view's a stand-in).
-        if let Some(on) = self.pool_on {
+        // the view the access reads; [`Self::buffer_placed`] makes the
+        // access.
+        if self.byte_only {
             let cbv = used.is_some_and(|u| u.kind == ResourceType::Cbv);
             let stride = if cbv { 16 } else { used.map_or(0, |u| u.stride) };
-            let byte = match index {
-                None => Some(off),
-                Some(i) if stride == 1 => Some(self.s.m.bin(c, Bin::Add, i, off)),
+            self.pool_byte = match index {
+                None => Some((dynamic, konst)),
+                Some(i) if stride == 1 => Some((Some(self.shared_sum(dynamic, i)), konst)),
                 Some(i) if stride >= 4 => {
                     let k = self.s.m.i32(stride);
-                    let at = self.s.m.bin(c, Bin::Mul, i, k);
-                    Some(self.s.m.bin(c, Bin::Add, at, off))
+                    let at = self.shared(1, i, k);
+                    Some((Some(self.shared_sum(dynamic, at)), konst))
                 }
                 Some(_) => None,
             };
-            if self.pool_only {
-                // The directory's way alone ([`Self::buffer_direct`]).
-                self.pool_byte = byte;
-                return Ok(());
-            }
-            if let Some(byte) = byte {
-                self.pool_byte = Some(byte);
-                let zero = self.s.m.i32(0);
-                off = self.s.m.select(c, on, zero, off);
-                index = index.map(|i| self.s.m.select(c, on, zero, i));
-            }
+            return Ok(());
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
