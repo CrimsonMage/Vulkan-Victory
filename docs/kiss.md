@@ -28,6 +28,7 @@ the twin; it implements only what is truly console-only.
 | Bink 2 video | The title's own Bink DLL, with XAudio2 passed through | title DLL | works |
 | GameInput, window, lifecycle | GameInput on PC; a Win32 window | `gameinput.rs`, `lifecycle.rs` | works |
 | XUser, XStore, saves, networking | PC GDK twins or local stand-ins; no network | `xuser.rs`, `xstore.rs`, `xgamesave.rs`, `net.rs` | works |
+| Console kernel (`kernelx.dll`, its legacy parts, `minuserx.dll`); runtime classes we lack | The PC's kernel32/kernelbase/advapi32 and user32 by name, our overrides first; kernelx's own exports mapped onto xmem, lifecycle and thread descriptions; unknown XGameRuntime classes to the PC's own `xgameruntime.dll` (Proton ships none: NOT_SUPPORTED, logged once per class) | `modules/mod.rs` (`twins`), `kernelx.rs`, `xgameruntime.rs` | built; this title imports none of them |
 | Console CPU instructions the PC lacks (CLZERO, MONITORX, INSERTQ ...) | Rewritten as plain x86 at the first trap (stubs for clzero loops and INSERTQ; PAUSE/NOP for MONITORX/MWAITX); emulated only as fallback | `victory-loader` | works |
 
 ## Targets
@@ -280,8 +281,23 @@ driver errors and no new crash, and the captures look no worse.
   locations fixed to this pack, cube derivatives (6-layer 2D array), generic
   DPP, wave64 cross-half ops, T# slot check, missing console list slots,
   fake queries, slot layout from one signal, 2-plane present, FSR4 with no
-  Vulkan path, no kernelx route, no forwarding of unknown XGameRuntime
-  classes to the PC's own.
+  Vulkan path.
+- 2026-11-26: HLE genericity (victory-hle): kernelx.dll and its legacy and
+  app-model parts resolve as the PC kernel (our modules first, then the
+  host by name), with kernelx's own exports mapped onto what we have
+  (title memory status from xmem's figures, title physical pages as XMem's,
+  allocation hooks, constrained-change registrations, thread names as
+  thread descriptions, console type from `VICTORY_CONSOLE`, OS version);
+  `GetProcAddress` on it resolves the same way; `VirtualAlloc` with console
+  flags goes the XMem way; `minuserx.dll` is user32, `xgameplatform.dll`
+  and `xgameruntime*` are ours; unknown XGameRuntime classes go to the
+  PC's own runtime where it exists. The routes alone booted unchanged in
+  vk24 (29/29 unimplemented-import lines). What remains: runtime areas answer only
+  the interface ids of two GDK versions (Minecraft 2022, this title), so
+  another GDK's title meets NOT_SUPPORTED; title memory status counts the
+  whole process as used (reads full); `VirtualProtect`/`VirtualAllocEx`
+  with console bits still reach the host; the console type values are a
+  guess; no XGameRuntime fallback without Gaming Services.
 - 2026-11-26: FIRST IMAGE ON VULKAN (run vk16, host f9b0165, translator
   b252e39): the loading art renders through victory's own Vulkan path (no
   vkd3d). Black-screen causes found on the way: separate VkImages per view

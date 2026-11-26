@@ -25,14 +25,20 @@ pub struct HleModule {
 
 impl HleModule {
     pub fn serves(&self, dll: &str) -> bool {
-        let dll = dll.to_ascii_lowercase();
-        self.dlls
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => dll.starts_with(prefix),
-                None => dll == *pattern,
-            })
+        matches(self.dlls, dll)
     }
+}
+
+/// Whether `dll` (any case) is one of lower-case `patterns`; a trailing
+/// `*` matches a prefix.
+pub(crate) fn matches<S: AsRef<str>>(patterns: &[S], dll: &str) -> bool {
+    let dll = dll.to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| match pattern.as_ref().strip_suffix('*') {
+            Some(prefix) => dll.starts_with(prefix),
+            None => dll == pattern.as_ref(),
+        })
 }
 
 /// Declares an export whose Rust name equals the imported name.

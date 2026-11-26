@@ -87,7 +87,7 @@ pub struct AnalyticsInfo {
     pub form: [u8; 64],
 }
 
-const OS: Version = Version {
+pub(crate) const OS: Version = Version {
     major: 10,
     minor: 0,
     build: 22000,

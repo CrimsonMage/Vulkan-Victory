@@ -9,6 +9,9 @@
 
 use std::ffi::{CStr, c_void};
 
+use victory_loader::{ImportResolver, Resolution};
+use victory_pe::ImportSymbol;
+
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
@@ -164,9 +167,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
-        Some(e) => e.address as *mut c_void,
-        None => {
+    // As at import binding: a DLL's other modules and its twins too
+    // (`kernelx.dll`'s XMem exports are xmem's).
+    let symbol = ImportSymbol::Name {
+        hint: 0,
+        name: name.clone().into_owned(),
+    };
+    match crate::HleResolver::default().resolve(m.dlls[0], &symbol) {
+        Resolution::Found { address, .. } => address as *mut c_void,
+        Resolution::Missing => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
             std::ptr::null_mut()
         }
@@ -325,9 +334,8 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
             }
         }
     }
-    let image = runtime::image_named(&file).map(|base| base as *mut c_void);
-    if let Some(module) = image.or_else(|| twin_module(&file)) {
-        return Some(module);
+    if let Some(base) = runtime::image_named(&file) {
+        return Some(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
     let host_dll = HostPolicy::default().allows(&file);
@@ -340,27 +348,30 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     if host_dll {
         return None;
     }
-    // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
-    // the console does not have it.
-    refuse(&file);
-    host::set_last_error(ERROR_MOD_NOT_FOUND);
-    Some(std::ptr::null_mut())
+    // A console DLL under another name is its first twin; any other host
+    // DLL (wininet, urlmon, ...) is beyond what we guard, and the console
+    // does not have it.
+    Some(twin_module(&file, load).unwrap_or_else(|| refuse(&file)))
 }
 
-/// A console DLL that is PC DLLs under another name (`kernelx.dll`) is the
-/// first of them, always loaded; `GetProcAddress` finds our overrides
-/// behind it as for any host module.
-fn twin_module(file: &str) -> Option<*mut c_void> {
-    let twin: Vec<u16> = super::twins(file)
-        .first()?
-        .encode_utf16()
-        .chain([0])
-        .collect();
-    Some(host::get_module_handle_w(twin.as_ptr()))
+/// A console DLL under another name with no module of its own
+/// (`minuserx.dll`, `xgameplatform.dll`) is its first twin: our pseudo
+/// module of it, else the host's (where `GetProcAddress` finds our
+/// overrides as for any host module).
+fn twin_module(file: &str, load: bool) -> Option<*mut c_void> {
+    let twin = *super::twins(file).first()?;
+    if let Some(module) = find_module(twin, load) {
+        return Some(module);
+    }
+    let twin: Vec<u16> = twin.encode_utf16().chain([0]).collect();
+    Some(match load {
+        true => host::load_library_ex_w(twin.as_ptr(), std::ptr::null_mut(), 0),
+        false => host::get_module_handle_w(twin.as_ptr()),
+    })
 }
 
-/// Logs a DLL name the title is refused, once.
-fn refuse(file: &str) {
+/// Logs a DLL name the title is refused, once; the load fails.
+fn refuse(file: &str) -> *mut c_void {
     static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let file = file.to_ascii_lowercase();
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
@@ -368,6 +379,8 @@ fn refuse(file: &str) {
         tracing::warn!(dll = file, "a host DLL outside the host policy: refused");
         refused.push(file);
     }
+    host::set_last_error(ERROR_MOD_NOT_FOUND);
+    std::ptr::null_mut()
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
@@ -596,8 +609,27 @@ mod tests {
             ERROR_MOD_NOT_FOUND
         );
         assert!(!LoadLibraryW(w("kernel32").as_ptr()).is_null());
-        // The console's kernelx is the PC's kernel32.
-        assert_eq!(LoadLibraryA(c"kernelx.dll".as_ptr().cast()), kernel32);
+        // The console's kernelx: its own exports, xmem's, our kernel32
+        // overrides and the host's kernel32.
+        let kernelx = LoadLibraryA(c"kernelx.dll".as_ptr().cast());
+        let proc = |name: &CStr| GetProcAddress(kernelx, name.as_ptr().cast()) as usize;
+        let ours = |dll, name| crate::registry::lookup(dll, name).unwrap();
+        assert_eq!(
+            proc(c"GetConsoleType"),
+            ours("kernelx.dll", "GetConsoleType")
+        );
+        assert_eq!(proc(c"XMemAlloc"), ours("xmem.dll", "XMemAlloc"));
+        assert_eq!(proc(c"CreateFileW"), ours("kernel32.dll", "CreateFileW"));
+        assert_eq!(proc(c"GetTickCount"), host as usize);
+        // Other names of PC DLLs and of the runtime.
+        assert_eq!(
+            LoadLibraryA(c"minuserx.dll".as_ptr().cast()),
+            LoadLibraryW(w("user32.dll").as_ptr())
+        );
+        assert_eq!(
+            LoadLibraryA(c"xgameplatform.dll".as_ptr().cast()),
+            LoadLibraryW(w("xgameruntime.dll").as_ptr())
+        );
         // By ordinal too (ws2_32 #4 is `connect`).
         let ws2 = LoadLibraryW(w("ws2_32.dll").as_ptr());
         assert_eq!(
