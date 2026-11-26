@@ -413,6 +413,13 @@ struct Maintenance8 {
 
 const MAINTENANCE8: &CStr = c"VK_KHR_maintenance8";
 
+impl Maintenance8 {
+    /// Whether the feature is on (`listed`: the device has the extension).
+    fn on(&self, listed: bool) -> bool {
+        listed && self.maintenance8 == vk::TRUE
+    }
+}
+
 impl Default for Maintenance8 {
     fn default() -> Self {
         Self { s_type: vk::StructureType::from_raw(1_000_574_000), p_next: std::ptr::null_mut(), maintenance8: vk::FALSE }
@@ -807,7 +814,7 @@ impl Host {
             timestamp_period: props.limits.timestamp_period,
             null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
             image_int64_atomics: int64_image.shader_image_int64_atomics == vk::TRUE,
-            maintenance8: has(MAINTENANCE8) && m8.maintenance8 == vk::TRUE,
+            maintenance8: m8.on(has(MAINTENANCE8)),
             extensions,
             features,
             core,
