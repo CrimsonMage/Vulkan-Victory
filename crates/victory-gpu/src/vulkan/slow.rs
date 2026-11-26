@@ -27,7 +27,7 @@ use super::{Backend, stage_cache};
 /// A compile running this long is slow (the bake's p99 is far below).
 pub(super) const SLOW_AFTER: Duration = Duration::from_secs(60);
 /// Slow compiles alive at a time (in the game).
-const LANE: usize = 2;
+const LANE: usize = 1;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

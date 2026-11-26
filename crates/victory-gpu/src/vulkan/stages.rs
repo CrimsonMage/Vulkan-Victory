@@ -39,10 +39,12 @@ fn workers() -> usize {
 /// 2 GiB a module of that size).
 const WORDS_IN_FLIGHT: u64 = 300_000;
 
-/// Stages bigger than this go to the slow lane (the CS_RaytracingResolve
-/// variants, 1.2-1.5 M words, ran over 25 minutes each in NVIDIA's
-/// compiler; the next biggest stages are well under).
-pub(super) const SLOW_WORDS: usize = 600_000;
+/// Stages bigger than this go to the slow lane: the words that compile at
+/// once, so a module that would take the whole budget never holds every
+/// other compile up (vk48: the ~200 CS_RaytracingResolve variants of
+/// 330,000-350,000 words each took the budget for 8 s in turn and world
+/// draws were skipped behind them).
+pub(super) const SLOW_WORDS: usize = WORDS_IN_FLIGHT as usize;
 
 thread_local! {
     /// This stage worker handed its place to a new one: it ends after its
