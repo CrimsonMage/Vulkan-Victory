@@ -142,6 +142,27 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: loops that give up, traced offline with real data
+  (`vk::interp`, a CPU interpreter of the thread IR: one console wave over
+  a memory image, missing memory listed; `examples/tir_run.rs`). Found:
+  the skip removal (`ir::without_skips`) let a wave with no lane left
+  walk a region holding a loop; the console never runs it, and a loop
+  whose way out needs a lane never ends there. PS_Textured_Eight's light
+  loop (`s59 += 1` until an active lane has `v56 == s59`,
+  `s_cbranch_vccz`) ran to the guard in every wave whose pixels had no
+  light (`v55 == 0` for all: EXEC empty at its `s_cbranch_execz`); a
+  region holding a loop (and no `s_barrier`) now keeps its skip (692 of
+  the 1,527 used programs change, 480 of them compute programs whose
+  early `if (id >= count) return` skip covers a loop; all translate and
+  validate). The batch-culling programs'
+  loops (plane, sphere, LOD, meshlet counts) are counted loops over
+  scalar counts read from memory; with sane counts the IR and the SPIR-V
+  (a Python SPIR-V interpreter in scratch) run them exactly, also with
+  EXEC empty. CS_DistanceWindowEmissivesCulling has only the plane and
+  sphere loops (counts at view record +0x004 and +0x374), so when it gives
+  up the card reads a count that is not small there: the view records
+  were never probed (0x400 bytes at V#(ud4+0x500).base + ud7 there; at
+  V#(ud4+0xac0).base + batch[0] in the batch programs, 0xbd8fc00 in vk44).
 - 2026-11-26: the zeros in streamed resources (vk17, vk35: `m_PageMap`
   0, a vtable 0) traced to xmem's filler pages. Every run made ~1,348
   fresh pages "fillers" at startup (zeros, shown at 8+ places counting
