@@ -1003,12 +1003,22 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        let at = request.destination as usize;
+        // The physical pages shown there now, if xmem shows any: none is
+        // taken for a filler page of zeros while the bytes come, and one
+        // that was stops being one first (its stand-ins elsewhere would
+        // never show them).
+        let _target = super::xmem::target_memory(at, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
         // The bytes are there: the GPU side's copies of them follow.
-        victory_gpu::title_memory_written(request.destination as usize, len);
+        victory_gpu::title_memory_written(at, len);
+        // Every other place that shows those pages reads the same bytes
+        // (said once per place where not).
+        #[cfg(feature = "diagnostics")]
+        super::xmem::check_aliases(at, len);
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
@@ -1020,6 +1030,8 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    // As for an address: no page under the request is a filler page.
+    let _target = super::xmem::target_pages(pages, offset, len);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {

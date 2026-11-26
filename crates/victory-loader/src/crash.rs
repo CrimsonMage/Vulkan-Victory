@@ -79,6 +79,83 @@ fn append_to_log(text: &str) {
     }
 }
 
+/// Says what the runtime maps at an address of title memory (xmem: a view
+/// or a stand-in, its section and page, the other places that show it),
+/// for access-violation reports; `None` where it maps nothing. Must not
+/// wait for a lock the faulting thread may hold.
+static DESCRIBE: std::sync::OnceLock<fn(usize) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Sets [`DESCRIBE`] (once; later calls change nothing).
+pub fn describe_title_memory_with(describe: fn(usize) -> Option<String>) {
+    let _ = DESCRIBE.set(describe);
+}
+
+/// Addresses below this are title memory (the console keeps it under
+/// 2^40; the host's own heaps lie above), from the first 64 KiB on.
+const TITLE_MEMORY: std::ops::Range<u64> = 0x1_0000..1 << 40;
+
+/// For an access violation: the faulting address as the runtime maps it,
+/// then, for each register that points into title memory, the 64 bytes
+/// there (as quadwords, to the end of the host page at most) and the same.
+fn title_memory_lines(fault: usize, context: &CONTEXT, line: &mut impl FnMut(String)) {
+    let describe = |at: usize| DESCRIBE.get().and_then(|d| d(at));
+    if let Some(d) = describe(fault) {
+        line(format!("  at the fault address {fault:#x}: {d}"));
+    }
+    let registers = [
+        ("rax", context.Rax),
+        ("rbx", context.Rbx),
+        ("rcx", context.Rcx),
+        ("rdx", context.Rdx),
+        ("rsi", context.Rsi),
+        ("rdi", context.Rdi),
+        ("rbp", context.Rbp),
+        ("r8", context.R8),
+        ("r9", context.R9),
+        ("r10", context.R10),
+        ("r11", context.R11),
+        ("r12", context.R12),
+        ("r13", context.R13),
+        ("r14", context.R14),
+        ("r15", context.R15),
+    ];
+    for (name, value) in registers {
+        if !TITLE_MEMORY.contains(&value) {
+            continue;
+        }
+        let at = value as usize;
+        let n = 64.min(0x1000 - (at & 0xfff));
+        if !readable(at, n) {
+            continue;
+        }
+        // SAFETY: `n` bytes inside one host page, found committed and
+        // readable just now.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
+        let words: Vec<String> = bytes
+            .chunks(8)
+            .map(|c| c.iter().rev().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        let d = describe(at).map_or(String::new(), |d| format!("\n      {d}"));
+        line(format!("  [{name} {at:#x}] {}{d}", words.join(" ")));
+    }
+}
+
+/// Whether `n` bytes from `at` are committed and readable, inside one
+/// region.
+fn readable(at: usize, n: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `at` itself.
+    let ok = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0;
+    ok && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && info.Protect & 0xff != PAGE_NOACCESS
+        && at + n <= info.BaseAddress as usize + info.RegionSize
+}
+
 /// The title's last lines of debug output, kept for crash reports.
 static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -290,6 +367,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    if code == EXCEPTION_ACCESS_VIOLATION {
+        title_memory_lines(p[1], context, &mut line);
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }

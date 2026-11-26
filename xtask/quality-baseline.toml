@@ -6,7 +6,7 @@
 [files]
 "crates/victory-formats/src/bcpack.rs" = 1581
 "crates/victory-hle/src/modules/gameinput.rs" = 1612
-"crates/victory-hle/src/modules/xmem.rs" = 1669
+"crates/victory-hle/src/modules/xmem.rs" = 1557
 "crates/victory-shader/src/ir.rs" = 1721
 
 [functions."apps/victory/src/census.rs"]
