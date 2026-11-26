@@ -252,6 +252,25 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: KISS audit of the kept "console side" (partly true):
+  KISS as is: gfx10 decoder (sp3.rs aside), native.rs, io.rs, spill.rs,
+  wave SSA + lift, frame.rs, fence.rs (once its Signal pumps Vulkan),
+  xmem's console API, dstorage.rs, d3d12x.rs. Not KISS: the vk/emit.rs
+  placement (Ramsey one-iteration loops at every merge -> 220 nested
+  constructs, 156 s compiles; replace with post-dominator selection
+  merges, ~300-400 lines), the per-loop iteration cap and seven VK_*
+  switches; host plumbing still carrying D3D12 machinery (list.rs ~1,600
+  D3D12 lines, memory.rs/unified/views/shadow/gather/descriptor-host/
+  memory-cache -> ~0 under Vulkan, indirect.rs windows), duplicated
+  mechanisms (held line in queue.rs and vulkan.rs; two card-page caches;
+  dominators thrice), serial timeline (all queues one after another),
+  leaks (descriptor mirror pending, Vulkan images never freed, map not
+  pruned on unmap). Vulkan plane 0 black: one VkImage per address+shape
+  means views of the same memory get separate images; fix: one image per
+  memory, mutable formats. After parity: delete ~37k translator lines
+  (emit/, hlsl/, resource.rs, structure.rs, bvh.rs) and ~15k host lines.
+  Code-shape limits (user): files 1,000 plan / 1,500 mandatory; cognitive
+  15/25, cyclomatic 10/20 per function; `cargo xtask quality` + baseline.
 - 2026-11-26: real NVIDIA compile times (native Vulkan, cache off, 68
   compute modules by size): new SPIR-V path (pre-OpPhi) p50 25 ms, p90
   538, max 1,043; old path (dxil-spirv) p50 84, p90 414, max 2,447. The
