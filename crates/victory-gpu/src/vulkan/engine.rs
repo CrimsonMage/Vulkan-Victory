@@ -92,7 +92,13 @@ pub(super) struct Engine {
     flights: VecDeque<Flight>,
     /// What each title list recorded since its reset.
     lists: HashMap<usize, Vec<Part>>,
+    /// Diagnostics: each line's last [`RECENT`] compute notes (dispatches,
+    /// indirect executions, bounding passes), for a device loss.
+    recent: HashMap<Line, VecDeque<String>>,
 }
+
+/// Compute notes kept per line.
+const RECENT: usize = 8;
 
 /// Waits passed at a present without being met.
 pub(super) static FORCED: AtomicU64 = AtomicU64::new(0);
@@ -272,7 +278,9 @@ impl Engine {
         let cpu = super::writes::record(b, &mut cmds, &part.writes);
         let trail = take_trails(&mut cmds);
         match b.timeline.submit_on(&b.host, line, cmds, &waits) {
-            Ok(value) => self.flights.push_back(Flight {
+            Ok(value) => {
+                self.remember(line, value, &trail);
+                self.flights.push_back(Flight {
                 line,
                 value,
                 writes: part.writes,
@@ -280,9 +288,11 @@ impl Engine {
                 signals: Vec::new(),
                 given: Instant::now(),
                 trail,
-            }),
+                });
+            }
             Err(e) => {
                 if b.timeline.lost() {
+                    self.report_lost(b);
                     lost_once();
                 } else {
                     tracing::error!(error = %format!("{e:#}"), "Vulkan: a submission failed; its writes are done now");
@@ -292,6 +302,54 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Diagnostics: keeps the compute notes of `line`'s submission `value`.
+    fn remember(&mut self, line: Line, value: u64, trail: &[String]) {
+        let compute = trail
+            .iter()
+            .filter(|n| n.starts_with("dispatch") || n.starts_with("indirect") || n.starts_with("bounding"));
+        let recent = self.recent.entry(line).or_default();
+        for n in compute {
+            if recent.len() == RECENT {
+                recent.pop_front();
+            }
+            recent.push_back(format!("v{value}: {n}"));
+        }
+    }
+
+    /// Diagnostics, once, when the device is found lost: every submission
+    /// still in the air (the faulting one is among them) with the last 16
+    /// notes of its trail, and each line's last compute notes.
+    pub(super) fn report_lost(&self, b: &Backend) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        ONCE.call_once(|| {
+            for f in &self.flights {
+                let (given, label) = b.timeline.line_given(f.line);
+                let tail = &f.trail[f.trail.len().saturating_sub(16)..];
+                tracing::error!(
+                    line = %label,
+                    value = f.value,
+                    given_last = given,
+                    age_ms = f.given.elapsed().as_millis() as u64,
+                    notes = f.trail.len(),
+                    trail = %tail.join(" | "),
+                    "Vulkan: device lost: a submission in the air"
+                );
+            }
+            for (&line, notes) in &self.recent {
+                let (given, label) = b.timeline.line_given(line);
+                tracing::error!(
+                    line = %label,
+                    given_last = given,
+                    dispatches = %notes.iter().cloned().collect::<Vec<_>>().join(" | "),
+                    "Vulkan: device lost: the line's last compute work"
+                );
+            }
+        });
     }
 
     /// The first submission in the air of each line (line, value).
@@ -600,6 +658,7 @@ fn landing() {
         // the CPU, as without a card).
         let lost = b.timeline.lost();
         if lost {
+            engine(b).report_lost(b);
             lost_once();
         } else if !b.timeline.wait_any(&b.host, &fronts, 100_000_000) {
             continue;

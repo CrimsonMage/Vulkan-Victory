@@ -55,6 +55,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::S
     }
     if let Some(s) = sc.as_mut() {
         if b.timeline.lost() {
+            engine(b).report_lost(b);
             lost_once();
         } else {
             show(b, s, frame, planes);

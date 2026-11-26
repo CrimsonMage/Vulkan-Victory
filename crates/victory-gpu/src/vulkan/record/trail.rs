@@ -8,6 +8,12 @@ impl Rec {
     /// Notes `what` in the command buffer's trail, with the pipeline's
     /// shader names when they change.
     pub(super) fn note(&mut self, what: impl FnOnce() -> String) {
+        self.note_as(what, false);
+    }
+
+    /// [`Rec::note`], with the shader names always (`named`): a dispatch,
+    /// so that each line's last dispatches name their programs.
+    pub(super) fn note_as(&mut self, what: impl FnOnce() -> String, named: bool) {
         if !cfg!(feature = "diagnostics") {
             return;
         }
@@ -15,7 +21,7 @@ impl Rec {
         let Some(r) = self.cmd.as_mut() else { return };
         let first = r.trail.notes.is_empty() && r.trail.earlier == 0;
         let same = std::mem::replace(&mut self.noted, pipeline) == pipeline;
-        let note = if same && !first {
+        let note = if same && !first && !named {
             what()
         } else {
             let names = crate::pipeline::parts(pipeline)

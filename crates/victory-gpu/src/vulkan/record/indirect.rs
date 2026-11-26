@@ -269,12 +269,15 @@ impl Rec {
             skipped(false);
             return;
         };
-        self.note(|| {
-            format!(
-                "indirect kind={} max={} count_at={:?} src={:#x}",
-                spec.kind, spec.max, spec.count, spec.src
-            )
-        });
+        self.note_as(
+            || {
+                format!(
+                    "indirect kind={} max={} count_at={:?} src={:#x}",
+                    spec.kind, spec.max, spec.count, spec.src
+                )
+            },
+            true,
+        );
         let size = 4 * spec.words;
         match spec.kind {
             DISPATCH => self.dispatch_indirect(b, buffer, at, spec.max),

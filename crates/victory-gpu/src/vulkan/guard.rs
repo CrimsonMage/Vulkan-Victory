@@ -26,6 +26,11 @@ fn buffer(b: &Backend) -> Option<&'static Buffer> {
                 Ok(buf) => {
                     // SAFETY: a mapped buffer of 8 bytes, ours.
                     unsafe { buf.mapped.cast::<[u32; 2]>().write([0; 2]) };
+                    tracing::info!(
+                        address = format_args!("{:#x}", buf.address),
+                        mapped = format_args!("{:p}", buf.mapped),
+                        "Vulkan: the loop guard buffer (host-visible, coherent, device address; pushed in dwords 2-3)"
+                    );
                     Some(buf)
                 }
                 Err(e) => {

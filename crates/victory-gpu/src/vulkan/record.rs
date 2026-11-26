@@ -551,6 +551,10 @@ impl Rec {
         let guard = super::guard::address(b);
         words[2] = guard as u32;
         words[3] = (guard >> 32) as u32;
+        if cfg!(feature = "diagnostics") && compute && guard == 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::error!("Vulkan: a compute dispatch is pushed no loop guard address"));
+        }
         let root = if compute { &self.compute } else { &self.graphics };
         for st in stages {
             for ud in &st.user_data {
@@ -797,7 +801,7 @@ impl Rec {
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
             STATS[1].fetch_add(1, Ordering::Relaxed);
-            self.note(|| format!("dispatch {x}x{y}x{z}"));
+            self.note_as(|| format!("dispatch {x}x{y}x{z}"), true);
         }
     }
 
