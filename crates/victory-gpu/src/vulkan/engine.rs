@@ -318,6 +318,30 @@ impl Engine {
         }
     }
 
+    /// Diagnostics: a loop gave up in a submission that just landed on one
+    /// of `lines`: each such line's last 4 compute notes (at most 16
+    /// reports in a run).
+    fn report_guard_hit(&self, b: &Backend, lines: &[Line]) {
+        static REPORTS: AtomicU64 = AtomicU64::new(0);
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        let mut seen: Vec<Line> = Vec::new();
+        for &line in lines {
+            if seen.contains(&line) || REPORTS.fetch_add(1, Ordering::Relaxed) >= 16 {
+                continue;
+            }
+            seen.push(line);
+            let Some(notes) = self.recent.get(&line) else { continue };
+            let last: Vec<&str> = notes.iter().rev().take(4).rev().map(String::as_str).collect();
+            tracing::warn!(
+                line = %b.timeline.line_given(line).1,
+                dispatches = %last.join(" | "),
+                "Vulkan: a loop gave up in a submission of this line: its last compute work"
+            );
+        }
+    }
+
     /// Diagnostics, once, when the device is found lost: every submission
     /// still in the air (the faulting one is among them) with the last 16
     /// notes of its trail, and each line's last compute notes.
@@ -384,6 +408,7 @@ impl Engine {
         let (done, left): (VecDeque<Flight>, VecDeque<Flight>) =
             std::mem::take(&mut self.flights).into_iter().partition(ran);
         self.flights = left;
+        let lines: Vec<Line> = done.iter().map(|f| f.line).collect();
         for f in done {
             for (at, what, bytes) in f.cpu {
                 write_now(b, at, what, bytes);
@@ -392,7 +417,9 @@ impl Engine {
                 crate::fence::set(fence as This, v);
             }
         }
-        super::guard::check(b);
+        if super::guard::check(b) {
+            self.report_guard_hit(b, &lines);
+        }
     }
 }
 

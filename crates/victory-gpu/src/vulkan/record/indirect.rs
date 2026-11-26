@@ -280,7 +280,10 @@ impl Rec {
         );
         let size = 4 * spec.words;
         match spec.kind {
-            DISPATCH => self.dispatch_indirect(b, buffer, at, spec.max),
+            DISPATCH => {
+                self.dispatch_indirect(b, buffer, at, spec.max);
+                self.watch_cull(b, None, Some((spec.src, spec.count)));
+            }
             MESH => self.mesh_indirect(b, buffer, at, counted, spec.max),
             _ => self.draw_indirect(
                 b,

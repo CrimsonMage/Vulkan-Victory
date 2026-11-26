@@ -239,6 +239,8 @@ pub(crate) struct Stage {
     rect: std::sync::OnceLock<Option<vk::Pipeline>>,
     #[allow(dead_code)]
     words: usize,
+    /// The program's loop-guard id (ABI v3), for diagnostics.
+    pub(crate) guard_id: u32,
 }
 
 impl Stage {
@@ -704,6 +706,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         samplers: vs.samplers.clone(),
         rect: std::sync::OnceLock::new(),
         words: vs.spirv.len(),
+        guard_id: vs.guard_id,
     }))
 }
 

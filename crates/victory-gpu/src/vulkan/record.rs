@@ -161,8 +161,10 @@ pub(crate) struct Rec {
     last_layout: String,
     /// What the console's own methods keep (`console.rs`, `query.rs`).
     console: console::State,
-    /// Diagnostics: the pipeline the trail last named (`trail.rs`).
+    /// Diagnostics: the pipeline the trail last named (`trail.rs`), and
+    /// the guard id of the compute stage last bound for a dispatch.
     noted: This,
+    guard_id: u32,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -206,6 +208,7 @@ impl Default for Rec {
             last_user: String::new(),
             last_layout: String::new(),
             noted: std::ptr::null(),
+            guard_id: 0,
             console: console::State::default(),
         }
     }
@@ -801,7 +804,9 @@ impl Rec {
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
             STATS[1].fetch_add(1, Ordering::Relaxed);
-            self.note_as(|| format!("dispatch {x}x{y}x{z}"), true);
+            let ud = [self.last_push[9], self.last_push[10], self.last_push[11], self.last_push[12]];
+            self.note_as(|| format!("dispatch {x}x{y}x{z} ud5-8={:08x} {:08x} {:08x} {:08x}", ud[0], ud[1], ud[2], ud[3]), true);
+            self.watch_cull(b, Some([x, y, z]), None);
         }
     }
 
@@ -827,6 +832,7 @@ impl Rec {
             skipped(false);
             return None;
         };
+        self.guard_id = stage.guard_id;
         self.end_pass(b);
         let cmd = self.cmd(b)?;
         self.indirect.clear();
