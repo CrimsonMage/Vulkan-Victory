@@ -217,6 +217,12 @@ pub(crate) fn created(p: &Arc<Pending>) {
     if p.shaders.is_empty() || !super::catalog::known(&p.key) {
         return;
     }
+    // `VICTORY_GPU=vulkan`: the stages go to the Vulkan backend's stage
+    // workers instead (no DXIL translation).
+    if crate::vulkan::on() {
+        crate::vulkan::pipeline_created(&p.shaders);
+        return;
+    }
     super::lock(&CREATED)
         .get_or_insert_with(HashMap::new)
         .insert(p.key.clone(), Arc::downgrade(p));

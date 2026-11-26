@@ -38,6 +38,8 @@ use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 use victory_vk::swapchain::Swapchain;
 use victory_vk::timeline::Timeline;
 
+mod stages;
+
 use crate::list::ValueWait;
 use crate::memory::GpuPage;
 use crate::object::This;
@@ -435,6 +437,15 @@ pub(crate) fn read(src: u64, dst: &mut [u8]) -> Option<bool> {
     // SAFETY: a page of a section's whole view, mapped while it lives.
     unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, dst.as_mut_ptr(), dst.len()) };
     Some(true)
+}
+
+/// The title created a pipeline an earlier run used: its stages are
+/// translated and compiled once (`stages`).
+pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader>]) {
+    if let Some(b) = backend() {
+        stages::layout(b);
+        stages::created(b, shaders);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -891,4 +902,5 @@ fn report(b: &Backend, frame: u64) {
         pool_binds = pool.binds,
         "Vulkan: queues, timeline and title memory"
     );
+    stages::report();
 }

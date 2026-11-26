@@ -239,6 +239,12 @@ impl Shader {
 
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
+    /// The container's bytes, as the title passed them.
+    #[cfg(windows)]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
