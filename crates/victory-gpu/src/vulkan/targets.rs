@@ -106,7 +106,52 @@ pub(super) fn save(frame: u64, p: &Plan) {
         );
         crate::capture::save_named(&name, w as u32, h as u32, w * 4, false, &rgba);
     }
+    for (img, at) in p.items.iter().filter(|(i, _)| i.depth() && texel(i) == 4) {
+        let n = img.extent.width as usize * img.extent.height as usize;
+        // SAFETY: as above.
+        let src = unsafe { std::slice::from_raw_parts((p.mapped as *const u8).add(*at as usize), n * 4) };
+        let (mut lo, mut hi, mut some) = (f32::MAX, f32::MIN, 0u64);
+        for c in src.chunks_exact(4) {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            (lo, hi) = (lo.min(v), hi.max(v));
+            some += u64::from(v != 0.0);
+        }
+        tracing::info!(frame, at = format_args!("{:#x}", img.key.address), width = img.extent.width, height = img.extent.height, min = lo, max = hi, not_zero = some, "Vulkan: a depth image's values at the dump");
+    }
+    tell_depth_uses();
     tracing::info!(frame, images = p.items.len(), "Vulkan: the card-written images dumped beside the frame");
+}
+
+/// Draws by depth target and depth state (the dump tells the commonest):
+/// (the depth image's address, test, write, compare, viewport min and max
+/// depth bits) -> draws.
+type DepthUse = (u64, bool, bool, i32, u32, u32);
+static DEPTH_USES: Mutex<Option<std::collections::HashMap<DepthUse, u64>>> = Mutex::new(None);
+
+/// A draw into depth image `at` with this depth state (counted while
+/// dumps are asked for).
+pub(super) fn depth_use(at: u64, test: bool, write: bool, compare: i32, viewport: Option<&vk::Viewport>) {
+    if from().is_none() {
+        return;
+    }
+    let (lo, hi) = viewport.map_or((0, 0), |v| (v.min_depth.to_bits(), v.max_depth.to_bits()));
+    *lock(&DEPTH_USES).get_or_insert_with(Default::default).entry((at, test, write, compare, lo, hi)).or_insert(0) += 1;
+}
+
+fn tell_depth_uses() {
+    let mut uses: Vec<(DepthUse, u64)> = lock(&DEPTH_USES).as_ref().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default();
+    uses.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    for ((at, test, write, compare, lo, hi), draws) in uses.into_iter().take(24) {
+        tracing::info!(
+            depth_image = format_args!("{at:#x}"),
+            test,
+            write,
+            compare_d3d = compare,
+            viewport_depth = format_args!("{}..{}", f32::from_bits(lo), f32::from_bits(hi)),
+            draws,
+            "Vulkan: draws by depth target and depth state"
+        );
+    }
 }
 
 fn half(x: u16) -> f32 {

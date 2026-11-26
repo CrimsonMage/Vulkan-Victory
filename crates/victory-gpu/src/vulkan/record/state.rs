@@ -145,6 +145,12 @@ impl Rec {
                 d.cmd_set_depth_bias(cmd, bias, clamp, slope);
             }
             self.depth_stencil_state(d, cmd, gs);
+            if cfg!(feature = "diagnostics")
+                && let Some(depth) = self.attached.iter().find(|i| i.depth())
+            {
+                let z = &gs.depth;
+                super::super::targets::depth_use(depth.key.address, z.DepthEnable.as_bool(), z.DepthEnable.as_bool() && z.DepthWriteMask.0 == 1, z.DepthFunc.0, self.viewports.first());
+            }
             d.cmd_set_primitive_topology(cmd, topology);
             let strip = matches!(topology, vk::PrimitiveTopology::LINE_STRIP | vk::PrimitiveTopology::TRIANGLE_STRIP);
             d.cmd_set_primitive_restart_enable(cmd, strip && gs.strip_cut.0 != 0);
