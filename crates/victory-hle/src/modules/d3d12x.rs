@@ -36,29 +36,11 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
-    victory_gpu::shader_cache::warm(container)
-}
-
-/// The standalone pipeline bake (`victory bake`): see
-/// `victory_gpu::pipeline::bake`.
-pub fn bake(jobs: Option<usize>) -> Result<victory_gpu::pipeline::Baked, String> {
-    victory_gpu::pipeline::bake(jobs)
-}
-
-/// The catalog's shaders without a translation in the cache: see
-/// `victory_gpu::pipeline::bake_missing_shaders`.
-pub fn bake_missing_shaders() -> Vec<[u8; 32]> {
-    victory_gpu::pipeline::bake_missing_shaders()
-}
-
-/// Keeps the host's translations of the title's shaders in `dir` (a
-/// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`).
+/// Keeps the Vulkan backend's translations of the title's shaders and its
+/// pipeline caches beside `dir` (a folder of the cache) across runs
+/// (`vulkan-stages`, `pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
-    victory_gpu::shader_cache::use_shader_cache(dir);
 }
 
 pub(crate) fn module() -> HleModule {

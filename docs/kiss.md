@@ -17,11 +17,11 @@ the twin; it implements only what is truly console-only.
 
 | Xbox side (what the title uses) | PC side (what victory turns it into) | Module | Status |
 |---|---|---|---|
-| Unified memory: the CPU writes, the GPU reads the same pages | One CPU-visible D3D12 heap (ReBAR video memory, spilling to system memory); resources placed in it at the title's offsets; sync at fences, submits and DirectStorage completion | `victory-gpu` (new `unified.rs`), `victory-hle/xmem.rs` | **probe built**: title memory stays in system RAM and is *opened* as D3D12 heaps (`OpenExistingHeapFromAddress1`/`FromFileMapping`); a ReBAR GPU-upload heap can't hold textures or sit at title addresses on this stack. Replaces write-watch, guards, snapshots and copies (~17k lines) |
-| D3D12.X device and command lists (`d3d12_xs`) | D3D12, call for call where a PC call exists | `victory-gpu` (`device`, `list`, `draw`) | works; pruning experiments |
-| Console GPU code (RDNA2 machine code, no HLSL or DXIL shipped) | Decoder → IR → **HLSL text → DXC** (`dxcompiler.dll` beside the exe) | `victory-shader` (new `hlsl/`) | **prototyping**; today a hand-written DXIL encoder |
-| Console tiled texture layouts | Detile once when the data arrives (resource creation, DirectStorage completion, title copies) | `victory-gpu/texture.rs` | works; to move to explicit points |
-| Ray tracing (console BVH format, title's own builder DLL) | Victory's builder in DXIL (`VICTORY_BVH_BUILDER`); until then rays miss (`VICTORY_BVH_MISS`) | `victory-shader/bvh.rs`, `intersect.rs` | partial |
+| Unified memory: the CPU writes, the GPU reads the same pages | Title memory imported by host pointer into Vulkan (buffer device addresses = title addresses, through the memory map); the pool's GPU view a sparse buffer of card pages bound at each page-mapping call, filled at announced writes | `victory-gpu/vulkan*`, `victory-vk`, `victory-hle/xmem.rs` | works (`docs/vulkan-host.md`) |
+| D3D12.X device and command lists (`d3d12_xs`) | Vulkan, recorded from the calls the title's threads write down | `victory-gpu` (`device`, `list`, `vulkan/`) | works; the only GPU back end since 2026-11-26 |
+| Console GPU code (RDNA2 machine code, no HLSL or DXIL shipped) | Decoder → IR → **SPIR-V** (`docs/vulkan-abi.md`), translated once per stage and kept on disk | `victory-shader` (`vk/`) | works |
+| Console tiled texture layouts | Detiled into card images when the data arrives | `victory-gpu/vulkan/images*` | works |
+| Ray tracing (console BVH format, title's own builder DLL) | Not yet on the SPIR-V path (the DXIL builder went with the D3D12 back end) | `victory-shader/vk/` | open |
 | 64-lane waves | 32-lane PC waves with emulation in the translator | `victory-shader` | works; keep |
 | Console DirectStorage (`XCRDAPI`) | One shared handle per file; each request does one positioned read of exactly its source range when it runs (uncompressed straight into title memory, compressed into a reused worker buffer, then inflate/unpack on the CPU); one FIFO worker pool, no lock per request (`dstorage streaming` line every 10 s) | `victory-hle/dstorage.rs` | built, not yet run |
 | XMA audio hardware (`AcpHal`), Opus (`xapu`) | Software decode → host audio (XAudio2 / WASAPI) | `victory-hle/audio*`, `apu.rs` | works; reverb (`chad` XDsp) silent |
@@ -40,7 +40,7 @@ the twin; it implements only what is truly console-only.
 - **Process memory (the PC's RAM)**: the baseline is a Series S, where the
   title has about 8 GB for everything, CPU and GPU. The title's own memory
   (~7.2 GB, all opened as heaps and so resident) is its budget; what is
-  ours (victory, Wine, vkd3d-proton, the driver) comes on top. Target:
+  ours (victory, Wine, the driver) comes on top. Target:
   the whole process at **≤ ~12 GB first, then toward ~10 GB**, read as the
   `unique` figure of the `process memory:` line (each page once; Linux's
   resident count, which `top` shows, counts a section page at each view
@@ -78,8 +78,9 @@ comparing. If something seems to need that, it is in the wrong class.
 - One behaviour, one code path. No `VICTORY_*` switch for experiments; a
   switch exists only for a user-facing choice (paths, logging, console
   profile, capture for testing, the few listed in the inventories).
-- Linux runs exactly the Windows build under stock Proton, with app-local
-  DLLs only: a current vkd3d-proton, `d3dcompiler_47`, DXC.
+- Linux runs exactly the Windows build under stock Proton (its
+  winevulkan); no app-local DLLs (no vkd3d-proton, `d3dcompiler_47` or
+  DXC since the D3D12 back end went).
 - Every change passes the gate before it lands.
 - Code shape (`cargo xtask quality`, run by the pre-commit hook): a file
   over 1,000 lines plans a split, over 1,500 must split; per function,
@@ -101,7 +102,7 @@ driver errors and no new crash, and the captures look no worse.
 
 | | Start (2026-11-25) | Now |
 |---|---|---|
-| Rust lines | 128,292 | 106,472 |
+| Rust lines | 128,292 | 78,027 (154,557 before the D3D12 back end went) |
 | `VICTORY_*` switches | 224 | 43 |
 | `diagnostics`-only blocks | 283 | 71 |
 | World frame time (Proton, 8 GB card) | 0.5–5 s | ~295 ms (~3.3 fps), Series S (run p20) |
@@ -159,6 +160,24 @@ driver errors and no new crash, and the captures look no worse.
   no cross-lane code, only scalar loops over ranges read from memory: if
   they still give up, their input (constants, indirect group counts) is
   wrong, not the waves.
+- 2026-11-26: DECISION (user): **D3D12 removed; victory is Vulkan only.**
+  `VICTORY_GPU` and every D3D12 branch are gone; device, queues, lists,
+  fences, present, resources, descriptors, views and title memory go
+  straight to the Vulkan backend. Deleted: the D3D12 device and host,
+  draw binding, descriptor host heaps, the 64 KiB directory and card page
+  cache, unified/views/shadow/gather/indirect windows, write watch,
+  guards and canary pages (xmem), the DXIL pipeline catalog, bake,
+  library and translated-shader cache (`victory bake` with them), D3D12
+  FSR, compose and capture paths, the frame-time and process-memory lines,
+  and the old translator (emit/ with the DXIL encoder, hlsl/, resource.rs,
+  structure.rs, bvh.rs). `emit/wave.rs` moved to `victory-shader/src/wave.rs`
+  for its port into `vk/`. A title pipeline's stages are now made at its
+  creation when the stage cache on disk holds one of them (was: the
+  D3D12 catalog). Rust lines 154,557 → 78,027 (victory-gpu 56,679 →
+  19,065; victory-shader 58,151 → 20,038; victory-hle 19,395 → 19,295;
+  apps/victory 1,837 → 1,146). The host's `d3d12.dll` is still loaded
+  for one thing: the title's `D3D12SerializeRootSignature` calls
+  (`root.rs`).
 
 - 2026-11-26: vk28 hung the card (Xid 109) at the first world frame
   (`docs/vulkan-host.md`, "vk28"). The pool view's error path had left its

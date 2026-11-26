@@ -70,8 +70,6 @@ const HOST_PROTECTION: u32 = 0x1ff;
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
 const ADDRESS_32BIT: u64 = 4;
-/// The host's write watching (not in windows-sys' memory module).
-const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -125,7 +123,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // choice; those not of placeholders are regions the GPU side reaches.
     let constrained = base.is_null();
     let region = constrained && kind & MEM_RESERVE_PLACEHOLDER == 0;
-    let (kind, bytes, canary) = reservation(kind, size, constrained, region);
+    let (kind, bytes) = reservation(kind, size, constrained, region);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -148,64 +146,35 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
         if !at.is_null() {
-            reserved(at as usize, size, placeholder, region, canary);
+            reserved(at as usize, size, placeholder, region);
         }
     }
     at
 }
 
-/// The D3D12 path (not `VICTORY_GPU=vulkan`), the only one with write
-/// watching, canary pages and guards; Vulkan needs announced writes alone.
-pub(crate) fn d3d12() -> bool {
-    !victory_gpu::vulkan_on()
-}
-
-/// Before the kernel writes `[at, at + len)`: the D3D12 path opens its
-/// guards there (a kernel write into one fails rather than faults).
-pub(crate) fn kernel_will_write(at: usize, len: usize) {
-    if d3d12() {
-        victory_gpu::kernel_will_write(at, len);
-    }
-}
-
-/// How memory is reserved, as (kind, bytes, canary); always at an address
-/// of our choice. A region of ours on the D3D12 path is write-watched (decision 0007) and under Proton has a canary page after
-/// the title's (unified memory: a host heap the GPU reads in place,
-/// checked through it); for Vulkan it is the title's 64 KiB pages.
-fn reservation(kind: u32, size: usize, constrained: bool, region: bool) -> (u32, usize, bool) {
+/// How memory is reserved, as (kind, bytes); always at an address of our
+/// choice. A region of ours is the title's 64 KiB pages.
+fn reservation(kind: u32, size: usize, constrained: bool, region: bool) -> (u32, usize) {
     let kind = if constrained { kind | MEM_RESERVE } else { kind };
     if !region {
-        return (kind, size, false);
+        return (kind, size);
     }
-    let title_bytes = size.next_multiple_of(PAGE);
-    if !d3d12() {
-        return (kind, title_bytes, false);
-    }
-    let canary = on_wine();
-    (kind | MEM_WRITE_WATCH, if canary { title_bytes + PAGE } else { size }, canary)
+    (kind, size.next_multiple_of(PAGE))
 }
 
 /// A reservation made at an address of our choice: noted for the fault
 /// handler, and for the GPU side a reservation physical pages are mapped
-/// into page by page (reached by directory, `victory_gpu::memory`) or a
-/// region (Vulkan: every one; D3D12: those whose canary page is there).
-fn reserved(at: usize, size: usize, placeholder: bool, region: bool, canary: bool) {
+/// into page by page (the pool's GPU view), or a region.
+fn reserved(at: usize, size: usize, placeholder: bool, region: bool) {
     RESERVED.write().unwrap_or_else(|e| e.into_inner()).insert(at, size);
     install_fault_handler();
     let title_bytes = size.next_multiple_of(PAGE);
     if placeholder {
         victory_gpu::title_page_reservation(at, title_bytes);
     }
-    let noted = if canary { commit_canary(at + title_bytes) } else { !d3d12() };
-    if region && noted {
+    if region {
         victory_gpu::title_region(at, title_bytes);
     }
-}
-
-/// Commits the canary page at `at`, the region's last; false if refused.
-fn commit_canary(at: usize) -> bool {
-    // SAFETY: the last page of the reservation just made, ours.
-    !unsafe { VirtualAlloc(at as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null()
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -529,20 +498,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 
 /// Sections for `n` pages, with how many pages each holds; none if the
 /// host refuses one. The GPU side reads sections in place: the Vulkan
-/// backend imports them by host pointer, the D3D12 path under Proton makes
-/// each a host heap (unified memory, `victory_gpu::unified`) checked by a
-/// canary page of ours after the title's. Sections of at most
-/// `UNIFIED_SECTION` pages, so that opening one pins only that much of the
-/// PC's memory.
+/// backend imports them by host pointer. Sections of at most
+/// `UNIFIED_SECTION` pages, so that importing one pins only that much of
+/// the PC's memory.
 fn new_sections(n: usize) -> Option<Vec<(Arc<Section>, usize)>> {
-    let unified = !d3d12() || on_wine();
-    let canary = if unified && d3d12() { PAGE } else { 0 };
-    let chunk = if unified { UNIFIED_SECTION } else { n };
     let mut sections = Vec::new();
     let mut done = 0;
     while done < n {
-        let pages_here = chunk.min(n - done);
-        let bytes = pages_here * PAGE + canary;
+        let pages_here = UNIFIED_SECTION.min(n - done);
+        let bytes = pages_here * PAGE;
         // A pagefile-backed section, its pages committed when first mapped
         // or written (`commit`): the title asks for 6.1 GiB at once, which
         // a busy host often cannot commit (error 1450).
@@ -567,16 +531,14 @@ fn new_sections(n: usize) -> Option<Vec<(Arc<Section>, usize)>> {
             // The sections made so far close with `sections`.
             return None;
         }
-        if unified {
-            victory_gpu::title_section(handle as usize, (pages_here * PAGE) as u64);
-        }
+        victory_gpu::title_section(handle as usize, (pages_here * PAGE) as u64);
         sections.push((Arc::new(Section::new(handle, pages_here * PAGE)), pages_here));
         done += pages_here;
     }
     Some(sections)
 }
 
-/// Pages per section with unified memory: 512 MiB.
+/// Pages per section: 512 MiB.
 const UNIFIED_SECTION: usize = 8192;
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -760,7 +722,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// takes and leaves it).
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     for (at, bytes) in shown_at(pages, offset, len) {
-        victory_gpu::title_memory_written(at, bytes, true);
+        victory_gpu::title_memory_written(at, bytes);
     }
 }
 
@@ -1080,21 +1042,10 @@ fn show(physical: &mut Physical, base: usize, len: usize, runs: &[Run], site: Si
             changed = true;
         }
     }
-    kept_as_written(&kept);
     if !changed {
         victory_gpu::mapstat::kept(site);
     }
     true
-}
-
-/// The D3D12 path takes a mapping of what was there already as a write
-/// (textures over it detile again); for Vulkan only data changes are.
-fn kept_as_written(kept: &[(usize, usize)]) {
-    if d3d12() {
-        for &(lo, hi) in kept {
-            victory_gpu::title_memory_written(lo, hi - lo, true);
-        }
-    }
 }
 
 /// Takes away what is mapped at `at` (a view, back to a placeholder, or a
@@ -1107,7 +1058,6 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
     // Out of the GPU side's map; what stays is shown again below.
     victory_gpu::title_memory_unmapped(at, size);
     if m.fill {
-        victory_gpu::title_memory_remapped(at, size);
         fill_ranges().remove(&at);
         // SAFETY: a stand-in of ours; it becomes a placeholder again.
         unsafe { VirtualFree(at as *mut c_void, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
@@ -1122,7 +1072,6 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
@@ -1234,8 +1183,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Sit
         victory_gpu::mapstat::unmapped(site, len);
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     if (0..len.div_ceil(PAGE)).any(|k| physical.shown.contains_key(&slice.key(k))) {
@@ -1274,7 +1221,6 @@ fn fill(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Si
         return false;
     }
     victory_gpu::mapstat::filled(site, len);
-    victory_gpu::title_memory_remapped(base, len);
     fill_ranges().insert(base, len);
     physical.views.insert(base, Mapped { len, slice, fill: true });
     true

@@ -137,10 +137,6 @@ pub extern "system" fn create(
     // SAFETY: checked non-null; the title passes its parameters and an id.
     let (version, iid) = unsafe { (parameters.read(), &*iid) };
     tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
-    // The title starts: the pipelines earlier runs used are made in the
-    // background from now on, ahead of the title's own asking.
-    #[cfg(windows)]
-    crate::pipeline::start_bake();
     if version != CHECKED_VERSION {
         tracing::warn!(
             version = format_args!("{version:#x}"),
@@ -527,25 +523,6 @@ mod tests {
         assert_eq!(get_device(fence, fence_iid, &mut found), E_NOINTERFACE);
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
-    }
-
-    /// The host's: a fence's `GetDevice` for `ID3D12Device5`.
-    #[cfg(windows)]
-    #[test]
-    fn the_hosts_children_hand_out_newer_device_levels() {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
-        };
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        // SAFETY: plain calls on the host device and its fence.
-        unsafe {
-            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            let mut device: Option<ID3D12Device5> = None;
-            assert!(fence.GetDevice(&mut device).is_ok());
-            assert!(device.is_some());
-        }
     }
 
     #[test]

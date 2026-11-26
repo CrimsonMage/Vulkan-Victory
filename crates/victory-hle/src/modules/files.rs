@@ -514,15 +514,12 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
     )
 }
 
-// Kernel reads into title memory. The GPU side leaves blocks of title GPU
-// buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; the title's
-// synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
-// destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first. A block guarded again before the kernel writes it (the
-// guard over all the views of a page protects other views from other
-// threads) fails that `ReadFile`, and the title's retry opens it again;
-// `fread` has no such retry and reads beside instead (see there).
+// Kernel reads into title memory. A page whose view `xmem` has taken away
+// for a moment (to map it again) fails the kernel's write instead of
+// faulting into its handler; the title's synchronous reads (title+0x313fc0)
+// read straight into 4 KiB-aligned destinations and retry a failed
+// `ReadFile` forever. `fread` has no such retry and reads beside instead
+// (see there). The bytes read are announced to the GPU side.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -531,7 +528,6 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    super::xmem::kernel_will_write(buffer as usize, len as usize);
     let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
@@ -540,17 +536,17 @@ pub extern "system" fn ReadFile(
     if ok != 0 && overlapped.is_null() && !read.is_null() {
         // SAFETY: the kernel wrote the count it read.
         let n = unsafe { *read } as usize;
-        victory_gpu::title_memory_written(buffer as usize, n, false);
+        victory_gpu::title_memory_written(buffer as usize, n);
     }
     ok
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
-/// through the kernel, whose write fails on a guarded block instead of
-/// faulting into the guard. So the bytes are read beside, a chunk at a time
-/// (a caller may ask for far more than the file holds), and copied in from
-/// user mode, where a guarded block faults into the guard like the title's
-/// own writes. Returns the items read, as the CRT does; the bytes of a
+/// through the kernel, whose write fails on a page that is away for a
+/// moment instead of faulting. So the bytes are read beside, a chunk at a
+/// time (a caller may ask for far more than the file holds), and copied in
+/// from user mode, where such a page faults like the title's own writes
+/// (`xmem::on_fault` waits). Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
@@ -566,11 +562,10 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
-            super::xmem::kernel_will_write(buffer as usize + done, n);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            victory_gpu::title_memory_written(buffer as usize + done, n, false);
+            victory_gpu::title_memory_written(buffer as usize + done, n);
             done += n;
         }
         if n < want {

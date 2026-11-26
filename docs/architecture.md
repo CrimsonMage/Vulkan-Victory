@@ -15,15 +15,15 @@
                                          victory-hle ── host Windows (shared APIs)
                                             │ D3D12.X
                                             ▼
-                                         victory-gpu ─► host D3D12
+                                         victory-gpu ─► victory-vk ─► host Vulkan
                                             │ shaders at pipeline creation
                                             ▼
                                          victory-shader ◄─► cache_dir
 ```
 
-Shaders are translated when the title creates a pipeline, from the bytes it
-passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files is only a warm-up.
+Shaders are translated to SPIR-V when the title creates a pipeline (or at its
+first draw), from the bytes it passes, wherever it loaded them from
+(executable, archive, memory), and kept on disk per stage.
 
 ## Crates
 
@@ -33,8 +33,9 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-pe` | read-only PE32+ and import-library analysis |
 | `victory-loader` | prepare, map, bind and start the title image |
 | `victory-hle` | console API implementations, host pass-through policy |
-| `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
-| `victory-shader` | Xbox shader containers → host shaders |
+| `victory-gpu` | D3D12.X objects, command lists and GPU memory → host Vulkan |
+| `victory-vk` | the Vulkan host: device, title memory imports, pool, swapchain, probe |
+| `victory-shader` | Xbox shader containers → SPIR-V |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | the title-specific formats, build identities, hooks |

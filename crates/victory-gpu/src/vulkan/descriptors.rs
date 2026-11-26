@@ -360,7 +360,7 @@ impl Heaps {
         let mut s = lock(&self.state);
         while s.immediate < list.len() {
             let n = s.immediate;
-            let desc = SamplerDesc::from_static(&victory_shader::emit::StaticSampler::from_words(list[n]));
+            let desc = SamplerDesc::from_static(&victory_shader::sampler::StaticSampler::from_words(list[n]));
             // SAFETY: valid create info; kept for the run.
             if let Ok(sampler) = unsafe { b.host.device.create_sampler(&desc.info(), None) } {
                 self.write_sampler(b, stages::IMMEDIATE_FIRST + n as u32, sampler);
@@ -488,7 +488,7 @@ impl SamplerDesc {
         }
     }
 
-    fn from_static(s: &victory_shader::emit::StaticSampler) -> SamplerDesc {
+    fn from_static(s: &victory_shader::sampler::StaticSampler) -> SamplerDesc {
         let border = match s.border {
             1 => [0.0, 0.0, 0.0, 1.0],
             2 => [1.0; 4],

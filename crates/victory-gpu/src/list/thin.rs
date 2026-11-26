@@ -1,5 +1,5 @@
 //! List calls that are only written down on the title's threads; workers of
-//! ours translate them into the host lists.
+//! ours record them into Vulkan command buffers ([`vulkan`]).
 //!
 //! Ported from VIctory-7900XTX (github.com/avatarmanz/VIctory-7900XTX,
 //! GPL-3.0-or-later, `crates/victory-gpu/src/list/thin.rs`, its
@@ -30,8 +30,7 @@
 //! has run, as on the console.
 //!
 //! Who touches what: the title's thread only [`Front`]; the worker that runs
-//! a stream everything else of the list (host list, draw state, parts,
-//! upload blocks), and nobody else until the stream is idle, which
+//! a stream everything else of the list (its recording, upload blocks), and nobody else until the stream is idle, which
 //! [`join`] and the list's release wait for. Workers translate different
 //! lists at once, as the title's threads did before; what lists share was
 //! made for that then.
@@ -84,15 +83,13 @@ impl Front {
 
     #[inline]
     fn put(&mut self, op: u64, args: &[u64]) {
-        let began = crate::fast::ticks();
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
-        self.after(began);
+        self.after();
     }
 
     /// [`Self::put`] of some words and then the bytes of some things.
     fn put_with(&mut self, op: u64, args: &[u64], blobs: &[&[u8]]) {
-        let began = crate::fast::ticks();
         let at = self.words.len();
         self.words.push(0);
         self.words.extend_from_slice(args);
@@ -106,15 +103,14 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
-        self.after(began);
+        self.after();
     }
 
     #[inline]
-    fn after(&mut self, began: u64) {
+    fn after(&mut self) {
         if self.words.len() >= CHUNK || workers() == 0 {
             self.hand_over();
         }
-        crate::frametime::written_down(crate::fast::ticks().wrapping_sub(began));
     }
 
     /// Hands the words written so far to the workers (with none, translates
@@ -204,9 +200,7 @@ impl Stream {
                 };
                 chunk
             };
-            let began = crate::fast::ticks();
-            let (calls, reset) = translate(list, &chunk);
-            crate::frametime::translated(crate::fast::ticks().wrapping_sub(began), calls);
+            let (_, reset) = vulkan::translate(list, &chunk);
             let mut inner = held(&self.inner);
             if reset {
                 give_back(std::mem::take(&mut inner.kept));
@@ -268,13 +262,11 @@ pub(super) fn is_thin(this: This) -> bool {
 /// Waits until the submitted `lists` are translated (each to its close).
 /// Before anything of a submission looks at its lists.
 pub(crate) fn join(lists: &[This]) {
-    let began = crate::fast::ticks();
     for &l in lists {
         if is_thin(l) {
             front(l).join();
         }
     }
-    crate::frametime::joined(crate::fast::ticks().wrapping_sub(began));
 }
 
 /// A list of ours goes: its stream is translated first (the workers hold
@@ -320,61 +312,60 @@ impl Word for f32 {
     }
 }
 
-/// The methods whose arguments are all plain values: the one the title calls,
-/// and the call made of it later.
+/// The methods whose arguments are all plain values: the one the title calls
+/// writes its op and arguments down.
 macro_rules! plain {
-    ($($op:ident $name:ident = $was:path, ($($a:ident: $t:ty),*);)*) => {
+    ($($op:ident $name:ident, ($($a:ident: $t:ty),*);)*) => {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
-        /// Whether `op` was one of them; done on `list`.
-        #[inline]
-        fn run_plain(op: u64, list: This, w: &[u64]) -> bool {
-            match op {
-                $(n if n == Plain::$op as u64 => {
-                    let mut words = w.iter();
-                    $(let $a: $t = Word::unword(words.next().copied().unwrap_or(0));)*
-                    let _ = words;
-                    $was(list $(, $a)*);
-                })*
-                _ => return false,
-            }
-            true
-        }
     };
 }
 
+/// The waits for memory values and the bottom-of-pipe writes written down,
+/// done on `list` through its methods (the Vulkan backend's queue lines).
+fn run_wait_or_write(op: u64, list: This, w: &[u64]) {
+    let u = |k: usize| w.get(k).copied().unwrap_or(0);
+    match op {
+        x if x == Plain::WRITE32 as u64 => super::write32(list, u(0), u(1) as u32, u(2) as u32, u(3) as u32),
+        x if x == Plain::WRITE64 as u64 => super::write64(list, u(0), u(1), u(2) as u32, u(3) as u32),
+        x if x == Plain::WAIT_VALUE as u64 => super::wait_value(list, u(0), u(1) as u32, u(2)),
+        x if x == Plain::WAIT_VALUE64 as u64 => super::wait_value64(list, u(0), u(1) as u32, u(2)),
+        _ => {}
+    }
+}
+
 plain! {
-    TOPOLOGY topology = state::topology, (v: u32);
-    STENCIL_REF stencil_ref = state::stencil_ref, (v: u32);
-    DEPTH_BOUNDS depth_bounds = state::depth_bounds, (min: f32, max: f32);
-    COMPUTE_TABLE compute_table = state::compute_table, (slot: u32, handle: u64);
-    GRAPHICS_TABLE graphics_table = state::graphics_table, (slot: u32, handle: u64);
-    COMPUTE_CONSTANT compute_constant = state::compute_constant, (slot: u32, value: u32, offset: u32);
-    GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
-    COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
-    GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
-    DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
-    DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
-    DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
-    DISPATCH_X dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
-    DISPATCH_MESH dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
-    DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
-    COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
-    COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
-    COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
-    COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
-    RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
-    RESOLVE_QUERIES resolve_queries = super::console::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
-    EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
-    WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
-    WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
-    WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
-    WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
+    TOPOLOGY topology, (v: u32);
+    STENCIL_REF stencil_ref, (v: u32);
+    DEPTH_BOUNDS depth_bounds, (min: f32, max: f32);
+    COMPUTE_TABLE compute_table, (slot: u32, handle: u64);
+    GRAPHICS_TABLE graphics_table, (slot: u32, handle: u64);
+    COMPUTE_CONSTANT compute_constant, (slot: u32, value: u32, offset: u32);
+    GRAPHICS_CONSTANT graphics_constant, (slot: u32, value: u32, offset: u32);
+    COMPUTE_VIEW compute_view, (slot: u32, address: u64);
+    GRAPHICS_VIEW graphics_view, (slot: u32, address: u64);
+    SET_PIPELINE set_pipeline, (pipeline: This);
+    DRAW draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
+    DRAW_INDEXED draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
+    DISPATCH dispatch, (x: u32, y: u32, z: u32);
+    DISPATCH_X dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
+    DISPATCH_MESH dispatch_mesh, (x: u32, y: u32, z: u32);
+    DISPATCH_MESH_X dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
+    COPY_BUFFER copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
+    COPY_RESOURCE copy_resource, (dst: This, src: This);
+    COPY_RESOURCE_X copy_resource_x, (dst: This, src: This, flags: u32);
+    COPY_MEMORY copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
+    RESOLVE resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
+    RESOLVE_QUERIES resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
+    EXECUTE_INDIRECT execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
+    WRITE32 write32, (address: u64, value: u32, flush: u32, flags: u32);
+    WRITE64 write64, (address: u64, value: u64, flush: u32, flags: u32);
+    WAIT_VALUE wait_value, (address: u64, comparison: u32, reference: u64);
+    WAIT_VALUE64 wait_value64, (address: u64, comparison: u32, reference: u64);
 }
 
 const fn after(n: u64) -> u64 {
@@ -397,8 +388,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
-const OWN: u64 = after(17);
-const OWN_VULKAN: u64 = after(18);
+const OWN_VULKAN: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -606,15 +596,6 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
-/// Work of ours recorded into a title list where its recording stands
-/// ([`super::record_own`]), run by the worker in its place in the stream.
-pub(super) type Own = Box<dyn FnOnce(&crate::host::HostList) -> bool>;
-
-/// [`super::record_own`] of a list whose calls are written down.
-pub(super) fn own(this: This, f: Own) {
-    front(this).put(OWN, &[Box::into_raw(Box::new(f)) as u64]);
-}
-
 /// Work of ours recorded into a title list's Vulkan command buffer where its
 /// recording stands, run by the worker in its place in the stream.
 pub(crate) type OwnVulkan = Box<dyn FnOnce(&mut crate::vulkan::record::Rec, &'static crate::vulkan::Backend)>;
@@ -626,107 +607,6 @@ pub(crate) fn record_vulkan(this: This, f: OwnVulkan) -> bool {
     }
     front(this).put(OWN_VULKAN, &[Box::into_raw(Box::new(f)) as u64]);
     true
-}
-
-/// Makes the calls of a stream on `list`: how many, and whether one of them
-/// was a reset (what the draw state kept of the stream before is let go).
-fn translate(list: This, stream: &[u64]) -> (u64, bool) {
-    if crate::vulkan::on() {
-        return vulkan::translate(list, stream);
-    }
-    let (mut i, mut calls, mut reset) = (0, 0, false);
-    while i < stream.len() {
-        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
-        let w = &stream[i + 1..i + 1 + len];
-        i += 1 + len;
-        calls += 1;
-        if run_plain(op, list, w) || console::run(op, list, w) {
-            continue;
-        }
-        let n = w.first().map_or(0, |&n| n as usize);
-        match op {
-            RESET => {
-                // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<Object>::dangling().as_ptr().cast_const();
-                let _ = super::reset(list, allocator, w[0] as This);
-                reset = true;
-            }
-            CLOSE => {
-                let _ = super::close(list);
-            }
-            UPLOAD => {
-                // SAFETY: made by `allocate_upload`, named once.
-                let block = *unsafe { Box::from_raw(w[0] as *mut Vec<u8>) };
-                // SAFETY: one of our lists.
-                let uploads = unsafe { &(*list.cast::<List>()).uploads };
-                uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
-            }
-            OWN => {
-                // SAFETY: made by `own`, named once.
-                let f = *unsafe { Box::from_raw(w[0] as *mut Own) };
-                super::record_own_here(list, f);
-            }
-            BARRIER => {
-                super::barrier(list, n as u32, at_or(w, 1));
-            }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
-            VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
-            SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
-            HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
-            COMPUTE_CONSTANTS => {
-                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            GRAPHICS_CONSTANTS => {
-                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
-            VERTEX_BUFFERS => {
-                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
-                state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
-            }
-            TARGETS => {
-                let mut handles = [0u64; 8];
-                let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
-                for (k, h) in handles.iter_mut().enumerate().take(n) {
-                    if w[1] >> k & 1 != 0 {
-                        *h = place(k);
-                    }
-                }
-                let depth = if w[2] != 0 { place(n) } else { 0 };
-                state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
-            }
-            CLEAR_RTV => {
-                super::clear_rtv(list, w[1..].as_ptr() as u64, at_or(w, 1 + RECORD), n as u32, at(w, 1 + RECORD + 2, n));
-            }
-            CLEAR_DSV => {
-                super::clear_dsv(
-                    list,
-                    w[3..].as_ptr() as u64,
-                    w[1] as u32,
-                    Word::unword(w[2]),
-                    (w[1] >> 32) as u8,
-                    n as u32,
-                    at(w, 3 + RECORD, n),
-                );
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
-            }
-            _ => {}
-        }
-    }
-    (calls, reset)
 }
 
 /// The table of a list whose calls are written down: that of the others with

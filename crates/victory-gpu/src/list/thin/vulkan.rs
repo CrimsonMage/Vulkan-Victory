@@ -1,5 +1,5 @@
-//! [`super::translate`] under `VICTORY_GPU=vulkan`: a stream's calls are
-//! recorded into Vulkan command buffers (`crate::vulkan::record`). Waits,
+//! A stream's calls are recorded into Vulkan command buffers
+//! (`crate::vulkan::record`). Waits,
 //! writes and resets still go through the list's methods, which hand them
 //! to the Vulkan backend's queue lines.
 
@@ -124,7 +124,7 @@ fn plain_work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool 
             rec.cut(list, b);
         }
         // Waits and bottom-of-pipe writes: the list's methods.
-        run_plain(op, list, c.w);
+        run_wait_or_write(op, list, c.w);
     }
     true
 }
@@ -181,9 +181,6 @@ fn work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool {
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
         }
-        // SAFETY: made by `own`, named once (nothing of ours records into
-        // Vulkan lists this way: `OWN_VULKAN` does).
-        OWN => drop(*unsafe { Box::from_raw(c.u(0) as *mut Own) }),
         OWN_VULKAN => {
             // SAFETY: made by `record_vulkan`, named once.
             let f = *unsafe { Box::from_raw(c.u(0) as *mut OwnVulkan) };

@@ -1,5 +1,8 @@
 # Shader translation pipeline (`crates/victory-shader`)
 
+> **Historical (2026-11-26).** This describes the D3D12 back end, which
+> is gone: victory is Vulkan only (`docs/vulkan-host.md`, `docs/kiss.md`).
+
 A console shader is a DXBC container whose `DXIL` part also carries the
 precompiled RDNA2 (GFX10) program. We translate the GFX10 code, not the
 bitcode (it uses console-only intrinsics). Entry point:

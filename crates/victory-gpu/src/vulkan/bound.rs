@@ -14,8 +14,8 @@
 //! dst[16 + 4 t] = (r < n && !bad) ? v : 0   // records packed, words * 4 apart
 //! ```
 //!
-//! The bounds are those of the D3D12 path (`crate::indirect`): records the
-//! title's own passes write are garbage when such a pass is dropped or
+//! The bounds are those the removed D3D12 path had: records the title's
+//! own passes write are garbage when such a pass is dropped or
 //! mistranslated, and a garbage draw hung the card (Xid 109).
 
 use victory_shader::vk::spirv::{Id, Module, en, glsl, op};

@@ -30,6 +30,11 @@ developer or publisher.
 
 ## Status of this fork (2026-11-25)
 
+> **2026-11-26: victory is Vulkan only.** The D3D12 back end (and with it
+> vkd3d-proton, DXC, the DXIL translator and `victory bake`) is gone; the
+> title's D3D12.X runs on Vulkan directly (`docs/vulkan-host.md`). The
+> tables below describe the D3D12 back end as it was.
+
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
@@ -324,8 +329,9 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
+Requirements: Windows 10/11 x64 (or Linux under stock Proton), a CPU with
+AVX2, a Vulkan 1.3 GPU with buffer device address and descriptor buffers
+(and mesh shaders for the world; `victory vkprobe` checks), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
@@ -370,10 +376,11 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--list] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory vkprobe
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
@@ -393,14 +400,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_VK_DUMP`, `VICTORY_VK_STAGES` and the other `VICTORY_VK_*` | Vulkan backend diagnostics (`docs/vulkan-host.md`) |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

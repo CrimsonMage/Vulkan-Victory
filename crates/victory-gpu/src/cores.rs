@@ -72,31 +72,3 @@ pub fn fast_cores() -> usize {
     cores.len()
 }
 
-/// Asks the system to run the calling thread on the slow cores only, where
-/// the processor has two kinds and at least eight slow logical processors
-/// (a helper that must not take a fast core from the title's threads).
-/// True if it was asked.
-///
-/// The title pins its threads as on the console, where disk decompression
-/// is the hardware's: measured on a 14700KF, 31 of its threads are tied to
-/// logical processors 0-13, the fast cores. The layer decompresses on as
-/// many worker threads as there are logical processors (28), free to run
-/// anywhere: in the opening cutscene's streaming stretch about ten of them
-/// were busy while the title's recording calls took three times as long.
-pub fn keep_on_slow_cores(what: &str) -> bool {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
-    let sets = cpu_sets();
-    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-    let slow: Vec<u32> = sets.iter().filter(|c| c.2 < best).map(|c| c.0).collect();
-    if slow.len() < 8 {
-        return false;
-    }
-    // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) } != 0;
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::info!(what, slow = slow.len(), of = sets.len(), ok, "helper threads are kept on the slow cores: the first one");
-    });
-    ok
-}
-

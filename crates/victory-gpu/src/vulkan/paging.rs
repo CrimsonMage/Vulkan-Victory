@@ -12,7 +12,15 @@ use std::collections::HashMap;
 use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 
 use super::{Memory, Section, backend, budget, images, memory};
-use crate::memory::GpuPage;
+
+/// A page of the GPU view of the pool: the section, the byte offset in it,
+/// and where the CPU sees it (the section's whole view, `xmem`).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuPage {
+    pub section: usize,
+    pub offset: u64,
+    pub cpu: usize,
+}
 
 /// Where a physical page's bytes are: its section's import.
 fn source_in(sections: &HashMap<usize, Section>, key: PageKey) -> Option<Source> {
@@ -23,7 +31,9 @@ fn source_in(sections: &HashMap<usize, Section>, key: PageKey) -> Option<Source>
     })
 }
 
-pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
+/// The title had its GPU map pool pages at `[to, to + 64 KiB * pages.len())`
+/// (`CopyPageMappingsBatchX`; `None`: unmapped there).
+pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
         return;
     };

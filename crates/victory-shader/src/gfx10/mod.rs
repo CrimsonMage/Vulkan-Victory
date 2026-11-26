@@ -330,6 +330,25 @@ fn isa(offset: usize, reason: &'static str) -> ShaderError {
     ShaderError::Isa { offset, reason }
 }
 
+/// The 32-bit value of an inline constant operand.
+pub(crate) fn inline(code: u8) -> Option<u32> {
+    let float = |f: f32| Some(f.to_bits());
+    match code {
+        128..=192 => Some(u32::from(code) - 128),
+        193..=208 => Some((192 - i32::from(code)) as u32),
+        240 => float(0.5),
+        241 => float(-0.5),
+        242 => float(1.0),
+        243 => float(-1.0),
+        244 => float(2.0),
+        245 => float(-2.0),
+        246 => float(4.0),
+        247 => float(-4.0),
+        248 => Some(0x3E22_F983),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

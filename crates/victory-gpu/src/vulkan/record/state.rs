@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::super::Backend;
 use super::{Rec, draw_test};
-use crate::pipeline::host::GraphicsState;
+use crate::pipeline::state::GraphicsState;
 
 /// # Safety
 /// Recording into `cmd`.

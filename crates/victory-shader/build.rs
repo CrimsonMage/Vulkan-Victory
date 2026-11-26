@@ -1,5 +1,5 @@
-//! Fingerprint of the translator's own source, for the shader cache key
-//! (`victory-gpu`'s `shader_cache`): a rebuilt executable whose translator did
+//! Fingerprint of the translator's own source, for the stage cache key
+//! (`victory-gpu`'s `vulkan/stage_cache.rs`): a rebuilt executable whose translator did
 //! not change keeps its cached translations. Also lists every `VICTORY_*`
 //! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.

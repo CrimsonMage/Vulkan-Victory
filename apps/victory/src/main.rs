@@ -3,7 +3,6 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
-mod bake;
 mod census;
 mod inspect;
 mod run;
@@ -74,36 +73,16 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
-    /// Run every shader found (containers, SGD5 files) through the
+    /// Run every shader found (containers, SGD5 files) through the SPIR-V
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
-        /// else the newest Windows SDK's).
-        #[arg(long)]
-        validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
-        #[arg(long)]
-        pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Warm the run's shader cache: a file of shader hashes (the 16
-        /// hex digits a run's log names a shader by, anywhere in a line);
-        /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `--host-wave` and
-        /// `--view-limit` to what the run's log says of the host.
-        #[arg(long)]
-        warm: Option<PathBuf>,
-        /// Translate as for a GPU whose waves are at most this many lanes.
-        #[arg(long)]
-        host_wave: Option<u32>,
-        /// Translate as on a host whose view heap is capped (its null slot).
-        #[arg(long)]
-        view_limit: Option<u32>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -124,21 +103,6 @@ enum Command {
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
         title_args: Vec<String>,
-    },
-    /// Compile the title's shaders before it runs ("compiling shaders"):
-    /// every pipeline earlier runs used, from the pipeline catalog, into
-    /// the caches the game reads (translated shaders, the host's pipeline
-    /// library, the driver's disk cache). Needs no running title; a
-    /// repeat takes seconds.
-    Bake {
-        /// The title's executable or folder, to translate shaders the
-        /// cache lacks from its files (default: the configured game
-        /// folder).
-        #[arg(long)]
-        title: Option<PathBuf>,
-        /// Compiler threads (default: half the logical processors).
-        #[arg(long)]
-        jobs: Option<usize>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -180,27 +144,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
-        Command::Translate {
-            paths,
-            validate,
-            pipelines,
-            list,
-            jobs,
-            warm,
-            host_wave,
-            view_limit,
-        } => {
-            if let Some(n) = view_limit {
-                victory_shader::emit::set_view_heap_limit(n);
-            }
-            if let Some(n) = host_wave {
-                victory_shader::emit::set_host_max_wave(n);
-            }
-            if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
-            }
-            translate::run(paths, validate, pipelines, list, jobs)
-        }
+        Command::Translate { paths, list, jobs } => translate::run(paths, list, jobs),
         Command::Run {
             exe,
             unimplemented,
@@ -209,7 +153,6 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
-        Command::Bake { title, jobs } => bake::run(title, jobs),
         Command::Config => show_config(),
         Command::Vkprobe => {
             if !victory_vk::vkprobe()? {

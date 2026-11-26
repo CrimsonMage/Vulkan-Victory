@@ -47,7 +47,7 @@ pub(in crate::vulkan) struct Linked {
 
 /// The pipeline of a draw with the stages `pre` and `pixel` (made: the
 /// parts and the link, each cached), `None` if a part is missing.
-pub(super) fn linked(b: &'static Backend, pre: &Stage, pixel: Option<&Stage>, gs: &crate::pipeline::host::GraphicsState, k: DrawKey) -> Option<Linked> {
+pub(super) fn linked(b: &'static Backend, pre: &Stage, pixel: Option<&Stage>, gs: &crate::pipeline::state::GraphicsState, k: DrawKey) -> Option<Linked> {
     let inputs = attributes(pre, gs);
     let fragment = match pixel {
         _ if draw_test() >= 2 => solid_fragment(b)?,
@@ -272,7 +272,7 @@ pub(super) fn stage_of(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shad
 /// the title's input layout: (location, binding | 0x100 per instance,
 /// format, offset). D3D12's "append aligned" offsets follow the elements
 /// before them in the same slot.
-pub(super) fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState) -> Vec<(u32, u32, vk::Format, u32)> {
+pub(super) fn attributes(pre: &Stage, gs: &crate::pipeline::state::GraphicsState) -> Vec<(u32, u32, vk::Format, u32)> {
     if pre.inputs.is_empty() {
         return Vec::new();
     }
@@ -308,7 +308,7 @@ pub(super) fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState)
 
 /// Diagnostics: the program's attribute inputs, the title's input layout
 /// and the attributes made of them.
-pub(super) fn layout_text(pre: &Stage, gs: &crate::pipeline::host::GraphicsState, made: &[(u32, u32, vk::Format, u32)]) -> String {
+pub(super) fn layout_text(pre: &Stage, gs: &crate::pipeline::state::GraphicsState, made: &[(u32, u32, vk::Format, u32)]) -> String {
     let wants: Vec<String> = pre.inputs.iter().map(|(s, i, l)| format!("{s}{i}@{l}")).collect();
     let elements: Vec<String> = gs
         .inputs

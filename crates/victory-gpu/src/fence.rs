@@ -1,5 +1,5 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. The title's
+//! signals and the Vulkan backend's landing thread move one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -33,9 +33,8 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers),
-    /// and when they were asked for (`now_us`, for the frame-time line).
-    waiters: Mutex<Vec<(u64, usize, u64)>>,
+    /// Events to set once the value reaches theirs (handles as integers).
+    waiters: Mutex<Vec<(u64, usize)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -94,39 +93,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // With submissions sent to the card and not waited for the signal
-        // may be behind them: the flights ahead of it land, which sets it
-        // (all of them if no signal of it is in the line).
+        // Blocks until the Vulkan backend's lines get the fence there.
+        drop(waiters);
         #[cfg(windows)]
-        if crate::vulkan::on() {
-            drop(waiters);
-            return if crate::vulkan::wait_for_fence(this, value) { S_OK } else { E_NOTIMPL };
-        }
-        #[cfg(windows)]
+        return if crate::vulkan::wait_for_fence(this, value) { S_OK } else { E_NOTIMPL };
+        #[cfg(not(windows))]
         {
-            drop(waiters);
-            let t = std::time::Instant::now();
-            if !crate::host::wait_for_signal(this as usize, value) {
-                crate::host::settle_now();
-            }
-            crate::frametime::waited(crate::frametime::Wait::Fence, t);
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
-            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
         }
-        // shortcut: a null event means "block until reached"; nothing else
-        // can reach it now, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
     }
-    waiters.push((value, event as usize, now_us()));
+    waiters.push((value, event as usize));
     S_OK
-}
-fn now_us() -> u64 {
-    #[cfg(windows)]
-    return crate::host::now_us();
-    #[cfg(not(windows))]
-    0
 }
 
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -134,15 +112,10 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event, asked)| {
+    waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
-            #[cfg(windows)]
-            {
-                crate::frametime::add(crate::frametime::Sum::FenceSet, 1);
-                crate::frametime::add(crate::frametime::Sum::FenceUs, now_us().saturating_sub(asked));
-            }
         }
         !reached
     });
@@ -151,11 +124,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]
-    if crate::vulkan::on() {
-        crate::vulkan::fence_signalled();
-    } else {
-        crate::queue::release_held(false);
-    }
+    crate::vulkan::fence_signalled();
     S_OK
 }
 

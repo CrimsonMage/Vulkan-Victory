@@ -4,19 +4,16 @@ Every `VICTORY_*` environment variable `crates/victory-shader` read before
 the simplification of 2026-11-25, its default, and what became of it. The
 rule: the default behaviour is kept, the switch and its other paths go.
 
-The shader cache key (`victory-gpu`'s `shader_cache`) is
-`emit::translation_fingerprint()`: the hash of this crate's `src` (made by
-`build.rs`), the value of every `VICTORY_*` name quoted in `src` (also
-found by `build.rs`), the host's widest wave and the view heap limit. That
-mechanism is unchanged; with the switches gone the list holds
-`VICTORY_BVH_MISS` only (plus the two build-time names `build.rs` itself
-defines, which are never set at run time).
+The stage cache key (`victory-gpu`'s `vulkan/stage_cache.rs`) is
+`victory_shader::translation_fingerprint()`: the hash of this crate's `src`
+(made by `build.rs`) and the value of every `VICTORY_*` name quoted in
+`src` (also found by `build.rs`).
 
 ## Kept
 
-| Switch | Default | What it does |
-|---|---|---|
-| `VICTORY_BVH_MISS` | off | `=1`: the ray-tracing node test (`image_bvh*_intersect_ray`) misses every node and reads no node memory (`emit::bvh_miss`, `emit/intersect.rs`). `victory-gpu`'s ambient path reads it too. |
+None. Since the DXIL translator went (2026-11-26, `docs/kiss.md`) this
+crate reads no switch (`VICTORY_BVH_MISS` went with `emit/`); the tables
+below are the history of the removed translator.
 
 ## Removed (default kept)
 

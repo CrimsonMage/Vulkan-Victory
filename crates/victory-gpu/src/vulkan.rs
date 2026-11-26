@@ -1,6 +1,4 @@
-//! The Vulkan backend behind `VICTORY_GPU=vulkan` (`docs/vulkan-host.md`,
-//! milestone M2a). The D3D12 host is not made at all ([`crate::host::host`]
-//! answers `None`); in its place:
+//! The Vulkan backend (`docs/vulkan-host.md`), the one GPU back end:
 //!
 //! - **Queues and fences** (`engine.rs`). Each title queue keeps a line
 //!   of items (fence waits, parts of submitted lists, signals) and has a
@@ -51,21 +49,8 @@ mod stage_cache;
 mod stages;
 mod writes;
 
-pub(crate) use paging::{title_memory_written, title_pages_aliased};
-
-/// Whether the Vulkan backend runs (`VICTORY_GPU=vulkan`; `d3d12` or unset:
-/// the D3D12 path).
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let asked = std::env::var("VICTORY_GPU").unwrap_or_default();
-        let on = asked.trim().eq_ignore_ascii_case("vulkan");
-        if on {
-            tracing::info!("VICTORY_GPU=vulkan: the Vulkan backend runs (milestone M2b: draws, dispatches, card images, descriptors, planes)");
-        }
-        on
-    })
-}
+pub use paging::{GpuPage, title_pages_aliased};
+pub(crate) use paging::title_memory_written;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -226,7 +211,7 @@ impl Memory {
                 continue;
             }
             // SAFETY: the region as `xmem` reserved it; committed whole here.
-            let ready = unsafe { crate::unified::ready_region(at, r.len) };
+            let ready = unsafe { ready_region(at, r.len) };
             let made = ready.map_err(|e| anyhow::anyhow!(e)).and_then(|()| {
                 // SAFETY: committed read-write pages that stay mapped until
                 // the region is released (`title_memory_released`).
@@ -331,11 +316,45 @@ impl Memory {
     }
 }
 
+/// Makes every page of a region committed and writable for the import:
+/// reserved pages are committed, and every page is written once in place
+/// (an atomic add of 0, which changes no byte whatever another thread
+/// does) so that it can be pinned. Refuses pages the title protected
+/// otherwise.
+unsafe fn ready_region(base: usize, total: usize) -> Result<(), String> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualQuery};
+    let end = base + total;
+    let mut at = base;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our structure.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return Err(format!("no answer for {at:#x}"));
+        }
+        let stop = (info.BaseAddress as usize + info.RegionSize).min(end);
+        match info.State {
+            // Read-write, whatever the caching modifiers.
+            MEM_COMMIT if matches!(info.Protect & 0x1ff, 0x04 | 0x40) => {}
+            // SAFETY: reserved pages of the region.
+            MEM_RESERVE if !unsafe { VirtualAlloc(at as *const _, stop - at, MEM_COMMIT, PAGE_READWRITE) }.is_null() => {}
+            state => return Err(format!("pages at {at:#x} are state {state:#x}, protection {:#x}", info.Protect)),
+        }
+        for page in (at..stop).step_by(4096) {
+            // SAFETY: committed read-write memory of the title's.
+            unsafe { (*(page as *const std::sync::atomic::AtomicU8)).fetch_add(0, Ordering::Relaxed) };
+        }
+        at = stop;
+    }
+    Ok(())
+}
+
 fn memory(b: &Backend) -> MutexGuard<'_, Memory> {
     lock(&b.memory)
 }
 
-pub(crate) fn title_region(at: usize, len: usize) {
+/// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
+/// of 64 KiB): imported when the card first needs it.
+pub fn title_region(at: usize, len: usize) {
     if let Some(b) = backend() {
         memory(b).regions.insert(
             at,
@@ -350,7 +369,8 @@ pub(crate) fn title_region(at: usize, len: usize) {
     }
 }
 
-pub(crate) fn title_section(handle: usize, len: u64) {
+/// `xmem` made a section for physical pages, `len` bytes of the title's.
+pub fn title_section(handle: usize, len: u64) {
     if let Some(b) = backend() {
         memory(b).sections.insert(
             handle,
@@ -364,7 +384,9 @@ pub(crate) fn title_section(handle: usize, len: u64) {
     }
 }
 
-pub(crate) fn title_section_gone(handle: usize) {
+/// The section's handle is closed (its pages are all freed): its import
+/// goes once the card has finished with it.
+pub fn title_section_gone(handle: usize) {
     let Some(b) = backend() else { return };
     let gone = memory(b).sections.remove(&handle);
     if let Some(Section {
@@ -378,7 +400,9 @@ pub(crate) fn title_section_gone(handle: usize) {
     }
 }
 
-pub(crate) fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+/// The runtime mapped `[at, at + len)` as a view of `section` from
+/// `offset` on.
+pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     if len < BIG_VIEW {
         return;
     }
@@ -394,7 +418,7 @@ pub(crate) fn title_memory_view(at: usize, len: usize, section: usize, offset: u
 /// stand-in): the views and imports there leave the map, card images over it
 /// go. An import is dropped only after the card has finished everything
 /// given so far (its pages are gone from the process).
-pub(crate) fn title_memory_unmapped(at: usize, len: usize) {
+pub fn title_memory_unmapped(at: usize, len: usize) {
     let Some(b) = backend() else { return };
     images::released(b, at as u64, len as u64, images::Dropped::Unmapped);
     let mut m = memory(b);
@@ -426,7 +450,8 @@ pub(crate) fn title_memory_unmapped(at: usize, len: usize) {
     }
 }
 
-pub(crate) fn title_page_reservation(at: usize, len: usize) {
+/// `xmem` reserved `[at, at + len)` for physical pages (a placeholder).
+pub fn title_page_reservation(at: usize, len: usize) {
     if let Some(b) = backend() {
         memory(b).reservations.insert(at, len);
     }
@@ -434,14 +459,17 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
 
 /// The title released a texture resource (its last reference).
 pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDesc) {
-    if on()
-        && let Some(b) = backend()
-    {
+    if let Some(b) = backend() {
         images::resource_gone(b, address, desc);
     }
 }
 
-pub(crate) fn title_memory_released(at: usize, len: usize) {
+/// The title freed, decommitted or unmapped `[at, at + len)`: card images
+/// and imports over it go, and pool pages there are unmapped.
+pub fn title_memory_released(at: usize, len: usize) {
+    if len == 0 || (at as u64) >= 1 << 40 {
+        return;
+    }
     let Some(b) = backend() else { return };
     images::released(b, at as u64, len as u64, images::Dropped::Freed);
     let mut m = memory(b);
@@ -494,8 +522,14 @@ pub(crate) fn read(src: u64, dst: &mut [u8]) -> Option<bool> {
     Some(true)
 }
 
-/// The title created a pipeline an earlier run used: its stages are
-/// translated and compiled once (`stages`).
+/// Whether an earlier run kept a translation of the container `full`
+/// (`stage_cache.rs`).
+pub(crate) fn stage_known(full: &[u8; 32]) -> bool {
+    stage_cache::known(full)
+}
+
+/// The title created a pipeline: its stages are translated and compiled
+/// once (`stages`).
 pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader>]) {
     if let Some(b) = backend() {
         stages::layout(b);

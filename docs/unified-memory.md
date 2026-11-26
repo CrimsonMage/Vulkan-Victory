@@ -1,5 +1,8 @@
 # Unified memory
 
+> **Historical (2026-11-26).** This describes the D3D12 back end, which
+> is gone: victory is Vulkan only (`docs/vulkan-host.md`, `docs/kiss.md`).
+
 The console has one memory. The title writes buffers and textures with the
 CPU and the GPU reads the same bytes; the GPU writes and the CPU reads them
 after a fence. VIctory today keeps title memory apart from host GPU memory
