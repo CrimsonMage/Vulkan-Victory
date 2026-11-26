@@ -208,6 +208,9 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     lift.mesh_stride = mesh_stride;
     lift.halves = pack16::halves(&native.io, &iface_elems);
     lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
+    if native.stage == HwStage::Vs {
+        lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
+    }
     let (mut f, iface) = lift.run()?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {
         tir::dump(&f);
@@ -255,6 +258,21 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
     }
     // interface (information only: locations are fixed per semantic)
     let mut interface = Vec::new();
+    // vertex attributes (a vertex program with a fetch shader): Location =
+    // the input-signature row; the host matches its input layout by semantic
+    if native.stage == HwStage::Vs {
+        for r in isg.iter().filter(|r| r.sv == 0 && r.reg < 32) {
+            if e.vertex_inputs.contains(&(r.reg as u8)) {
+                interface.push(Interface {
+                    semantic: r.name.clone(),
+                    index: r.index,
+                    location: r.reg as u8,
+                    input: true,
+                    word: None,
+                });
+            }
+        }
+    }
     let rows = if native.stage == HwStage::Ps { &isg } else { &osg };
     for r in rows.iter().filter(|r| r.sv == 0) {
         interface.push(Interface {

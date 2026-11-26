@@ -194,6 +194,8 @@ pub struct Lift<'a> {
     pub halves: HashMap<(u8, u8), (u8, u8)>,
     /// Mesh: the row of the parameter entry the compiler left unnamed.
     pub unnamed_row: Option<u8>,
+    /// Vertex inputs: whether each input-signature row is a float.
+    pub vs_float: HashMap<u8, bool>,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -263,6 +265,7 @@ impl<'a> Lift<'a> {
             a16_vals: Vec::new(),
             halves: HashMap::new(),
             unnamed_row: None,
+            vs_float: HashMap::new(),
         };
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
@@ -652,6 +655,12 @@ impl<'a> Lift<'a> {
             let u = |l: &mut Self, b| l.f.global(Op::Builtin(b), Ty::U32);
             let x = match input {
                 Input::VertexId => u(self, Builtin::VertexIndex),
+                // A vertex attribute the console's fetch shader loads: a
+                // vertex input at the location of its signature row.
+                Input::Attribute { row, channel } => {
+                    let ty = if self.vs_float.get(&row).copied().unwrap_or(true) { Ty::F32 } else { Ty::U32 };
+                    self.f.global(Op::Input { loc: row, comp: channel, interp: Interp::Flat }, ty)
+                }
                 Input::InstanceId => {
                     let i = u(self, Builtin::InstanceIndex);
                     let b = u(self, Builtin::BaseInstance);
@@ -1650,6 +1659,8 @@ impl<'a> Lift<'a> {
                 self.sdst(inst, dst, 1, R::D(z));
                 Ok(())
             }
+            // the call of the vertex fetch shader: its results are inputs
+            "swappc" => Ok(()),
             "setreg" | "setreg_imm32" | "setprio" | "version" | "waitcnt_vscnt" | "waitcnt_vmcnt" | "waitcnt_expcnt"
             | "waitcnt_lgkmcnt" => Ok(()),
             "getreg" => {

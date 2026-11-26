@@ -33,6 +33,8 @@ pub struct Stage {
 
 pub struct Emitted {
     pub words: Vec<u32>,
+    /// Vertex programs: the input rows read as vertex attributes.
+    pub vertex_inputs: Vec<u8>,
     /// (location, word index of the Location literal) of pixel inputs.
     pub input_locations: Vec<(u8, usize)>,
 }
@@ -476,7 +478,10 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn input(&mut self, row: u8, chan: u8, interp: Interp) -> Id {
+    fn input(&mut self, row: u8, chan: u8, interp: Interp, ty: Ty) -> Id {
+        if self.st.stage == HwStage::Vs {
+            return self.vertex_input(row, chan, ty);
+        }
         let (loc, comp) = self.st.locs.get(&(row, chan)).copied().unwrap_or((31, chan));
         let f = self.t.f32_;
         let var = if let Some(&v) = self.inputs.get(&loc) {
@@ -581,6 +586,27 @@ impl<'a> Emit<'a> {
             self.block = lm;
             k += threads;
         }
+    }
+
+    /// A vertex attribute: Location = its input-signature row, a vec4 of
+    /// floats or unsigned integers.
+    fn vertex_input(&mut self, row: u8, chan: u8, ty: Ty) -> Id {
+        let e = if ty == Ty::F32 { self.t.f32_ } else { self.t.u32_ };
+        let var = if let Some(&v) = self.inputs.get(&row) {
+            v
+        } else {
+            let v4 = self.m.t_vec(e, 4);
+            let p = self.m.t_ptr(en::SC_INPUT, v4);
+            let v = self.m.variable(p, en::SC_INPUT);
+            self.m.decorate(v, en::DEC_LOCATION, &[u32::from(row)]);
+            self.interface.push(v);
+            self.inputs.insert(row, v);
+            v
+        };
+        let p = self.m.t_ptr(en::SC_INPUT, e);
+        let k = self.c32(u32::from(chan));
+        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, k]);
+        self.m.op(op::LOAD, e, &[ptr])
     }
 
     fn output(&mut self, slot: u16) -> (Id, Id) {
@@ -1024,7 +1050,7 @@ impl<'a> Emit<'a> {
                 self.map_load(q, &[k])
             }
             Op::Builtin(b) => self.builtin(b),
-            Op::Input { loc, comp, interp } => self.input(loc, comp, interp),
+            Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
             Op::Spv(o) => {
                 let mut ops = args.clone();
                 ops.extend_from_slice(&n.imm);
@@ -1406,7 +1432,9 @@ impl<'a> Emit<'a> {
                 let mut incoming = Vec::new();
                 // a chain of selections: if (storage) { if (int) A else B } else { ... }
                 let emit_variant = |e: &mut Self, storage: bool, int: bool| -> Id {
-                    let (im, _) = e.load_image(class, int, storage, false, tw);
+                    // a size query keeps a cube a cube (loads read it as an array)
+                    let c = if size && !storage { ImageClass { dynamic: false, ..class } } else { class };
+                    let (im, _) = e.load_image(c, int, storage, false, tw);
                     if size {
                         e.m.capability(en::CAP_IMAGE_QUERY);
                         if storage || class.ms {
@@ -1494,7 +1522,8 @@ impl<'a> Emit<'a> {
                 if class.ms {
                     return self.c32(1);
                 }
-                let (im, _) = self.load_image(class, false, false, false, tw);
+                let c = ImageClass { dynamic: false, ..class };
+                let (im, _) = self.load_image(c, false, false, false, tw);
                 self.m.op(op::IMAGE_QUERY_LEVELS, u, &[im])
             }
             ImageKind::Atomic(o) => {
@@ -2038,7 +2067,8 @@ impl<'a> Emit<'a> {
         }
         let (words, at) = self.m.finish();
         let input_locations = self.input_locations.iter().map(|&(l, w)| (l, at + w)).collect();
-        Ok(Emitted { words, input_locations })
+        let vertex_inputs = if self.st.stage == HwStage::Vs { self.inputs.keys().copied().collect() } else { Vec::new() };
+        Ok(Emitted { words, input_locations, vertex_inputs })
     }
 
     fn tree_root(&mut self) {

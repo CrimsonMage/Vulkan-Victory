@@ -372,8 +372,9 @@ impl Lift<'_> {
             "get_resinfo" => {
                 let m = self.addr_dw(inst, &addr, 0)?;
                 flags |= img::LOD;
-                args.push(self.k32(0));
-                let _ = args.pop();
+                // no coordinate (a placeholder), then the level
+                let z = self.k32(0);
+                args.push(z);
                 args.push(m);
                 let class = ImageClass { dynamic: true, ..class };
                 let n = match (sdim, arrayed) {
@@ -386,10 +387,11 @@ impl Lift<'_> {
                     Ty::vec(S::U32, n),
                     args.clone(),
                 );
+                let z = self.k32(0);
                 let lv = self.emit(
                     Op::Image { kind: ImageKind::Levels, class, sampler: Sampler::None, flags: 0 },
                     Ty::U32,
-                    vec![tw],
+                    vec![tw, z],
                 );
                 let mut all = Vec::new();
                 for c in 0..3u32 {
