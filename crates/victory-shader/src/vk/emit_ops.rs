@@ -149,47 +149,6 @@ impl Emit<'_> {
         0
     }
 
-    /// Mesh outputs: [index] of the arrays (clamped), then the component;
-    /// the primitive export as three indices and the cull flag.
-    fn mesh_output_op(&mut self, n: &Node, slot: u16, comp: u8, args: &[Id], var: Id, elem: Id) {
-        let u = self.t.u32_;
-        let max = if slot == OUT_PRIMITIVE { self.st.mesh.1 } else { self.st.mesh.0 };
-        let km = self.c32(max.max(1) - 1);
-        let i = self.m.ext(glsl::U_MIN, u, &[args[1], km]);
-        if slot == OUT_PRIMITIVE {
-            let x = if self.f.ty(n.args[0]) == Ty::F32 { self.m.op(op::BITCAST, u, &[args[0]]) } else { args[0] };
-            return self.mesh_primitive(x, var, i);
-        }
-        let x = if self.f.ty(n.args[0]) == Ty::F32 { args[0] } else { self.m.op(op::BITCAST, elem, &[args[0]]) };
-        let p = self.m.t_ptr(en::SC_OUTPUT, elem);
-        let k = self.c32(u32::from(comp));
-        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, i, k]);
-        self.m.op_void(op::STORE, &[ptr, x]);
-    }
-
-    /// Three 10-bit indices; bit 31 culls.
-    fn mesh_primitive(&mut self, x: Id, var: Id, i: Id) {
-        let (u, b) = (self.t.u32_, self.t.bool_);
-        let m = self.c32(0x3FF);
-        let (k10, k20, k31) = (self.c32(10), self.c32(20), self.c32(31));
-        let i0 = self.m.op(op::BITWISE_AND, u, &[x, m]);
-        let s1 = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k10]);
-        let i1 = self.m.op(op::BITWISE_AND, u, &[s1, m]);
-        let s2 = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k20]);
-        let i2 = self.m.op(op::BITWISE_AND, u, &[s2, m]);
-        let v3 = self.m.t_vec(u, 3);
-        let tri = self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[i0, i1, i2]);
-        let p3 = self.m.t_ptr(en::SC_OUTPUT, v3);
-        let ptr = self.m.op(op::ACCESS_CHAIN, p3, &[var, i]);
-        self.m.op_void(op::STORE, &[ptr, tri]);
-        let c = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k31]);
-        let z = self.c32(0);
-        let culled = self.m.op(op::I_NOT_EQUAL, b, &[c, z]);
-        let pb = self.m.t_ptr(en::SC_OUTPUT, b);
-        let cp = self.m.op(op::ACCESS_CHAIN, pb, &[self.cull, i]);
-        self.m.op_void(op::STORE, &[cp, culled]);
-    }
-
     /// args[0] picks one of the rest (clamped) through a function array.
     pub(super) fn pick(&mut self, v: V, args: &[Id]) -> Id {
         let var = self.picks[&v];

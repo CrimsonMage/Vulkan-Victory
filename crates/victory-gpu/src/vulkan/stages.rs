@@ -25,7 +25,7 @@ use super::Backend;
 use crate::pipeline::Shader;
 
 /// The ABI version the host binds for (`docs/vulkan-abi.md`).
-pub(crate) const HOST_ABI: u32 = 3;
+pub(crate) const HOST_ABI: u32 = 4;
 
 /// Stage workers: half the logical processors, 4 to 8, below the title's
 /// threads (`SetThreadPriority` below normal): draws wait for their stages.
@@ -241,6 +241,8 @@ pub(crate) struct Stage {
     words: usize,
     /// The program's loop-guard id (ABI v3), for diagnostics.
     pub(crate) guard_id: u32,
+    /// Mesh: host groups per console group (ABI v4 section 6), 1 otherwise.
+    pub(crate) mesh_parts: u32,
 }
 
 impl Stage {
@@ -611,7 +613,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
         let _ = std::fs::write(dir.join(format!("{hash}.{:?}.spv", vs.stage)), bytes);
     }
-    if let Some(why) = usage.refused(limits(b)) {
+    if let Some(why) = limits(b).refuses(&usage) {
         if cfg!(feature = "diagnostics") {
             tracing::info!(stage = ?vs.stage, hash = %hash, why = %why, "Vulkan part: refused before compiling");
         }
@@ -647,7 +649,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
                 out_vertices = usage.out_vertices,
                 out_primitives = usage.out_primitives,
                 out_locations = usage.out_locations,
-                mesh_out_bytes = usage.mesh_output_bytes(limits(b)),
+                mesh_out_bytes = usage.mesh_output_bytes(limits(b).mesh_budget()),
                 thread = std::thread::current().name().unwrap_or("?"),
                 "Vulkan part: compiling"
             );
@@ -711,6 +713,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         rect: std::sync::OnceLock::new(),
         words: vs.spirv.len(),
         guard_id: vs.guard_id,
+        mesh_parts: vs.mesh_parts.max(1),
     }))
 }
 

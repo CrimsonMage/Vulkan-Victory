@@ -20,6 +20,8 @@ pub struct Graph {
     /// Per loop header: its merge children outside the loop placed after
     /// the exit (their blocks wrap the loop).
     pub after_exit: Vec<Vec<usize>>,
+    /// Blocks inside a loop (some natural loop holds them).
+    pub in_loop: Vec<bool>,
 }
 
 impl Graph {
@@ -45,14 +47,18 @@ impl Graph {
         }
         let mut exit = vec![None; n];
         let mut after_exit = vec![Vec::new(); n];
+        let mut in_loop = vec![false; n];
         for &h in order.iter().filter(|&&h| header[h]) {
             let inside = natural_loop(h, &preds, &rpo);
+            for (b, &i) in inside.iter().enumerate() {
+                in_loop[b] |= i;
+            }
             let (y, after) = loop_exit(h, &inside, &children, &merge, &preds, &rpo);
             exit[h] = y;
             after_exit[h] = after;
         }
         let pre = preorder(&children);
-        Ok(Graph { rpo, header, merge, children, idom, pre, exit, after_exit })
+        Ok(Graph { rpo, header, merge, children, idom, pre, exit, after_exit, in_loop })
     }
 
     /// Whether block `a` dominates block `b`.

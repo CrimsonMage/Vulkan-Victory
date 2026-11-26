@@ -121,7 +121,10 @@ impl Emit<'_> {
                     self.block = sm;
                     self.m.op_void(op::UNREACHABLE, &[]);
                 }
-                Term::Return => self.m.op_void(op::RETURN, &[]),
+                Term::Return => {
+                    self.leave();
+                    self.m.op_void(op::RETURN, &[]);
+                }
             },
             Some((&y, [])) if matches!(self.f.blocks[x].term, Term::Branch(..)) && !self.st.no_sel.contains(&x) => {
                 // the branch's join: a selection construct merging at it

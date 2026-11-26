@@ -17,7 +17,7 @@ use victory_shader::{HwStage, RootType};
 /// The file encoding's version: bump it when `encode`/`decode` change.
 /// (The key used to hash this whole file, so any edit here, even one that
 /// left the encoding alone, threw every kept translation away.)
-const MAGIC: &[u8; 8] = b"vkstage2";
+const MAGIC: &[u8; 8] = b"vkstage3";
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -301,6 +301,7 @@ fn encode(vs: &VkShader) -> Vec<u8> {
     let mut w: Vec<u32> = vec![stage_code(vs.stage)];
     w.extend(vs.local_size);
     w.push(vs.guard_id);
+    w.push(vs.mesh_parts);
     w.push(vs.user_data.len() as u32);
     for u in &vs.user_data {
         w.extend([u.index, u32::from(u.slot), root_code(u.root), u.dword]);
@@ -350,6 +351,7 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     let stage = stage_of(r.next()?)?;
     let local_size = [r.next()?, r.next()?, r.next()?];
     let guard_id = r.next()?;
+    let mesh_parts = r.next()?;
     let n = r.next()? as usize;
     let mut user_data = Vec::with_capacity(n);
     for _ in 0..n {
@@ -372,5 +374,5 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     }
     let n = r.next()? as usize;
     let spirv = r.take(n)?.to_vec();
-    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id })
+    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id, mesh_parts })
 }

@@ -1,6 +1,8 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v3** (2026-11-26: the loop guard buffer in push dwords 2–3; v2
+Status: **v4** (2026-11-26: mesh output memory within 32 KiB, a mesh
+program over it split into `VkShader::mesh_parts` host groups in y;
+v3 2026-11-26: the loop guard buffer in push dwords 2–3; v2
 2026-11-26: semantic registry, six-layer 2D-array views of cubes on set 0
 binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
 amended the same day: immediate samplers in set 1 by specialization
@@ -28,7 +30,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 3`
+`ABI_VERSION = 4`
 
 ## 1. Vulkan requirements
 
@@ -317,12 +319,41 @@ at pipeline creation.
   group shape, EXEC starts with the threads inside the group; group ids
   from `WorkgroupId`.
 - **Mesh.** `VK_EXT_mesh_shader`, `OutputVertices`/`OutputPrimitivesEXT`
-  the console's maxima, triangles. The module sets the output counts to
-  the maxima at its start and culls every primitive
-  (`CullPrimitiveEXT`) until the console code exports it (the console's
-  `GS_ALLOC_REQ` counts are not used). Thread n writes vertex n and
-  primitive n (`LocalInvocationIndex`). Dispatched as `vkCmdDrawMeshTasksEXT(x,
-  1, 1)` with the title's group count.
+  the console's maxima (the program's record; the HLSL maxima in `PSV0`
+  agree: 128/128 for every mesh program of the title), triangles. The
+  module sets the output counts to the maxima at its start and makes
+  every primitive the degenerate triangle (0, 0, 0) until the console code
+  exports it (no `CullPrimitiveEXT`; the console's `GS_ALLOC_REQ` counts
+  are not used). Thread n writes vertex n and primitive n
+  (`LocalInvocationIndex`).
+  **Output memory.** `vk::usage` (translator crate) reads a module's
+  outputs and counts them as the Vulkan specification does ("Mesh Shader
+  Output": every output but the primitive indices; a user output as whole
+  locations, 4 scalars each; a built-in as its scalars), `scalars × 4 ×
+  align(count, granularity)` per vertex and per primitive. The translator
+  keeps every module within `usage::MESH_OUTPUT_BUDGET` (32,768 bytes at
+  granularities 32/32: NVIDIA's limits, the smallest of the cards in use);
+  the host checks the same count against the device's limits
+  (`victory_vk::limits`) and refuses a module over them.
+  **Split.** A program whose 128 vertices do not fit (position and 16 or
+  more locations) runs each console group as `VkShader::mesh_parts` host
+  groups: its vertices in blocks of `b` (32, or 21 when 96 vertices still
+  do not fit), each host group holding the vertices of one set of three
+  blocks (`OutputVertices` = 3b: 96 or 63) and the triangles whose blocks
+  are in that set (a triangle's own blocks, made up to three with the
+  lowest other blocks: exactly one set). Every host group runs the whole
+  console program (programs that write memory are never split). Parts:
+  C(4, 3) = 4 or C(7, 3) = 35; the part is `WorkgroupId.y % mesh_parts`.
+  Triangles of one console group are then rasterised part by part, not in
+  the console's order. Dispatched as `vkCmdDrawMeshTasksEXT(x,
+  y × mesh_parts, z)` with the title's group count (`mesh_parts` 1 for a
+  program that fits); indirect records get y = min(y, 1) × `mesh_parts`
+  from the bounding pass.
+  **Waves.** In a mesh group of several console waves whose `s_barrier`s
+  not every invocation reaches exactly once (the NGG code for a group
+  that culls everything: its first wave alone takes one more barrier
+  before its dummy export), the barriers are counted per subgroup instead
+  of `OpControlBarrier` (section 9).
 
 ## 7. Waves
 
@@ -348,6 +379,7 @@ pub struct VkShader {
     pub interface: Vec<Interface>,       // semantics and locations (information only)
     pub local_size: [u32; 3],            // compute / mesh
     pub approximate: Vec<Approx>,        // approximations taken (note, opcode), section 9
+    pub mesh_parts: u32,                 // mesh: host groups per console group in y (section 6)
 }
 ```
 
@@ -380,9 +412,22 @@ Known gaps (the program translates; the result differs from the console):
   a mask whose two dwords are written apart (`s_mov_b32 exec_hi, -1` in a
   wave prefix sum) gives each half its own dword. In a group of one console
   wave the halves meet at two group barriers around a workgroup slot; in
-  larger groups each pair meets through workgroup arrival counters with a
-  bounded wait (2^20 polls; a pair that runs out stops exchanging instead
-  of hanging), as in xcl's `docs/wave64-on-wave32.md`. Before an LDS
+  larger groups too where every invocation makes the exchange exactly once
+  (its block in no loop and on every path to a return), unless the
+  program's console barriers are counted; elsewhere each pair meets
+  through workgroup arrival counters with a bounded wait, as in xcl's
+  `docs/wave64-on-wave32.md`: 2^10 polls; a half that runs out, or finds
+  its partner returned (a return marks the subgroup's counters gone),
+  stops exchanging for the rest of the invocation and marks itself gone,
+  so its partner stops too and a pair waits out the bound at most once.
+  Counted console barriers (mesh groups of several waves with uneven
+  `s_barrier`s, section 6): each subgroup counts its barriers and at its
+  k-th waits until every other subgroup has passed k or has returned, as
+  the console's barrier counts waves and drops ended ones; bounded by
+  2^14 polls, after which the subgroup stops waiting at barriers.
+  NVIDIA keeps every subgroup of a workgroup resident and schedules them
+  all, so a spinning subgroup does not keep its partner from running; the
+  bounds only stop a partner that never comes. Before an LDS
   access, when either half may have made another since they last met, the
   halves meet (the console's wave runs its LDS accesses in order across all
   64 lanes). A mask read inside a lane guard stays per half (listed in

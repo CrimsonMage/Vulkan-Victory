@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The module reader and mesh output accounting (`vk::usage`), shared with the translator.
+victory-shader.workspace = true
 # Vulkan bindings; `loaded` opens vulkan-1.dll at run time (Proton's winevulkan).
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
 
