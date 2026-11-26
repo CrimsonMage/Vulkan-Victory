@@ -199,7 +199,8 @@ pub unsafe fn dispatch(desc: *const u8) -> bool {
     let (cw, ch) = (a.Width as u32, a.Height);
     let (rw, rh) = within(pair(desc, RENDER_SIZE), cw, ch);
     let (ow, oh) = within(pair(desc, UPSCALE_SIZE), b.Width as u32, b.Height);
-    crate::list::record_own(list, |list: &HostList| {
+    // (Run later, by the worker that translates the list: `move`.)
+    crate::list::record_own(list, move |list: &HostList| {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(

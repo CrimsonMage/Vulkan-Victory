@@ -48,7 +48,7 @@ static WAITS: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(
 
 /// Plain sums ([`Sum`]).
 static SUMS: [AtomicU64; SUMS_N] = [const { AtomicU64::new(0) }; SUMS_N];
-const SUMS_N: usize = 13;
+const SUMS_N: usize = 14;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Sum {
@@ -82,6 +82,9 @@ pub(crate) enum Sum {
     PoolBytes,
     /// Blocks of the directory (4 KiB) copied to the card.
     DirectoryBlocks,
+    /// Nanoseconds the copy-queue workers spent detiling first uploads
+    /// (`crate::texture::ahead`), outside any submission.
+    AheadNs,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
@@ -250,6 +253,48 @@ impl Drop for Timed {
             held.set(h);
         });
     }
+}
+
+/// The title's side of the list calls (`crate::list` `thin`): ticks and
+/// calls of writing them down; the workers' side: ticks and calls of
+/// translating them (the by-call sums above are taken there too, inside the
+/// list methods the workers run); submissions' ticks waiting until their
+/// lists were translated, and those submissions.
+static WRITTEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static TRANSLATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static JOINED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// [`WRITTEN`] held on the thread, added every 64 calls (as [`Timed`]).
+    static WRITING: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// A title thread wrote a list call down in `ticks`.
+#[inline]
+pub(crate) fn written_down(ticks: u64) {
+    WRITING.with(|w| {
+        let (t, n) = w.get();
+        let (t, n) = (t + ticks, n + 1);
+        if n >= 64 {
+            WRITTEN[0].fetch_add(t, Relaxed);
+            WRITTEN[1].fetch_add(u64::from(n), Relaxed);
+            w.set((0, 0));
+        } else {
+            w.set((t, n));
+        }
+    });
+}
+
+/// A worker translated `calls` list calls in `ticks`.
+pub(crate) fn translated(ticks: u64, calls: u64) {
+    TRANSLATED[0].fetch_add(ticks, Relaxed);
+    TRANSLATED[1].fetch_add(calls, Relaxed);
+}
+
+/// A submission waited `ticks` until its lists were translated.
+pub(crate) fn joined(ticks: u64) {
+    JOINED[0].fetch_add(ticks, Relaxed);
+    JOINED[1].fetch_add(1, Relaxed);
 }
 
 /// `since` until now, as nanoseconds of `sum`.
@@ -737,15 +782,31 @@ pub(crate) fn frame() {
         }
     }
     let fence_set = sums[Sum::FenceSet as usize];
+    let pair = |a: &[AtomicU64; 2]| (per(crate::fast::ticks_to_ns(take(&a[0]))), take(&a[1]) as f64 / frames);
+    let ((written_ms, written_n), (translated_ms, translated_n), (joined_ms, joined_n)) =
+        (pair(&WRITTEN), pair(&TRANSLATED), pair(&JOINED));
+    #[cfg(windows)]
+    let workers = crate::list::workers();
+    #[cfg(not(windows))]
+    let workers = 0;
+    let lists = format!(
+        "list calls written down by title threads {written_ms:.1} ms ({written_n:.0} calls, summed); translated by {workers} workers {translated_ms:.1} ms ({translated_n:.0} calls, summed); \
+         submissions waited for translation {joined_ms:.1} ms ({joined_n:.1} of them)"
+    );
+    #[cfg(windows)]
+    let ahead = crate::texture::ahead::line();
+    #[cfg(not(windows))]
+    let ahead = String::new();
     tracing::info!(
-        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
-         in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
+        "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; {lists}; translation into our lists {:.1} ms (summed; {calls}); \
+         in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms; first uploads detiled by the copy-queue workers {:.1} ms, {ahead}), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
          on average; buffers named by lists: in place (read over the bus) {:.0} MB, pool by directory {:.0} MB, windows {:.0} MB (the fallback, \
          copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {dispatch}; {indirect}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
         per(sums[Sum::TextureNs as usize]),
+        per(sums[Sum::AheadNs as usize]),
         per(waited),
         per(sums[Sum::LandNs as usize]),
         fence_set as f64 / frames,

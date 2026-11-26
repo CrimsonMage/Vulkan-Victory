@@ -18,6 +18,10 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+/// List calls written down on the title's threads, translated by workers.
+#[cfg(windows)]
+mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -127,6 +131,11 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// The calls written down and not translated yet ([`thin`]): the one
+    /// field the title's threads touch. Everything above is the worker's
+    /// that translates the list, until [`join`].
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -173,13 +182,26 @@ macro_rules! timed {
 /// recorded (it then set descriptor heaps, a root signature and a
 /// pipeline of its own, and the next draw or dispatch sets the title's
 /// again). False, recording nothing, if `this` is not one of our lists.
+/// With calls written down ([`thin`]) `f` runs on the worker that
+/// translates the list, in its place among the title's calls, and true
+/// means only that the list is ours.
 #[cfg(windows)]
-pub(crate) fn record_own(this: This, f: impl FnOnce(&crate::host::HostList) -> bool) -> bool {
+pub(crate) fn record_own(this: This, f: impl FnOnce(&crate::host::HostList) -> bool + 'static) -> bool {
+    if thin::is_thin(this) {
+        thin::own(this, Box::new(f));
+        return true;
+    }
     if !object::has_table(this, &LIST_FUNCTIONS)
         && !object::has_table(this, &NEWER_LIST_FUNCTIONS)
     {
         return false;
     }
+    record_own_here(this, f)
+}
+
+/// [`record_own`] on the thread that records `this` now.
+#[cfg(windows)]
+fn record_own_here(this: This, f: impl FnOnce(&crate::host::HostList) -> bool) -> bool {
     let mut recorded = false;
     with_state_as(this, crate::frametime::Call::Own, |list, state| {
         recorded = f(list);
@@ -188,6 +210,19 @@ pub(crate) fn record_own(this: This, f: impl FnOnce(&crate::host::HostList) -> b
         }
     });
     recorded
+}
+
+/// Waits until the calls written down into the submitted `lists` are
+/// translated ([`thin`]): before anything of a submission looks at them.
+#[cfg(windows)]
+pub(crate) fn join(lists: &[This]) {
+    thin::join(lists);
+}
+
+/// The workers that translate list calls (0: the title's threads do).
+#[cfg(windows)]
+pub(crate) fn workers() -> usize {
+    thin::workers()
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -577,11 +612,19 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
-    let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+    #[cfg(windows)]
+    let thin = crate::host::host().is_some();
+    #[cfg(not(windows))]
+    let thin = false;
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut list = Box::new(List {
+        object: match (thin, crate::device::newer()) {
+            #[cfg(windows)]
+            (true, true) => Object::new(&thin::NEWER_TABLE),
+            #[cfg(windows)]
+            (true, false) => Object::new(&thin::TABLE),
+            (_, true) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (_, false) => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -609,9 +652,16 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: thin::Front::new(0),
     });
+    // The stream names the list by its address, which stays from here on.
+    #[cfg(windows)]
+    {
+        list.thin = thin::Front::new(std::ptr::from_ref::<List>(&list) as usize);
+    }
     #[cfg(not(windows))]
-    let _ = pipeline;
+    let _ = (pipeline, thin);
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
 
@@ -631,6 +681,10 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    // A list that goes is translated to its end first: the worker holds it
+    // until then. (Each release asks; an idle stream answers at once.)
+    #[cfg(windows)]
+    thin::release(this);
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {

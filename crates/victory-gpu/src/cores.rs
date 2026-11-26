@@ -2,8 +2,8 @@
 //! kinds (fast cores and efficiency cores).
 
 /// The system's processor sets of group 0: each one's id, its logical
-/// processor and its efficiency class (higher is faster).
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+/// processor, its efficiency class (higher is faster) and its core.
+fn cpu_sets() -> Vec<(u32, u8, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -23,7 +23,7 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.LogicalProcessorIndex, set.EfficiencyClass));
+            sets.push((set.Id, set.LogicalProcessorIndex, set.EfficiencyClass, set.CoreIndex));
         }
         at += info.Size as usize;
     }
@@ -55,6 +55,21 @@ pub fn keep_on_fast_cores(what: &str) {
     } else {
         tracing::info!(what, fast = fast.len(), of = sets.len(), "the thread is kept on the fast cores");
     }
+}
+
+/// The fast cores (physical cores of the highest efficiency class; all
+/// cores where they are alike): 8 on an i7-14700 (8 P-cores with two
+/// threads each, 12 E-cores). At least 1.
+pub fn fast_cores() -> usize {
+    let sets = cpu_sets();
+    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
+    let mut cores: Vec<u8> = sets.iter().filter(|c| c.2 == best).map(|c| c.3).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    if cores.is_empty() {
+        return std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(1);
+    }
+    cores.len()
 }
 
 /// Asks the system to run the calling thread on the slow cores only, where

@@ -730,6 +730,40 @@ pub(crate) fn make_waiting() {
     }
 }
 
+/// Title slots (their handles) that show the fallback until the first
+/// upload of a texture has run (`crate::texture::ahead`), by texture.
+#[cfg(windows)]
+static WAITING_UPLOAD: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The slot at `handle` shows the fallback until the first upload of title
+/// texture `resource` has run.
+#[cfg(windows)]
+fn wait_landed(resource: usize, handle: u64) {
+    let mut waiting = WAITING_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let slots = waiting.entry(resource).or_default();
+    if !slots.contains(&handle) {
+        slots.push(handle);
+    }
+}
+
+/// Makes the slots that showed the fallback again, for the textures whose
+/// first upload has run since the last call: before a submission runs, by
+/// the thread that submits (with [`make_waiting`]).
+#[cfg(windows)]
+pub(crate) fn make_landed() {
+    for resource in crate::texture::ahead::take_landed() {
+        let handles = WAITING_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
+        for handle in handles.into_iter().flatten() {
+            if let Some((heap, index)) = shader_slot(handle)
+                && let Some(Some(host)) = heap.host.get()
+            {
+                host.remake(index, handle);
+            }
+        }
+    }
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
@@ -748,6 +782,8 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    #[cfg(windows)]
+    WAITING_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;

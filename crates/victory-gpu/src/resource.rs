@@ -1122,6 +1122,9 @@ pub(crate) struct HostTexture {
     /// For a texture the card writes: its title memory (first byte, end),
     /// in [`TARGET_SPANS`] while it lives; (0, 0) otherwise.
     span: (u64, u64),
+    /// Its first upload: none asked yet, on the copy queue, landed, or
+    /// recorded into a list (`crate::texture::ahead`).
+    pub(crate) ahead: std::sync::atomic::AtomicU8,
 }
 
 /// Host copies of textures the card writes (targets, depth, unordered
@@ -1390,6 +1393,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // not.
         let dropped = dropped_levels(this, &r.desc);
         let kept = if dropped > 0 { smaller(&r.desc, dropped) } else { r.desc };
+        // A texture the title fills starts in the common state, whatever
+        // the title asked: its first upload may go on the copy queue, which
+        // takes textures only from there (`crate::texture::ahead`); lists
+        // move it from there to what they need at submission, as from any
+        // state.
+        let initial = if fills(&r.desc) { 0 } else { r.host.state };
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1401,7 +1410,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&kept, r.host.state, clear, true) } else { None };
+            let reserved = if partly { host_texture_as(&kept, initial, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1415,7 +1424,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&kept, r.host.state, clear),
+            None => host_texture(&kept, initial, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1433,7 +1442,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        let state = crate::host::legal_state(&texture, crate::host::texture_state(initial));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
@@ -1879,7 +1888,7 @@ pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
 
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
-fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+pub(crate) fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
     let Some(host) = crate::host::host() else {
         return 0;
     };
@@ -1905,6 +1914,7 @@ impl HostTexture {
             tiled: None,
             dropped: 0,
             span: (0, 0),
+            ahead: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -1924,6 +1934,7 @@ impl HostTexture {
             tiled: Some(tiled),
             dropped: 0,
             span: (0, 0),
+            ahead: std::sync::atomic::AtomicU8::new(0),
         }
     }
 }
@@ -1994,6 +2005,15 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// Title texture `this`'s host copy if it has one (none is made).
+#[cfg(windows)]
+pub(crate) fn made_host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, false).map(|made| made.0)
 }
 
 /// A host texture like the title's: same description, in GPU memory,

@@ -1979,11 +1979,18 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            SHOWN_LATER.set(0);
             let kept = if later {
                 None
             } else {
                 self.make_slot(index, &view)
             };
+            // Shows the fallback: made again when the texture's first
+            // upload has run (`super::make_landed`).
+            let shown_later = SHOWN_LATER.replace(0);
+            if shown_later != 0 {
+                super::wait_landed(shown_later, handle);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -1993,6 +2000,35 @@ impl HostHeap {
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
+    }
+
+    /// Makes slot `index` again from the record at `handle`, if the slot
+    /// was made from that very record (it showed the fallback until its
+    /// texture's first upload had run: `super::make_landed`).
+    pub(crate) fn remake(&self, index: u32, handle: u64) {
+        if index >= self.count {
+            return;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if tag != VIEW_TAG || made[index as usize] != key {
+            return;
+        }
+        let Some(view) = view_at(i, generation) else {
+            return;
+        };
+        SHOWN_LATER.set(0);
+        if let Some(kept) = make(&view, self.cpu(index)) {
+            self.keep(index, kept);
+        }
+        // (Still on its way: another upload of a new host copy.)
+        let again = SHOWN_LATER.replace(0);
+        drop(made);
+        if again != 0 {
+            super::wait_landed(again, handle);
+        }
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2704,8 +2740,15 @@ fn twin_uav(
     Some(desc)
 }
 
+thread_local! {
+    /// The title texture the last [`make`] on this thread showed the
+    /// fallback for, until its first upload has run (0: none).
+    static SHOWN_LATER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
+
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
@@ -2795,6 +2838,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         },
                     };
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                }
+                // A texture whose first upload is on the copy queue (or
+                // starts now) is not shown before it has run: the slot shows
+                // the fallback until then (`crate::texture::ahead`).
+                if let Some(kept) = crate::texture::ahead::show_later(resource, texture, desc.as_ref(), at) {
+                    SHOWN_LATER.set(resource as usize);
+                    return Some(Some(kept));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

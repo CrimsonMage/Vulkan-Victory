@@ -631,11 +631,16 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   zeros the title shows at many places`.
 - The gate line (`… fps, … ms/frame …; card memory …`) gives the result.
 - Every 5 s, `frame time: … ms/frame over N frames: GPU busy B ms, idle
-  I; S submissions/frame (U untimed); title threads recording into our
-  lists R ms (summed; by call ms/n: state, draw, mesh, dispatch, indirect,
-  reset, own | besides: barrier, copy, clear, value); in submissions P ms
-  (… of them; by part: enter, descriptors, upkeep, steps, execute;
-  textures brought up to date T ms), waiting for the card W ms [why ms/n,
+  I; S submissions/frame (U untimed); list calls written down by title
+  threads Wt ms (n calls, summed); translated by K workers Wk ms (n calls,
+  summed); submissions waited for translation J ms (n of them);
+  translation into our lists R ms (summed; by call ms/n: state, draw,
+  mesh, dispatch, indirect, reset, own | besides: barrier, copy, clear,
+  value); in submissions P ms (… of them; by part: enter, descriptors,
+  upkeep, steps, execute; textures brought up to date T ms; first uploads
+  detiled by the copy-queue workers A ms, first uploads on the copy queue
+  n (MB, ms from the asking on average, longest; left to the lists for
+  room, waited for by lists)), waiting for the card W ms [why ms/n,
   …]; flights landed in L ms; title fence events set n/frame, D ms after
   the ask on average; buffers named by lists: in place (read over the bus)
   X MB, pool by directory P MB, windows Z MB (the fallback, copies on the
@@ -653,7 +658,12 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   of the fence's signal, all of them if no signal is in the line), `own`
   (the card running a waited submission). The pipelines are sampled every
   30th frame with a timestamp at each pipeline change of the title's
-  lists. R is the sum of the kinds before the bar (the calls that pass
+  lists. The title's threads only write list calls down (`list/thin.rs`):
+  Wt is all they spend in our list methods; the workers translate the
+  calls (Wk, wall time of their chunks; R and the by-call split are taken
+  inside the list methods they run, so R ≤ Wk); J is what
+  `ExecuteCommandLists` waited for the last of its lists to be translated.
+  R is the sum of the kinds before the bar (the calls that pass
   through a list's draw state), each with its ms and calls per frame;
   barriers, copies, clears and memory-value waits and writes are timed
   beside it, not in R. The parts of a submission: `enter` (the submission

@@ -22,6 +22,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+/// First uploads on a copy queue of their own; slots shown after them.
+pub(crate) mod ahead;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -510,6 +513,8 @@ static HOST_WRITTEN: Mutex<Option<crate::fast::FastSet<usize>>> = Mutex::new(Non
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    // Not while its first upload is on the copy queue: after it.
+    ahead::listed(resource);
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -616,6 +621,18 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// A draw of `list` samples title texture `resource` (host copy `texture`)
+/// through a slot: [`upload`], unless the texture's first upload is on the
+/// copy queue (its slots show the fallback until it has run, and the list
+/// must not name it meanwhile): false then.
+pub(crate) fn sample(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+    if ahead::pending(resource) {
+        return false;
+    }
+    upload(list, resource, texture);
+    true
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -636,6 +653,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
+    // From the lists from now on; a first upload on the copy queue runs
+    // first (then the staging buffer is up to date and uploaded).
+    ahead::listed(resource);
     let Some(staging) = staging(resource, texture) else {
         return;
     };

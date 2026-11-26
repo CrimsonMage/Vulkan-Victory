@@ -2173,6 +2173,7 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        crate::descriptor::make_landed();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // Unified memory: the shader writes of submissions that finished
         // are announced (textures over them detile again).

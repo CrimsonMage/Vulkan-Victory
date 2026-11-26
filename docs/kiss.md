@@ -116,6 +116,7 @@ driver errors and no new crash, and the captures look no worse.
 | 20 | `globallycoherent` UAVs, device-scope barriers and fenced atomics for compute programs that sync across groups (the BVH builder's, and any with `buffer_gl1_inv`); builder still off by default (`VICTORY_BVH_BUILDER=1` to try). Placed textures picked by index whose memory holds only zeros get no host copy until data arrives | subagent | built, not yet run |
 | 16 | Try XCL (github.com/xcl-dev/xcl) for ideas: builds and starts under stock Proton (`/mnt/data/xcl/run.sh`, own prefix); backs title memory with sparse VRAM windows + 512 MB coherent window | coordinator | stalled before its first frame under Proton (title graphics memory 4.5 GB > its 4 GB coherent window); idea study stopped |
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
+| 24 | Thin recording (after VIctory-7900XTX `VICTORY_THIN`, GPL-3.0): the title's threads only write list calls down (`list/thin.rs`), a worker per fast core translates them, `ExecuteCommandLists` waits for its lists; first uploads of title-filled textures on a copy queue of their own, detiled by its workers, slots show a 1x1 grey fallback until the queue's fence (`texture/ahead.rs`, after their `VICTORY_UPLOAD_AHEAD`/`VICTORY_SHOW_AFTER`) | subagent | built, not yet run |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
@@ -240,3 +241,12 @@ driver errors and no new crash, and the captures look no worse.
   entries come from the batches, and victory's CPU reads of it go through
   the sections' whole views. Windows stay only as the fallback, without
   copy-out.
+- 2026-11-25: VIctory-7900XTX study (GPL-3.0, code reusable with notice).
+  Taken: list calls written down on the title's threads and translated by
+  workers of ours (their `VICTORY_THIN`; here the only path, into the
+  title's own list, the submission waiting for its lists instead of their
+  line of submissions); first uploads on a copy queue with slots shown
+  after its fence (their `VICTORY_UPLOAD_AHEAD` + `VICTORY_SHOW_AFTER`,
+  which ended a device loss every ~15 min there). Not taken: their async
+  submit thread and joined parts, relay, compares, card steps (mirroring
+  machinery this tree deleted).
