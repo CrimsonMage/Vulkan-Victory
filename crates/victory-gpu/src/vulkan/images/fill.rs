@@ -16,18 +16,7 @@ use super::{Image, Key, PLACES, STATS, USERS, full_barrier, once_warn, registry,
 pub(crate) fn written(at: u64, len: u64) {
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
-    // Images start at most 4 GiB before the write.
-    let from = Key {
-        address: at.saturating_sub(4 << 30),
-        dimension: 0,
-        width: 0,
-        height: 0,
-        depth_or_array: 0,
-        mips: 0,
-        element: 0,
-        samples: 0,
-        depth: false,
-    };
+    let from = r.first_over(at);
     let mut hit = Vec::new();
     for (k, img) in r.images.range(from..) {
         if k.address >= at + len {
@@ -46,8 +35,7 @@ pub(crate) fn written(at: u64, len: u64) {
 pub(crate) fn released(b: &Backend, at: u64, len: u64, why: super::Dropped) {
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
-    // Images start at most 4 GiB before the range.
-    let from = Key { address: at.saturating_sub(4 << 30), dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false };
+    let from = r.first_over(at);
     let gone: Vec<Key> = r
         .images
         .range(from..)

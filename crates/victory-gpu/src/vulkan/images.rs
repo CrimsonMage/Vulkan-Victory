@@ -259,6 +259,48 @@ struct Registry {
     staging: Vec<(u64, Buffer)>,
     pending: Vec<Arc<Image>>,
     blocks: Vec<Block>,
+    /// The most title bytes any image made so far covers: how far before
+    /// an address an image over it can start.
+    widest: u64,
+}
+
+impl Registry {
+    /// The key every image that may cover `at` sorts at or after.
+    fn first_over(&self, at: u64) -> Key {
+        Key { address: at.saturating_sub(self.widest), dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false }
+    }
+
+    /// The title's memory under a new image held other textures: one
+    /// memory holds one texture at a time on the console, so filled images
+    /// that start elsewhere and overlap `[at, at + len)` are textures the
+    /// title has since replaced (it reuses its texture pool without
+    /// unmapping it). They go once the card is done with them; without
+    /// this they piled up to the card-memory ceiling (vk46: 35,467 live).
+    fn drop_overlaid(&mut self, b: &Backend, at: u64, len: u64) {
+        let gone: Vec<Key> = self
+            .images
+            .range(self.first_over(at)..)
+            .take_while(|(k, _)| k.address < at + len)
+            .filter(|(k, i)| k.address != at && !i.card_written() && k.address + i.bytes.max(1) > at)
+            .map(|(k, _)| *k)
+            .collect();
+        let value = b.timeline.last();
+        for k in gone {
+            if let Some(img) = self.images.remove(&k) {
+                if cfg!(feature = "diagnostics") && DROPPED[Dropped::Overlaid as usize].load(Ordering::Relaxed) < 12 {
+                    tracing::info!(
+                        new_at = %format_args!("{at:#x}+{len:#x}"),
+                        old_at = %format_args!("{:#x}+{:#x}", k.address, img.bytes),
+                        old = %format_args!("{:?} {}x{} mips={}", img.format, img.extent.width, img.extent.height, img.mips),
+                        "Vulkan: a texture made over an older one's memory (the older image goes)"
+                    );
+                }
+                super::descriptors::image_gone(img.id);
+                self.dropped.push((value, img));
+                DROPPED[Dropped::Overlaid as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 // SAFETY: the staging buffers' mapped pointers are used only under the lock.
@@ -278,9 +320,11 @@ pub(crate) enum Dropped {
     Unmapped,
     Remapped,
     Resource,
+    /// A newer texture was made over part of its memory.
+    Overlaid,
 }
 
-pub(crate) static DROPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub(crate) static DROPPED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Images made by what named them first (a view, a resource: target, copy,
 /// plane), and by 256 MiB of title address (diagnostics: where they come from).
@@ -303,6 +347,7 @@ pub(crate) fn report() {
         dropped_unmapped = n(&DROPPED, 1),
         dropped_remapped = n(&DROPPED, 2),
         dropped_resource = n(&DROPPED, 3),
+        dropped_overlaid = n(&DROPPED, 4),
         not_fitting_aliases = UNFIT.load(Ordering::Relaxed),
         made_at = %top.join(" "),
         "Vulkan: images"
@@ -431,6 +476,10 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
     match made {
         Some(img) => {
             let img = Arc::new(img);
+            r.widest = r.widest.max(img.bytes);
+            if !img.card_written() {
+                r.drop_overlaid(b, address, img.bytes.max(1));
+            }
             // Into GENERAL and cleared at the next flush (ahead of anything
             // that uses it); filled after that unless the card writes it.
             img.pending.store(true, Ordering::Relaxed);

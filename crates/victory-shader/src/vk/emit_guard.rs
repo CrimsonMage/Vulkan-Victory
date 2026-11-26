@@ -5,6 +5,12 @@
 //! its merge and returns; it first counts itself in the host's guard buffer
 //! (push dwords 2-3: its device address, 0 for none): dword 0 += 1, dword 1
 //! = the program's guard id.
+//!
+//! The count goes up by a value the driver cannot see through (1 + the top
+//! bit of push dword 3, the high half of a device address: always 1). With
+//! a constant step NVIDIA's compiler analyses the shared counter across
+//! nested loops for a very long time: CS_DummyResolve (30 loops, 28,672
+//! words) compiled in 1,376 s, and in 0.5 s with this step.
 
 use super::*;
 
@@ -26,9 +32,11 @@ impl Emit<'_> {
     pub(super) fn guard_back(&mut self, cont: Id, header: Id, merge: Id) {
         let var = self.spent();
         let (u, b) = (self.t.u32_, self.t.bool_);
-        let one = self.c32(1);
+        let (hi, k31, one) = (self.push_load(3), self.c32(31), self.c32(1));
+        let top = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[hi, k31]);
+        let step = self.m.op(op::I_ADD, u, &[top, one]);
         let count = self.m.op(op::LOAD, u, &[var]);
-        let next = self.m.op(op::I_ADD, u, &[count, one]);
+        let next = self.m.op(op::I_ADD, u, &[count, step]);
         self.m.op_void(op::STORE, &[var, next]);
         let lim = self.c32(self.st.loop_limit);
         let over = self.m.op(op::U_GREATER_THAN_EQUAL, b, &[next, lim]);
