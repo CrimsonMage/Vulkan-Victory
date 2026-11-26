@@ -1121,6 +1121,20 @@ impl Staging {
                 span
             });
         }
+        // The GPU view of the pool: no host view to read in place, its
+        // pages through their sections (`crate::memory`).
+        if crate::memory::gpu_view(self.memory as u64, size as u64) {
+            return with_read(size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                let hash = blake3::hash(&read[..size]);
+                if last.hash != Some(hash) {
+                    last.hash = Some(hash);
+                    last.changed = Some(frame);
+                    self.detile(read);
+                }
+                size
+            });
+        }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -1314,6 +1328,11 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    // The GPU view of the pool has no host view: its pages are there when
+    // the title mapped them (`crate::memory`).
+    if crate::memory::gpu_view(at as u64, len as u64) {
+        return crate::memory::mapped(at as u64, len as u64, all);
+    }
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);

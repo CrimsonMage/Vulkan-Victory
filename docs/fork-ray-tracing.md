@@ -41,10 +41,14 @@ shaders and emulates the one instruction.
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
 2. **Title memory by raw address from shaders.** A directory with one entry per
-   64 KiB of title address space leads a shader to the layer's host copy of
-   that memory; loads, stores, atomic add/sub and float min/max go through it.
-   Before a dispatch the host makes ready the memory its root views and root
-   constants name.
+   64 KiB of title address space leads a shader to where the layer has that
+   memory (an opened section of the title's page pool, or a buffer placed
+   over title memory); loads, stores, atomic add/sub and float min/max go
+   through it. Before a dispatch the host makes ready the memory its root
+   views and root constants name. The same directory serves buffer views
+   over the page pool (`docs/unified-memory.md`, "Title memory by
+   directory"); it lies in the card's memory, in each view heap's memory
+   run (`victory_shader::emit::MEMORY_RUN_POOL`).
 3. **The ray test, emulated in DXIL.** Four slab tests and a sorting network
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in

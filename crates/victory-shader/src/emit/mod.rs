@@ -110,9 +110,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_RUN_DIRECTORY, MEMORY_RUN_FAULTS, MEMORY_RUN_POOL, POOL_ENTRY_BYTES,
+    POOL_FLAG, POOL_SLOTS, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE,
+    USER_MEMORY_BASE, USER_ROOT_POOL, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// `VICTORY_BVH_MISS=1`: the ray-tracing node test
@@ -182,6 +182,21 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// Whether the shader reads title memory by directory
+    /// ([`USER_MEMORY_BASE`]): the host keeps the memory run in the view
+    /// heap it binds and tells the shader where it is.
+    pub fn reads_memory(&self) -> bool {
+        self.user_data.iter().any(|u| u.root == RootType::Other(USER_MEMORY_BASE))
+    }
+
+    /// Whether the shader reads title memory by raw address
+    /// (`resource::MEMORY`; its [`USER_MEMORY_BASE`] dword has slot 1): the
+    /// host reads its fault notes and makes ready the memory its root
+    /// arguments name before it runs.
+    pub fn reads_by_address(&self) -> bool {
+        self.user_data.iter().any(|u| u.root == RootType::Other(USER_MEMORY_BASE) && u.slot == 1)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {

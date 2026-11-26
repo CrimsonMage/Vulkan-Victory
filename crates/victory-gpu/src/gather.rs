@@ -1,35 +1,29 @@
-//! Windows of title memory over scattered pages (`docs/unified-memory.md`,
-//! "Windows over scattered pages"; `docs/kiss.md`). The title maps its
-//! physical-page pool page by page in scattered order, so a 4 MiB window
-//! of that memory is no run of one section and no buffer can be placed
-//! over it (`crate::shadow`). Its home stays the pages, whose sections are
-//! opened as heaps (`crate::unified`); the window is a buffer on the card
-//! that GPU copies fill from them, one copy per run of pages:
+//! Windows of title memory over scattered pages: the fallback for what
+//! the directory cannot express (`crate::memory`, `docs/unified-memory.md`
+//! "Title memory by directory"): index buffers, indirect arguments, title
+//! copies on the card, typed buffer views, root views of programs with a
+//! spilled user-data table. The title maps its physical-page pool page by
+//! page in scattered order, so a 4 MiB window of that memory is no run of
+//! one section and no buffer can be placed over it (`crate::shadow`). Its
+//! home stays the pages, whose sections are opened as heaps
+//! (`crate::unified`); the window is a buffer on the card that GPU copies
+//! fill from them, one copy per run of pages, before a list that names
+//! the window: the pages the title changed since the last copy in (all of
+//! them the first time). Changed means mapped anew (`XMemMapPhysicalPages`,
+//! page-mapping copies: [`remapped`]), announced written (DirectStorage
+//! completion, file reads, title copies on the CPU: [`written`]), or
+//! written by shaders through another view of the same pages (a pool view,
+//! an in-place buffer), noted at the submission that runs them
+//! ([`around`]).
 //!
-//! - **in**, before a list that names the window: the pages the title
-//!   changed since the last copy in (all of them the first time). Changed
-//!   means mapped anew (`XMemMapPhysicalPages`, page-mapping copies:
-//!   [`remapped`]), announced written (DirectStorage completion, file
-//!   reads, title copies on the CPU: [`written`]), or written by shaders
-//!   through another view of the same pages (an in-place buffer, another
-//!   window), noted at the submission that runs them ([`around`]);
-//! - **out**, after a list whose shaders write the window, only with
-//!   `VICTORY_GATHER_COPYOUT=1` ([`copy_out`]; off by default): the ranges
-//!   they write, copied into the pages, so that the title and every other
-//!   view of them see it. Off, what shaders write into a window stays in
-//!   it, as it stayed in the buffers of their own before.
+//! What shaders write into a window stays in it: nothing is copied back
+//! (a copy out of whole declared ranges overwrote what the title's CPU had
+//! changed since; the Series S run of 91e6851 crashed at loading). Writes
+//! through raw, structured and constant views go by directory into the
+//! pages themselves.
 //!
-//!   Why off: a declared range is a whole view, not the bytes written, so
-//!   the copy out wrote the window's bytes over everything in it, also
-//!   bytes the title's CPU had changed since (it does not announce its own
-//!   writes): the Series S run of 91e6851 crashed in the title's code at
-//!   loading (a read through a pointer that had become 0), where the build
-//!   before it ran into the world.
-//!
-//! The copies go to the one host queue in order around the list, between
+//! The copies go to the one host queue in order before the list, between
 //! barriers that order everything before them: queue order is the order.
-//! A page copied in after a list wrote it through another view has what
-//! that list wrote; a page copied out reaches the views copied in after.
 //! Nothing is filled by the CPU, compared, or copied at every submission,
 //! and the CPU never reads the window.
 //!
@@ -48,6 +42,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+use crate::memory::{Running, own_list};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -137,18 +133,6 @@ fn index() -> MutexGuard<'static, Index> {
 /// Windows alive and their bytes; windows made since the start.
 static LIVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// `VICTORY_GATHER_COPYOUT`: `1` copies what shaders wrote into windows
-/// back into their pages after the list; unset or `0`, never (see the
-/// module comment).
-pub(crate) fn copy_out() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_GATHER_COPYOUT").is_ok_and(|v| v.trim() == "1");
-        tracing::info!(on, "windows over scattered pages: what shaders write into them is copied back into the title's pages (VICTORY_GATHER_COPYOUT)");
-        on
-    })
-}
-
 /// Whether any window over scattered pages is alive.
 pub(crate) fn any() -> bool {
     LIVE[0].load(Ordering::Relaxed) > 0
@@ -201,9 +185,8 @@ pub(crate) fn forget(id: u64, start: u64, gather: &Gather) {
 }
 
 /// The pages under `spans` (unit, offset, bytes) changed: the windows
-/// showing them, but window `except`, copy them in again before the next
-/// list that names them.
-fn mark(spans: &[(Home, u64, u64)], except: Option<u64>) {
+/// showing them copy them in again before the next list that names them.
+fn mark(spans: &[(Home, u64, u64)]) {
     if spans.is_empty() {
         return;
     }
@@ -214,9 +197,7 @@ fn mark(spans: &[(Home, u64, u64)], except: Option<u64>) {
             let first = offset & !(K64 - 1);
             for (_, users) in ix.by_page.range((home, first)..(home, offset + len)) {
                 for &(id, page) in users {
-                    if Some(id) != except
-                        && let Some(shadow) = ix.windows.get(&id).and_then(Weak::upgrade)
-                    {
+                    if let Some(shadow) = ix.windows.get(&id).and_then(Weak::upgrade) {
                         hit.push((shadow, page));
                     }
                 }
@@ -244,7 +225,7 @@ pub(crate) fn written(at: u64, len: u64) {
     }
     let mut spans = Vec::new();
     crate::unified::spans(at, len, &mut spans);
-    mark(&spans, None);
+    mark(&spans);
 }
 
 /// The title mapped `[at, at + len)` anew (or the runtime told the view it
@@ -292,9 +273,6 @@ enum Op {
     In(ID3D12Resource, Home, u64, u64, u64),
     /// Zeros into the window: its offset, bytes.
     Zero(ID3D12Resource, u64, u64),
-    /// From the window into a unit's page(s): unit, its offset, the
-    /// window's offset, bytes.
-    Out(ID3D12Resource, Home, u64, u64, u64),
 }
 
 /// Zeros the card reads for pages no unit holds ([`Src::Zero`]), and its
@@ -307,7 +285,6 @@ fn push(ops: &mut Vec<Op>, op: Op) {
     let same = |a: &ID3D12Resource, b: &ID3D12Resource| a.as_raw() == b.as_raw();
     match (ops.last_mut(), &op) {
         (Some(Op::In(w, h, from, to, n)), Op::In(w2, h2, from2, to2, n2))
-        | (Some(Op::Out(w, h, from, to, n)), Op::Out(w2, h2, from2, to2, n2))
             if same(w, w2) && h == h2 && *from + *n == *from2 && *to + *n == *to2 && *from / CHUNK == (*from2 + *n2 - 1) / CHUNK =>
         {
             *n += *n2;
@@ -368,113 +345,23 @@ fn plan_in(shadow: &Arc<Shadow>, ops: &mut Vec<Op>) {
     }
 }
 
-/// The copies out of what shaders wrote at `[address, address + len)` of
-/// `shadow` into its pages; `marks` gets the units' bytes written.
-fn plan_out(shadow: &Arc<Shadow>, address: u64, len: u64, ops: &mut Vec<Op>, marks: &mut Vec<(Home, u64, u64)>) {
-    let Some(gather) = shadow.gather() else {
-        return;
-    };
-    let (start, bytes) = shadow.span();
-    let (lo, hi) = (address.max(start), address.saturating_add(len).min(start + bytes));
-    let pages = gather.pages();
-    let mut at = lo;
-    while at < hi {
-        let i = ((at - start) / K64) as usize;
-        let page = start + i as u64 * K64;
-        let stop = (page + K64).min(hi);
-        // Never a page the window has no copy of (zeros, not looked up), nor
-        // one whose copy is behind what the title has there.
-        if let Some(&Src::At(home, offset)) = pages.src.get(i)
-            && !pages.behind[i]
-        {
-            let (to, n) = (offset + (at - page), stop - at);
-            push(ops, Op::Out(shadow.buffer.clone(), home, to, at - start, n));
-            marks.push((home, to, n));
-        }
-        at = stop;
-    }
-}
-
-/// At submission, for one list: the copies to run before it (pages of the
-/// windows it names that are behind) and after it (what its shaders wrote
-/// into windows, `writes`: window, address, bytes). The writes, and those
-/// it makes in place (`in_place`: address, bytes), make the other windows
-/// over the same pages behind, so that a later list's copy in has them.
-pub(crate) fn around(
-    named: &[Arc<Shadow>],
-    writes: &[(Arc<Shadow>, u64, u64)],
-    in_place: &[(u64, u64)],
-) -> [Option<ID3D12CommandList>; 2] {
+/// At submission, for one list: the copies to run before it (pages of
+/// the windows it names that are behind). What it writes in place or by
+/// directory (`written`: address, bytes) makes the windows over the same
+/// pages behind, so that a later list's copy in has it.
+pub(crate) fn around(named: &[Arc<Shadow>], written: &[(u64, u64)]) -> Option<ID3D12CommandList> {
     let mut before = Vec::new();
     for shadow in named {
         plan_in(shadow, &mut before);
     }
-    let mut after = Vec::new();
-    for (shadow, address, len) in writes {
-        let mut marks = Vec::new();
-        plan_out(shadow, *address, *len, &mut after, &mut marks);
-        mark(&marks, Some(shadow.id()));
-    }
-    if any() && !in_place.is_empty() {
+    if any() && !written.is_empty() {
         let mut spans = Vec::new();
-        for &(address, len) in in_place {
+        for &(address, len) in written {
             crate::unified::spans(address, len, &mut spans);
         }
-        mark(&spans, None);
+        mark(&spans);
     }
-    [record(&before), record(&after)]
-}
-
-/// A list of ours for the copies, with what it names held until it has run.
-struct CopyList {
-    allocator: ID3D12CommandAllocator,
-    list: ID3D12GraphicsCommandList,
-    list7: Option<ID3D12GraphicsCommandList7>,
-    kept: Vec<ID3D12Resource>,
-}
-
-// SAFETY: free-threaded D3D12 objects; a list is recorded by one thread and
-// handed back only once its submission has run.
-unsafe impl Send for CopyList {}
-
-static SPARE: Mutex<Vec<CopyList>> = Mutex::new(Vec::new());
-
-/// A copy list in a submission: back to [`SPARE`] once that has run
-/// (`crate::host::retire`).
-struct Running(Option<CopyList>);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        if let Some(mut list) = self.0.take() {
-            list.kept.clear();
-            SPARE.lock().unwrap_or_else(|e| e.into_inner()).push(list);
-        }
-    }
-}
-
-fn copy_list() -> Option<CopyList> {
-    if let Some(list) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-        return Some(list);
-    }
-    let host = crate::host::host()?;
-    // SAFETY: plain object creation; the list is closed at once.
-    let made = unsafe {
-        (|| -> windows::core::Result<CopyList> {
-            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList =
-                host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
-            list.Close()?;
-            let list7 = crate::host::enhanced_barriers().then(|| list.cast().ok()).flatten();
-            Ok(CopyList { allocator, list, list7, kept: Vec::new() })
-        })()
-    };
-    match made {
-        Ok(list) => Some(list),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host list for the copies of windows over scattered pages");
-            None
-        }
-    }
+    record(&before)
 }
 
 /// The buffer of zeros ([`ZEROS`] bytes).
@@ -502,7 +389,7 @@ fn record(ops: &[Op]) -> Option<ID3D12CommandList> {
     if ops.is_empty() {
         return None;
     }
-    let mut c = copy_list()?;
+    let mut c = own_list()?;
     // Buffers over units' chunks, asked once per list.
     let mut spans: HashMap<(Home, u64), Option<ID3D12Resource>> = HashMap::new();
     let mut span = |home: Home, offset: u64| -> Option<(ID3D12Resource, u64)> {
@@ -539,17 +426,8 @@ fn record(ops: &[Op]) -> Option<ID3D12CommandList> {
                         }
                         None => lost += 1,
                     },
-                    Op::Out(window, home, to, from, n) => match span(*home, *to) {
-                        Some((dest, at)) => {
-                            c.list.CopyBufferRegion(&dest, at, window, *from, *n);
-                            add(Sum::Scatters, 1);
-                            add(Sum::ScatterBytes, *n);
-                            kept.push(dest);
-                        }
-                        None => lost += 1,
-                    },
                 }
-                let (Op::In(window, ..) | Op::Zero(window, ..) | Op::Out(window, ..)) = op;
+                let (Op::In(window, ..) | Op::Zero(window, ..)) = op;
                 kept.push(window.clone());
             }
             crate::host::order_writes(&c.list, c.list7.as_ref());

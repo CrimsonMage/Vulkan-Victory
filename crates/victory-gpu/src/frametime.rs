@@ -69,17 +69,19 @@ pub(crate) enum Sum {
     CopyBytes,
     /// Of `SubmitNs`: bringing textures up to date (detiling, hashing).
     TextureNs,
-    /// Bytes of windows over scattered pages (`crate::gather`, copies on
-    /// the card of the title's pages) named by lists, once per list.
+    /// Bytes of windows over scattered pages (`crate::gather`, the
+    /// fallback: copies on the card of the title's pages) named by lists,
+    /// once per list.
     WindowBytes,
     /// Copies into such windows from their pages (runs of pages the title
     /// changed), and their bytes.
     Gathers,
     GatherBytes,
-    /// Copies of what shaders wrote into such windows back into their
-    /// pages, and their bytes.
-    Scatters,
-    ScatterBytes,
+    /// Bytes of pool views (title memory read and written by directory,
+    /// `crate::memory`) named by lists, once per list.
+    PoolBytes,
+    /// Blocks of the directory (4 KiB) copied to the card.
+    DirectoryBlocks,
 }
 
 pub(crate) fn add(sum: Sum, n: u64) {
@@ -738,8 +740,8 @@ pub(crate) fn frame() {
     tracing::info!(
         "frame time: {ms_frame:.1} ms/frame over {frames:.0} frames: {card}; title threads recording into our lists {:.1} ms (summed; {calls}); \
          in submissions {:.1} ms ({:.1} of them; {phases}; textures brought up to date {:.1} ms), waiting for the card {:.1} ms [{waits}]; flights landed in {:.1} ms; title fence events set {:.1}/frame, {:.1} ms after the ask \
-         on average; buffers named by lists: in place (read over the bus) {:.0} MB, not in place (filled at submission) {:.0} MB, windows over scattered pages \
-         (copies on the card) {:.0} MB; window gathers {:.1} ({:.1} MB), scatters {:.1} ({:.1} MB); {dispatch}; {indirect}; {pipes}",
+         on average; buffers named by lists: in place (read over the bus) {:.0} MB, pool by directory {:.0} MB, windows {:.0} MB (the fallback, \
+         copies on the card; gathers {:.1}, {:.1} MB), not in place (filled at submission) {:.0} MB; directory blocks copied {:.1}; {dispatch}; {indirect}; {pipes}",
         per(recording),
         per(sums[Sum::SubmitNs as usize]),
         sums[Sum::Submits as usize] as f64 / frames,
@@ -749,11 +751,11 @@ pub(crate) fn frame() {
         fence_set as f64 / frames,
         if fence_set > 0 { sums[Sum::FenceUs as usize] as f64 / 1000.0 / fence_set as f64 } else { 0.0 },
         sums[Sum::InPlaceBytes as usize] as f64 / frames / 1e6,
-        sums[Sum::CopyBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::PoolBytes as usize] as f64 / frames / 1e6,
         sums[Sum::WindowBytes as usize] as f64 / frames / 1e6,
         sums[Sum::Gathers as usize] as f64 / frames,
         sums[Sum::GatherBytes as usize] as f64 / frames / 1e6,
-        sums[Sum::Scatters as usize] as f64 / frames,
-        sums[Sum::ScatterBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::CopyBytes as usize] as f64 / frames / 1e6,
+        sums[Sum::DirectoryBlocks as usize] as f64 / frames,
     );
 }

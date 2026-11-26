@@ -481,37 +481,71 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   textures over it detile again once it has finished
   (`unified::gpu_wrote`, `settle`). A view that the title maps anew marks
   its in-place buffers stale and the next ask places new ones.
-- **Windows over scattered pages** (`gather.rs`). The title maps its
-  physical-page pool page by page in scattered order (~62k single-page
-  views in run p13), so a 4 MiB window there is not one run of a section
-  and no buffer can be placed over it; an ask that fits in one run gets an
-  in-place buffer over that run as before. Otherwise the window is a
+- **Title memory by directory** (`memory.rs`; translator
+  `emit/shader.rs` `MEMORY_RUN_POOL`, `emit/lower.rs` `buffer`, `smem`).
+  The title maps its physical-page pool page by page in scattered order
+  (~62k single-page views in run p13), and maps its GPU view of the pool
+  only by page-mapping copies (`CopyPageMappingsBatchX`, one 64 KiB page
+  per range; static analysis of the executable: the CPU never touches that
+  view). No buffer spans such memory, so the GPU reaches it the way the
+  ray-tracing walkers reach title memory by address: through a
+  **directory**, one entry per 64 KiB of title address space below
+  128 GiB, giving the copy that holds the page and the byte offset there.
+  A copy is a raw view over a whole opened section (at most 512 MiB, the
+  largest raw view), so every pool page has one home, the title's own
+  page, and what shaders write lands there.
+  - *Pool views.* A raw, structured or constant buffer view whose memory
+    lies in a page reservation (`xmem`'s placeholders,
+    `victory_gpu::title_page_reservation`) gets a null host descriptor
+    and an entry in its heap's **pool table** (title address | flag,
+    bytes; `descriptor/host.rs` `make_slot`). Root views over pool memory
+    likewise, through a dynamic slot's entry named by the user-data word
+    `USER_ROOT_POOL` (root CBVs are bound to a 64 KiB stand-in). The
+    translator lowers every raw, structured and constant buffer access
+    twice: the view's way (read at offset 0 where the flag is set), and
+    under a branch on the flag (uniform where the descriptor is) the
+    directory's way at the view's address plus the access's byte; loads
+    and stores of several dwords that cross a 64 KiB edge are split per
+    dword; byte and 16-bit accesses, typed-format loads from raw views
+    (`tbuffer_load_format_*`, decoded in the shader) and atomics go too.
+    A pool view's record count comes from the pool table. Typed views
+    (`buffer_*_format_*`, d16) keep windows.
+  - *Entries.* The GPU view of the pool has no host view at all
+    (`xmem::map_alias`): each page-mapping copy writes its entries
+    (`memory::title_pages_aliased`) and the CPU side reads those pages
+    through the sections' whole views (`memory::read`/`write`, used by
+    `host::copy_mapped`, `read_into` and `texture::readable`, so textures
+    detile from there). Pages of other page reservations (the CPU view, the
+    pool view) get entries once a pool view or raw-address code names them,
+    and follow the views the runtime maps there from then on (so the
+    title's CPU-only page pools are never opened). Entries live in a mirror;
+    the 4 KiB blocks written since go to the directory, which lies in the
+    card's memory, by GPU copies in a list of ours at the head of the next
+    submission (`memory::flush`): remaps land in queue order, as on the
+    console, and the card's scattered lookups stay in its own memory.
+  - *Copies* are numbered when an entry first names a section, and opened
+    (pinned) at the next binding or submission; their views go into every
+    view heap's **memory run** (pool table SRV, fault notes UAV, directory
+    SRV, null view, copies), found by the user-data word
+    `USER_MEMORY_BASE`. Nothing is gathered, nothing copied back: what
+    shaders write through a pool view is declared written (`named`), so
+    CPU steps of later submissions that read it wait for it, textures over
+    it detile again once it ran, and windows over the same pages copy
+    them in again.
+- **Windows over scattered pages** (`gather.rs`), the fallback for what
+  the directory cannot express: index and vertex buffers, indirect
+  arguments, title copies on the card, typed buffer views, root views of
+  programs with a spilled user-data table. A 4 MiB window there is a
   buffer on the card (the PC's memory past 85% of the card's budget)
   that GPU copies fill from the opened section heaps, one
   `CopyBufferRegion` per run of pages, in a list of ours run just before
   the title list that names it, and only for its pages that are behind:
-  all of them the first time, then those the title maps anew
-  (`XMemMapPhysicalPages`, page-mapping copies, a view told:
-  `gather::remapped`), announces written (DirectStorage, file reads, title
-  copies on the CPU: `unified::written`), or that shaders wrote through
-  another view (an in-place buffer, another window: noted when the list
-  that writes is submitted, so the next list that names the window copies
-  them). Copy out (`VICTORY_GATHER_COPYOUT=1`, off by default): after a
-  list whose shaders write a window, a list of ours copies the written
-  ranges back into the section heaps, so the title and every alias see
-  them; off, shader writes into a window stay in it (as in the buffers of
-  their own before). Off because a declared range is a whole view, not
-  the bytes written: the copy out overwrote what the title's CPU had
-  changed since (Series S run of 91e6851: a crash in the title's code at
-  loading). It never copies pages that read as zeros or whose copy is
-  behind. Copies sit between global barriers on the one host
-  queue: queue order is the order. Pages no unit holds that the title has
-  not mapped, or shows by read-only stand-ins, read as zeros. Nothing is
-  filled on the CPU and the CPU never reads the window. Whether a window
-  opens in place whole is asked once per window until the title maps
-  there anew (it was asked at every ask: 34,553 refusals in run p13).
-  Gave up a page-table mirror: tile mappings into opened sections read
-  wrong data on this stack (probe, 2026-11-25).
+  all of them the first time, then those the title maps anew, announces
+  written, or that shaders wrote through another view (a pool view, an
+  in-place buffer). What shaders write into a window stays in it: the
+  copy out (`VICTORY_GATHER_COPYOUT`) is gone (a declared range is a whole
+  view, not the bytes written: it overwrote what the title's CPU had
+  changed since, and the Series S run of 91e6851 crashed at loading).
   shortcut: CPU writes the title makes into pool pages without saying so
   reach a window only with the next announced change of those pages.
 - **Not in place** (since 2026-11-25 the only other kind; card copies,
@@ -568,8 +602,10 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   must not appear. A `why` with "silent fallback" means the import
   failed.
 - Every 10 s: `unified: N heaps opened (… MB of title memory), R refused;
-  buffers in place: … alive (… MB) …; windows over scattered pages … alive
-  (… MB), … made; title copies on the GPU …, on the
+  buffers in place: … alive (… MB) …; by directory: pages of the pool's
+  GPU view mapped … (… MB), entries written …, directory blocks copied to
+  the card …, sections opened as copies …, refused …; windows over
+  scattered pages (fallback) … alive (… MB), … made; title copies on the GPU …, on the
   CPU after waiting for the card …; textures checked for an announced
   write …, by their hash …`. Good signs: R = 0, in-place buffers in the
   hundreds or thousands, "on the CPU after waiting" small next to "on the
@@ -602,10 +638,10 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   textures brought up to date T ms), waiting for the card W ms [why ms/n,
   …]; flights landed in L ms; title fence events set n/frame, D ms after
   the ask on average; buffers named by lists: in place (read over the bus)
-  X MB, not in place (filled at submission) Y MB, windows over scattered
-  pages (copies on the card) Z MB; window gathers n (M MB), scatters n (M
-  MB); dispatch binding ms/n: whole, skipped, tables, by-address memory,
-  root views; top pipelines (ms of a
+  X MB, pool by directory P MB, windows Z MB (the fallback, copies on the
+  card; gathers n, M MB), not in place (filled at submission) Y MB;
+  directory blocks copied n; dispatch binding ms/n: whole, skipped,
+  tables, by-address memory, root views; top pipelines (ms of a
   sampled frame, of A in all): name ms; …` (`frametime.rs`). All per
   frame. B and I come from GPU timestamps around each submission (B + I ≈
   the frame when the card is the limit only if I is small). The waits by
@@ -626,8 +662,11 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
   for a texture, finished shader writes announced), `steps` (the lists'
   CPU steps: fills, copies, textures, the planning of window copies; the
   timestamps), `execute` (`ExecuteCommandLists` of a submission sent
-  ahead; a waited one counts as the `own` wait). Window gathers and
-  scatters are GPU copies per frame (runs of pages) and their bytes. The
+  ahead; a waited one counts as the `own` wait). `pool by directory` is
+  the bytes of pool views lists name (once per list), `windows` those of
+  the fallback windows; window gathers are GPU copies per frame (runs of
+  pages) and their bytes; directory blocks are the 4 KiB blocks of
+  entries copied to the card per frame. The
   dispatch binding: whole bindings and the time they took (of it:
   `tables`, `by-address memory`, `root views`), and `skipped` ones (bound
   already, or only root constants changed: the user data is set again).

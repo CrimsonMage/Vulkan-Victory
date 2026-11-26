@@ -651,10 +651,10 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         // Without the tests' stand-in the nodes are read as the title's
         // programs will read them: through the host's directory of title
         // memory. The program lowers and validates, and asks the host for
-        // the directory and for the list of pages it found no copy of.
+        // the memory run (directory, fault notes, copies) as a program that
+        // reads by raw address.
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
-        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
-        assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        assert!(shader.reads_by_address());
     }
 }
 

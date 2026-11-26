@@ -843,9 +843,11 @@ fn copy_on_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> b
     if !crate::unified::on() || len == 0 {
         return false;
     }
-    // In place, or a window over scattered pages if what is written into
-    // it is copied back into them after the list (`crate::gather`).
-    let Some(d) = crate::shadow::find(to, len).filter(|d| d.in_place() || (d.gather().is_some() && crate::gather::copy_out())) else {
+    // In place. (Into pool memory the copy is made on the CPU at
+    // submission, into the pages themselves: a window there would keep it.)
+    // shortcut: on the card, page by page into the opened sections, it
+    // would keep queue order with the list's other work.
+    let Some(d) = crate::shadow::find(to, len).filter(|d| d.in_place()) else {
         return false;
     };
     let Some(s) = crate::shadow::find(from, len) else {
@@ -1494,6 +1496,14 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         list.defer(move || {
+            // The GPU view of the pool has no host view: through its pages
+            // (`crate::memory`).
+            if crate::memory::gpu_view(src, len as u64) || crate::memory::gpu_view(dst, len as u64) {
+                let mut bytes = vec![0u8; len];
+                crate::host::copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
+                crate::host::copy_mapped(dst as *mut u8, bytes.as_ptr(), len, true);
+                return;
+            }
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {

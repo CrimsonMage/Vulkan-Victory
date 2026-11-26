@@ -177,6 +177,18 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// What a pool table entry says of a buffer view ([`Lower::pool_view`]).
+#[derive(Debug, Clone, Copy)]
+struct PoolView {
+    /// The view is a pool view: read through the directory.
+    on: V,
+    /// Its title address, low dword and bits 32 to 39.
+    lo: V,
+    hi: V,
+    /// Its bytes.
+    bytes: V,
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -210,6 +222,18 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Pool table entries read ([`Self::pool_view`]), by block and site.
+    pools: HashMap<(usize, Site, u8), PoolView>,
+    /// The program reads title memory by raw address (`resource::MEMORY`).
+    by_address: bool,
+    /// While a buffer access that may be a pool view is lowered its view's
+    /// way ([`Self::buffer`]): the register writes, held back until the
+    /// directory's way joins them; whether the view is a pool view (the
+    /// view's way then reads at offset 0); and the byte offset into the
+    /// view the access reads, for the directory's way.
+    held: Option<Vec<(Reg, V, Option<V>)>>,
+    pool_on: Option<V>,
+    pool_byte: Option<V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1349,6 +1373,11 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             strides: HashMap::new(),
+            pools: HashMap::new(),
+            by_address: false,
+            held: None,
+            pool_on: None,
+            pool_byte: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2600,13 +2629,28 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
-    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
-    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
-    /// it and the byte in that view. A page without a copy reads zeros
-    /// (and drops writes) through the null view at the first slot, and its
-    /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    /// The view-heap slot `below` slots under the memory run's base
+    /// (`shader.rs` `MEMORY_RUN_POOL`; 0: the base itself), computed in the
+    /// current block. A program that reads memory by raw address asks for
+    /// the base with slot 1 (`HostShader::reads_by_address`).
+    fn memory_run(&mut self, below: u32) -> V {
+        use super::shader::USER_MEMORY_BASE;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), u8::from(self.by_address), 0);
+        if below == 0 {
+            return base;
+        }
+        let k = self.s.m.i32(below);
+        self.s.m.bin(self.cur, Bin::Sub, base, k)
+    }
+
+    /// The directory entry of the 40-bit title address `lo`, `hi`
+    /// (`shader.rs` `MEMORY_RUN_POOL`): the view-heap slot of the raw view
+    /// of the copy holding it and the byte in that view. A page without a
+    /// copy reads zeros (and drops writes) through the null view at the
+    /// base. With `faults`, its number is left for the host, for lanes that
+    /// run (`guard`). No control flow: the current block stays.
+    fn lookup(&mut self, lo: V, hi: V, guard: Option<V>, faults: bool) -> (V, V) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_RUN_DIRECTORY, MEMORY_RUN_FAULTS};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2623,7 +2667,8 @@ impl<'a> Lower<'a> {
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
-        let directory = self.s.root_srv_handle(SLOT_MEMORY);
+        let slot = self.memory_run(MEMORY_RUN_DIRECTORY);
+        let directory = self.s.heap_handle(c, slot, false, false, (11, 0));
         let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
         let entry = self.s.op(
             c,
@@ -2635,38 +2680,227 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
-        let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
-        if let Some(g) = guard {
-            missing = self.s.m.bin(c, Bin::And, missing, g);
+        if faults {
+            // A page without a copy: its number, at a place by the number,
+            // or at the sink for lanes that do not run and pages that have
+            // one.
+            let zero = k(self, 0);
+            let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+            if let Some(g) = guard {
+                missing = self.s.m.bin(c, Bin::And, missing, g);
+            }
+            let places = k(self, MEMORY_FAULTS - 1);
+            let place = self.s.m.bin(c, Bin::URem, page, places);
+            let one = k(self, 1);
+            let place = self.s.m.bin(c, Bin::Add, place, one);
+            let k2 = k(self, 2);
+            let place = self.s.m.bin(c, Bin::Shl, place, k2);
+            let place = self.s.m.select(c, missing, place, zero);
+            let slot = self.memory_run(MEMORY_RUN_FAULTS);
+            let faults = self.s.heap_handle(c, slot, false, false, (11 | 0x1000, 0));
+            let void = self.s.t.void;
+            let mask = self.s.m.i8(1);
+            self.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[faults, place, iu, page, iu, iu, iu, mask, align],
+            );
         }
-        let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
-        let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
-        let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
-        let faults = self.s.root_uav_handle(SLOT_FAULTS);
-        let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
-        self.s.op(
-            c,
-            "rawBufferStore.i32",
-            Attr::NoUnwind,
-            void,
-            140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
-        );
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let base = self.memory_run(0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (slot, byte)
+    }
+
+    /// Title memory at the 40-bit address `lo`, `hi` by raw address
+    /// (`resource::MEMORY`): the handle of the raw view of the copy holding
+    /// it and the byte in that view ([`Self::lookup`], faults noted).
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        self.by_address = true;
+        let (slot, byte) = self.lookup(lo, hi, guard, true);
+        let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
         (h, byte)
+    }
+
+    /// The handle and byte of the dword of title memory at `lo`, `hi`, for
+    /// a pool view ([`Self::pool_view`]): its page has a directory entry
+    /// whenever the title maps it, so no fault is noted.
+    fn pool_dword(&mut self, lo: V, hi: V) -> (V, V) {
+        let (slot, byte) = self.lookup(lo, hi, None, false);
+        let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
+        (h, byte)
+    }
+
+    /// `n` dwords (1 to 4) of title memory from `lo`, `hi` (4-byte
+    /// aligned) through the directory: one load, or one per dword where
+    /// they cross a 64 KiB page edge (the next page lies anywhere).
+    fn pool_load(&mut self, lo: V, hi: V, n: u32) -> Vec<V> {
+        let load = |l: &mut Self, lo: V, hi: V, n: u32| -> Vec<V> {
+            let (h, byte) = l.pool_dword(lo, hi);
+            let c = l.cur;
+            let (iu, align) = (l.s.m.undef(l.s.t.i32), l.s.m.i32(4));
+            let mask = l.s.m.i8((1u8 << n) - 1);
+            let r = l.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
+            (0..n)
+                .map(|k| {
+                    let x = l.s.m.extract(c, r, k);
+                    l.as_int(x)
+                })
+                .collect()
+        };
+        let whole = load(self, lo, hi, n);
+        if n == 1 {
+            return whole;
+        }
+        let cross = self.page_cross(lo, n);
+        let at = self.begin_guarded(Some(cross));
+        let mut split = Vec::new();
+        for k in 0..n {
+            let (lo_k, hi_k) = self.address_plus(lo, hi, 4 * k as i32);
+            split.push(load(self, lo_k, hi_k, 1)[0]);
+        }
+        let pairs: Vec<(V, V)> = split.into_iter().zip(whole).collect();
+        self.end_guarded(at, &pairs)
+    }
+
+    /// Whether `n` dwords from the address whose low dword is `lo` cross a
+    /// 64 KiB page edge.
+    fn page_cross(&mut self, lo: V, n: u32) -> V {
+        let c = self.cur;
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let room = self.s.m.i32(0x1_0000 - 4 * n);
+        self.s.m.cmp(c, pred::IUGT, within, room)
+    }
+
+    /// Stores `vals` (1 to 4 dwords) to title memory from `lo`, `hi`
+    /// through the directory, split at a 64 KiB page edge as
+    /// [`Self::pool_load`].
+    fn pool_store(&mut self, lo: V, hi: V, vals: &[V]) {
+        let store = |l: &mut Self, lo: V, hi: V, vals: &[V]| {
+            let (h, byte) = l.pool_dword(lo, hi);
+            let iu = l.s.m.undef(l.s.t.i32);
+            let mut args = vec![h, byte, iu];
+            args.extend(vals);
+            args.resize(3 + 4, iu);
+            args.push(l.s.m.i8((1u8 << vals.len()) - 1));
+            args.push(l.s.m.i32(4));
+            let void = l.s.t.void;
+            l.s.op(l.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+        };
+        if vals.len() == 1 {
+            store(self, lo, hi, vals);
+            return;
+        }
+        let cross = self.page_cross(lo, vals.len() as u32);
+        let t = self.s.m.bool(true);
+        let whole = self.s.m.bin(self.cur, Bin::Xor, cross, t);
+        let at = self.begin_guarded(Some(whole));
+        store(self, lo, hi, vals);
+        self.end_guarded(at, &[]);
+        let at = self.begin_guarded(Some(cross));
+        for (k, &x) in vals.iter().enumerate() {
+            let (lo_k, hi_k) = self.address_plus(lo, hi, 4 * k as i32);
+            store(self, lo_k, hi_k, &[x]);
+        }
+        self.end_guarded(at, &[]);
+    }
+
+    /// A 64-bit title address plus a byte offset computed in the shader.
+    fn address_add(&mut self, lo: V, hi: V, off: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let sum = self.s.m.bin(c, Bin::Add, lo, off);
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, one);
+        (sum, hi)
+    }
+
+    /// The heap slot whose pool table entry describes the descriptor `src`
+    /// names; none for descriptors no pool view can be.
+    fn descriptor_slot(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        Ok(Some(match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
+            Source::Phi { block, args } => self.descriptor_phi(*block, args, false, 8)?,
+            Source::Select { scc, args } => {
+                let [Source::Loaded { load: a, first: fa }, Source::Loaded { load: b, first: fb }] = args[..] else {
+                    return Ok(None);
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Ok(None),
+                };
+                let set = self.heap_index(a, fa, false)?;
+                let clear = self.heap_index(b, fb, false)?;
+                self.s.m.select(self.cur, cond, set, clear)
+            }
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => self.lane_heap_index(src, false)?,
+            Source::Built { address, .. } => {
+                use super::shader::USER_ROOT_POOL;
+                if address.param == CODE {
+                    return Ok(None);
+                }
+                let Some(rp) = self.x.native.layout.get(address.param).copied() else {
+                    return Ok(None);
+                };
+                // A spilled program's root arguments fill the host's root
+                // signature already (`user_first`): its root views keep
+                // their windows.
+                if rp.root != RootType::Descriptor || crate::spill::is_spilled(self.x.native) {
+                    return Ok(None);
+                }
+                self.host_word(RootType::Other(USER_ROOT_POOL), rp.slot, 0)
+            }
+            Source::Constant(_) => return Ok(None),
+        }))
+    }
+
+    /// The pool table entry of the buffer view `src` names (`shader.rs`
+    /// `MEMORY_RUN_POOL`), read in the current block: whether it is a pool
+    /// view, its title address and its bytes. None where no view can be
+    /// one.
+    fn pool_view(&mut self, site: Site, src: &Source) -> Option<PoolView> {
+        use super::shader::{MEMORY_RUN_POOL, POOL_ENTRY_BYTES, POOL_FLAG, POOL_SLOTS};
+        // By the descriptor load where there is one: every access through
+        // it in the block reads the same entry.
+        let key = match src {
+            Source::Loaded { load, first } => (self.cur, *load, *first),
+            _ => (self.cur, site, u8::MAX),
+        };
+        if let Some(&p) = self.pools.get(&key) {
+            return Some(p);
+        }
+        let slot = self.descriptor_slot(src).ok().flatten()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(POOL_SLOTS - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let k = self.s.m.i32(POOL_ENTRY_BYTES);
+        let at = self.s.m.bin(c, Bin::Mul, slot, k);
+        let table = self.memory_run(MEMORY_RUN_POOL);
+        let table = self.s.heap_handle(c, table, false, false, (11, 0));
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(7), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, align]);
+        let word = |l: &mut Self, k: u32| {
+            let x = l.s.m.extract(c, r, k);
+            l.as_int(x)
+        };
+        let (lo, hi, bytes) = (word(self, 0), word(self, 1), word(self, 2));
+        let flag = self.s.m.i32(POOL_FLAG);
+        let set = self.s.m.bin(c, Bin::And, hi, flag);
+        let zero = self.s.m.i32(0);
+        let on = self.s.m.cmp(c, pred::NE, set, zero);
+        let k8 = self.s.m.i32(0xFF);
+        let hi = self.s.m.bin(c, Bin::And, hi, k8);
+        let p = PoolView { on, lo, hi, bytes };
+        self.pools.insert(key, p);
+        Some(p)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -3692,6 +3926,12 @@ impl<'a> Lower<'a> {
 
     /// Writes VGPR `reg` (or the SGPR of a lane read), under `guard`.
     fn write(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
+        if let Some(held) = self.held.as_mut() {
+            // A buffer access that may be a pool view: written once the
+            // directory's way joins it ([`Self::buffer`]).
+            held.push((reg, x, guard));
+            return;
+        }
         let x = match (Self::sdwa_dst(inst), reg) {
             (Some((sel, unused)), Reg::V(_)) => self.place_bits(inst, reg, x, sel, unused),
             _ => x,
@@ -5260,7 +5500,6 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked descriptor")?;
-        let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
@@ -5282,6 +5521,63 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A view that may be a pool view (`Self::buffer`): the view's way,
+        // then the directory's under a branch on the pool table's flag. A
+        // root view's stand-in (64 KiB, a constant buffer's most) is read at
+        // its start where the offset is computed.
+        if let Some(p) = self.pool_view(site, src) {
+            self.held = Some(Vec::new());
+            let view_addr = if matches!(src, Source::Built { .. }) && !matches!(addr, V::Const(_)) {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, p.on, zero, addr)
+            } else {
+                addr
+            };
+            let done = self.smem_view(inst, site, src, view_addr, *offset, extra, *soffset, count, code);
+            let held = self.held.take().unwrap_or_default();
+            done?;
+            let at = self.begin_guarded(Some(p.on));
+            let mut inside = Vec::new();
+            for first in (0..count).step_by(4) {
+                let n = (count - first).min(4);
+                let k = self.s.m.i32(4 * first);
+                let off = self.s.m.bin(self.cur, Bin::Add, addr, k);
+                let (lo, hi) = self.address_add(p.lo, p.hi, off);
+                inside.extend(self.pool_load(lo, hi, n));
+            }
+            if inside.len() != held.len() {
+                return Err("a pool view access whose two ways differ");
+            }
+            let pairs: Vec<(V, V)> = inside.into_iter().zip(held.iter().map(|w| w.1)).collect();
+            let joined = self.end_guarded(at, &pairs);
+            for (&(reg, _, guard), x) in held.iter().zip(joined) {
+                self.write(inst, reg, x, guard);
+            }
+            return Ok(());
+        }
+        self.smem_view(inst, site, src, addr, *offset, extra, *soffset, count, code)
+    }
+
+    /// The view's way of a scalar buffer load ([`Self::smem`]): `addr` the
+    /// byte offset into the view (`offset` its constant part, `extra` the
+    /// computed one, `soffset` the offset register), `count` dwords into
+    /// SGPRs from `code` on.
+    #[allow(clippy::too_many_arguments)]
+    fn smem_view(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        addr: V,
+        offset: i32,
+        extra: Option<V>,
+        soffset: Operand,
+        count: u32,
+        code: u8,
+    ) -> Result<(), Why> {
+        let c = self.cur;
+        let kind = self.used_kind(src);
+        let offset = &offset;
         // A buffer the program picks from the view heap by an index it
         // computes (`ResourceHeap`) has no used-resource entry, and the
         // heap holds a buffer view there, not a constant buffer: read as
@@ -5646,6 +5942,21 @@ impl<'a> Lower<'a> {
                 } else {
                     n
                 };
+                // A pool view's host descriptor is null: its bytes are in
+                // the pool table (`shader.rs` `MEMORY_RUN_POOL`).
+                let per = match props.0 & 0xFF {
+                    11 => Some(stride.max(1)),
+                    12 => Some(props.1.max(1)),
+                    _ => None,
+                };
+                let n = match per.and_then(|per| Some((per, self.pool_view(site, &src)?))) {
+                    Some((per, p)) => {
+                        let k = self.s.m.i32(per);
+                        let records = self.s.m.bin(c, Bin::UDiv, p.bytes, k);
+                        self.s.m.select(c, p.on, records, n)
+                    }
+                    None => n,
+                };
                 let mut words = vec![(2, n)];
                 // Its address too, where the code computes with it and the
                 // host can tell it.
@@ -5820,11 +6131,9 @@ impl<'a> Lower<'a> {
     // some values; correct it with an integer check if a title compares
     // converted values exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
-        let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
-        let c = self.cur;
-        let total: u32 = bits.iter().sum();
-        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+        let mut load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+            let c = l.cur;
+            let (u, align) = (l.s.m.undef(l.s.t.i32), l.s.m.i32(4));
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -5841,17 +6150,33 @@ impl<'a> Lower<'a> {
                 })
                 .collect()
         };
+        self.format_from(off, format, channels, &mut load)
+    }
+
+    /// [`Self::format_load`] with the dwords read by `load` (byte offset,
+    /// dwords): a raw view's, or the directory's for a pool view.
+    fn format_from(
+        &mut self,
+        off: V,
+        format: u8,
+        channels: u32,
+        load: &mut dyn FnMut(&mut Self, V, u32) -> Vec<V>,
+    ) -> Result<Vec<V>, Why> {
+        let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let total: u32 = bits.iter().sum();
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let at = self.s.m.bin(self.cur, Bin::And, off, not3);
             let w = load(self, at, 1)[0];
+            let c = self.cur;
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)
         };
+        let c = self.cur;
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
@@ -9925,7 +10250,204 @@ impl<'a> Lower<'a> {
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// A buffer access (`buffer_*`, `tbuffer_*`). Raw, structured and
+    /// constant views may be pool views (`shader.rs` `MEMORY_RUN_POOL`):
+    /// the access is then lowered twice, the view's way (whose host
+    /// descriptor is null for a pool view, read at the view's start) and,
+    /// under a branch on the pool table's flag (uniform where the
+    /// descriptor is), the directory's way at the view's title address plus
+    /// the access's byte. What they read joins where the branch ends.
+    /// Typed views (`buffer_*_format_*`, d16) keep the view's way alone:
+    /// the host keeps their windows.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let pool = self.buffer_pool(inst, (b, i));
+        self.pool_on = pool.map(|p| p.on);
+        self.pool_byte = None;
+        self.held = pool.map(|_| Vec::new());
+        let done = self.buffer_view(inst, b, i);
+        let held = self.held.take().unwrap_or_default();
+        self.pool_on = None;
+        let byte = self.pool_byte.take();
+        done?;
+        let joined = match (pool, byte) {
+            (Some(p), Some(byte)) => self.buffer_by_directory(inst, b, i, p, byte, &held)?,
+            _ => held.iter().map(|w| w.1).collect(),
+        };
+        for (&(reg, _, guard), x) in held.iter().zip(joined) {
+            self.write(inst, reg, x, guard);
+        }
+        Ok(())
+    }
+
+    /// The pool table entry of the view a buffer access names, if the
+    /// access is one the directory's way lowers.
+    fn buffer_pool(&mut self, inst: &Inst, site: Site) -> Option<PoolView> {
+        let Fields::Buffer { lds, tfe, format, .. } = &inst.fields else {
+            return None;
+        };
+        let name = inst.name();
+        let typed = name.starts_with("buffer_load_format") || name.starts_with("buffer_store_format");
+        if *lds || *tfe || typed || name.contains("_d16") || name.ends_with("_inv") {
+            return None;
+        }
+        if format.is_some() && !name.starts_with("tbuffer_load_format_") {
+            return None;
+        }
+        let src = self.descriptors.get(&(site, false)).copied()?;
+        self.pool_view(site, src)
+    }
+
+    /// The directory's way of a buffer access to a pool view `p`, `byte`
+    /// bytes into it, under a branch on its flag (and, for stores and
+    /// atomics, the lane guard); returns the values joined with those the
+    /// view's way wrote (`held`, in order).
+    fn buffer_by_directory(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        p: PoolView,
+        byte: V,
+        held: &[(Reg, V, Option<V>)],
+    ) -> Result<Vec<V>, Why> {
+        let Fields::Buffer { data, format, cache, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let guard = self.guard(b, i)?;
+        let store = name.starts_with("buffer_store_");
+        let atomic = name.strip_prefix("buffer_atomic_");
+        let mut on = p.on;
+        if let Some(g) = guard
+            && (store || atomic.is_some())
+        {
+            on = self.s.m.bin(self.cur, Bin::And, on, g);
+        }
+        let at = self.begin_guarded(Some(on));
+        let (lo, hi) = self.address_add(p.lo, p.hi, byte);
+        let narrow = match name {
+            "buffer_load_ubyte" | "buffer_store_byte" => Some((8, false)),
+            "buffer_load_sbyte" => Some((8, true)),
+            "buffer_load_ushort" | "buffer_store_short" => Some((16, false)),
+            "buffer_load_sshort" => Some((16, true)),
+            _ => None,
+        };
+        let count = |rest: &str| match rest {
+            "dword" | "format_x" => Ok(1u32),
+            "dwordx2" | "format_xy" => Ok(2),
+            "dwordx3" | "format_xyz" => Ok(3),
+            "dwordx4" | "format_xyzw" => Ok(4),
+            _ => Err(name),
+        };
+        let inside: Vec<V> = if let Some(op) = atomic {
+            let d = data.as_ref().ok_or("buffer atomic data")?;
+            let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 } else { 1 })?;
+            let code = match op {
+                "add" => 0,
+                "and" => 1,
+                "or" => 2,
+                "xor" => 3,
+                "smin" => 4,
+                "smax" => 5,
+                "umin" => 6,
+                "umax" => 7,
+                "swap" => 8,
+                "cmpswap" => u32::MAX,
+                _ => return Err(name),
+            };
+            let (h, at) = self.pool_dword(lo, hi);
+            let (iu, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.i32);
+            let r = if code == u32::MAX {
+                let args = [h, at, iu, iu, vals[1], vals[0]];
+                self.s.op(self.cur, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79, &args)
+            } else {
+                let code = self.s.m.i32(code);
+                let args = [h, code, at, iu, iu, vals[0]];
+                self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            };
+            if cache.glc { vec![r] } else { Vec::new() }
+        } else if let Some((bits, signed)) = narrow {
+            // As the view's way: the dword holding the value, and the next
+            // for a 16-bit value at a dword's last byte (each looked up on
+            // its own: the next may lie on the next page).
+            let c = self.cur;
+            let k3 = self.s.m.i32(3);
+            let within = self.s.m.bin(c, Bin::And, lo, k3);
+            let alo = self.s.m.bin(c, Bin::Sub, lo, within);
+            let shift = self.s.m.bin(c, Bin::Shl, within, k3);
+            let (nlo, nhi) = self.address_plus(alo, hi, 4);
+            let ones = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
+            let k8 = self.s.m.i32(8);
+            let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
+            if store {
+                let d = data.as_ref().ok_or("buffer store data")?;
+                let v = self.vgprs(inst, d, 1)?[0];
+                let v = self.s.m.bin(c, Bin::And, v, ones);
+                let all = self.s.m.i32(u32::MAX);
+                let clear = self.s.m.bin(c, Bin::Shl, ones, shift);
+                let keep = self.s.m.bin(c, Bin::Xor, clear, all);
+                let set = self.s.m.bin(c, Bin::Shl, v, shift);
+                let keep_next = self.s.m.i32(0xffff_ff00);
+                let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
+                let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
+                let (iu, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.i32);
+                let (h, at) = self.pool_dword(alo, hi);
+                for (op, x) in [(and, keep), (or, set)] {
+                    self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, iu, iu, x]);
+                }
+                if bits == 16 {
+                    let second = self.begin_guarded(Some(straddles));
+                    let (h, at) = self.pool_dword(nlo, nhi);
+                    for (op, x) in [(and, keep_next), (or, set_next)] {
+                        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, iu, iu, x]);
+                    }
+                    self.end_guarded(second, &[]);
+                }
+                Vec::new()
+            } else {
+                let low = self.pool_load(alo, hi, 1)[0];
+                let high = (bits == 16).then(|| self.pool_load(nlo, nhi, 1)[0]);
+                let c = self.cur;
+                let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
+                if let Some(high) = high {
+                    let zero = self.s.m.i32(0);
+                    let high = self.s.m.bin(c, Bin::Shl, high, k8);
+                    let high = self.s.m.select(c, straddles, high, zero);
+                    x = self.s.m.bin(c, Bin::Or, x, high);
+                }
+                x = self.s.m.bin(c, Bin::And, x, ones);
+                if signed {
+                    let up = self.s.m.i32(32 - bits);
+                    x = self.s.m.bin(c, Bin::Shl, x, up);
+                    x = self.s.m.bin(c, Bin::AShr, x, up);
+                }
+                vec![x]
+            }
+        } else if store {
+            let n = count(name.strip_prefix("buffer_store_").unwrap_or(""))?;
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let vals = self.vgprs(inst, d, n as u8)?;
+            self.pool_store(lo, hi, &vals);
+            Vec::new()
+        } else if let Some(f) = *format {
+            let n = count(name.strip_prefix("tbuffer_load_").unwrap_or(""))?;
+            let mut load = |l: &mut Self, at: V, n: u32| {
+                let (alo, ahi) = l.address_add(p.lo, p.hi, at);
+                l.pool_load(alo, ahi, n)
+            };
+            self.format_from(byte, f, n, &mut load)?
+        } else {
+            let n = count(name.strip_prefix("buffer_load_").ok_or(name)?)?;
+            self.pool_load(lo, hi, n)
+        };
+        if inside.len() != held.len() {
+            return Err("a pool view access whose two ways differ");
+        }
+        let pairs: Vec<(V, V)> = inside.into_iter().zip(held.iter().map(|w| w.1)).collect();
+        Ok(self.end_guarded(at, &pairs))
+    }
+
+    fn buffer_view(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
             addr,
@@ -10064,6 +10586,30 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
+        }
+        // A view that may be a pool view ([`Self::buffer`]): the byte into
+        // the view the access reads, for the directory's way; this way then
+        // reads at the view's start (its host descriptor is null, a root
+        // view's a stand-in).
+        if let Some(on) = self.pool_on {
+            let cbv = used.is_some_and(|u| u.kind == ResourceType::Cbv);
+            let stride = if cbv { 16 } else { used.map_or(0, |u| u.stride) };
+            let byte = match index {
+                None => Some(off),
+                Some(i) if stride == 1 => Some(self.s.m.bin(c, Bin::Add, i, off)),
+                Some(i) if stride >= 4 => {
+                    let k = self.s.m.i32(stride);
+                    let at = self.s.m.bin(c, Bin::Mul, i, k);
+                    Some(self.s.m.bin(c, Bin::Add, at, off))
+                }
+                Some(_) => None,
+            };
+            if let Some(byte) = byte {
+                self.pool_byte = Some(byte);
+                let zero = self.s.m.i32(0);
+                off = self.s.m.select(c, on, zero, off);
+                index = index.map(|i| self.s.m.select(c, on, zero, i));
+            }
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -11412,7 +11958,12 @@ mod tests {
                 slot: 0,
             }]
         };
-        lower_with(&words, layout(), used()).unwrap();
+        let l = lower_with(&words, layout(), used()).unwrap();
+        // The view may be a pool view: the shader finds the memory run,
+        // and reads nothing by raw address.
+        use super::super::shader::USER_MEMORY_BASE;
+        let base = |slot| l.user_data.iter().any(|u| u.root == RootType::Other(USER_MEMORY_BASE) && u.slot == slot);
+        assert!(base(0) && !base(1));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
@@ -11477,8 +12028,10 @@ mod tests {
         for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
             let (layout, used) = texture_and_uav_tables();
             let l = lower_wave(words, layout, used, false).unwrap();
-            // One image handle, from the join's per-lane heap index.
-            assert_eq!(l.nonuniform_handles, 1);
+            // One image handle, from the join's per-lane heap index, and
+            // the copy the UAV's bytes lie in if it is a pool view (each
+            // lane's address finds its own).
+            assert_eq!(l.nonuniform_handles, 2);
             assert!(!l.wave_ops);
         }
     }

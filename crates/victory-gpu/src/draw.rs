@@ -157,6 +157,17 @@ pub(crate) struct State {
     root_srv_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: crate::fast::FastMap<(usize, u64), RootSlot>,
+    /// Root views over pool memory in this list (`crate::memory`): (title
+    /// heap, title address) → the dynamic slot standing for them (a null
+    /// view whose pool table entry holds the address).
+    root_pool_slots: crate::fast::FastMap<(usize, u64), u32>,
+    /// Of the binding under way: the root views over pool memory its
+    /// shaders read by directory, (compute, root slot, dynamic slot)
+    /// (`victory_shader::emit::USER_ROOT_POOL`).
+    root_pools: Vec<(bool, u8, u32)>,
+    /// The memory run's base in the view heap of the last whole binding
+    /// (`crate::memory`), for a dispatch whose constants alone changed.
+    memory_base: u32,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// Of the dynamic slots taken a chunk at a time ([`State::take_slots`]):
@@ -244,6 +255,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_pool_slots.clear();
         self.chunk = (0, 0, 0);
         self.tables_gone = true;
     }
@@ -679,9 +691,18 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_POOL, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            // (A dispatch whose constants alone changed: the run its last
+            // whole binding found.)
+            return memory.map_or(self.memory_base, |m| m.base);
+        }
+        if kind == USER_ROOT_POOL {
+            return self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map_or(victory_shader::emit::POOL_SLOTS - 1, |r| r.2);
+        }
+        if kind == USER_VIEW_BIAS && self.root_pools.iter().any(|r| r.0 == compute && r.1 == slot) {
+            // By directory: from the title's address itself.
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -717,14 +738,18 @@ impl State {
         }
     }
 
-    /// For a shader that reads title memory by address
-    /// ([`crate::memory`]): its directory, fault notes and view slots,
-    /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    /// For a shader that reads title memory by directory
+    /// ([`crate::memory`]): the memory run of the bound view heap; for one
+    /// that reads by raw address (`by_address`) also the pages its root
+    /// views and constants name made ready.
+    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, by_address: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
+        if !by_address {
+            return crate::memory::ready(list, heap, None);
+        }
         // Gathered in memory the thread keeps (the builder dispatches
         // hundreds of times a frame).
         thread_local! {
@@ -741,7 +766,7 @@ impl State {
                     _ => {}
                 }
             }
-            crate::memory::ready(list, heap, addresses, constants, writes)
+            crate::memory::ready(list, heap, Some((addresses, constants, writes)))
         })
     }
 
@@ -955,44 +980,34 @@ impl State {
             // copied back into title memory afterwards.
             let writes = t.stores;
             // Title memory by address: what the shader finds it by.
-            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            let memory = if t.host.reads_memory() {
                 let at = crate::fast::ticks();
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                let Some(ready) = self.memory_ready(list, compute, writes, t.host.reads_by_address()) else {
+                    once!("a shader that reads title memory by directory without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
                 if compute {
                     part(Part::Memory, at);
                 }
+                self.memory_base = ready.base;
                 // What it stores by address reaches the pages with copies
                 // (numbered just now included).
-                if writes {
+                if writes && t.host.reads_by_address() {
                     list.wrote_by_address();
                 }
                 Some(ready)
             } else {
                 None
             };
+            if !self.root_pool_views(list, &t.host, compute) {
+                self.made = made;
+                return false;
+            }
             self.user_data(list, stage, &made, memory.as_ref(), compute);
             self.made = made;
             let roots_began = crate::fast::ticks();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    if srv && slot == victory_shader::emit::SLOT_MEMORY {
-                        // Ours: the directory of title memory by address.
-                        if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
-                        }
-                        continue;
-                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1015,6 +1030,24 @@ impl State {
                         continue;
                     }
                     let tabled = srv;
+                    // Over pool memory, read by directory: the slot standing
+                    // for it (a null view), or for a constant buffer a
+                    // stand-in the shader reads nothing from.
+                    if let Some(index) = self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map(|r| r.2) {
+                        let host = crate::descriptor::heap(self.heaps[0] as This).host();
+                        // SAFETY: an open list; the slot is in the bound view
+                        // heap, the stand-in lives as long as the process.
+                        unsafe {
+                            match (srv, host, crate::memory::stand_in()) {
+                                (true, Some(host), _) if compute => l.SetComputeRootDescriptorTable(param, host.gpu_handle(index)),
+                                (true, Some(host), _) => l.SetGraphicsRootDescriptorTable(param, host.gpu_handle(index)),
+                                (false, _, Some(gpu)) if compute => l.SetComputeRootConstantBufferView(param, gpu),
+                                (false, _, Some(gpu)) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -1061,16 +1094,15 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
-                if slot == victory_shader::emit::SLOT_FAULTS {
-                    // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
+                if let Some(index) = self.root_pools.iter().find(|r| r.0 == compute && r.1 == slot).map(|r| r.2) {
+                    if let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() {
+                        let handle = host.gpu_handle(index);
+                        // SAFETY: an open list; the slot is in the bound view heap.
                         unsafe {
                             if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
+                                l.SetComputeRootDescriptorTable(param, handle);
                             } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
+                                l.SetGraphicsRootDescriptorTable(param, handle);
                             }
                         }
                     }
@@ -1096,9 +1128,7 @@ impl State {
         list.twins_written();
         // A shader that reads title memory by address is made ready every
         // time: copies other lists numbered since are its too.
-        let by_address = p.stages.iter().any(|s| {
-            s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)
-        });
+        let by_address = p.stages.iter().any(|s| s.translated().host.reads_by_address());
         BIND_WRITES.with_borrow(|w| self.writes[kind].clone_from(w));
         self.untracked[kind] = UNTRACKED.get();
         if !by_address {
@@ -1294,6 +1324,61 @@ impl State {
         if !compute {
             let tested = if self.depth_state == DEPTH_READ { self.depth } else { 0 };
             TESTED_DEPTH.set((tested, read));
+        }
+        true
+    }
+
+    /// The root views over pool memory that the shader `t` reads by
+    /// directory (`victory_shader::emit::USER_ROOT_POOL`): each gets a
+    /// dynamic slot of the bound view heap standing for it (a null view of
+    /// its kind, its pool table entry holding the title address), once per
+    /// address per list, noted in [`State::root_pools`] for the user data
+    /// and the root bindings. False if the draw must be dropped (no view
+    /// heap, no slot).
+    fn root_pool_views(&mut self, list: &HostList, t: &victory_shader::emit::HostShader, compute: bool) -> bool {
+        use victory_shader::emit::USER_ROOT_POOL;
+        self.root_pools.retain(|r| r.0 != compute);
+        for u in &t.user_data {
+            if u.root != RootType::Other(USER_ROOT_POOL) {
+                continue;
+            }
+            let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            if !crate::memory::covers(address) {
+                continue;
+            }
+            let heap = match self.heaps[0] {
+                0 => None,
+                h => Some(crate::descriptor::heap(h as This)),
+            };
+            let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+                once!("a root view over pool memory without a bound view heap: the draw is dropped");
+                return false;
+            };
+            let uav = t.root_uavs.contains(&u.slot);
+            let key = (std::ptr::from_ref(heap) as usize, address);
+            let reach = crate::memory::root_reach(address);
+            let index = match self.root_pool_slots.get(&key) {
+                Some(&index) => index,
+                None => {
+                    let Some(index) = self.take_slots(key.0, host, 1) else {
+                        return false;
+                    };
+                    if !host.pool_root_at(index, address, reach, uav) {
+                        // No pool table: its window, as before.
+                        continue;
+                    }
+                    self.root_pool_slots.insert(key, index);
+                    index
+                }
+            };
+            let writes = uav && STORES.get();
+            crate::memory::named(list, address, reach, writes);
+            if writes {
+                note_write(list, address, reach, Cause::RootUav);
+            }
+            self.root_pools.push((compute, u.slot, index));
         }
         true
     }
@@ -1557,6 +1642,11 @@ impl State {
                     .collect();
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
+            }
+            // A pool view is read by directory (`crate::memory`).
+            if let Some((address, len)) = crate::descriptor::host::pool_range(&view) {
+                crate::memory::named(list, address, len, false);
+                continue;
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
@@ -2433,6 +2523,8 @@ impl State {
             };
             let readable = used.iter().filter(tables).filter(|u| u.slot == slot && u.kind == ResourceType::Cbv).all(|u| {
                 match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                    // Pool memory: by directory from the title's slot.
+                    Some(View::Constant(address, _)) if crate::memory::covers(address) => true,
                     Some(View::Constant(address, size)) => {
                         address % 256 == 0
                             && crate::shadow::find(address, u64::from(size).max(1)).is_some_and(|s| {
@@ -2584,6 +2676,13 @@ impl State {
                 let index = first + k;
                 let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    // Pool memory, constant buffers too: by directory.
+                    Some(view) if crate::descriptor::host::pool_range(&view).is_some() => {
+                        host.make_at(index, &view);
+                        if let Some(kind) = used.map(|u| u.kind).or_else(|| view_kind(&view)) {
+                            readable(list, kind, &view);
+                        }
+                    }
                     Some(View::Constant(address, size)) => {
                         // On 256 bytes in title memory the card reads in
                         // place: read there, as root constant views are
@@ -3037,6 +3136,16 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    // A pool view: read and written by directory, in title memory itself
+    // (`crate::memory`); nothing to bring up to date.
+    if let Some((address, len)) = crate::descriptor::host::pool_range(view) {
+        let writes = kind == ResourceType::Uav && STORES.get();
+        crate::memory::named(list, address, len, writes);
+        if writes {
+            note_write(list, address, len, Cause::TableUav);
+        }
+        return;
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -3245,12 +3354,14 @@ fn describe(view: Option<&View>) -> String {
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
         // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0u8; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("Constant({address:#x}, {size})")
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
