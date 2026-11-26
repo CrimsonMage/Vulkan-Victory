@@ -4,8 +4,10 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`heap`]: the counting global allocator of the `diagnostics` build.
 
 pub mod config;
+pub mod heap;
 pub mod logging;
 pub mod policy;
 

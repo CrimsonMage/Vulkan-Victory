@@ -578,6 +578,7 @@ fn workers() -> &'static Sender<Job> {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
                     .spawn(move || {
+                        victory_core::heap::enter_for_thread(victory_core::heap::Owner::Streaming);
                         loop {
                             let next = lock(receiver).recv();
                             let Ok(job) = next else { return };
@@ -858,9 +859,12 @@ thread_local! {
 }
 
 /// Runs `f` on `len` bytes of a worker's buffer, which is kept for the
-/// next request up to 8 MiB (larger ones give their memory back).
+/// next request up to 1 MiB (larger ones give their memory back). Requests
+/// average 20 to 100 KiB; with a worker per core (28 here) and three
+/// buffers each, keeping up to 8 MiB held up to 670 MB of the PC's memory
+/// after a burst, never given back.
 fn scratch<R>(buffer: &'static LocalKey<RefCell<Vec<u8>>>, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    const KEPT: usize = 8 << 20;
+    const KEPT: usize = 1 << 20;
     buffer.with_borrow_mut(|bytes| {
         if bytes.len() < len {
             bytes.resize(len, 0);

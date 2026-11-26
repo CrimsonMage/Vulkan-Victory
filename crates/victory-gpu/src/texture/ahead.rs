@@ -212,6 +212,7 @@ impl Worker {
     }
 
     fn work(self) {
+        victory_core::heap::enter_for_thread(victory_core::heap::Owner::Textures);
         let mut value = 0;
         loop {
             let mut jobs = Vec::new();

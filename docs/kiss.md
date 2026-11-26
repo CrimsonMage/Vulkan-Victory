@@ -36,6 +36,14 @@ the twin; it implements only what is truly console-only.
   More is better (the title's own cap is 30; see workstream 10 for 60).
 - **Low memory**: as little card memory and system memory as the content
   needs, not a mirror of everything.
+- **Process memory (the PC's RAM)**: the baseline is a Series S, where the
+  title has about 8 GB for everything, CPU and GPU. The title's own memory
+  (~7.2 GB, all opened as heaps and so resident) is its budget; what is
+  ours (victory, Wine, vkd3d-proton, the driver) comes on top. Target:
+  the whole process at **≤ ~12 GB first, then toward ~10 GB**, read as the
+  `unique` figure of the `process memory:` line (each page once; Linux's
+  resident count, which `top` shows, counts a section page at each view
+  that maps it). Last full run: ~16.7 GB resident, ~9.5 GB of it ours.
 - **Iterate**: measure (`frame time:` line, card/PC memory), cut the
   biggest cost, repeat.
 - **Content is streamed on demand and then stays put**: the title loads it
@@ -118,6 +126,7 @@ driver errors and no new crash, and the captures look no worse.
 | 12 | Texture quality setting (`VICTORY_TEXTURE_QUALITY`, medium under 10 GB) and lighter menus | subagent | merged (be13db8) |
 | 24 | Thin recording (after VIctory-7900XTX `VICTORY_THIN`, GPL-3.0): the title's threads only write list calls down (`list/thin.rs`), a worker per fast core translates them, `ExecuteCommandLists` waits for its lists; first uploads of title-filled textures on a copy queue of their own, detiled by its workers, slots show a 1x1 grey fallback until the queue's fence (`texture/ahead.rs`, after their `VICTORY_UPLOAD_AHEAD`/`VICTORY_SHOW_AFTER`) | subagent | built, not yet run |
 | 25 | Card page cache for the pool (`memory/cache.rs`): each physical pool page a list names gets one copy in 64 MiB blocks of card memory (a directory copy per block, every alias's entry names it), taken in at first naming or announced change (DirectStorage, file reads, CPU title copies, page mappings), shader writes copied back after each list word by word against a twin (only changed words, never over CPU writes), heap-picked writes held off the cache, LRU eviction by frame inside 90% of memcap's ceiling (idle texture copies let go first for room), naming lock-free once per view and list and off while the cache has no block; frame line `pool page cache: …` | subagent | p21: never opened (gated on the falling system budget), naming cost ~900 ms/frame of workers; fixed, built, not yet run |
+| 26 | Process memory: `process memory:` line every 10 s (Linux's smaps joined with a `VirtualQuery` walk and our counters; victory's heap by owner through a counting allocator in the diagnostics build); DirectStorage worker buffers kept up to 1 MiB (was 8 MiB × 3 × 28 workers), texture read buffers up to 16 MiB per thread (was the largest texture) | subagent | built, not yet run |
 | 10 | 60 fps: hand the title a 16.7 ms frame interval (its own request is 33.3 ms, `frame.rs`) | — | after a steady 30 in the world |
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
@@ -277,3 +286,18 @@ driver errors and no new crash, and the captures look no worse.
   which ended a device loss every ~15 min there). Not taken: their async
   submit thread and joined parts, relay, compares, card steps (mirroring
   machinery this tree deleted).
+- 2026-11-25: process memory (workstream 26). Linux counts a page at each
+  address that maps it: the pool's sections are mapped by the title's CPU
+  view and by victory's whole view of each section (its own writes), so
+  the 16.7 GB resident of the last full run may count up to the
+  sections' 4.4 GB twice. The new line gives both counts; the target is
+  read on the unique one. Title memory opened as heaps is pinned, so
+  resident whole, used or not. Not done, and why: the 1.8 GB of
+  "textures the title fills" are the card's memory, not the PC's
+  (staging is freed after each upload, ~30 MB alive); pool pages cannot
+  be discarded once on the card, since the title's CPU view reads the
+  same pages, textures let go for room are detiled again from them (7.4
+  GB let go by idle eviction in that run), the card page cache refills
+  from them and the GPU reads uncached pages in place;
+  translated shaders kept for pipelines (`pipeline.rs`) are counted
+  (owner "shaders") but left to the pipeline work.

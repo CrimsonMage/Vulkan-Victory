@@ -290,6 +290,13 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<Vec<Idle>> = std::sync::Mutex::new(Vec::new());
 
+/// For the process memory line: host lists kept idle (each holds its
+/// command allocators' memory, the driver's).
+#[cfg(windows)]
+pub(crate) fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 /// The most host lists kept idle.
 #[cfg(windows)]
 // (512 since run 221: with submissions prepared by a thread of ours the
