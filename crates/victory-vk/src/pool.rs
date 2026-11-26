@@ -629,6 +629,22 @@ impl PoolView {
         self.flush(host, timeline, fills, binds)
     }
 
+    /// Diagnostics: the pages shown, and the runs they make (title pages
+    /// in a row showing physical pages in a row of one section): how
+    /// scattered the title's mapping is.
+    pub fn runs(&self) -> (u64, u64) {
+        let mut shown: Vec<(u64, PageKey)> = self.bound.iter().map(|(&i, &k)| (i, k)).collect();
+        shown.sort_unstable();
+        let runs = shown
+            .windows(2)
+            .filter(|w| {
+                let ((i, a), (j, b)) = (w[0], w[1]);
+                !(j == i + 1 && b.0 == a.0 && b.1 == a.1 + PAGE)
+            })
+            .count() as u64;
+        (shown.len() as u64, runs + u64::from(!shown.is_empty()))
+    }
+
     /// The physical page a title address of the view shows.
     pub fn page_at(&self, title: u64) -> Option<(PageKey, u64)> {
         let off = title.checked_sub(self.title_start)?;

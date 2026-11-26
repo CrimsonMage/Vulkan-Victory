@@ -45,6 +45,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::S
     engine(b).pump(b, true);
     split(Split::Submit, t);
     images::refresh(b, frame);
+    super::stale::each_present(b);
     super::stages::new_frame();
     super::follow_budget(b);
     let presented = Instant::now();

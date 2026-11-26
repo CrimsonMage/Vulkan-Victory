@@ -63,12 +63,23 @@ pub(super) fn copied(b: &Backend, at: u64, len: u64) {
     }
 }
 
+/// Every present, with the experiment on: stale pages are copied again
+/// (one frame late for what the CPU writes each frame).
+pub(super) fn each_present(b: &Backend) {
+    if cfg!(feature = "diagnostics") && resync() {
+        check(b, false);
+    }
+}
+
 /// The 10 s line: sampled pages whose home no longer holds what the card
 /// copied.
 pub(super) fn report(b: &Backend) {
-    if !cfg!(feature = "diagnostics") {
-        return;
+    if cfg!(feature = "diagnostics") {
+        check(b, true);
     }
+}
+
+fn check(b: &Backend, tell: bool) {
     let samples: Vec<(u64, u64)> = lock(&SAMPLES).iter().map(|(&p, &h)| (p, h)).collect();
     let mut stale = Vec::new();
     for &(page, was) in &samples {
@@ -81,12 +92,16 @@ pub(super) fn report(b: &Backend) {
         }
     }
     let first: Vec<String> = stale.iter().take(6).map(|p| format!("{p:#x}")).collect();
-    tracing::info!(
-        sampled = samples.len(),
-        stale = stale.len(),
-        first = %first.join(" "),
-        "Vulkan: pool pages the CPU changed after the card copied them, unannounced (a sample: one page in 8)"
-    );
+    if tell {
+        let (pages, runs) = super::memory(b).pools.iter().map(|p| p.runs()).fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.1));
+        tracing::info!(pages, runs, "Vulkan: the pool's GPU view: pages shown and the runs they make");
+        tracing::info!(
+            sampled = samples.len(),
+            stale = stale.len(),
+            first = %first.join(" "),
+            "Vulkan: pool pages the CPU changed after the card copied them, unannounced (a sample: one page in 8)"
+        );
+    }
     if resync() {
         for page in stale {
             super::title_memory_written(page as usize, PAGE as usize);
