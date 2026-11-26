@@ -1,0 +1,19 @@
+[package]
+name = "victory-vk"
+description = "The Vulkan host backend (docs/vulkan-host.md): instance, device, title memory by device address, descriptor buffers, presentation; `victory vkprobe`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Vulkan bindings; `loaded` opens vulkan-1.dll at run time (Proton's winevulkan).
+ash = { version = "0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging"] }
+
+[lints]
+workspace = true

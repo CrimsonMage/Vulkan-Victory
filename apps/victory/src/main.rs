@@ -142,6 +142,10 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Self-test of the Vulkan backend (docs/vulkan-host.md): device and
+    /// what it lacks, title memory imported and read by device address,
+    /// descriptor buffer, a SPIR-V compute program, a cleared swapchain.
+    Vkprobe,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -207,6 +211,12 @@ fn main() -> Result<()> {
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Bake { title, jobs } => bake::run(title, jobs),
         Command::Config => show_config(),
+        Command::Vkprobe => {
+            if !victory_vk::vkprobe()? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
