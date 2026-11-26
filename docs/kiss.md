@@ -276,6 +276,16 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: the white world (vk32, frame 2,048): the world is mostly not
+  drawn: 2.8M draws/dispatches skipped as not compiled against 1.6M run,
+  2,376 stages queued. Skipped one-off passes (exposure, histogram, LUT)
+  and an empty scene blow auto-exposure to white. In-game compute stages
+  compile at 860 ms (one at a time) against ~120 ms for the same modules
+  offline (spvtime, with descriptor buffers, spec constants and the disk
+  cache), 89% inside NVIDIA's compiler; and the driver disk cache does not
+  hit between runs (per-run spec constants suspected). Culling loops
+  (*_BatchCull) still hit the guard: the old path's whole-wave section
+  lowering (emit/wave.rs) was not carried into vk/.
 - 2026-11-26: world load on Vulkan hangs the GPU (Xid 109), also with
   indirect off. Pool garbage fixed (a map failing halfway left pages
   showing other pages' bytes); texture quality now applied on Vulkan. The
