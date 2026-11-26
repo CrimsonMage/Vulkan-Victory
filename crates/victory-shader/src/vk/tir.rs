@@ -91,9 +91,11 @@ pub enum Helper {
     /// (title base u64, bytes u32) -> device base u64, or the zero block
     /// when the bytes are not inside one range.
     TranslateRange,
-    /// (device address u64, V# FORMAT u32) -> uvec4: a typed buffer
-    /// element decoded (floats as their bits; missing channels 0, alpha 1).
+    /// (device address u64, shape u32) -> uvec4: a typed buffer element
+    /// decoded (floats as their bits; missing channels 0, alpha 1).
     Typed,
+    /// (V# FORMAT u32) -> the shape `Typed` decodes (a table lookup).
+    TypedShape,
 }
 
 /// Image access kinds.

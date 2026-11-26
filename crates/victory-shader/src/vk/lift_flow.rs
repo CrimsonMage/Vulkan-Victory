@@ -55,6 +55,7 @@ impl Lift<'_> {
                 Err(_) => self.f.global(Op::Undef, ty),
             };
             let phi = self.f.push(Node { op: Op::Phi, ty, args: vec![inner, outer], imm: Vec::new() });
+            self.born.insert(phi, self.cur_block);
             phis.push(phi);
             self.vals.insert(new, R::D(phi));
         }
@@ -102,6 +103,9 @@ impl Lift<'_> {
         // Blocks in dominator-tree preorder: a block's dominators first, so
         // pure values are shared down the tree (one CSE scope per block).
         let (pre, idom) = dom_preorder(p);
+        for &b in pre.iter().skip(1) {
+            self.depth[b] = self.depth[idom[b]] + 1;
+        }
         self.done = vec![None; p.blocks.len()];
         let mut scopes: Vec<(usize, usize)> = Vec::new();
         for &b in &pre {
@@ -127,6 +131,7 @@ impl Lift<'_> {
     pub(super) fn lift_block(&mut self, b: usize) -> Res<()> {
         let p = self.p;
         self.cur = Vec::new();
+        self.cur_block = b;
         self.words.clear();
         // loads are not shared across blocks
         self.epoch += 1;
@@ -139,7 +144,9 @@ impl Lift<'_> {
                 let saved_cur = std::mem::take(&mut self.cur);
                 self.cur = std::mem::take(&mut self.done[q].as_mut().unwrap().body);
                 self.no_cse = true;
+                self.cur_block = q;
                 let r = self.edge_k(q, b, k);
+                self.cur_block = b;
                 self.no_cse = false;
                 self.done[q].as_mut().unwrap().body = std::mem::replace(&mut self.cur, saved_cur);
                 r?;
@@ -199,6 +206,7 @@ impl Lift<'_> {
                 Ty::U32
             };
             let x = self.f.push(Node { op: Op::Phi, ty, args: vec![u32::MAX; phi.args.len()], imm: Vec::new() });
+            self.born.insert(x, b);
             nodes[j] = x;
             let r = match (phi.reg == Reg::Scc, mask) {
                 (true, _) => R::B(x),

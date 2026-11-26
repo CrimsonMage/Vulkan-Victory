@@ -600,3 +600,5 @@ mod ops;
 mod guard;
 #[path = "emit_xchg.rs"]
 mod xchg;
+#[path = "emit_typed.rs"]
+mod typed;

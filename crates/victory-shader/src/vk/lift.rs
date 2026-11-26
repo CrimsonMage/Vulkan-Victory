@@ -211,6 +211,16 @@ pub struct Lift<'a> {
     words: HashMap<V, (V, V)>,
     /// An LDS access since the halves last met (lift_wave.rs).
     lds_dirty: bool,
+    /// The block whose body `cur` is.
+    cur_block: usize,
+    /// The block each value made in a block body belongs to (prelude values
+    /// have none).
+    born: HashMap<V, usize>,
+    /// Depth of each block in the dominator tree.
+    depth: Vec<usize>,
+    /// Each V#'s derived values (by its four words), made once in the
+    /// deepest block defining a word, for every access below it.
+    vsharps: HashMap<Vec<V>, mem::VSharp>,
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
@@ -302,6 +312,10 @@ impl<'a> Lift<'a> {
             xwave: Self::paired_halves(native),
             words: HashMap::new(),
             lds_dirty: false,
+            cur_block: 0,
+            born: HashMap::new(),
+            depth: vec![0; p.blocks.len()],
+            vsharps: HashMap::new(),
             guarded: false,
             sel: None,
             undo: Vec::new(),
@@ -394,6 +408,8 @@ impl<'a> Lift<'a> {
             && key.is_some()
             && node.args.iter().all(|a| !self.open.as_ref().unwrap().inner.contains(a));
         let v = self.f.push(node);
+        // (inside a guard: not visible after it)
+        self.born.insert(v, if self.guarded && !hoist { usize::MAX } else { self.cur_block });
         if self.guarded && !hoist {
             let o = self.open.as_mut().expect("an open guard");
             o.items.push(Item::N(v));
