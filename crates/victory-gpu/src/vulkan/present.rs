@@ -142,6 +142,7 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         // everything below leaves it so.
         unsafe {
             clear(d, cmd, t);
+            super::gputime::arm(b, cmd, frame);
             if compose::record(b, cmd, t, planes) {
                 PLANES_SHOWN.fetch_add(1, Ordering::Relaxed);
             }
@@ -163,6 +164,7 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         }
         return;
     }
+    super::gputime::tell(b, frame);
     if super::targets::pending(frame) && idle(b) {
         super::targets::save_pending(b, frame);
     }

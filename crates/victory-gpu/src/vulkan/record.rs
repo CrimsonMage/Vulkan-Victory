@@ -661,6 +661,7 @@ impl Rec {
             if self.bound != made.pipeline {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, made.pipeline);
                 self.bound = made.pipeline;
+                super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             }
             let mut list: Vec<&Stage> = vec![&pre];
             if let Some(p) = &pixel {
@@ -885,6 +886,7 @@ impl Rec {
             if self.bound_compute != pipeline {
                 b.host.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.bound_compute = pipeline;
+                super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             }
             self.push(b, cmd, &[&stage], true);
         }
