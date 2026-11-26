@@ -130,14 +130,18 @@ impl Lift<'_> {
         let bytes64 = self.spv(op::I_MUL, Ty::U64, &[nr64, st64]);
         let max = self.f.konst(Ty::U64, 0xFFFF_FFFF);
         let bytes64 = self.gl(glsl::U_MIN, Ty::U64, &[bytes64, max]);
-        // the device base (the zero block when the base is in no range) and
-        // the bytes up to the end of the base's range at most (a V# larger
-        // than the memory it lies in, such as NUM_RECORDS -1, reaches its
-        // range's end)
-        let dev = self.translate(base);
-        let left = self.emit(Op::Call(Helper::RangeLeft), Ty::U64, vec![base]);
-        let bytes64 = self.gl(glsl::U_MIN, Ty::U64, &[bytes64, left]);
-        let limit = self.spv(op::U_CONVERT, Ty::U32, &[bytes64]);
+        // The whole V# lies in one memory range, or it reads the zero block
+        // and writes the sink. (A rule that let a V# larger than its range
+        // reach the range's end, for the BVH builder kernel's NUM_RECORDS
+        // -1 views, faulted the card at world start in every run: vk58,
+        // vk62-65. Back to this rule until that is understood; the kernel's
+        // views read no records again.)
+        let bytes = self.spv(op::U_CONVERT, Ty::U32, &[bytes64]);
+        let dev = self.emit(Op::Call(Helper::TranslateRange), Ty::U64, vec![base, bytes]);
+        let zero = self.fallback(false);
+        let mapped = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[dev, zero]);
+        let z = self.k32(0);
+        let limit = self.spv(op::SELECT, Ty::U32, &[mapped, bytes, z]);
         let shape = self.typed_shape(w[3]);
         VSharp { shape, dev, limit, stride }
     }
