@@ -1137,6 +1137,10 @@ impl Memory {
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
 /// pool's GPU view from their homes).
 fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    // Diagnostics read whatever a draw pushed (not always an address): only
+    // memory known to be title memory the CPU reads (run vk26 crashed in a
+    // copy from address 0 here).
+    anyhow::ensure!(at != 0 && cpu_readable(b, at, len), "{at:#x} is not title memory the CPU reads");
     let m = memory(b);
     let mut out = vec![0u8; len as usize];
     let mut done = 0u64;
@@ -1144,7 +1148,7 @@ fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
         let here = at + done;
         let page_left = PAGE - (here % PAGE);
         let n = page_left.min(len - done);
-        let (cpu, _) = m.cpu_of(here).ok_or_else(|| anyhow::anyhow!("title memory at {here:#x} has no CPU view"))?;
+        let (cpu, _) = m.cpu_of(here).filter(|&(c, _)| c != 0).ok_or_else(|| anyhow::anyhow!("title memory at {here:#x} has no CPU view"))?;
         // SAFETY: committed title memory (or a section page's home).
         unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, out.as_mut_ptr().add(done as usize), n as usize) };
         done += n;
