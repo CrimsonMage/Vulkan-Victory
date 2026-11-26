@@ -1659,8 +1659,9 @@ impl<'a> Lift<'a> {
                 self.sdst(inst, dst, 1, R::D(z));
                 Ok(())
             }
-            // the call of the vertex fetch shader: its results are inputs
-            "swappc" => Ok(()),
+            // the call of the vertex fetch shader: its results are inputs;
+            // a far jump (the block's exit already goes there)
+            "swappc" | "setpc" => Ok(()),
             "setreg" | "setreg_imm32" | "setprio" | "version" | "waitcnt_vscnt" | "waitcnt_vmcnt" | "waitcnt_expcnt"
             | "waitcnt_lgkmcnt" => Ok(()),
             "getreg" => {
@@ -2577,7 +2578,31 @@ impl<'a> Lift<'a> {
                 self.def(inst, Reg::V(d), R::D(v));
             }
             "ds_write_b16" | "ds_write_b8" => {
-                return Err(unsupported(off, name));
+                // a half or byte of a dword: clear it, then set it (two
+                // atomics, so lanes writing the other bytes are kept)
+                let a = match &addr {
+                    Some(o) => {
+                        let x = self.opnd(inst, o)?;
+                        self.u32v(x)
+                    }
+                    None => self.k32(0),
+                };
+                let k = self.k32(o16);
+                let b = self.spv(op::I_ADD, Ty::U32, &[a, k]);
+                let two = self.k32(2);
+                let i = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[b, two]);
+                let three = self.k32(3);
+                let bo = self.spv(op::BITWISE_AND, Ty::U32, &[b, three]);
+                let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[bo, three]);
+                let m = self.k32(if name.ends_with("16") { 0xFFFF } else { 0xFF });
+                let x = self.opnd_dw(inst, &data[0], 0, false)?;
+                let x = self.u32v(x);
+                let x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
+                let xs = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[x, sh]);
+                let ms = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[m, sh]);
+                let keep = self.spv(op::NOT, Ty::U32, &[ms]);
+                self.emit(Op::LdsAtomic(op::ATOMIC_AND), Ty::U32, vec![i, keep]);
+                self.emit(Op::LdsAtomic(op::ATOMIC_OR), Ty::U32, vec![i, xs]);
             }
             _ if name.starts_with("ds_") && atomic_op(name).is_some() => {
                 let opc = atomic_op(name).unwrap();
