@@ -137,30 +137,94 @@ required item stops device creation.
 
 ### 3.3 Pipelines
 
-- A title PSO becomes a `VkPipeline` (graphics, mesh or compute) from the
-  translator's `VkShader`s (ABI section 8). Pipelines are made on the
-  workers of `pipeline/make.rs`, with draw priority, as today.
-- **Dynamic state** keeps the key small. Dynamic everywhere:
-  - core 1.3: viewport and scissor with count, stencil reference and
-    masks, blend constants, depth bias and bounds, cull mode, front face,
-    topology, depth test, write and compare, stencil test and ops,
-    primitive restart;
-  - with EDS3: blend enables, equations and write masks, polygon mode,
-    depth clamp and clip, sample mask, alpha to coverage.
+**The constraint (measured).** Baking the 2,024 pipelines one run used
+took ~7.7 s of NVIDIA compile per pipeline: 4.3 CPU-hours on the
+D3D12/vkd3d path, where every combination of shaders and state is a
+full compile. Under Vulkan, **each shader stage is compiled once, and a
+draw links stages cheaply.** State the title varies is dynamic, so a
+state change never costs a compile.
 
-  The key is the shaders, the attachment formats, the sample count and
-  what EDS3 does not cover.
-- **`VkPipelineCache`** is one blob per `pipelineCacheUUID` in the run's
-  cache folder, loaded at start and saved as `pipeline.rs`
-  `save_pipeline_cache` saves today. It replaces `ID3D12PipelineLibrary`
-  (`pipeline/library.rs`). The driver's own disk cache (NVIDIA's, under
-  Proton in the prefix's cache folder) sits beneath it. The early-start
-  list of title pipelines stays.
-- **Graphics pipeline libraries**, when offered: each stage is compiled
-  into a library as soon as the title creates the PSO. A draw whose
-  optimised pipeline is not ready yet uses a fast-linked one
-  (milliseconds) instead of being dropped. Run p28 still dropped ~1,300
-  draws a frame waiting for pipelines.
+**What is compiled when** (graphics pipeline libraries, the default):
+
+| When | What | Where | Cost |
+|---|---|---|---|
+| The title creates a PSO (`CreateGraphicsPipelineState`, which carries the stages' code) | Each stage is translated to SPIR-V (`shader_cache.rs`, keyed by content). Each stage not seen before becomes a **library part**: a *pre-rasterisation* part per vertex (or task+mesh) program, and a *fragment shader* part per pixel program. They are queued on the `pipeline/make.rs` workers, background threads below the title's. A stage shared by many PSOs is compiled once. | background | one driver compile per distinct stage, not per PSO |
+| The same moment | The *vertex input* part: one for every pipeline, since there are no vertex inputs (ABI section 6) and topology and restart are dynamic. The *fragment output* part: one per attachment format set and sample count (blend is dynamic with EDS3), so a few dozen in all. | background | negligible |
+| The first draw with a PSO | **Fast link** of its four parts, with no link-time optimisation, on the recording worker. It is cached per tuple of parts, and later draws find it with one lock-free lookup. | recording worker | ~0.1 ms with `graphicsPipelineLibraryFastLinking` (vkprobe measures it) |
+| Right after | The **optimised link** (`LINK_TIME_OPTIMIZATION`, parts made with `RETAIN_LINK_TIME_OPTIMIZATION_INFO`) is queued on the workers at low priority. When it is done it replaces the fast one in the lookup (one atomic store); draws recorded after that use it. | background | a full compile, but nothing waits for it |
+| Compute PSO | One compute pipeline per compute program (a compute PSO is one stage). | background | one compile per program |
+
+- **If a stage is not ready at a draw.** The draw raises its parts to the
+  front of the workers' queue (draw priority, as `make.rs` does today)
+  and is **skipped for that frame**. The frame line counts it. The
+  recording worker never waits: one wait would stall the whole list and
+  every list behind it.
+  - With compiles per distinct stage, and started at PSO creation (the
+    title creates its PSOs at load, ahead of use), skips should be rare
+    and short.
+  - A second run starts warm: `VkPipelineCache`, the driver's disk cache
+    and the early-start list of `pipeline/library.rs` all carry over.
+- **Dynamic state on everything the title varies:**
+  - core 1.3: viewport and scissor with count, cull mode, front face,
+    topology, primitive restart, depth test, write and compare, depth bias
+    and its enable, stencil test, ops, masks and reference, blend
+    constants, rasteriser discard, depth bounds;
+  - with EDS3 (`Caps::dynamic_blend`, `dynamic_raster`): blend enables,
+    equations and write masks, polygon mode, depth clamp, sample count,
+    sample mask, alpha to coverage, and depth clip and conservative mode
+    where offered.
+
+  vkprobe's library parts declare exactly these, per part
+  (`graphics.rs` `dynamic`).
+- **The rest is static and lives in parts with few variants:**
+  - attachment formats and sample count (the output part);
+  - sample-rate shading (the fragment part);
+  - line width (lines are rare).
+
+  A title state the host cannot make dynamic on the driver joins the key
+  of the part it belongs to, never the key of a stage compile.
+- **One pipeline layout for everything** (the ABI's global sets plus 256
+  bytes of push constants), so parts never differ by layout and need no
+  `INDEPENDENT_SETS`.
+- **Stages must compile without knowing each other.** ABI v0 links pixel
+  inputs to vertex outputs by *rewriting* the pixel module's locations
+  per pair. That ties a fragment part to one vertex program, so parts
+  would multiply by pairs. Host proposal 6 (section 6) fixes each
+  semantic's location instead. Pixel inputs then also need
+  `graphicsPipelineLibraryIndependentInterpolationDecoration` (vkprobe
+  reports it), or the vertex outputs must carry the same interpolation
+  decorations.
+- **Shader objects** (`VK_EXT_shader_object`) are the alternative model:
+  one `VkShaderEXT` per stage, compiled at PSO creation, no link at all,
+  every state set per command buffer (about 30 calls at a pipeline
+  change, cheap, and mostly already set by the draw state).
+  - They take no `VkPipelineCache`. Their binaries
+    (`vkGetShaderBinaryDataEXT`, keyed by SPIR-V hash and the driver's
+    `shaderBinaryUUID`) would go to victory's own cache file, beside the
+    shader cache.
+  - NVIDIA implements both natively. vkprobe compiles the same triangle
+    both ways, times every part and the links, and draws with each.
+- **The choice:**
+  1. libraries when the driver offers fast linking (they keep the driver
+     cache and get optimised code later);
+  2. else shader objects;
+  3. else whole pipelines with the same dynamic state, one compile per
+     (stages, formats). Still one compile per state-free combination,
+     not per state.
+- **Caches.**
+  - **`VkPipelineCache`** is one blob per `pipelineCacheUUID` in the run's
+    cache folder, loaded at start and saved as `pipeline.rs`
+    `save_pipeline_cache` saves today, with parts and optimised pipelines
+    alike. It replaces `ID3D12PipelineLibrary` (`pipeline/library.rs`).
+  - **The driver's disk cache** sits beneath it. Under Proton, the
+    launcher should keep NVIDIA's cache on (`__GL_SHADER_DISK_CACHE=1`),
+    large (`__GL_SHADER_DISK_CACHE_SIZE`, several GiB), never cleaned
+    (`__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`), and at a path per build of
+    victory. The launcher is outside the repository (open question 5).
+- **Smaller programs compile faster.** The directory lookups that the
+  window removes are a large part of today's translated code: without
+  the directory, the shaders of run p27 had 16.3M SPIR-V instructions
+  instead of 28.0M. So each stage compile should also get cheaper.
 - **The shader cache** (`shader_cache.rs`) keeps its key scheme. The
   payload becomes SPIR-V.
 - **Internal programs.** The indirect bounder, display-plane compose,
@@ -396,6 +460,7 @@ creation.
 | `host.rs` | instance, device, queues; the extension and feature tables with purpose and need; `Caps`; memory types and budgets |
 | `memory.rs` | `Imported` (a title range imported by host pointer, its device base, `device_address(title)`); `Buffer` (victory's own: card, upload, readback) |
 | `descriptors.rs` | descriptor-buffer properties, layouts, `vkGetDescriptorEXT` writes; the fallback set |
+| `graphics.rs` | graphics pipelines from library parts (dynamic state per part, fast and optimised links) and from shader objects; a 64x64 target drawn and read back |
 | `compute.rs` | the probe's SPIR-V program (GLSL in the module notes) and its pipeline with a `VkPipelineCache` |
 | `present.rs` | a Win32 window, surface, swapchain, frames cleared by dynamic rendering |
 | `probe.rs` | `victory vkprobe` |
@@ -430,6 +495,9 @@ The exit code is 1 if a required step failed.
 | card copy (streamed once) | 1 MiB copied from the import into card memory, read there by address |
 | descriptor heap in title memory (`[no]` allowed) | a descriptor written by the CPU into imported title memory, used as the descriptor buffer |
 | title window (`[no]` allowed) | the sparse window of section 3.4 |
+| pipeline model (`[info]`) | libraries, fast linking, independent interpolation, shader objects, dynamic blend/raster state |
+| pipeline libraries (`[no]` allowed) | a triangle's four parts compiled apart and timed; fast link and optimised link timed; the same pipeline whole timed; both linked pipelines draw the right colour |
+| shader objects (`[no]` allowed) | the triangle's two stages as shader objects, timed, binary size; drawn with every state set |
 | images over title memory (`[info]`) | linear and optimal RGBA8 importability from host memory |
 | pipeline cache | bytes after one pipeline; cache UUID |
 
@@ -453,6 +521,9 @@ vkprobe: Vulkan host self-test (docs/vulkan-host.md)
 [ok]   card copy (streamed once): 1 MiB copied from title memory into card memory and read there by address (.. ms)
 [ok]   descriptor heap in title memory: ...            (or [no] with the reason)
 [ok]   title window (sparse buffer over imports): ...   (or [no] with the reason)
+[info] pipeline model: graphics pipeline libraries true, fast linking true, independent interpolation true; shader objects true; blend state dynamic true, raster state dynamic true
+[ok]   pipeline libraries: parts compiled in .. (vertex input) + .. (pre-rasterisation) + .. (fragment) + .. (output) ms; fast link 0.0.. ms, optimised link .. ms, the same pipeline whole .. ms; both linked pipelines drew right
+[ok]   shader objects: both stages compiled in .. ms (no link), binaries .. bytes; drew right
 [info] images over title memory: linear RGBA8 ...; optimal RGBA8 ...
 [ok]   pipeline cache: .. bytes after one pipeline; cache UUID ...
 vkprobe: 11 of 11 required steps passed
@@ -466,9 +537,9 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
 
 | # | Work | Size | Gate |
 |---|---|---|---|
-| M1 | Foundation and `victory vkprobe` (this) | ~2,600 lines incl. tables; done | vkprobe passes under Proton; the title window and descriptor-heap answers recorded here |
+| M1 | Foundation and `victory vkprobe` (this) | ~4,000 lines (rustfmt-expanded tables and embedded SPIR-V included); done | vkprobe passes under Proton; the title window, descriptor-heap and pipeline-model answers recorded here |
 | M2a | **Menus' frame on Vulkan, 2D first.** `VICTORY_GPU=vulkan` makes a `victory-vk` device beside the title-facing objects. The swapchain goes on the title's window. xmem's announcements (`title_region`, `title_section`, `title_memory_view`, `title_pages_aliased`, releases) drive imports and window binds. Queues, timeline fences and fills of fence values come next, then the display planes composed from title memory and present. | ~3,000 lines | boot, intro video and menus' planes show, captures match D3D12 |
-| M2b | **Menus' draws and dispatches** through the new translator (ABI v0). The workers record `VkCommandBuffer`s. Graphics, mesh and compute pipelines, with GPL fast-link and the persisted cache. Dynamic rendering, barriers and layouts. Descriptor buffers with T#/S# slots. Host textures (detile and upload as today), clears, copies, resolves, queries. | ~5,000 lines | menus at ≥30 fps (D3D12: ~26), captures match, no driver error in the 5-minute gate run up to the world's door |
+| M2b | **Menus' draws and dispatches** through the new translator (ABI v0). The workers record `VkCommandBuffer`s. Stages compiled once at PSO creation as library parts (or shader objects, per vkprobe), fast link at the first draw, optimised link in the background, the persisted cache; a skipped-draw count for parts not ready. Dynamic rendering, barriers and layouts. Descriptor buffers with T#/S# slots. Host textures (detile and upload as today), clears, copies, resolves, queries. | ~5,000 lines | menus at ≥30 fps (D3D12: ~26), captures match, no driver error in the 5-minute gate run up to the world's door |
 | M3 | **The world.** Bounded indirect, mesh shaders at scale, levels on demand as sparse images, streamed-once promotion by re-binding window pages, depth and UAV twins, the upscale and ambient stand-ins, the BVH builder's programs, the frame-time line with Vulkan timestamps, the memory ceiling from the budget. | ~5,000 lines | the gate run reaches the world with no Xid, card memory ≤ D3D12's, frame time ≤ D3D12's (~95 ms in run p28) |
 | M4 | **Parity, then deletion.** Default `VICTORY_GPU=vulkan`; one gate run of each; then the D3D12 path goes (section 3.7, ~20,000 lines). vkd3d-proton, `d3dcompiler_47` and DXC are no longer shipped beside the exe. The switch goes. | −20,000 lines | gate, binary size and build time down |
 | M5 | **60 fps work.** Async compute on its queue, big lists split into secondary command buffers, GPU detiling from the window, present wait. | measured | `docs/kiss.md` workstream 10 |
@@ -501,7 +572,22 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
    dword 0"): the host checks at heap creation that the title's heap
    lies below 4 GiB, and logs if not. xmem's 32-bit requests already land
    there.
-6. **The map's `device_base` is read per distinct base** (v0 section 3):
+6. **Fixed locations per semantic; no pixel-module rewrite per pair.**
+   v0's `link(vertex, pixel)` rewrites the pixel module's `Location`s
+   for each vertex program it meets. That makes a fragment library part
+   (or shader object) depend on the vertex program, so parts multiply by
+   pairs, which is exactly the per-combination compile this design
+   avoids (section 3.3). Proposal: the translator gives each semantic
+   (name and index) a fixed location from one table for the whole pack,
+   in both the vertex outputs and the pixel inputs. The table can be
+   found offline from the pack: the count of distinct semantics must be
+   at most 32. A pixel input that no vertex output writes reads an
+   undefined value instead of 0. If that matters for a title shader, the
+   translator can make the pixel program read 0 for semantics that are
+   rarely written. Pixel inputs keep their interpolation decorations.
+   Vertex outputs carry none, which relies on the driver's independent
+   interpolation (vkprobe reports it).
+7. **The map's `device_base` is read per distinct base** (v0 section 3):
    agreed. The host keeps the map in card memory and never rewrites a
    live one. With the window it never changes during a run.
 
@@ -523,6 +609,10 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
    embedded words plus an xtask to regenerate them.
 4. **The switch** `VICTORY_GPU`: a user-facing choice during M2–M3, gone
    at M4. Agreed?
-5. **Native Windows** (no Proton) is not covered. Host-pointer imports of
+5. **The driver's disk cache under Proton.** The `victory-proton`
+   launcher (outside the repository) should set
+   `__GL_SHADER_DISK_CACHE=1`, `__GL_SHADER_DISK_CACHE_SIZE` (several
+   GiB) and `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`. May it?
+6. **Native Windows** (no Proton) is not covered. Host-pointer imports of
    section views should work on Windows' NVIDIA driver too, but nobody
    has tested it.

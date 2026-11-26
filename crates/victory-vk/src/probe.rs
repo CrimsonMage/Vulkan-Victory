@@ -18,6 +18,7 @@ use windows_sys::Win32::System::Memory::{
 
 use crate::compute::{self, Push};
 use crate::descriptors::{self, Fallback};
+use crate::graphics;
 use crate::host::{Host, Need, version};
 use crate::memory::{Buffer, Imported, Place, TITLE_USAGE};
 use crate::present;
@@ -823,6 +824,28 @@ unsafe fn steps(host: &Host, p: &mut Report) -> Result<()> {
         p.try_step("title window (sparse buffer over imports)", res);
     }
 
+    // Graphics pipelines: stages compiled once, linked per draw.
+    let c = &host.caps;
+    p.info(
+        "pipeline model",
+        format!(
+            "graphics pipeline libraries {}, fast linking {}, independent interpolation {}; shader objects {}; blend state dynamic {}, raster state dynamic {}",
+            c.pipeline_library,
+            c.fast_linking,
+            c.independent_interpolation,
+            c.shader_object,
+            c.dynamic_blend,
+            c.dynamic_raster
+        ),
+    );
+    match graphics::Target::new(host) {
+        Ok(target) => {
+            unsafe { graphics_steps(host, p, &target, runner.probe.cache) };
+            unsafe { target.destroy(host) };
+        }
+        Err(e) => p.no("graphics target", format!("{e:#}")),
+    }
+
     // Images over title memory (a query; no image is made).
     p.info("images over title memory", image_support(host));
 
@@ -1038,4 +1061,57 @@ fn image_support(host: &Host) -> String {
         });
     }
     out.join("; ")
+}
+
+/// Pipeline libraries and shader objects: compile times, link times, and a
+/// draw with each.
+unsafe fn graphics_steps(
+    host: &Host,
+    p: &mut Report,
+    target: &graphics::Target,
+    cache: vk::PipelineCache,
+) {
+    let device = &host.device;
+    let layout = match unsafe {
+        device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+    } {
+        Ok(l) => l,
+        Err(e) => return p.no("pipeline libraries", format!("vkCreatePipelineLayout: {e}")),
+    };
+    let res = graphics::Libraries::new(host, layout, cache).and_then(|libs| {
+        let draws = (|| -> Result<String> {
+            let fast = target.draw(host, |cmd| unsafe { graphics::draw_pipeline(host, cmd, libs.fast) })?;
+            let optimised = target.draw(host, |cmd| unsafe { graphics::draw_pipeline(host, cmd, libs.optimised) })?;
+            ensure!(graphics::right(fast), "the fast-linked pipeline drew {fast:?}, expected {:?}", graphics::EXPECT);
+            ensure!(graphics::right(optimised), "the optimised pipeline drew {optimised:?}, expected {:?}", graphics::EXPECT);
+            let t = &libs.times;
+            Ok(format!(
+                "parts compiled in {:.2} (vertex input) + {:.2} (pre-rasterisation) + {:.2} (fragment) + {:.2} (output) ms; fast link {:.3} ms, optimised link {:.2} ms, the same pipeline whole {:.2} ms; both linked pipelines drew right",
+                t.vertex_input, t.pre_raster, t.fragment, t.output, t.fast_link, t.optimised_link, t.monolithic
+            ))
+        })();
+        unsafe { libs.destroy(host) };
+        draws
+    });
+    p.try_step("pipeline libraries", res);
+
+    let res = graphics::Objects::new(host).and_then(|objects| {
+        let draw = target
+            .draw(host, |cmd| unsafe { objects.draw(host, cmd) })
+            .and_then(|px| {
+                ensure!(
+                    graphics::right(px),
+                    "shader objects drew {px:?}, expected {:?}",
+                    graphics::EXPECT
+                );
+                Ok(format!(
+                    "both stages compiled in {:.2} ms (no link), binaries {} bytes; drew right",
+                    objects.ms, objects.binary_bytes
+                ))
+            });
+        unsafe { objects.destroy(host) };
+        draw
+    });
+    p.try_step("shader objects", res);
+    unsafe { device.destroy_pipeline_layout(layout, None) };
 }

@@ -85,7 +85,12 @@ pub const EXTENSIONS: &[Extension] = &[
     ext(
         ext::graphics_pipeline_library::NAME,
         Need::Wanted,
-        "fast-linked pipelines while the optimised one compiles (no dropped draws)",
+        "stages compiled once, linked in a millisecond, optimised later",
+    ),
+    ext(
+        ext::shader_object::NAME,
+        Need::Wanted,
+        "stages compiled once, no link, all state dynamic (alternative to pipeline libraries)",
     ),
     ext(
         ext::mutable_descriptor_type::NAME,
@@ -211,9 +216,24 @@ pub struct Caps {
     /// Each known extension and whether the device has it.
     pub extensions: Vec<(&'static Extension, bool)>,
     pub features: Vec<Feature>,
+    /// The core features as enabled.
+    pub core: vk::PhysicalDeviceFeatures,
     pub descriptor_buffer: bool,
     pub host_memory: bool,
     pub mesh_shader: bool,
+    /// Graphics pipeline libraries (with their pair extension).
+    pub pipeline_library: bool,
+    /// The driver's fast link is fast (property `graphicsPipelineLibraryFastLinking`).
+    pub fast_linking: bool,
+    /// Fragment libraries need not repeat the pre-rasterisation stage's
+    /// interpolation decorations.
+    pub independent_interpolation: bool,
+    pub shader_object: bool,
+    /// Blend enable, equation and write mask as dynamic state.
+    pub dynamic_blend: bool,
+    /// Polygon mode, depth clamp, rasterisation samples, sample mask and
+    /// alpha to coverage as dynamic state (what shader objects need).
+    pub dynamic_raster: bool,
     pub memory_budget: bool,
     pub win32_surface: bool,
     pub min_imported_host_pointer_alignment: u64,
@@ -290,6 +310,7 @@ pub struct Host {
     pub win32_surface: Option<khr::win32_surface::Instance>,
     pub swapchain: khr::swapchain::Device,
     pub host_memory: ext::external_memory_host::Device,
+    pub shader_objects: Option<ext::shader_object::Device>,
     pub descriptor_buffer: Option<ext::descriptor_buffer::Device>,
     /// The instance API version the loader reports.
     pub instance_version: u32,
@@ -385,6 +406,7 @@ impl Host {
         let mut m4_props = vk::PhysicalDeviceMaintenance4Properties::default();
         let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v13_props = vk::PhysicalDeviceVulkan13Properties::default();
+        let mut gpl_props = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let props = {
             let mut p2 = vk::PhysicalDeviceProperties2::default()
                 .push_next(&mut driver_props)
@@ -393,6 +415,9 @@ impl Host {
                 .push_next(&mut v13_props);
             if has(ext::external_memory_host::NAME) {
                 p2 = p2.push_next(&mut host_props);
+            }
+            if has(ext::graphics_pipeline_library::NAME) {
+                p2 = p2.push_next(&mut gpl_props);
             }
             unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
             p2.properties
@@ -418,6 +443,7 @@ impl Host {
         let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
         let mut border = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut clip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
+        let mut objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -451,6 +477,9 @@ impl Host {
             if on(ext::depth_clip_enable::NAME) {
                 f2 = f2.push_next(&mut clip);
             }
+            if on(ext::shader_object::NAME) {
+                f2 = f2.push_next(&mut objects);
+            }
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -467,10 +496,21 @@ impl Host {
         m5.p_next = null;
         border.p_next = null;
         clip.p_next = null;
+        objects.p_next = null;
 
         let features = feature_table(&core, &v11, &v12, &v13);
         let descriptor_buffer = db.descriptor_buffer == vk::TRUE;
         let mesh_shader = mesh.mesh_shader == vk::TRUE;
+        let pipeline_library = gpl.graphics_pipeline_library == vk::TRUE;
+        let shader_object = objects.shader_object == vk::TRUE;
+        let dynamic_blend = eds3.extended_dynamic_state3_color_blend_enable == vk::TRUE
+            && eds3.extended_dynamic_state3_color_blend_equation == vk::TRUE
+            && eds3.extended_dynamic_state3_color_write_mask == vk::TRUE;
+        let dynamic_raster = eds3.extended_dynamic_state3_polygon_mode == vk::TRUE
+            && eds3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE
+            && eds3.extended_dynamic_state3_rasterization_samples == vk::TRUE
+            && eds3.extended_dynamic_state3_sample_mask == vk::TRUE
+            && eds3.extended_dynamic_state3_alpha_to_coverage_enable == vk::TRUE;
 
         // What costs speed or needs set-up the backend does not do.
         core.robust_buffer_access = vk::FALSE;
@@ -583,6 +623,9 @@ impl Host {
             if has(ext::depth_clip_enable::NAME) {
                 info = info.push_next(&mut clip);
             }
+            if shader_object {
+                info = info.push_next(&mut objects);
+            }
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 
@@ -616,6 +659,14 @@ impl Host {
             descriptor_buffer,
             host_memory: true,
             mesh_shader,
+            pipeline_library,
+            fast_linking: gpl_props.graphics_pipeline_library_fast_linking == vk::TRUE,
+            independent_interpolation: gpl_props
+                .graphics_pipeline_library_independent_interpolation_decoration
+                == vk::TRUE,
+            shader_object,
+            dynamic_blend,
+            dynamic_raster,
             memory_budget: has(ext::memory_budget::NAME),
             win32_surface,
             min_imported_host_pointer_alignment: host_props.min_imported_host_pointer_alignment,
@@ -632,12 +683,15 @@ impl Host {
             timestamp_period: props.limits.timestamp_period,
             extensions,
             features,
+            core,
         };
 
         let surface = win32_surface.then(|| khr::surface::Instance::new(&entry, &instance));
         let win32 = win32_surface.then(|| khr::win32_surface::Instance::new(&entry, &instance));
         let swapchain = khr::swapchain::Device::new(&instance, &device);
         let host_memory = ext::external_memory_host::Device::new(&instance, &device);
+        let shader_objects =
+            shader_object.then(|| ext::shader_object::Device::new(&instance, &device));
         let descriptor_buffer_fn =
             descriptor_buffer.then(|| ext::descriptor_buffer::Device::new(&instance, &device));
 
@@ -653,6 +707,7 @@ impl Host {
             win32_surface: win32,
             swapchain,
             host_memory,
+            shader_objects,
             descriptor_buffer: descriptor_buffer_fn,
             instance_version,
             instance_extensions,

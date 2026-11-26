@@ -19,6 +19,7 @@
 
 pub mod compute;
 pub mod descriptors;
+pub mod graphics;
 pub mod host;
 pub mod memory;
 #[cfg(windows)]
