@@ -1520,6 +1520,27 @@ Host side of ABI v3 (translator ab78299):
   1.0 s old, the oldest unfinished submission of every line still running
   is printed with its trail.
 
+### Stage compile speed and the caches (after vk32/vk33)
+
+- spvtime timed the modules against the ABI v0 layout (two sets, a
+  sampler binding in set 0, immutable samplers in set 1, **no set 3**).
+  Every translated module reads the memory map from set 3 binding 0, so
+  its layout was not the module's (undefined; the compiler may fold the
+  map's reads and the address search away). It also left
+  robustBufferAccess and robustImageAccess on. `target/spvtime-abi3/spvtime3.c`
+  (in this worktree, not committed) creates them as the host does: the v3
+  layout, the host's device features, specialisation 0 = false and
+  100..131, `DESCRIPTOR_BUFFER` flags, optionally a `VkPipelineCache`
+  (`SPVTIME_CACHE`) and several threads (`SPVTIME_THREADS`).
+- Pipelines differed between runs: immediate sampler slots (constants
+  100 + n) were handed out first come. They are now kept in
+  `immediate-samplers.txt` beside the translations.
+- The `VkPipelineCache` was saved only at the end of a run, which killed
+  runs never reach. It is now saved every 60 s while parts compile.
+- Stage workers: half the logical processors (4 to 8), below-normal
+  priority, at most 1 M SPIR-V words compiling at once. "Vulkan part:
+  compiled" has `cpu_ms` beside `ms`.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

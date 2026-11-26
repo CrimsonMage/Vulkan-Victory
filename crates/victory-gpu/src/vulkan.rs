@@ -783,6 +783,7 @@ fn start_reports() {
                 std::thread::sleep(Duration::from_millis(250));
                 budget::steps(b);
                 engine::report_stalls(b);
+                stages::save_cache_now_and_then(b);
                 if last.elapsed() >= Duration::from_secs(10) {
                     last = Instant::now();
                     report(b, FRAME.load(Ordering::Relaxed));

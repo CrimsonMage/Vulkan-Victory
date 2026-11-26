@@ -103,6 +103,36 @@ fn save_registry(dir: &std::path::Path) {
     }
 }
 
+/// The immediate samplers' slots of earlier runs (`stages::immediate_slot`):
+/// one sampler a line, its four words in hex, in slot order. Kept apart
+/// from the translations (slots are the host's, not the translator's).
+fn immediates_path() -> Option<PathBuf> {
+    Some(dir()?.join("immediate-samplers.txt"))
+}
+
+pub(crate) fn load_immediates() -> Vec<[u32; 4]> {
+    let Some(text) = immediates_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    let parse = |line: &str| -> Option<[u32; 4]> {
+        let w: Vec<u32> = line.split_whitespace().map(|x| u32::from_str_radix(x, 16).ok()).collect::<Option<_>>()?;
+        w.try_into().ok()
+    };
+    let list: Option<Vec<[u32; 4]>> = text.lines().filter(|l| !l.trim().is_empty()).map(parse).collect();
+    let list = list.unwrap_or_default();
+    tracing::info!(samplers = list.len(), "Vulkan: immediate sampler slots of earlier runs");
+    list
+}
+
+pub(crate) fn save_immediates(list: &[[u32; 4]]) {
+    let Some(p) = immediates_path() else { return };
+    let text: String = list.iter().map(|w| format!("{:08x} {:08x} {:08x} {:08x}\n", w[0], w[1], w[2], w[3])).collect();
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
 /// Keeps `vs`, the translation of the container `full`.
 pub(crate) fn write(full: &[u8; 32], vs: &VkShader) {
     let Some(p) = path(full) else { return };
