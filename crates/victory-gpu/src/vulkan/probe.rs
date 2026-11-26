@@ -12,8 +12,11 @@ use victory_vk::memory::{Buffer, Place};
 
 use super::{Backend, memory, read_title};
 
-/// Bytes probed at each address.
-const SPAN: u64 = 64;
+/// Bytes probed at an address at most (each target says how many).
+const SPAN: u64 = 0x120;
+
+/// A probe target: what it is, its title address, and bytes.
+pub(super) type Target = (String, u64, u64);
 /// The marker written after the copies: the probe has run.
 const DONE: u32 = 0x600d_f00d;
 /// Probes in a run at most.
@@ -67,23 +70,23 @@ pub(super) fn describe(b: &Backend, at: u64) -> String {
     format!("{home}; {map}; {}", page(at))
 }
 
-/// The CPU's dwords at `at` (`SPAN` bytes), if it reads them.
-fn cpu_words(b: &Backend, at: u64) -> Option<Vec<u32>> {
-    let bytes = read_title(b, at, SPAN).ok()?;
+/// The CPU's dwords at `at` (`len` bytes), if it reads them.
+fn cpu_words(b: &Backend, at: u64, len: u64) -> Option<Vec<u32>> {
+    let bytes = read_title(b, at, len).ok()?;
     Some(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
 struct Probe {
     buf: Buffer,
-    targets: Vec<(String, u64)>,
+    targets: Vec<Target>,
     cpu: Vec<Option<Vec<u32>>>,
 }
 
 static PROBES: Mutex<Vec<Probe>> = Mutex::new(Vec::new());
 /// The last culling dispatch's targets, described again at a guard hit.
-static LAST: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+static LAST: Mutex<Vec<Target>> = Mutex::new(Vec::new());
 
-pub(super) fn remember(targets: &[(String, u64)]) {
+pub(super) fn remember(targets: &[Target]) {
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = targets.to_vec();
 }
 
@@ -95,12 +98,12 @@ pub(super) fn describe_last(b: &Backend) {
         return;
     }
     let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    for (what, at) in last {
+    for (what, at, len) in last {
         tracing::warn!(
             what = %what,
             at = format_args!("{at:#x}"),
             home = %describe(b, at),
-            cpu = format_args!("{:08x?}", cpu_words(b, at).map(|c| c[..8].to_vec())),
+            cpu = format_args!("{:08x?}", cpu_words(b, at, len)),
             "Vulkan: at a guard hit, the last culling dispatch's memory"
         );
     }
@@ -110,11 +113,22 @@ static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 /// Records, into `cmd` (outside rendering), a copy of `SPAN` bytes at each
 /// target as the card sees them; logs where each lives. At most [`MOST`]
 /// probes a run.
-pub(super) fn record(b: &Backend, cmd: vk::CommandBuffer, targets: Vec<(String, u64)>) {
+pub(super) fn record(b: &Backend, cmd: vk::CommandBuffer, targets: Vec<Target>) {
     use std::sync::atomic::Ordering;
     if !cfg!(feature = "diagnostics") || targets.is_empty() || MADE.fetch_add(1, Ordering::Relaxed) >= MOST {
         return;
     }
+    // Each copy stays inside the map range that holds its start.
+    let targets: Vec<Target> = {
+        let m = memory(b);
+        targets
+            .into_iter()
+            .map(|(w, at, len)| {
+                let room = m.map.range_of(at).map_or(0, |r| r.title_start + r.title_size - at);
+                (w, at, len.min(SPAN).min(room) & !3)
+            })
+            .collect()
+    };
     let n = targets.len() as u64;
     let Ok(buf) = Buffer::new(&b.host, n * SPAN + 16, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback) else { return };
     // SAFETY: our mapped buffer, `n * SPAN + 16` bytes.
@@ -124,17 +138,19 @@ pub(super) fn record(b: &Backend, cmd: vk::CommandBuffer, targets: Vec<(String, 
     // title buffers the card reads into our read-back buffer.
     unsafe {
         super::images::full_barrier(d, cmd);
-        for (k, (_, at)) in targets.iter().enumerate() {
-            if let Some((src, off)) = super::buffer_of(b, *at) {
-                let region = vk::BufferCopy::default().src_offset(off).dst_offset(k as u64 * SPAN).size(SPAN);
+        for (k, (_, at, len)) in targets.iter().enumerate() {
+            if *len > 0
+                && let Some((src, off)) = super::buffer_of(b, *at)
+            {
+                let region = vk::BufferCopy::default().src_offset(off).dst_offset(k as u64 * SPAN).size(*len);
                 d.cmd_copy_buffer(cmd, src, buf.buffer, &[region]);
             }
         }
         super::images::full_barrier(d, cmd);
         d.cmd_update_buffer(cmd, buf.buffer, n * SPAN, &DONE.to_le_bytes());
     }
-    let cpu = targets.iter().map(|(_, at)| cpu_words(b, *at)).collect();
-    for (what, at) in &targets {
+    let cpu = targets.iter().map(|(_, at, len)| cpu_words(b, *at, *len)).collect();
+    for (what, at, _) in &targets {
         tracing::info!(what = %what, at = format_args!("{at:#x}"), home = %describe(b, *at), "Vulkan probe: where the card reads it");
     }
     PROBES.lock().unwrap_or_else(|e| e.into_inner()).push(Probe { buf, targets, cpu });
@@ -159,20 +175,20 @@ pub(super) fn check(b: &Backend) {
             left.push(p);
             continue;
         }
-        for (k, (what, at)) in p.targets.iter().enumerate() {
-            // SAFETY: as above, `SPAN` bytes at `k * SPAN`.
-            let card: Vec<u32> = (0..SPAN as usize / 4).map(|w| unsafe { p.buf.mapped.add(k * SPAN as usize + 4 * w).cast::<u32>().read_volatile() }).collect();
-            let now = cpu_words(b, *at);
+        for (k, (what, at, len)) in p.targets.iter().enumerate() {
+            // SAFETY: as above, `len` <= `SPAN` bytes at `k * SPAN`.
+            let card: Vec<u32> = (0..*len as usize / 4).map(|w| unsafe { p.buf.mapped.add(k * SPAN as usize + 4 * w).cast::<u32>().read_volatile() }).collect();
+            let now = cpu_words(b, *at, *len);
             let at_record = p.cpu[k].as_ref();
             tracing::info!(
                 what = %what,
                 at = format_args!("{at:#x}"),
                 same_as_cpu_at_record = at_record.is_some_and(|c| *c == card),
                 same_as_cpu_now = now.as_ref().is_some_and(|c| *c == card),
-                card = format_args!("{:08x?}", &card[..8]),
-                cpu_at_record = format_args!("{:08x?}", at_record.map(|c| &c[..8])),
-                cpu_now = format_args!("{:08x?}", now.as_ref().map(|c| &c[..8])),
-                "Vulkan probe: what the card read (first 8 dwords; 0xeeeeeeee: not copied)"
+                card = format_args!("{:08x?}", card),
+                cpu_at_record = format_args!("{:08x?}", at_record),
+                cpu_now = format_args!("{:08x?}", now),
+                "Vulkan probe: what the card read (0xeeeeeeee: not copied)"
             );
         }
         // SAFETY: the card has run the copies into it.

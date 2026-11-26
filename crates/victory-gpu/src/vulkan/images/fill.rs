@@ -476,15 +476,19 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
 }
 
 
-/// A fingerprint (never 0) of three 16 KiB windows of `[at, at + len)`
-/// read through its CPU view (`read_title`: pool pages through the pool's
-/// CPU view); `None` where there is none.
+/// A fingerprint (never 0) of `[at, at + len)` read through its CPU view
+/// (`read_title`: pool pages through the pool's CPU view); `None` where
+/// there is none. Textures up to [`WHOLE`] are hashed whole: a glyph cache
+/// the CPU updates in small rectangles anywhere (vk40: UI text with letters
+/// missing) changes outside any window. Bigger ones are hashed in three
+/// 16 KiB windows (movie frames, rewritten whole).
 fn fingerprint(b: &Backend, at: u64, len: u64) -> Option<u64> {
     const WINDOW: u64 = 16 << 10;
+    const WHOLE: u64 = 4 << 20;
     if !super::super::cpu_readable(b, at, len) {
         return None;
     }
-    let windows = if len <= 3 * WINDOW { vec![(0, len)] } else { vec![(0, WINDOW), ((len / 2) & !0xfff, WINDOW), (len - WINDOW, WINDOW)] };
+    let windows = if len <= WHOLE { vec![(0, len)] } else { vec![(0, WINDOW), ((len / 2) & !0xfff, WINDOW), (len - WINDOW, WINDOW)] };
     let mut hasher = blake3::Hasher::new();
     for (from, n) in windows {
         hasher.update(&super::super::read_title(b, at + from, n).ok()?);

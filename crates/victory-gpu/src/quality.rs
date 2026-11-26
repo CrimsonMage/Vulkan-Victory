@@ -1,5 +1,5 @@
 //! Texture quality, as a PC game has it: `VICTORY_TEXTURE_QUALITY=high`,
-//! `medium` or `low`. Default: `medium` on a card with less than 10 GB of
+//! `medium` or `low`. Default: `low` on a card with less than 10 GB of
 //! its own memory, else `high`.
 //!
 //! At `medium` the card image of a texture the title fills leaves out its
@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 /// The levels left out, plus one (0: not decided yet).
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 
-/// A card with less of its own memory than this gets `medium` by default.
+/// A card with less of its own memory than this gets `low` by default (vk40:
+/// at `medium` an 8 GB card ran past its ceiling in the world).
 const HIGH_FROM: u64 = 10 << 30;
 
 /// The smallest side, in texels, of a texture whose host copy may be made
@@ -25,7 +26,7 @@ pub(crate) const SMALLEST: u64 = 256;
 fn decide(value: Option<&str>, dedicated: u64) -> (u32, &'static str, bool) {
     let by_default = || {
         if dedicated != 0 && dedicated < HIGH_FROM {
-            (1, "medium")
+            (2, "low")
         } else {
             (0, "high")
         }
@@ -101,12 +102,12 @@ mod tests {
 
     #[test]
     fn the_default_follows_the_cards_memory() {
-        assert_eq!(decide(None, 8151 << 20).0, 1);
+        assert_eq!(decide(None, 8151 << 20).0, 2);
         assert_eq!(decide(None, 12 << 30).0, 0);
-        assert_eq!(decide(Some(""), 8151 << 20).0, 1);
+        assert_eq!(decide(Some(""), 8151 << 20).0, 2);
         assert_eq!(decide(Some("LOW"), 16 << 30).0, 2);
         assert_eq!(decide(Some("high"), 4 << 30).0, 0);
-        assert_eq!(decide(Some("ultra"), 4 << 30).0, 1);
+        assert_eq!(decide(Some("ultra"), 4 << 30).0, 2);
     }
 
     #[test]

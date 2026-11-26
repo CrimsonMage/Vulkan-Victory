@@ -108,19 +108,39 @@ impl Rec {
             user_data_map = %self.last_user,
             "Vulkan: a culling dispatch (diagnostics)"
         );
-        // What the card reads there: the table, the batch records and the
-        // tables the program reads at +0xac0, +0xb20 and +0x780 of it.
-        let table = u64::from(ud[0]);
-        let mut targets = vec![("descriptor table".to_string(), table)];
-        for (what, off) in [("records", 0u64), ("batch", 0xac0), ("planes/48-byte table", 0xb20), ("classes", 0x780)] {
-            if off != 0 {
-                targets.push((format!("table+{off:#x}"), table + off));
-            }
-            if let Ok(v) = read_title(b, table + off, 16) {
-                let base = u64::from(u32::from_le_bytes([v[0], v[1], v[2], v[3]])) | u64::from(u16::from_le_bytes([v[4], v[5]])) << 32;
-                if base != 0 {
-                    targets.push((what.to_string(), base));
-                }
+        // What the card reads there (the translator's reading of the
+        // batch culling programs): user data 0-8; the V#s at user-data
+        // dword 4 (a table address) +0xac0, +0x3a0, +0xb20, +0x2e0; the
+        // records at the V# at user-data dword 5 (s88 = records[group]);
+        // and for the first groups, 0x120 bytes at the +0xac0 V#'s base
+        // plus s88.
+        let pushed = self.last_push;
+        tracing::info!(
+            program = %names,
+            user_data_0_8 = format_args!("{:08x?}", &pushed[4..13]),
+            "Vulkan: a culling dispatch's user data (diagnostics)"
+        );
+        let t4 = u64::from(pushed[8]);
+        let t5 = u64::from(pushed[9]);
+        let base_at = |at: u64| -> Option<u64> {
+            let v = read_title(b, at, 8).ok()?;
+            let base = u64::from(u32::from_le_bytes([v[0], v[1], v[2], v[3]])) | u64::from(u16::from_le_bytes([v[4], v[5]])) << 32;
+            (base != 0).then_some(base)
+        };
+        let mut targets: Vec<super::super::probe::Target> = [0xac0u64, 0x3a0, 0xb20, 0x2e0]
+            .iter()
+            .map(|off| (format!("ud4+{off:#x} V#"), t4 + off, 16))
+            .collect();
+        targets.push(("ud5 V# (records)".into(), t5, 16));
+        let records = base_at(t5);
+        if let Some(r) = records {
+            targets.push(("records[0..16]".into(), r, 64));
+        }
+        if let (Some(r), Some(batch)) = (records, base_at(t4 + 0xac0)) {
+            for g in [0u64, 1, 2] {
+                let Ok(w) = read_title(b, r + 4 * g, 4) else { continue };
+                let s88 = u64::from(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+                targets.push((format!("batch group {g} (s88={s88:#x})"), batch + s88, 0x120));
             }
         }
         super::super::probe::remember(&targets);

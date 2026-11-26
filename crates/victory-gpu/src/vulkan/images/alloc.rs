@@ -29,7 +29,7 @@ pub(super) fn allocate(
         vk::MemoryPropertyFlags::HOST_VISIBLE,
     )?;
     if needs.size > BLOCK / 4 {
-        if !super::super::budget::fits(&b.host, needs.size) {
+        if !super::super::budget::fits(b, needs.size) {
             return None;
         }
         // SAFETY: valid allocate info.
@@ -67,7 +67,7 @@ pub(super) fn allocate(
             return Some((blk.memory, at));
         }
     }
-    if !super::super::budget::fits(&b.host, BLOCK) {
+    if !super::super::budget::fits(b, BLOCK) {
         return None;
     }
     // SAFETY: valid allocate info.

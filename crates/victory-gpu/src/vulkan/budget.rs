@@ -51,13 +51,33 @@ pub(super) fn limit(host: &Host) -> u64 {
     let Some((budget, usage)) = heap(host) else {
         return CEILING;
     };
+    // The driver's own use for us (spills, internal heaps) counts against
+    // the ceiling too: the process's whole use stays under it (vk40: ours
+    // 5,318 MiB, the process 5,609).
     let others = usage.saturating_sub(account::card_total());
-    CEILING.min(budget.saturating_sub(others).saturating_sub(ROOM))
+    CEILING.saturating_sub(others).min(budget.saturating_sub(others).saturating_sub(ROOM))
 }
 
-/// Whether `bytes` more of ours (an image block) may be allocated.
-pub(super) fn fits(host: &Host, bytes: u64) -> bool {
-    let fits = account::card_total() + bytes <= limit(host) + ROOM / 2;
+/// Whether `bytes` more of ours (an image block) may be allocated: never
+/// past the limit. Images come first: the pool's views give blocks back
+/// for them now (down to [`LEAST`]) if the memory lock is free; otherwise
+/// at the next frame, and the image waits for its next naming.
+pub(super) fn fits(b: &Backend, bytes: u64) -> bool {
+    let host = &b.host;
+    let over = || (account::card_total() + bytes).saturating_sub(limit(host));
+    if over() > 0
+        && let Ok(mut m) = b.memory.try_lock()
+    {
+        let mut need = over();
+        for p in &mut m.pools {
+            let has = p.card_bytes();
+            let target = has.saturating_sub(need).max(LEAST);
+            if target < has && p.shrink(host, &b.timeline, target).is_ok() {
+                need = need.saturating_sub(has - p.card_bytes());
+            }
+        }
+    }
+    let fits = over() == 0;
     if !fits {
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
