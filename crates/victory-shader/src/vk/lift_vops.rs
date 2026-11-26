@@ -3,9 +3,7 @@
 use super::*;
 
 impl Lift<'_> {
-    #[allow(unused_variables)]
-    pub(super) fn op_cndmask_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_cndmask_b32(&mut self, inst: &Inst, _name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let m = self.opnd_mask(inst, &v.src[2])?;
         // floats stay floats (constants follow the other side)
@@ -27,8 +25,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_fmac_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_fmac_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.fsrc(inst, v, 0)?;
@@ -46,9 +43,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_med3_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_med3_f32(&mut self, inst: &Inst, _name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.fsrc(inst, v, 0)?;
         let b = self.fsrc(inst, v, 1)?;
@@ -65,8 +60,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_fma_mix_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_fma_mix_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         // op_sel_hi[i]: src i is f16 (op_sel[i] its high half), else f32
@@ -110,10 +104,8 @@ impl Lift<'_> {
         Ok(())
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_fma_f16(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_fma_f16(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.f16src(inst, v, 0)?;
         let b = self.f16src(inst, v, 1)?;
         let c = if name == "v_fmac_f16" {
@@ -137,10 +129,8 @@ impl Lift<'_> {
         self.write_half(inst, v, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_pk_fma_f16(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_pk_fma_f16(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let n = if name == "v_pk_fma_f16" { 3 } else { 2 };
         let mut lo = Vec::new();
         let mut hi = Vec::new();
@@ -185,10 +175,7 @@ impl Lift<'_> {
         Ok(())
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_lshrrev_b16(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
+    pub(super) fn op_lshrrev_b16(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let a = self.usrc(inst, v, 0)?;
         let b = self.usrc(inst, v, 1)?;
         let (z, s16) = (self.k32(0), self.k32(16));
@@ -213,9 +200,7 @@ impl Lift<'_> {
         self.write_half(inst, v, h)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_cvt_pk_u8_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_cvt_pk_u8_f32(&mut self, inst: &Inst, _name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         // byte (src1 & 3) of src2 replaced by u8(src0)
         let a = self.fsrc(inst, v, 0)?;
@@ -233,9 +218,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_mul_u32_u24(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_mul_u32_u24(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.usrc(inst, v, 0)?;
         let b = self.usrc(inst, v, 1)?;
@@ -259,10 +242,8 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_lshlrev_b64(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_lshlrev_b64(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let s = self.usrc(inst, v, 0)?;
         let a = self.opnd_u64(inst, &v.src[1])?;
         let k63 = self.k32(63);
@@ -280,9 +261,7 @@ impl Lift<'_> {
         Ok(())
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_alignbit_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_alignbit_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.usrc(inst, v, 0)?;
         let b = self.usrc(inst, v, 1)?;
@@ -301,8 +280,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_perm_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_perm_b32(&mut self, inst: &Inst, _name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.usrc(inst, v, 0)?;
@@ -335,9 +313,7 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_min3_u32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_min3_u32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let s = name.ends_with("i32");
         let (mn, mx) = if s { (glsl::S_MIN, glsl::S_MAX) } else { (glsl::U_MIN, glsl::U_MAX) };
@@ -357,10 +333,8 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
     pub(super) fn op_mad_u64_u32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let a = self.usrc(inst, v, 0)?;
         let b = self.usrc(inst, v, 1)?;
         let c = self.opnd_u64(inst, &v.src[2])?;
@@ -380,9 +354,7 @@ impl Lift<'_> {
         Ok(())
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_mbcnt_lo_u32_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_mbcnt_lo_u32_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         // bits of the mask below this lane's console lane
         let m = self.usrc(inst, v, 0)?;
@@ -402,10 +374,8 @@ impl Lift<'_> {
         f(self, x)
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_writelane_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
+    pub(super) fn op_writelane_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let off = inst.machine.offset;
-        let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let s = self.usrc(inst, v, 0)?;
         let l = self.usrc(inst, v, 1)?;
         let Some(Operand::Vector { reg, .. }) = v.dst else { return Err(unsupported(off, name)) };
@@ -430,9 +400,7 @@ impl Lift<'_> {
         Ok(())
     }
 
-    #[allow(unused_variables)]
-    pub(super) fn op_permlanex16_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        let off = inst.machine.offset;
+    pub(super) fn op_permlanex16_b32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
         let f = |l: &mut Self, x: V| -> Res<()> { l.vdst(inst, v, x) };
         let x = self.usrc(inst, v, 0)?;
         let s1 = self.usrc(inst, v, 1)?;

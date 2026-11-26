@@ -21,7 +21,7 @@ use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, Operand, Valu};
 use crate::io::{self, Input, Target};
 use crate::ir::{self, Exit, Inst, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, RootType, StageIo};
+use crate::native::{HwStage, NativeProgram, StageIo};
 
 /// Which half of a console wave64 mask a register dword holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,11 +919,6 @@ fn atomic_op(name: &str) -> Option<u16> {
     })
 }
 
-#[allow(dead_code)]
-fn root_window(stage: HwStage, t: RootType) -> u32 {
-    let _ = t;
-    push_window(stage)
-}
 
 // Instruction families live in their own files.
 #[path = "lift_image.rs"]
