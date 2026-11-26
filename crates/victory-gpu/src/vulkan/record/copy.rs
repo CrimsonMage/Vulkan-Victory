@@ -49,19 +49,22 @@ impl Rec {
             return;
         };
         let mut regions = Vec::new();
-        for mip in 0..di.mips.min(si.mips) {
+        // Level by console level (texture quality may leave out the largest
+        // of either image).
+        for mip in 0..di.mips {
+            let Some(sm) = (mip + di.dropped).checked_sub(si.dropped).filter(|&m| m < si.mips) else { continue };
             let ext = vk::Extent3D {
-                width: (di.extent.width.min(si.extent.width) >> mip).max(1),
-                height: (di.extent.height.min(si.extent.height) >> mip).max(1),
-                depth: (di.extent.depth.min(si.extent.depth) >> mip).max(1),
+                width: (di.extent.width >> mip).min(si.extent.width >> sm).max(1),
+                height: (di.extent.height >> mip).min(si.extent.height >> sm).max(1),
+                depth: (di.extent.depth >> mip).min(si.extent.depth >> sm).max(1),
             };
-            let layers = |i: &Image| vk::ImageSubresourceLayers {
+            let layers = |i: &Image, m: u32| vk::ImageSubresourceLayers {
                 aspect_mask: i.aspect(),
-                mip_level: mip,
+                mip_level: m,
                 base_array_layer: 0,
                 layer_count: di.layers.min(si.layers),
             };
-            regions.push(vk::ImageCopy::default().src_subresource(layers(&si)).dst_subresource(layers(&di)).extent(ext));
+            regions.push(vk::ImageCopy::default().src_subresource(layers(&si, sm)).dst_subresource(layers(&di, mip)).extent(ext));
         }
         self.copy_images(b, &si, &di, &regions);
         di.written[2].fetch_add(1, Ordering::Relaxed);
@@ -83,16 +86,13 @@ impl Rec {
     }
 
     pub(crate) fn copy_texture(&mut self, b: &'static Backend, dst: &CopyLocation, x: u32, y: u32, z: u32, src: &CopyLocation, boxed: Option<[u32; 6]>) {
-        let sub = |l: &CopyLocation, i: &Image| {
-            let index = l.footprint.offset as u32;
-            (index % i.mips, index / i.mips)
-        };
+        // A level texture quality left out is not copied.
+        let sub = |l: &CopyLocation, i: &Image| images::subresource(i, l.footprint.offset as u32);
         let dst_image = if dst.kind == 0 { images::of_resource(b, dst.resource) } else { None };
         let src_image = if src.kind == 0 { images::of_resource(b, src.resource) } else { None };
         match (dst_image, src_image) {
             (Some(di), Some(si)) => {
-                let (dm, dl) = sub(dst, &di);
-                let (sm, sl) = sub(src, &si);
+                let (Some((dm, dl)), Some((sm, sl))) = (sub(dst, &di), sub(src, &si)) else { return };
                 let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, (si.extent.width >> sm).max(1), (si.extent.height >> sm).max(1), (si.extent.depth >> sm).max(1)]);
                 let region = vk::ImageCopy::default()
                     .src_subresource(vk::ImageSubresourceLayers { aspect_mask: si.aspect(), mip_level: sm, base_array_layer: sl, layer_count: 1 })
@@ -109,7 +109,7 @@ impl Rec {
                 let Some((data, _)) = crate::resource::buffer_bytes(src.resource) else { return };
                 let fp = src.footprint;
                 let Some((buffer, offset)) = super::super::buffer_of(b, data as u64 + fp.offset) else { return };
-                let (dm, dl) = sub(dst, &di);
+                let Some((dm, dl)) = sub(dst, &di) else { return };
                 let (element, block) = crate::resource::element(fp.format).unwrap_or((4, 1));
                 let row_texels = (u64::from(fp.row_pitch) / element * block) as u32;
                 let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, fp.width, fp.height, fp.depth]);
@@ -135,7 +135,7 @@ impl Rec {
                 let Some((data, _)) = crate::resource::buffer_bytes(dst.resource) else { return };
                 let fp = dst.footprint;
                 let Some((buffer, offset)) = super::super::buffer_of(b, data as u64 + fp.offset) else { return };
-                let (sm, sl) = sub(src, &si);
+                let Some((sm, sl)) = sub(src, &si) else { return };
                 let (element, block) = crate::resource::element(fp.format).unwrap_or((4, 1));
                 let [l, t, f, r, bt, k] = boxed.unwrap_or([0, 0, 0, (si.extent.width >> sm).max(1), (si.extent.height >> sm).max(1), (si.extent.depth >> sm).max(1)]);
                 let region = vk::BufferImageCopy::default()

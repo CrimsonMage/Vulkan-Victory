@@ -97,6 +97,10 @@ fn backend() -> Option<&'static Backend> {
             });
             match made {
                 Ok(b) => {
+                    // Texture quality from the card's own memory, as the
+                    // D3D12 host decides it.
+                    let dedicated = b.host.heaps().iter().filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|(h, _)| h.size).max();
+                    crate::quality::set(dedicated.unwrap_or(0));
                     let c = &b.host.caps;
                     tracing::info!(
                         device = %c.device_name,

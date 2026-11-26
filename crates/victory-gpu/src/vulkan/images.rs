@@ -46,6 +46,7 @@ const DEPTH_STENCIL: u32 = 2;
 const UNORDERED: u32 = 4;
 const BUFFER: u32 = 1;
 const TEXTURE_1D: u32 = 2;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// The shape that, with the address, names an image.
@@ -86,6 +87,9 @@ pub(crate) struct Image {
     pub(crate) format: vk::Format,
     pub(crate) extent: vk::Extent3D,
     pub(crate) mips: u32,
+    /// The console's largest levels the image leaves out (texture quality,
+    /// `crate::quality`): its level 0 is the console's level `dropped`.
+    pub(crate) dropped: u32,
     pub(crate) layers: u32,
     pub(crate) kind: vk::ImageType,
     pub(crate) samples: u32,
@@ -158,6 +162,10 @@ impl Image {
         if !self.usage.contains(usage) || usage.is_empty() {
             return None;
         }
+        // The console's levels to the image's: a view from a level left out
+        // starts at the image's level 0, with as many levels fewer.
+        let base = v.base_mip.saturating_sub(self.dropped).min(self.mips - 1);
+        let count = v.mips.saturating_sub(self.dropped.saturating_sub(v.base_mip));
         let mut narrowed = vk::ImageViewUsageCreateInfo::default().usage(usage);
         let info = vk::ImageViewCreateInfo::default()
             .image(self.image)
@@ -171,8 +179,8 @@ impl Image {
             })
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: v.aspect,
-                base_mip_level: v.base_mip.min(self.mips - 1),
-                level_count: v.mips.clamp(1, self.mips - v.base_mip.min(self.mips - 1)),
+                base_mip_level: base,
+                level_count: count.clamp(1, self.mips - base),
                 base_array_layer: v.base_layer.min(self.layers - 1),
                 layer_count: v.layers.clamp(1, self.layers - v.base_layer.min(self.layers - 1)),
             })
@@ -299,6 +307,52 @@ pub(crate) fn report() {
         made_at = %top.join(" "),
         "Vulkan: images"
     );
+    if cfg!(feature = "diagnostics") {
+        let (biggest, by_kind) = biggest();
+        tracing::info!(biggest = %biggest, by_kind = %by_kind, "Vulkan: where image memory goes");
+    }
+}
+
+/// Diagnostics: the 8 live images with the most card memory, and card
+/// memory by format and whether the card writes them (each piece of memory
+/// counted once, at its first image).
+fn biggest() -> (String, String) {
+    // The registry before the places, as `at` takes them.
+    let guard = registry();
+    let Some(r) = guard.as_ref() else { return (String::new(), String::new()) };
+    let places = lock(&PLACES);
+    let mut seen = std::collections::HashSet::new();
+    let mut sized: Vec<(u64, &Arc<Image>)> = Vec::new();
+    let mut kinds: std::collections::HashMap<(vk::Format, bool), (u64, u64)> = std::collections::HashMap::new();
+    for img in r.images.values() {
+        let Some(&(memory, offset, size, _)) = places.get(&img.id) else { continue };
+        if !seen.insert((memory, offset)) {
+            continue;
+        }
+        sized.push((size, img));
+        let k = kinds.entry((img.format, img.card_written())).or_insert((0, 0));
+        k.0 += size;
+        k.1 += 1;
+    }
+    sized.sort_by_key(|&(size, _)| std::cmp::Reverse(size));
+    let biggest: Vec<String> = sized
+        .iter()
+        .take(8)
+        .map(|(size, i)| {
+            format!(
+                "{}MB {:?} {}x{}x{} mips={} dropped={} card_written={} at={:#x}",
+                size >> 20, i.format, i.extent.width, i.extent.height, i.extent.depth.max(i.layers), i.mips, i.dropped, i.card_written(), i.key.address
+            )
+        })
+        .collect();
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by_key(|&(_, (size, _))| std::cmp::Reverse(size));
+    let by_kind: Vec<String> = kinds
+        .iter()
+        .take(8)
+        .map(|((f, w), (size, n))| format!("{:?}{} {}MB n={n}", f, if *w { " card-written" } else { "" }, size >> 20))
+        .collect();
+    (biggest.join("; "), by_kind.join("; "))
 }
 
 static UNFIT: AtomicU64 = AtomicU64::new(0);
@@ -417,6 +471,9 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         0 => full,
         n => u32::from(n).min(full),
     };
+    let dropped = dropped_of(desc, card_written || depth || alias.is_some(), mips);
+    let extent = vk::Extent3D { width: extent.width >> dropped, height: extent.height >> dropped, ..extent };
+    let mips = mips - dropped;
     let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
     if depth {
         usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
@@ -516,6 +573,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         format,
         extent,
         mips,
+        dropped,
         layers: layers.max(1),
         kind,
         samples: key.samples,
@@ -532,6 +590,32 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         hot_until: AtomicU64::new(0),
         cpu_changed: AtomicBool::new(false),
     })
+}
+
+/// The largest levels texture quality leaves out of the image of a texture
+/// the title fills (`crate::quality`, as the D3D12 path's
+/// `resource::dropped_levels`): two-dimensional, of one sample, in a
+/// console layout the detiling reads. None of a texture the card writes,
+/// a depth texture or an image over another's memory (`kept_whole`).
+fn dropped_of(desc: &ResourceDesc, kept_whole: bool, mips: u32) -> u32 {
+    if kept_whole || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
+        return 0;
+    }
+    let Some((_, block)) = crate::resource::element(crate::resource::pc_format(desc.format)) else {
+        return 0;
+    };
+    let readable = crate::resource::texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+    if !readable {
+        return 0;
+    }
+    crate::quality::dropped_for(desc.width, u64::from(desc.height), mips, block)
+}
+
+/// The image's level and layer of the console's subresource `index`
+/// (levels first, then layers); `None` for a level the image leaves out.
+pub(crate) fn subresource(img: &Image, index: u32) -> Option<(u32, u32)> {
+    let console = img.mips + img.dropped;
+    Some(((index % console).checked_sub(img.dropped)?, index / console))
 }
 
 /// # Safety

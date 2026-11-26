@@ -261,7 +261,10 @@ unsafe fn set_up_image(d: &victory_vk::ash::Device, cmd: vk::CommandBuffer, imag
 /// One subresource of a fill: where it goes in the staging buffer.
 struct Sub {
     slice: u32,
+    /// The image's level, and the console's (texture quality leaves the
+    /// largest out).
     mip: u32,
+    console: u32,
     extent: vk::Extent3D,
     row: u64,
     rows: u64,
@@ -283,7 +286,7 @@ fn plan(img: &Image) -> anyhow::Result<Vec<Sub>> {
     let slices = if img.kind == vk::ImageType::TYPE_3D { 1 } else { img.layers };
     let mut out = Vec::new();
     for slice in 0..slices {
-        for mip in 0..img.mips.min(layout.mips.len() as u32) {
+        for mip in 0..img.mips.min((layout.mips.len() as u32).saturating_sub(img.dropped)) {
             let w = (img.extent.width >> mip).max(1);
             let h = (img.extent.height >> mip).max(1);
             let dd = (img.extent.depth >> mip).max(1);
@@ -292,6 +295,7 @@ fn plan(img: &Image) -> anyhow::Result<Vec<Sub>> {
             out.push(Sub {
                 slice,
                 mip,
+                console: mip + img.dropped,
                 extent: vk::Extent3D { width: w, height: h, depth: dd },
                 row,
                 rows,
@@ -315,7 +319,7 @@ fn detile(b: &Backend, img: &Image, subs: &[Sub], linear: &mut [u8], base: u64) 
     let mut at = 0usize;
     for s in subs {
         let out = &mut linear[at..at + s.bytes as usize];
-        if layout.detile(&tiled, s.mip, s.slice, out, s.row as usize, (s.row * s.rows) as usize).is_ok() {
+        if layout.detile(&tiled, s.console, s.slice, out, s.row as usize, (s.row * s.rows) as usize).is_ok() {
             regions.push(
                 vk::BufferImageCopy::default()
                     .buffer_offset(base + at as u64)
