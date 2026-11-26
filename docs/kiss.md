@@ -328,6 +328,21 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (evening): Vulkan only (D3D12 removed, ~77k lines). Found
+  and fixed on the way to the world: xmem treated 1,348 fresh pool pages
+  as zero "fillers" (the title's recurring null-pointer crash and stale
+  culling inputs); imports freed while recorded copies still named them
+  (Xid 31); stale/zero/2D-only descriptor slots (Xid 13 Illegal
+  Instruction Parameter; now robustness2 null descriptors); zero-group
+  mesh dispatches; images over the ceiling (texture quality low on <10 GB,
+  driver memory counted); glyph-cache refills (whole-texture fingerprint
+  up to 4 MiB); the stage cache and pipeline cache now hit across runs.
+  Translator: real BVH intersect, exact wave64 one-wave exchange, group
+  barriers order buffer memory, v_min3/max3_f16, float atomic min/max.
+  Open: 9 world/character mesh programs over NVIDIA's 32 KiB mesh output
+  memory (refused, so the world is black); culling loops on correct
+  inputs (being traced); a GPU hang at world start; compile times of
+  seconds per big program (cache makes later runs fast).
 - 2026-11-26: the white world (vk32, frame 2,048): the world is mostly not
   drawn: 2.8M draws/dispatches skipped as not compiled against 1.6M run,
   2,376 stages queued. Skipped one-off passes (exposure, histogram, LUT)
