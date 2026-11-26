@@ -187,6 +187,13 @@ pub struct Lift<'a> {
     wave64: bool,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The current image address as 16-bit components (a16).
+    a16: bool,
+    a16_vals: Vec<V>,
+    /// 16-bit interface rows: (row, half) -> (row, column) ([`super::pack16`]).
+    pub halves: HashMap<(u8, u8), (u8, u8)>,
+    /// Mesh: the row of the parameter entry the compiler left unnamed.
+    pub unnamed_row: Option<u8>,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -252,6 +259,10 @@ impl<'a> Lift<'a> {
             site: (0, 0),
             wave64: p.wave64,
             mesh_stride: 0,
+            a16: false,
+            a16_vals: Vec::new(),
+            halves: HashMap::new(),
+            unnamed_row: None,
         };
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
@@ -478,7 +489,10 @@ impl<'a> Lift<'a> {
             if self.f.ty(n.args[0]) == ty {
                 return Some(n.args[0]);
             }
-            if let Op::Const(bits) = src.op {
+            if let Op::Const(bits) = src.op
+                && ty.n == 1
+                && self.f.ty(n.args[0]).n == 1
+            {
                 return Some(self.f.konst(ty, bits));
             }
             if src.op == Op::Spv(op::BITCAST) && self.f.ty(src.args[0]) == ty {
@@ -2173,7 +2187,12 @@ impl<'a> Lift<'a> {
             let d16 = name.contains("_d16_");
             match fmt {
                 Some(f) => {
-                    let (bytes, kind) = tformat(f).ok_or(unsupported(off, "a typed buffer format"))?;
+                    let Some((bytes, kind)) = tformat(f) else {
+                        if std::env::var_os("VK_FMT").is_some() {
+                            eprintln!("typed buffer format {f} ({name})");
+                        }
+                        return Err(unsupported(off, "a typed buffer format"));
+                    };
                     (bytes, Kind::T(kind, ch, d16))
                 }
                 None => {
@@ -2652,6 +2671,32 @@ impl<'a> Lift<'a> {
         // mesh: vertex and primitive n are written by thread n of the group
         let index = (self.native.stage == HwStage::Ms)
             .then(|| self.f.global(Op::Builtin(Builtin::LocalInvocationIndex), Ty::U32));
+        let slot = match e.target {
+            Target::Param { usage: crate::native::Usage::Other(0), .. } if self.native.stage == HwStage::Ms => {
+                u16::from(self.unnamed_row.ok_or(unsupported(off, "a mesh parameter without a row"))?)
+            }
+            _ => slot,
+        };
+        // 16-bit outputs: each dword carries two halves, each a column of a row
+        if matches!(e.target, Target::Param { .. }) && self.halves.keys().any(|k| u16::from(k.0) == slot) {
+            for (c, v) in e.values.iter().enumerate() {
+                let Some(v) = v else { continue };
+                let r = self.value(*v, off)?;
+                let x = self.data(r);
+                let x = self.u32v(x);
+                for high in [false, true] {
+                    let Some(&(row, col)) = self.halves.get(&(slot as u8, 2 * c as u8 + u8::from(high))) else {
+                        continue;
+                    };
+                    let f = self.half_f32(x, high);
+                    let mut args = vec![f];
+                    args.extend(index);
+                    self.emit(Op::Output { slot: u16::from(row), comp: col }, Ty::VOID, args);
+                    self.note_output(u16::from(row), col);
+                }
+            }
+            return Ok(());
+        }
         for (c, v) in e.values.iter().enumerate() {
             if let Some(v) = v {
                 let r = self.value(*v, off)?;
@@ -2704,10 +2749,18 @@ impl<'a> Lift<'a> {
             io::Interp::Vertex { attribute, vertex: 2 } => (*attribute, Interp::Flat),
             _ => return Err(unsupported(off, "an interpolation of vertex values")),
         };
-        if attr.high {
-            return Err(unsupported(off, "an f16 high-half interpolation"));
-        }
-        let loc = attr.row;
+        let name = inst.name();
+        let f16 = name.contains("f16");
+        // A 16-bit value: half 2c (+1 high) of a packed parameter, one
+        // column of one signature row.
+        let (loc, comp) = if f16 {
+            let h = 2 * attr.channel + u8::from(attr.high);
+            *self.halves.get(&(attr.row, h)).ok_or(unsupported(off, "a 16-bit read of a 32-bit input"))?
+        } else if attr.high {
+            return Err(unsupported(off, "a high half of a 32-bit input"));
+        } else {
+            (attr.row, attr.channel)
+        };
         if let Some(e) = self.iface.inputs.iter().find(|e| e.0 == loc) {
             if e.1 != mode {
                 return Err(unsupported(off, "one attribute interpolated two ways"));
@@ -2715,16 +2768,19 @@ impl<'a> Lift<'a> {
         } else {
             self.iface.inputs.push((loc, mode));
         }
-        let x = self.f.global(Op::Input { loc, comp: attr.channel, interp: mode }, Ty::F32);
-        let name = inst.name();
-        let x = if name.contains("f16") {
-            // f16 result in the low half
+        let x = self.f.global(Op::Input { loc, comp, interp: mode }, Ty::F32);
+        if f16 {
+            // an f16 result into a half of the destination
             let h = self.spv(op::F_CONVERT, Ty::F16, &[x]);
+            if let Fields::Valu(v) = &inst.fields {
+                let v = v.clone();
+                return self.write_half(inst, &v, h);
+            }
             let hb = self.spv(op::BITCAST, Ty::U16, &[h]);
-            self.spv(op::U_CONVERT, Ty::U32, &[hb])
-        } else {
-            x
-        };
+            let x = self.spv(op::U_CONVERT, Ty::U32, &[hb]);
+            self.def(inst, Reg::V(reg), R::D(x));
+            return Ok(());
+        }
         self.def(inst, Reg::V(reg), R::D(x));
         Ok(())
     }

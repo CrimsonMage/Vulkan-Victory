@@ -106,7 +106,7 @@ impl Lift<'_> {
 
     /// Writes an f16 or u16 result into the destination's low half (high
     /// with op_sel bit 3 or an SDWA WORD_1 select), keeping the other half.
-    fn write_half(&mut self, inst: &Inst, v: &Valu, x: V) -> Res<()> {
+    pub(super) fn write_half(&mut self, inst: &Inst, v: &Valu, x: V) -> Res<()> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err(unsupported(inst.machine.offset, "a 16-bit result outside a VGPR"));
         };

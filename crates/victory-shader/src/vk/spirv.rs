@@ -524,6 +524,14 @@ impl Module {
             &[sampled_ty, dim, u32::from(depth), u32::from(arrayed), u32::from(ms), sampled, 0],
         )
     }
+    /// OpTypeImage with a depth flag and an image format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn t_image_df(&mut self, sampled_ty: Id, dim: u32, depth: bool, arrayed: bool, ms: bool, sampled: u32, format: u32) -> Id {
+        self.global(
+            op::TYPE_IMAGE,
+            &[sampled_ty, dim, u32::from(depth), u32::from(arrayed), u32::from(ms), sampled, format],
+        )
+    }
     /// A function type with parameters.
     pub fn global_fn_type(&mut self, ret: Id, params: &[Id]) -> Id {
         let mut ops = vec![ret];

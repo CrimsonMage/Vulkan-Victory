@@ -211,7 +211,7 @@ pub struct Emit<'a> {
     /// Blocks that pass a jump on into a construct's merge (no value).
     pass_in: HashMap<Id, Vec<Id>>,
     jmp: Id,
-    images: HashMap<(u8, bool, bool, bool, bool, bool), Id>,
+    images: HashMap<(u8, bool, bool, bool, bool, bool, u32), Id>,
     samplers: Id,
     spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,
@@ -640,11 +640,16 @@ impl<'a> Emit<'a> {
 
     /// The image array variable for a class; `depth` for comparisons.
     fn image_var(&mut self, c: ImageClass, uint: bool, storage: bool, depth: bool) -> (Id, Id) {
+        self.image_var_f(c, uint, storage, depth, 0)
+    }
+
+    /// The same with an image format (R32ui = 33 for atomics).
+    fn image_var_f(&mut self, c: ImageClass, uint: bool, storage: bool, depth: bool, format: u32) -> (Id, Id) {
         // cube images cannot be fetched or stored: as 2D arrays then
         let (dim, arrayed) = if c.dim == 3 && (storage || !c.storage && c.dynamic) { (1, true) } else { (c.dim, c.arrayed) };
-        let key = (dim, arrayed, c.ms, uint, storage, depth);
+        let key = (dim, arrayed, c.ms, uint, storage, depth, format);
         let sty = if uint { self.t.u32_ } else { self.t.f32_ };
-        let ity = self.m.t_image_d(sty, u32::from(dim), depth, arrayed, c.ms, if storage { 2 } else { 1 });
+        let ity = self.m.t_image_df(sty, u32::from(dim), depth, arrayed, c.ms, if storage { 2 } else { 1 }, format);
         if let Some(&v) = self.images.get(&key) {
             return (v, ity);
         }
@@ -1330,7 +1335,11 @@ impl<'a> Emit<'a> {
                 self.m.op(op::IMAGE_QUERY_LEVELS, u, &[im])
             }
             ImageKind::Atomic(o) => {
-                let (_, ptr) = self.load_image(class, true, true, false, tw);
+                let (var, ity) = self.image_var_f(class, true, true, false, 33);
+                let k = self.c32(0xFF_FFFF);
+                let slot = self.m.op(op::BITWISE_AND, u, &[tw, k]);
+                let pi = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, ity);
+                let ptr = self.m.op(op::ACCESS_CHAIN, pi, &[var, slot]);
                 let pt = self.m.t_ptr(11, u); // StorageClass Image
                 let s = sample.unwrap_or_else(|| self.c32(0));
                 let tp = self.m.op(60, pt, &[ptr, coord, s]); // OpImageTexelPointer

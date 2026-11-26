@@ -5,6 +5,9 @@ use crate::vk::tir::{Sampler, img};
 
 impl Lift<'_> {
     fn addr_dw(&mut self, inst: &Inst, addr: &[Operand], k: usize) -> Res<V> {
+        if self.a16 {
+            return self.a16_vals.get(k).copied().ok_or(unsupported(inst.machine.offset, "an image address"));
+        }
         let x = if addr.len() == 1 {
             let o = addr[0];
             self.opnd_dw(inst, &o, k as u8, false)?
@@ -21,12 +24,14 @@ impl Lift<'_> {
         else {
             unreachable!()
         };
-        if a16 || tfe || lwe {
-            return Err(unsupported(off, "an image access with a16, tfe or lwe"));
+        if tfe || lwe {
+            return Err(unsupported(off, "an image access with tfe or lwe"));
         }
         if name.starts_with("image_bvh") {
             return self.bvh_miss(inst, &data);
         }
+        self.a16 = false;
+        self.a16_vals.clear();
         // T# word 7 (slot and flags)
         let tw = self.opnd_dw(inst, &rsrc, 7, false)?;
         let tw = self.u32v(tw);
@@ -46,6 +51,65 @@ impl Lift<'_> {
         let dreg = match data {
             Operand::Vector { reg, .. } => reg,
             _ => return Err(unsupported(off, name)),
+        };
+        // The address as components in order. With a16 the components after
+        // the whole dwords (offset, bias, z-compare) are 16-bit, two per
+        // dword, low half first: the derivatives (x then y, each set from a
+        // fresh dword), then coordinates, level and clamp.
+        let addr = if a16 {
+            let sample = rest.starts_with("sample") || rest.starts_with("gather4");
+            let mods = rest.trim_start_matches("sample").trim_start_matches("gather4");
+            let has = |m: &str| mods.split('_').any(|t| t == m);
+            let (pre, g, more) = if sample {
+                let dims = match sdim {
+                    0 => 1,
+                    2 | 3 => 3,
+                    _ => 2,
+                };
+                let pre = usize::from(has("o")) + usize::from(has("b")) + usize::from(has("c"));
+                let g = if has("d") { dims } else { 0 };
+                (pre, g, coords + usize::from(has("l")) + usize::from(has("cl")))
+            } else {
+                (0, 0, coords + usize::from(rest.ends_with("_mip")) + usize::from(ms))
+            };
+            let mut out = Vec::new();
+            let mut dw = 0usize;
+            for i in 0..pre {
+                let x = self.addr_dw(inst, &addr, dw)?;
+                // the bias is an f16 in the low half of its dword
+                let bias_at = usize::from(has("o"));
+                let x = if sample && has("b") && i == bias_at { self.half_f32(x, false) } else { x };
+                out.push(Operand::Literal(0));
+                self.a16_vals.push(x);
+                dw += 1;
+            }
+            let half = |l: &mut Self, dw: usize, j: usize| -> Res<V> {
+                let x = l.addr_dw(inst, &addr, dw + j / 2)?;
+                Ok(if sample {
+                    let f = l.half_f32(x, j % 2 == 1);
+                    l.u32v(f)
+                } else {
+                    let (o, w) = (l.k32(16 * (j % 2) as u32), l.k32(16));
+                    l.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[x, o, w])
+                })
+            };
+            for _ in 0..(if g > 0 { 2 } else { 0 }) {
+                for j in 0..g {
+                    let x = half(self, dw, j)?;
+                    out.push(Operand::Literal(0));
+                    self.a16_vals.push(x);
+                }
+                dw += g.div_ceil(2);
+            }
+            for j in 0..more {
+                let x = half(self, dw, j)?;
+                out.push(Operand::Literal(0));
+                self.a16_vals.push(x);
+            }
+            self.a16 = true;
+            out
+        } else {
+            addr
         };
         let mut k = 0usize; // address dword cursor
         let mut args = vec![tw];

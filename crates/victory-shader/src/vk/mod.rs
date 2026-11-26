@@ -10,6 +10,7 @@
 
 pub mod emit;
 pub mod lift;
+pub mod pack16;
 pub mod spirv;
 pub mod tir;
 
@@ -127,6 +128,8 @@ struct SigRow {
     comp: u32,
     reg: u32,
     mask: u8,
+    /// 16-bit (minimum precision or a native 16-bit type).
+    half: bool,
 }
 
 fn signature(part: &[u8]) -> Result<Vec<SigRow>, ShaderError> {
@@ -148,6 +151,7 @@ fn signature(part: &[u8]) -> Result<Vec<SigRow>, ShaderError> {
             comp: u32_at(part, at + 16)?,
             reg: u32_at(part, at + 20)?,
             mask: *part.get(at + 24).ok_or(ShaderError::Malformed("truncated signature"))?,
+            half: matches!(u32_at(part, at + 16)?, 4..=6) || u32_at(part, at + 28)? != 0,
         });
     }
     Ok(out)
@@ -185,8 +189,25 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         }
         _ => 0,
     };
+    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let elems = |rows: &[SigRow]| -> Vec<pack16::Elem> {
+        rows.iter()
+            .filter(|r| r.reg < 32)
+            .map(|r| pack16::Elem {
+                row: r.reg as u8,
+                col: r.mask.trailing_zeros().min(3) as u8,
+                cols: r.mask.count_ones().max(1) as u8,
+                half: r.half,
+                user: r.sv == 0,
+            })
+            .collect()
+    };
+    let iface_elems = if native.stage == HwStage::Ps { elems(&isg) } else { elems(&osg) };
     let mut lift = lift::Lift::new(&p, &native, &io);
     lift.mesh_stride = mesh_stride;
+    lift.halves = pack16::halves(&native.io, &iface_elems);
+    lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
     let (mut f, iface) = lift.run()?;
     if std::env::var("VK_DUMP").is_ok_and(|v| v == "2") {
         tir::dump(&f);
@@ -196,8 +217,6 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         tir::dump(&f);
     }
     let ir_insts = f.count();
-    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
-    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let mut out_types = HashMap::new();
     if native.stage == HwStage::Ps {
         for r in &osg {
