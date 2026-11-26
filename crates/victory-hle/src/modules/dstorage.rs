@@ -12,15 +12,17 @@
 //! into the worker's reusable buffer, then zlib data is inflated and/or
 //! BCPack data unpacked from there into the destination.
 //!
-//! Submitted requests of every queue go, in submission order, through one
-//! channel to one pool of workers (one per core), which run them in
-//! parallel. Completion is what stays in order: a status entry is written
-//! once every request enqueued before it on its queue has finished, with
-//! the first failure (in queue order) since the previous status entry, or
-//! success. A status entry closes a segment of its queue's requests; the
-//! segment counts what it still waits for (its requests, the segment
-//! before it, its own submission) and the last of those writes the status
-//! and lets the next segment go on. No lock is taken per request.
+//! Submitted requests of every queue go, in submission order, into one
+//! line taken by a few workers ([`WORKERS`]), which run them in parallel
+//! and sleep on a condition variable while the line is empty. Completion
+//! is what stays in order: a status entry is written once every request
+//! enqueued before it on its queue has finished, with the first failure
+//! (in queue order) since the previous status entry, or success. A status
+//! entry closes a segment of its queue's requests; the segment counts what
+//! it still waits for (its requests, the segment before it, its own
+//! submission) and the last of those writes the status and lets the next
+//! segment go on. Per request, only the line's lock is taken (to put it in
+//! and to take it out).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -29,8 +31,8 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
@@ -507,14 +509,14 @@ impl Lane {
 
     /// Hands the enqueued requests to the workers, in order.
     fn submit(&self, open: &mut Open) {
-        let workers = workers();
+        start_workers();
         for command in open.commands.drain(..) {
             match command {
                 Command::Read(job) => {
                     let depth = STATS.depth.fetch_add(1, Ordering::Relaxed) + 1;
                     STATS.peak.fetch_max(depth, Ordering::Relaxed);
-                    // The workers' end of the channel lives for the process.
-                    let _ = workers.send(job);
+                    lock(&LINE.0).push_back(job);
+                    LINE.1.notify_one();
                 }
                 Command::Status(segment) => segment.release(self),
             }
@@ -565,35 +567,37 @@ impl Job {
     }
 }
 
-/// The workers' channel, with the workers started on first use: one per
-/// core. One worker at a time waits on the channel, the rest for it.
-fn workers() -> &'static Sender<Job> {
-    static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
-    JOBS.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Job>();
-        let receiver: &'static Mutex<Receiver<Job>> = Box::leak(Box::new(Mutex::new(receiver)));
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(move || {
-                        victory_core::heap::enter_for_thread(victory_core::heap::Owner::Streaming);
-                        loop {
-                            let next = lock(receiver).recv();
-                            let Ok(job) = next else { return };
-                            job.run();
-                        }
-                    })
-                    .is_ok()
-            })
-            .count();
-        let _ = std::thread::Builder::new()
-            .name("dstorage stats".into())
-            .spawn(report);
+/// Workers of [`LINE`]. A request is one positioned read, then mostly an
+/// inflate and/or BCPack unpack: the loading bursts took ~6 s of worker
+/// time per 10 s on one worker per core (28, the `dstorage streaming`
+/// line), so four keep up. Idle, they sleep on the condition variable.
+const WORKERS: usize = 4;
+
+/// The submitted requests of every queue, in submission order, and the
+/// condition variable signalled once per request put in.
+static LINE: (Mutex<VecDeque<Job>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+
+/// Starts the workers and the streaming line, once.
+fn start_workers() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let spawn = |name: String, f: fn()| std::thread::Builder::new().name(name).spawn(f).is_ok();
+        let started = (0..WORKERS).filter(|i| spawn(format!("dstorage {i}"), work)).count();
+        spawn("dstorage stats".into(), report);
         tracing::info!(workers = started, "dstorage: workers");
-        sender
-    })
+    });
+}
+
+/// A worker: the line's requests in order, asleep while there are none.
+fn work() {
+    victory_core::heap::enter_for_thread(victory_core::heap::Owner::Streaming);
+    let (line, ready) = &LINE;
+    loop {
+        let next = ready.wait_while(lock(line), |jobs| jobs.is_empty()).unwrap_or_else(PoisonError::into_inner).pop_front();
+        if let Some(job) = next {
+            job.run();
+        }
+    }
 }
 
 /// What the workers did since the last streaming line.
@@ -785,12 +789,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         };
         return into_destination(request, size, |out| match memory {
             Some(source) => copy(source, out),
-            // Straight into the destination. A kernel read into a block the
-            // GPU side guarded again meanwhile (the guard over all the views
-            // of a page protects other views from other threads) is refused
-            // instead of faulting into the guard; that one is read beside
-            // and copied in from user mode, where it faults like the title's
-            // own writes.
+            // Straight into the destination. A kernel read into a page that
+            // is not there for a moment (its view away while xmem maps it
+            // again, either GPU path) or, on the D3D12 path, into a block
+            // guarded again meanwhile is refused instead of faulting; that
+            // one is read beside and copied in from user mode, where it
+            // faults like the title's own writes (`xmem::on_fault` waits).
             None => match read_at(request, out) {
                 Err(hr) if REFUSED.contains(&hr) => {
                     STATS.bounced.fetch_add(1, Ordering::Relaxed);
@@ -860,9 +864,9 @@ thread_local! {
 
 /// Runs `f` on `len` bytes of a worker's buffer, which is kept for the
 /// next request up to 1 MiB (larger ones give their memory back). Requests
-/// average 20 to 100 KiB; with a worker per core (28 here) and three
-/// buffers each, keeping up to 8 MiB held up to 670 MB of the PC's memory
-/// after a burst, never given back.
+/// average 20 to 100 KiB; when there was a worker per core (28 here),
+/// keeping up to 8 MiB in each of three buffers held up to 670 MB of the
+/// PC's memory after a burst, never given back.
 fn scratch<R>(buffer: &'static LocalKey<RefCell<Vec<u8>>>, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     const KEPT: usize = 1 << 20;
     buffer.with_borrow_mut(|bytes| {
@@ -997,11 +1001,11 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. A kernel read into a block guarded again meanwhile
-        // is refused (`execute` reads that one beside); `fill`'s own writes
-        // fault into the guard.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // The D3D12 path opens its guarded blocks and learns a placed
+        // texture there changes. A kernel read into a block guarded again
+        // meanwhile is refused (`execute` reads that one beside); `fill`'s
+        // own writes fault into the guard.
+        super::xmem::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
