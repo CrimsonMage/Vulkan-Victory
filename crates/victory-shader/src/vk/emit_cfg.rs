@@ -79,6 +79,7 @@ impl Emit<'_> {
             self.set_id(ph, id);
         }
         self.cphi.insert(x, cids);
+        self.loop_counter(pre, cont);
         self.m.op_void(op::LOOP_MERGE, &[merge, cont, 0]);
         let body = self.m.id();
         self.branch_to(body);
@@ -209,7 +210,11 @@ impl Emit<'_> {
             if let Some(d) = &c.disp {
                 self.disp_phis(d, c.header);
             }
-            self.branch_to(c.header);
+            if matches!(kind, Ctx::Loop(_)) {
+                self.guard_back(c.cont, c.header, c.merge);
+            } else {
+                self.branch_to(c.header);
+            }
         }
         self.m.label(c.merge);
         self.block = c.merge;
@@ -223,16 +228,19 @@ impl Emit<'_> {
             let ids = self.phis_at(&tys, &preds, &|p, k| inc.iter().find(|e| e.1 == p).map(|e| e.0[k]));
             self.pending.insert(y, ids);
         }
-        if c.arrivals.is_empty() || self.ctx.is_empty() {
-            return;
-        }
         // the block whose code reaches the merge on every path
         let dom = match kind {
             Ctx::Block(y) | Ctx::Sel(y) => self.g.idom[y],
             Ctx::Loop(x) | Ctx::Disp(x) => x,
         };
-        let ladder = self.ladder(&c.arrivals, &preds, dom);
-        self.dispatch(ladder);
+        let ladder = (!c.arrivals.is_empty() && !self.ctx.is_empty()).then(|| self.ladder(&c.arrivals, &preds, dom));
+        // the merge's phis first, then the guard's way out
+        if matches!(kind, Ctx::Loop(_)) {
+            self.guard_exit(c.cont, &preds);
+        }
+        if let Some(l) = ladder {
+            self.dispatch(l);
+        }
     }
 
     /// The block placed at a construct's merge.

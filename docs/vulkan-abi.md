@@ -1,7 +1,8 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v2** (2026-11-26: semantic registry, six-layer 2D-array views of
-cubes on set 0 binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
+Status: **v3** (2026-11-26: the loop guard buffer in push dwords 2–3; v2
+2026-11-26: semantic registry, six-layer 2D-array views of cubes on set 0
+binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
 amended the same day: immediate samplers in set 1 by specialization
 constant, change 8). v1 takes the host's
 proposals (`docs/vulkan-host.md` section 6). Owner of the translator side:
@@ -27,7 +28,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 2`
+`ABI_VERSION = 3`
 
 ## 1. Vulkan requirements
 
@@ -61,11 +62,27 @@ memory model. Every module passes `spirv-val --target-env vulkan1.3
 
 | Dwords | Content |
 |---|---|
-| 0–3 | reserved, 0 (v0 had the memory map's address here; v1 reads the map from a uniform buffer, section 3) |
+| 0–1 | reserved, 0 (v0 had the memory map's address here; v1 reads the map from a uniform buffer, section 3) |
+| 2–3 | the device address of the **guard buffer** (low dword at 2), 0 for none (section 2.1) |
 | 4–31 | user data of the first stage: compute, vertex or mesh program (user-data dword k at push dword 4 + k; k < 28) |
 | 32–63 | user data of the pixel program (user-data dword k at push dword 32 + k; k < 32) |
 
 A compute program may use dwords 4–63 (k < 60).
+
+### 2.1 The loop guard
+
+Every loop counts its iterations and gives up after 2^18 of them (compute)
+or 2^16 (vertex, mesh, pixel): it leaves and the invocation returns, so a
+loop that never exits (a mistranslation, or memory that reads zeros) cannot
+hang the GPU. Before returning, when push dwords 2–3 hold an address, the
+invocation adds 1 to **dword 0** of the guard buffer (`OpAtomicIAdd`,
+device scope) and stores the program's **guard id** in **dword 1**
+(`VkShader::guard_id`, FNV-1a of the console container). The host gives
+one 8-byte host-visible buffer (one per queue is enough), with
+`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`, zeroed; after a submission it
+reads it, and when dword 0 is not 0 it logs the count and the pipeline
+whose stage has that guard id, then zeroes it. A program that hits the
+guard has a loop to fix, not a limit to raise.
 
 User-data dword k is what the console puts in user SGPR k of the stage
 (SGPR k + 8 for mesh programs, which run as a merged stage). The
