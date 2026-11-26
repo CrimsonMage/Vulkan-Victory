@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use ash::vk;
 
 use crate::host::Host;
+use crate::timeline::Timeline;
 
 pub struct Swapchain {
     surface: vk::SurfaceKHR,
@@ -187,7 +188,11 @@ impl Swapchain {
     unsafe fn drop_images(&mut self, host: &Host) {
         let d = &host.device;
         unsafe {
-            let _ = d.device_wait_idle();
+            // The frames in flight (not the whole device: waiting for it
+            // idle would touch every queue without their lock).
+            if !self.fences.is_empty() {
+                let _ = d.wait_for_fences(&self.fences, true, 2_000_000_000);
+            }
             for v in self.views.drain(..) {
                 d.destroy_image_view(v, None);
             }
@@ -204,7 +209,7 @@ impl Swapchain {
     pub fn frame(
         &mut self,
         host: &Host,
-        timeline: Option<(vk::Semaphore, u64)>,
+        timeline: &Timeline,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer, &Target),
     ) -> Result<()> {
         let d = &host.device;
@@ -259,44 +264,54 @@ impl Swapchain {
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
             d.end_command_buffer(cmd)?;
-            let mut waits = vec![
-                vk::SemaphoreSubmitInfo::default()
-                    .semaphore(self.acquired[f])
-                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
-            ];
-            if let Some((sem, value)) = timeline {
-                waits.push(
-                    vk::SemaphoreSubmitInfo::default()
-                        .semaphore(sem)
-                        .value(value)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
-                );
-            }
             let signals = [vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.rendered[i])
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
             let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-            d.queue_submit2(
-                host.queues.graphics.queue,
-                &[vk::SubmitInfo2::default()
-                    .wait_semaphore_infos(&waits)
-                    .command_buffer_infos(&cmds)
-                    .signal_semaphore_infos(&signals)],
-                self.fences[f],
-            )?;
-            let wait = [self.rendered[i]];
+            let fence = self.fences[f];
+            let acquired = self.acquired[f];
+            let rendered = [self.rendered[i]];
             let swapchains = [self.swapchain];
             let indices = [index];
-            match host.swapchain.queue_present(
-                host.queues.graphics.queue,
-                &vk::PresentInfoKHR::default()
-                    .wait_semaphores(&wait)
-                    .swapchains(&swapchains)
-                    .image_indices(&indices),
-            ) {
+            // Behind everything the queue was given, under its lock.
+            let presented = timeline.with_queue(|queue, last| {
+                let waits = [
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(acquired)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(timeline.semaphore)
+                        .value(last)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+                ];
+                let submitted = timeline.check(
+                    d.queue_submit2(
+                        queue,
+                        &[vk::SubmitInfo2::default()
+                            .wait_semaphore_infos(&waits)
+                            .command_buffer_infos(&cmds)
+                            .signal_semaphore_infos(&signals)],
+                        fence,
+                    ),
+                );
+                if let Err(e) = submitted {
+                    return (Err(e), false);
+                }
+                let r = timeline.check(
+                    host.swapchain.queue_present(
+                        queue,
+                        &vk::PresentInfoKHR::default()
+                            .wait_semaphores(&rendered)
+                            .swapchains(&swapchains)
+                            .image_indices(&indices),
+                    ),
+                );
+                (r, false)
+            })?;
+            match presented {
                 Ok(false) => {}
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.make(host)?,
-                Err(e) => bail!("vkQueuePresentKHR: {e}"),
+                Err(e) => bail!("vkQueueSubmit2 or vkQueuePresentKHR: {e}"),
             }
         }
         Ok(())

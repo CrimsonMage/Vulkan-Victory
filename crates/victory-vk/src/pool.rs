@@ -13,10 +13,18 @@
 //! Room: card pages come in 64 MiB blocks while the view's use stays under
 //! its budget. Past it, the page touched least recently (mapped or written,
 //! never one touched in the current tick) is *evicted*: every title page
-//! showing it is bound to the zero page and its card page is freed. An
-//! evicted page comes back, filled again, at its next announced write or
-//! mapping. Until then it reads zeros (shortcut: a page the title never
-//! announces again stays zeros).
+//! showing it is unbound and its card page is freed. An evicted page comes
+//! back, filled again, at its next announced write or mapping. Until then
+//! it reads what an unbound sparse page reads (zeros on a driver with
+//! `residencyNonResidentStrict`; shortcut: a page the title never announces
+//! again stays so). Pages nothing shows are unbound, never bound to a page
+//! of zeros: binding a whole 16 GiB reservation page by page at creation
+//! stalled the queue for seconds in the first M2a run.
+//!
+//! Every bind is checked against the buffer's size and the block's before
+//! it goes to the queue, binds of one call are made once per page (the last
+//! wins) and merged into runs, and they go in this order: unbinds, then the
+//! fills of new pages, then the binds to card pages.
 //!
 //! Imported host memory cannot back a sparse buffer on NVIDIA (vkprobe,
 //! 2026-11-26), which is why the pages live in card memory.
@@ -83,7 +91,6 @@ pub struct PoolView {
     pub device_base: u64,
     memory_type: u32,
     blocks: Vec<Block>,
-    zero: Slot,
     pages: HashMap<PageKey, Page>,
     /// Title page index -> the physical page it shows.
     bound: HashMap<u64, PageKey>,
@@ -94,7 +101,7 @@ pub struct PoolView {
 
 impl PoolView {
     /// A view of `len` bytes from title address `title_start`, every page
-    /// bound to the zero page.
+    /// unbound.
     pub fn new(
         host: &Host,
         timeline: &Timeline,
@@ -141,23 +148,13 @@ impl PoolView {
             device_base,
             memory_type,
             blocks: Vec::new(),
-            zero: Slot { block: 0, page: 0 },
             pages: HashMap::new(),
             bound: HashMap::new(),
             budget,
             stats: Stats::default(),
         };
+        let _ = timeline;
         view.grow(host)?;
-        view.zero = view.take().context("no zero page")?;
-        let zero = view.zero;
-        let zbuf = view.blocks[0].buffer;
-        timeline.record(host, |d, cmd| unsafe {
-            d.cmd_fill_buffer(cmd, zbuf, u64::from(zero.page) * PAGE, PAGE, 0);
-        })?;
-        // Every page shows zeros until mapped.
-        let all: Vec<vk::SparseMemoryBind> =
-            (0..len / PAGE).map(|p| view.bind_to(p, zero)).collect();
-        timeline.bind_sparse(host, &[(buffer, all)])?;
         Ok(view)
     }
 
@@ -209,12 +206,73 @@ impl PoolView {
         None
     }
 
-    fn bind_to(&self, title_page: u64, slot: Slot) -> vk::SparseMemoryBind {
-        vk::SparseMemoryBind::default()
-            .resource_offset(title_page * PAGE)
-            .size(PAGE)
-            .memory(self.blocks[slot.block as usize].memory)
-            .memory_offset(u64::from(slot.page) * PAGE)
+    /// The sparse binds for `binds` (title page, card page or none): once
+    /// per page, the last wins; checked; merged into runs. Unbinds first.
+    fn sparse(
+        &self,
+        binds: Vec<(u64, Option<Slot>)>,
+    ) -> Result<(Vec<vk::SparseMemoryBind>, Vec<vk::SparseMemoryBind>)> {
+        let pages: std::collections::BTreeMap<u64, Option<Slot>> = binds.into_iter().collect();
+        let block_bytes = u64::from(BLOCK_PAGES) * PAGE;
+        let (mut unbind, mut bind): (Vec<vk::SparseMemoryBind>, Vec<vk::SparseMemoryBind>) =
+            (Vec::new(), Vec::new());
+        // Runs: (first title page, pages, first card page).
+        let mut run: Option<(u64, u64, Option<Slot>)> = None;
+        let close =
+            |run: (u64, u64, Option<Slot>), unbind: &mut Vec<_>, bind: &mut Vec<_>| -> Result<()> {
+                let (t, n, slot) = run;
+                ensure!(
+                    (t + n) * PAGE <= self.len,
+                    "a bind past the pool view: pages {t}+{n} of {}",
+                    self.len / PAGE
+                );
+                let b = vk::SparseMemoryBind::default()
+                    .resource_offset(t * PAGE)
+                    .size(n * PAGE);
+                match slot {
+                    None => unbind.push(b),
+                    Some(s) => {
+                        let block = self
+                            .blocks
+                            .get(s.block as usize)
+                            .context("a bind to a block that does not exist")?;
+                        let offset = u64::from(s.page) * PAGE;
+                        ensure!(
+                            offset + n * PAGE <= block_bytes,
+                            "a bind past its block: page {}+{n}",
+                            s.page
+                        );
+                        bind.push(b.memory(block.memory).memory_offset(offset));
+                    }
+                }
+                Ok(())
+            };
+        for (t, slot) in pages {
+            let joins = run.is_some_and(|(rt, rn, rs)| {
+                rt + rn == t
+                    && match (rs, slot) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            a.block == b.block && u64::from(a.page) + rn == u64::from(b.page)
+                        }
+                        _ => false,
+                    }
+            });
+            if joins {
+                if let Some(r) = run.as_mut() {
+                    r.1 += 1;
+                }
+                continue;
+            }
+            if let Some(r) = run.take() {
+                close(r, &mut unbind, &mut bind)?;
+            }
+            run = Some((t, 1, slot));
+        }
+        if let Some(r) = run {
+            close(r, &mut unbind, &mut bind)?;
+        }
+        Ok((unbind, bind))
     }
 
     /// A card page for a new physical page: a free one, a new block within
@@ -223,7 +281,7 @@ impl PoolView {
         &mut self,
         host: &Host,
         tick: u64,
-        binds: &mut Vec<vk::SparseMemoryBind>,
+        binds: &mut Vec<(u64, Option<Slot>)>,
     ) -> Result<Slot> {
         if let Some(s) = self.take() {
             return Ok(s);
@@ -242,11 +300,9 @@ impl PoolView {
             .min_by_key(|(_, p)| p.touched)
             .map(|(k, _)| *k)
             .context("the pool view is out of card memory and every page is in use this tick")?;
-        let zero = self.zero;
         let page = self.pages.get_mut(&victim).expect("victim");
         let slot = page.slot.take().expect("victim has a page");
-        let shown = page.shown.clone();
-        binds.extend(shown.iter().map(|&t| self.bind_to(t, zero)));
+        binds.extend(page.shown.iter().map(|&t| (t, None)));
         self.stats.evicted += 1;
         self.stats.pages_in_card -= 1;
         Ok(slot)
@@ -290,7 +346,7 @@ impl PoolView {
                 }
             }
             let Some((key, source)) = page else {
-                binds.push(self.bind_to(t, self.zero));
+                binds.push((t, None));
                 continue;
             };
             let slot = match self.pages.get(key).and_then(|p| p.slot) {
@@ -309,7 +365,7 @@ impl PoolView {
                         self.stats.refilled += 1;
                         let others = entry.shown.clone();
                         entry.slot = Some(s);
-                        binds.extend(others.iter().map(|&o| self.bind_to(o, s)));
+                        binds.extend(others.iter().map(|&o| (o, Some(s))));
                     }
                     self.pages.get_mut(key).expect("page").slot = Some(s);
                     s
@@ -319,7 +375,7 @@ impl PoolView {
             p.touched = tick;
             p.shown.push(t);
             self.bound.insert(t, *key);
-            binds.push(self.bind_to(t, slot));
+            binds.push((t, Some(slot)));
         }
         self.flush(host, timeline, fills, binds)
     }
@@ -329,8 +385,13 @@ impl PoolView {
         host: &Host,
         timeline: &Timeline,
         fills: Vec<(Source, Slot)>,
-        binds: Vec<vk::SparseMemoryBind>,
+        binds: Vec<(u64, Option<Slot>)>,
     ) -> Result<()> {
+        let (unbind, bind) = self.sparse(binds)?;
+        if !unbind.is_empty() {
+            self.stats.binds += unbind.len() as u64;
+            timeline.bind_sparse(host, &[(self.buffer, unbind)])?;
+        }
         if !fills.is_empty() {
             self.stats.filled += fills.len() as u64;
             let blocks: Vec<vk::Buffer> = self.blocks.iter().map(|b| b.buffer).collect();
@@ -348,9 +409,9 @@ impl PoolView {
                 }
             })?;
         }
-        if !binds.is_empty() {
-            self.stats.binds += binds.len() as u64;
-            let all: Vec<BufferBinds> = vec![(self.buffer, binds)];
+        if !bind.is_empty() {
+            self.stats.binds += bind.len() as u64;
+            let all: Vec<BufferBinds> = vec![(self.buffer, bind)];
             timeline.bind_sparse(host, &all)?;
         }
         Ok(())
@@ -389,7 +450,7 @@ impl PoolView {
                     let p = self.pages.get_mut(&key).expect("bound page");
                     p.slot = Some(s);
                     let shown = p.shown.clone();
-                    binds.extend(shown.iter().map(|&t| self.bind_to(t, s)));
+                    binds.extend(shown.iter().map(|&t| (t, Some(s))));
                     self.stats.refilled += 1;
                     self.stats.pages_in_card += 1;
                     s
