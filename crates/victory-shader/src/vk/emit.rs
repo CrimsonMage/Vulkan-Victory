@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use super::lift::{Interface, OUT_DEPTH, OUT_POSITION, OUT_SAMPLE_MASK, OUT_STENCIL};
+use super::lift::{Interface, OUT_DEPTH, OUT_POSITION, OUT_PRIMITIVE, OUT_SAMPLE_MASK, OUT_STENCIL};
 use super::spirv::{Id, Module, en, glsl, op};
 use super::tir::{Builtin, Func, Helper, ImageClass, ImageKind, Interp, Item, Op, S, Sampler, Term, Ty, V, img};
 use crate::native::HwStage;
@@ -24,6 +24,11 @@ pub struct Stage {
     /// Output types per location: 0 float, 1 uint, 2 int.
     pub out_types: HashMap<u16, u8>,
     pub loop_limit: u32,
+    /// Interface rows and channels to (location, component): the fixed
+    /// location of each semantic (`super::SEMANTIC_LOCATIONS`).
+    pub locs: HashMap<(u8, u8), (u8, u8)>,
+    /// Mesh: maximum vertices and primitives.
+    pub mesh: (u32, u32),
 }
 
 pub struct Emitted {
@@ -188,6 +193,8 @@ pub struct Emit<'a> {
     inputs: HashMap<u8, Id>,
     outputs: HashMap<u16, (Id, Id)>,
     lds: Id,
+    map_var: Id,
+    cull: Id,
     /// Inside a flat guard: its condition (effects go to the sink).
     pred: Option<Id>,
     sink: Id,
@@ -206,7 +213,7 @@ pub struct Emit<'a> {
     jmp: Id,
     images: HashMap<(u8, bool, bool, bool, bool, bool), Id>,
     samplers: Id,
-    static_samplers: Id,
+    spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,
     picks: HashMap<V, Id>,
     g: Option<Graph>,
@@ -251,6 +258,8 @@ impl<'a> Emit<'a> {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             lds: 0,
+            map_var: 0,
+            cull: 0,
             pred: None,
             sink: 0,
             fwd: HashMap::new(),
@@ -262,7 +271,7 @@ impl<'a> Emit<'a> {
             jmp: 0,
             images: HashMap::new(),
             samplers: 0,
-            static_samplers: 0,
+            spec_samplers: HashMap::new(),
             helpers: HashMap::new(),
             picks: HashMap::new(),
             g: None,
@@ -342,22 +351,19 @@ impl<'a> Emit<'a> {
         self.push
     }
 
-    /// The memory map's struct type (`docs/vulkan-abi.md` section 3), read
-    /// only, behind a PhysicalStorageBuffer pointer.
+    /// The memory map's struct type (`docs/vulkan-abi.md` section 3).
     fn map_type(&mut self) -> Id {
         if self.map == 0 {
             let (u, q) = (self.t.u32_, self.t.u64_);
             let range = self.m.t_struct(&[q, q, q, q], 3);
             for (k, o) in [0u32, 8, 16, 24].iter().enumerate() {
                 self.m.member_decorate(range, k as u32, en::DEC_OFFSET, &[*o]);
-                self.m.member_decorate(range, k as u32, 24, &[]); // NonWritable
             }
             let arr = self.m.t_array(range, 64);
             self.m.decorate(arr, en::DEC_ARRAY_STRIDE, &[32]);
             let st = self.m.t_struct(&[q, q, u, arr], 4);
             for (k, o) in [0u32, 8, 16, 32].iter().enumerate() {
                 self.m.member_decorate(st, k as u32, en::DEC_OFFSET, &[*o]);
-                self.m.member_decorate(st, k as u32, 24, &[]);
             }
             self.m.decorate(st, en::DEC_BLOCK, &[]);
             self.map = st;
@@ -365,34 +371,33 @@ impl<'a> Emit<'a> {
         self.map
     }
 
-    /// A pointer to the memory map (push dwords 0-1), made here.
+    /// Experiment: no binary search code (one range only).
+    fn no_search() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VK_SEARCH").is_ok_and(|v| v == "0"))
+    }
+
+    /// The memory map: a uniform buffer, set 3 binding 0 (read with uniform
+    /// loads; NVIDIA compiled a pointer-loaded map ~35x slower).
     fn map_ptr(&mut self) -> Id {
         let st = self.map_type();
-        let var = self.push_var();
-        let u = self.t.u32_;
-        let p = self.m.t_ptr(en::SC_PUSH_CONSTANT, u);
-        let z = self.c32(0);
-        let one = self.c32(1);
-        let a = self.m.op(op::ACCESS_CHAIN, p, &[var, z, z]);
-        let b = self.m.op(op::ACCESS_CHAIN, p, &[var, z, one]);
-        let lo = self.m.op(op::LOAD, u, &[a]);
-        let hi = self.m.op(op::LOAD, u, &[b]);
-        let v2 = self.m.t_vec(u, 2);
-        let pair = self.m.op(op::COMPOSITE_CONSTRUCT, v2, &[lo, hi]);
-        let q = self.t.u64_;
-        let addr = self.m.op(op::BITCAST, q, &[pair]);
-        let pt = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, st);
-        self.m.op(op::CONVERT_U_TO_PTR, pt, &[addr])
+        if self.map_var == 0 {
+            let p = self.m.t_ptr(en::SC_UNIFORM, st);
+            self.map_var = self.m.variable(p, en::SC_UNIFORM);
+            self.m.decorate(self.map_var, en::DEC_DESCRIPTOR_SET, &[3]);
+            self.m.decorate(self.map_var, en::DEC_BINDING, &[0]);
+            self.interface.push(self.map_var);
+        }
+        self.map_var
     }
 
     /// Loads a member of the memory map (u64 or u32 by `ty`); `path` ids.
     fn map_load_at(&mut self, map: Id, ty: Id, path: &[Id]) -> Id {
-        let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, ty);
+        let p = self.m.t_ptr(en::SC_UNIFORM, ty);
         let mut ops = vec![map];
         ops.extend_from_slice(path);
         let ptr = self.m.op(op::ACCESS_CHAIN, p, &ops);
-        let align = if ty == self.t.u64_ { 8 } else { 4 };
-        self.m.op(op::LOAD, ty, &[ptr, en::MEM_ALIGNED, align])
+        self.m.op(op::LOAD, ty, &[ptr])
     }
 
     fn map_load(&mut self, ty: Id, path: &[u32]) -> Id {
@@ -471,7 +476,8 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn input(&mut self, loc: u8, comp: u8, interp: Interp) -> Id {
+    fn input(&mut self, row: u8, chan: u8, interp: Interp) -> Id {
+        let (loc, comp) = self.st.locs.get(&(row, chan)).copied().unwrap_or((31, chan));
         let f = self.t.f32_;
         let var = if let Some(&v) = self.inputs.get(&loc) {
             v
@@ -506,7 +512,81 @@ impl<'a> Emit<'a> {
         self.m.op(op::LOAD, f, &[ptr])
     }
 
+    /// A mesh output array (per vertex, or per primitive for the indices).
+    fn mesh_output(&mut self, slot: u16) -> (Id, Id) {
+        if let Some(&o) = self.outputs.get(&slot) {
+            return o;
+        }
+        let (u, f) = (self.t.u32_, self.t.f32_);
+        let (mv, mp) = self.st.mesh;
+        let (elem, n, var) = match slot {
+            OUT_PRIMITIVE => {
+                let v3 = self.m.t_vec(u, 3);
+                let arr = self.m.t_array(v3, mp.max(1));
+                let p = self.m.t_ptr(en::SC_OUTPUT, arr);
+                let v = self.m.variable(p, en::SC_OUTPUT);
+                self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_PRIMITIVE_TRIANGLE_INDICES_EXT]);
+                (u, mp, v)
+            }
+            _ => {
+                let v4 = self.m.t_vec(f, 4);
+                let arr = self.m.t_array(v4, mv.max(1));
+                let p = self.m.t_ptr(en::SC_OUTPUT, arr);
+                let v = self.m.variable(p, en::SC_OUTPUT);
+                if slot == OUT_POSITION {
+                    self.m.decorate(v, en::DEC_BUILTIN, &[en::BI_POSITION]);
+                } else {
+                    self.m.decorate(v, en::DEC_LOCATION, &[u32::from(slot)]);
+                }
+                (f, mv, v)
+            }
+        };
+        let _ = n;
+        self.interface.push(var);
+        self.outputs.insert(slot, (var, elem));
+        (var, elem)
+    }
+
+    /// Mesh: every primitive culled until its export (so the counts can be
+    /// the maxima, declared at the start).
+    fn mesh_prologue(&mut self) {
+        let (mv, mp) = self.st.mesh;
+        let (u, b) = (self.t.u32_, self.t.bool_);
+        let (kv, kp) = (self.c32(mv), self.c32(mp));
+        self.m.op_void(op::SET_MESH_OUTPUTS, &[kv, kp]);
+        let arr = self.m.t_array(b, mp.max(1));
+        let p = self.m.t_ptr(en::SC_OUTPUT, arr);
+        let cull = self.m.variable(p, en::SC_OUTPUT);
+        self.m.decorate(cull, en::DEC_BUILTIN, &[en::BI_CULL_PRIMITIVE_EXT]);
+        self.m.decorate(cull, en::DEC_PER_PRIMITIVE_EXT, &[]);
+        self.interface.push(cull);
+        self.cull = cull;
+        let me = self.builtin(Builtin::LocalInvocationIndex);
+        let threads = self.st.local_size[0].max(1);
+        let pb = self.m.t_ptr(en::SC_OUTPUT, b);
+        let t = self.m.c_bool(true);
+        let mut k = 0;
+        while k < mp {
+            let kk = self.c32(k);
+            let i = self.m.op(op::I_ADD, u, &[me, kk]);
+            let inside = self.m.op(op::U_LESS_THAN, b, &[i, kp]);
+            let (lt, lm) = (self.m.id(), self.m.id());
+            self.m.op_void(op::SELECTION_MERGE, &[lm, 0]);
+            self.m.op_void(op::BRANCH_CONDITIONAL, &[inside, lt, lm]);
+            self.m.label(lt);
+            let ptr = self.m.op(op::ACCESS_CHAIN, pb, &[cull, i]);
+            self.m.op_void(op::STORE, &[ptr, t]);
+            self.m.op_void(op::BRANCH, &[lm]);
+            self.m.label(lm);
+            self.block = lm;
+            k += threads;
+        }
+    }
+
     fn output(&mut self, slot: u16) -> (Id, Id) {
+        if self.st.stage == HwStage::Ms {
+            return self.mesh_output(slot);
+        }
         if let Some(&o) = self.outputs.get(&slot) {
             return o;
         }
@@ -581,8 +661,7 @@ impl<'a> Emit<'a> {
             self.m.capability(en::CAP_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
             self.m.capability(en::CAP_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
         }
-        self.m.capability(en::CAP_RUNTIME_DESCRIPTOR_ARRAY);
-        let arr = self.m.t_runtime_array(ity);
+        let arr = self.m.t_array(ity, 1 << 20);
         let p = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
         let v = self.m.variable(p, en::SC_UNIFORM_CONSTANT);
         self.m.decorate(v, en::DEC_DESCRIPTOR_SET, &[0]);
@@ -602,42 +681,38 @@ impl<'a> Emit<'a> {
         (self.m.op(op::LOAD, ity, &[ptr]), ptr)
     }
 
+    /// Samplers: set 1, binding 0, `SAMPLER[4096]`. A heap sampler is at
+    /// the slot in its S#; immediate sampler n at the index specialization
+    /// constant 100 + n gives (the host's reserved slots).
     fn load_sampler(&mut self, s: Sampler, sw: Option<Id>) -> Id {
         let sty = self.m.t_sampler();
         let p = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, sty);
-        match s {
-            Sampler::Static(n) => {
-                if self.static_samplers == 0 {
-                    let count = self.iface.samplers.len().max(1) as u32;
-                    let arr = self.m.t_array(sty, count);
-                    let pa = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
-                    self.static_samplers = self.m.variable(pa, en::SC_UNIFORM_CONSTANT);
-                    self.m.decorate(self.static_samplers, en::DEC_DESCRIPTOR_SET, &[1]);
-                    let b = u32::from(self.st.stage == HwStage::Ps);
-                    self.m.decorate(self.static_samplers, en::DEC_BINDING, &[b]);
-                    self.interface.push(self.static_samplers);
-                }
-                let k = self.c32(n);
-                let ptr = self.m.op(op::ACCESS_CHAIN, p, &[self.static_samplers, k]);
-                self.m.op(op::LOAD, sty, &[ptr])
-            }
-            _ => {
-                if self.samplers == 0 {
-                    let arr = self.m.t_runtime_array(sty);
-                    let pa = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
-                    self.samplers = self.m.variable(pa, en::SC_UNIFORM_CONSTANT);
-                    self.m.decorate(self.samplers, en::DEC_DESCRIPTOR_SET, &[0]);
-                    self.m.decorate(self.samplers, en::DEC_BINDING, &[2]);
-                    self.interface.push(self.samplers);
-                    self.m.capability(en::CAP_RUNTIME_DESCRIPTOR_ARRAY);
-                }
-                let u = self.t.u32_;
-                let k = self.c32(0xFFF);
-                let idx = self.m.op(op::BITWISE_AND, u, &[sw.unwrap(), k]);
-                let ptr = self.m.op(op::ACCESS_CHAIN, p, &[self.samplers, idx]);
-                self.m.op(op::LOAD, sty, &[ptr])
-            }
+        if self.samplers == 0 {
+            let arr = self.m.t_array(sty, 4096);
+            let pa = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
+            self.samplers = self.m.variable(pa, en::SC_UNIFORM_CONSTANT);
+            self.m.decorate(self.samplers, en::DEC_DESCRIPTOR_SET, &[1]);
+            self.m.decorate(self.samplers, en::DEC_BINDING, &[0]);
+            self.interface.push(self.samplers);
         }
+        let u = self.t.u32_;
+        let idx = match s {
+            Sampler::Static(n) => match self.spec_samplers.get(&n) {
+                Some(&id) => id,
+                None => {
+                    let id = self.m.spec_u32(u, 0);
+                    self.m.decorate(id, en::DEC_SPEC_ID, &[100 + n]);
+                    self.spec_samplers.insert(n, id);
+                    id
+                }
+            },
+            _ => {
+                let k = self.c32(0xFFF);
+                self.m.op(op::BITWISE_AND, u, &[sw.unwrap(), k])
+            }
+        };
+        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[self.samplers, idx]);
+        self.m.op(op::LOAD, sty, &[ptr])
     }
 
     // ---- helpers ----
@@ -701,6 +776,21 @@ impl<'a> Emit<'a> {
                 let dev = e.m.op(op::I_ADD, q, &[base, d]);
                 (e.m.op(op::SELECT, q, &[hit, dev, zero]), lim)
             };
+            if Self::no_search() {
+                let r0 = through(self, z);
+                let out = if range {
+                    let v2 = self.m.t_vec(u, 2);
+                    let pair = self.m.op(op::BITCAST, v2, &[r0.0]);
+                    let lo = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 0]);
+                    let hi = self.m.op(op::COMPOSITE_EXTRACT, u, &[pair, 1]);
+                    self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[lo, hi, r0.1])
+                } else {
+                    r0.0
+                };
+                self.m.op_void(254, &[out]);
+                self.m.op_void(op::FUNCTION_END, &[]);
+                continue;
+            }
             let (lf, ls, lm) = (self.m.id(), self.m.id(), self.m.id());
             self.m.op_void(op::SELECTION_MERGE, &[lm, 0]);
             self.m.op_void(op::BRANCH_CONDITIONAL, &[one_range, lf, ls]);
@@ -868,7 +958,55 @@ impl<'a> Emit<'a> {
                 self.m.op(o, tid, &ops)
             }
             Op::Output { slot, comp } => {
+                // user outputs of vertex and mesh programs at their semantics' locations
+                let (slot, comp) = if slot < 0x100 && self.st.stage != HwStage::Ps {
+                    match self.st.locs.get(&(slot as u8, comp)) {
+                        Some(&(l, c)) => (u16::from(l), c),
+                        None => {
+                            self.ids[v as usize] = 0;
+                            return;
+                        }
+                    }
+                } else {
+                    (slot, comp)
+                };
                 let (var, elem) = self.output(slot);
+                if self.st.stage == HwStage::Ms {
+                    // [index] of the arrays (clamped), then the component
+                    let (u, b) = (self.t.u32_, self.t.bool_);
+                    let max = if slot == OUT_PRIMITIVE { self.st.mesh.1 } else { self.st.mesh.0 };
+                    let km = self.c32(max.max(1) - 1);
+                    let i = self.m.ext(glsl::U_MIN, u, &[args[1], km]);
+                    if slot == OUT_PRIMITIVE {
+                        let x = if self.f.ty(n.args[0]) == Ty::F32 { self.m.op(op::BITCAST, u, &[args[0]]) } else { args[0] };
+                        let m = self.c32(0x3FF);
+                        let (k10, k20, k31) = (self.c32(10), self.c32(20), self.c32(31));
+                        let i0 = self.m.op(op::BITWISE_AND, u, &[x, m]);
+                        let s1 = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k10]);
+                        let i1 = self.m.op(op::BITWISE_AND, u, &[s1, m]);
+                        let s2 = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k20]);
+                        let i2 = self.m.op(op::BITWISE_AND, u, &[s2, m]);
+                        let v3 = self.m.t_vec(u, 3);
+                        let tri = self.m.op(op::COMPOSITE_CONSTRUCT, v3, &[i0, i1, i2]);
+                        let p3 = self.m.t_ptr(en::SC_OUTPUT, v3);
+                        let ptr = self.m.op(op::ACCESS_CHAIN, p3, &[var, i]);
+                        self.m.op_void(op::STORE, &[ptr, tri]);
+                        let c = self.m.op(op::SHIFT_RIGHT_LOGICAL, u, &[x, k31]);
+                        let z = self.c32(0);
+                        let culled = self.m.op(op::I_NOT_EQUAL, b, &[c, z]);
+                        let pb = self.m.t_ptr(en::SC_OUTPUT, b);
+                        let cp = self.m.op(op::ACCESS_CHAIN, pb, &[self.cull, i]);
+                        self.m.op_void(op::STORE, &[cp, culled]);
+                    } else {
+                        let x = if self.f.ty(n.args[0]) == Ty::F32 { args[0] } else { self.m.op(op::BITCAST, elem, &[args[0]]) };
+                        let p = self.m.t_ptr(en::SC_OUTPUT, elem);
+                        let k = self.c32(u32::from(comp));
+                        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, i, k]);
+                        self.m.op_void(op::STORE, &[ptr, x]);
+                    }
+                    self.ids[v as usize] = 0;
+                    return;
+                }
                 let at = self.f.ty(n.args[0]);
                 let at = self.ty(at);
                 let x = if at != elem { self.m.op(op::BITCAST, elem, &[args[0]]) } else { args[0] };
@@ -1669,6 +1807,9 @@ impl<'a> Emit<'a> {
         for v in self.f.prelude.clone() {
             self.emit_node(v);
         }
+        if self.st.stage == HwStage::Ms {
+            self.mesh_prologue();
+        }
         if self.f.nodes.iter().any(|n| matches!(n.op, Op::Store { .. } | Op::Atomic(_))) {
             let q = self.t.u64_;
             self.sink = self.map_load(q, &[1]);
@@ -1711,6 +1852,15 @@ impl<'a> Emit<'a> {
             HwStage::Cs => {
                 let [x, y, z] = self.st.local_size;
                 self.m.execution_mode(fid, en::EM_LOCAL_SIZE, &[x.max(1), y.max(1), z.max(1)]);
+            }
+            HwStage::Ms => {
+                self.m.extension("SPV_EXT_mesh_shader");
+                self.m.capability(en::CAP_MESH_SHADING_EXT);
+                let [x, y, z] = self.st.local_size;
+                self.m.execution_mode(fid, en::EM_LOCAL_SIZE, &[x.max(1), y.max(1), z.max(1)]);
+                self.m.execution_mode(fid, en::EM_OUTPUT_VERTICES, &[self.st.mesh.0.max(1)]);
+                self.m.execution_mode(fid, en::EM_OUTPUT_PRIMITIVES_EXT, &[self.st.mesh.1.max(1)]);
+                self.m.execution_mode(fid, en::EM_OUTPUT_TRIANGLES_EXT, &[]);
             }
             _ => {}
         }
