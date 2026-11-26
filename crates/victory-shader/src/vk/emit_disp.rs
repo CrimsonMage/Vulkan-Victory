@@ -92,6 +92,12 @@ impl Emit<'_> {
 
     /// A jump into a case of the dispatch loop at stack position `i`.
     pub(super) fn disp_continue(&mut self, i: usize, to: usize, vals: &[Id]) {
+        let cont = self.disp_edge(i, to, vals);
+        self.branch_to(cont);
+    }
+
+    /// The edge into a case: noted at the continue target; its label.
+    pub(super) fn disp_edge(&mut self, i: usize, to: usize, vals: &[Id]) -> Id {
         let d = self.cons[i].disp.as_ref().unwrap();
         let j = d.cases.iter().position(|c| c.0 == to).unwrap();
         let map = d.cases[j].1.clone();
@@ -104,7 +110,7 @@ impl Emit<'_> {
         let blk = self.block;
         let cont = self.cons[i].cont;
         self.cons[i].disp.as_mut().unwrap().conts.push((state, full, blk));
-        self.branch_to(cont);
+        cont
     }
 
     /// The continue target's phis: the next state and slot values.
