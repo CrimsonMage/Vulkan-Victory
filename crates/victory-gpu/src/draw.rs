@@ -191,6 +191,18 @@ pub(crate) struct State {
     /// one pipeline that differ in their constants were bound whole for
     /// each.
     consts: [Option<(usize, u64)>; 2],
+    /// Per kind: whether a view the last whole binding's shaders read was of
+    /// the depth target it only tests ([`State::bound`]'s third field, kept
+    /// for [`State::constants_only`]).
+    bound_read: [bool; 2],
+    /// Of the whole binding under way: a stage before the last made fresh
+    /// tables (their offsets are not kept for [`State::constants_only`]).
+    any_made: bool,
+    /// Per kind: a root view was set since the last whole binding. Root
+    /// views read by directory are user data like root constants
+    /// (`HostShader::root_memory`), so they keep [`State::consts`]; a
+    /// pipeline with a root view the host binds (the fallback) binds whole.
+    views_set: [bool; 2],
     /// Per kind, what the last whole binding's shaders write
     /// (`BIND_WRITES`, `UNTRACKED`): a binding taken from it writes the
     /// same, which ends the list's window of bounded indirect records over
@@ -480,7 +492,9 @@ impl State {
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
         if !matches!(self.roots_ref(compute).get(slot as usize), Some(&Root::View(a)) if a == address) {
-            set(self.roots(compute), slot, Root::View(address));
+            // As a root constant ([`State::views_set`]).
+            self.views_set[usize::from(compute)] = true;
+            set(self.constants(compute), slot, Root::View(address));
         }
     }
 
@@ -925,7 +939,7 @@ impl State {
         self.early_textures(list, p, compute);
         let began = crate::fast::ticks();
         let kind = usize::from(compute);
-        if self.bound_already(list, p, compute) || (compute && self.constants_only(list, p)) {
+        if self.bound_already(list, p, compute) || self.constants_only(list, p, compute) {
             // It writes what the binding it is taken from writes.
             for &(address, len, cause) in &self.writes[kind] {
                 list.wrote(address, len, cause);
@@ -940,6 +954,7 @@ impl State {
         }
         self.bound[kind] = None;
         self.consts[kind] = None;
+        self.views_set[kind] = false;
         BIND_WRITES.with_borrow_mut(Vec::clear);
         UNTRACKED.set(false);
         if compute {
@@ -994,7 +1009,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        for stage in &p.stages {
+        self.any_made = false;
+        for (n, stage) in p.stages.iter().enumerate() {
             let t = stage.translated();
             STORES.set(t.stores);
             // In the list's own vector: no allocation per draw.
@@ -1002,6 +1018,9 @@ impl State {
             made.clear();
             let at = crate::fast::ticks();
             self.tables(list, &t.used, &t.host.root_indexed_views, compute, &mut made);
+            if n + 1 < p.stages.len() && !made.is_empty() {
+                self.any_made = true;
+            }
             if compute {
                 part(Part::Tables, at);
             }
@@ -1183,7 +1202,12 @@ impl State {
                 }
             }
             self.bound[kind] = Some((p.pso.as_raw() as usize, list.epoch(), TESTED_DEPTH.get().1));
-            if compute && p.stages.len() == 1 && p.stages[0].translated().host.root_indexed_views.is_empty() {
+            self.bound_read[kind] = TESTED_DEPTH.get().1;
+            // (A draw's stages besides the last made no fresh tables: their
+            // offsets are not kept.)
+            if p.stages.iter().all(|s| s.translated().host.root_indexed_views.is_empty())
+                && (compute || (self.made.is_empty() && !self.any_made))
+            {
                 self.consts[kind] = Some((p.pso.as_raw() as usize, list.epoch()));
             }
         }
@@ -1306,18 +1330,28 @@ impl State {
         }
     }
 
-    /// For a dispatch: whether only root constants changed since the last
-    /// whole binding of `p` ([`State::consts`]); its user data is then set
-    /// again from them, with the offsets of the tables that binding made.
-    fn constants_only(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+    /// Whether only root constants and root views read by directory changed
+    /// since the last whole binding of `p` of its kind ([`State::consts`]);
+    /// its user data is then set again from them (with the offsets of the
+    /// tables that binding made), the root views' pages seen to and what is
+    /// written through them declared, and nothing else.
+    fn constants_only(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let kind = usize::from(compute);
         let pso = p.pso.as_raw() as usize;
-        let Some((was, epoch)) = self.consts[1] else {
+        let Some((was, epoch)) = self.consts[kind] else {
             return false;
         };
-        let [stage] = &p.stages[..] else {
+        if was != pso || epoch != list.epoch() || self.host_roots[kind] != p.root.as_raw() as usize || self.host_heaps != self.heaps {
             return false;
+        }
+        // A root view the host binds (the translator's fallback) is bound
+        // whole.
+        let bound_views = |s: &crate::pipeline::host::Stage| {
+            !s.root_cbvs.is_empty()
+                || !s.root_uavs.is_empty()
+                || s.root_srvs.iter().any(|r| r.0 != victory_shader::emit::SLOT_STRIDES)
         };
-        if was != pso || epoch != list.epoch() || self.host_roots[1] != p.root.as_raw() as usize || self.host_heaps != self.heaps {
+        if self.views_set[kind] && p.stages.iter().any(bound_views) {
             return false;
         }
         if self.host_pipeline != pso {
@@ -1327,9 +1361,33 @@ impl State {
             self.host_pipeline = pso;
         }
         let made = std::mem::take(&mut self.made);
-        self.user_data(list, stage, &made, None, true);
+        for stage in &p.stages {
+            let t = stage.translated();
+            let memory = if t.host.root_memory.is_empty() {
+                None
+            } else {
+                let Some(ready) = self.memory_ready(list, compute, false, false, &t.host.root_memory) else {
+                    self.made = made;
+                    return false;
+                };
+                if t.stores {
+                    self.root_memory_writes(list, &t.host.root_memory, compute);
+                }
+                Some(ready)
+            };
+            self.user_data(list, stage, &made, memory.as_ref(), compute);
+        }
         self.made = made;
-        self.bound[1] = Some((pso, epoch, false));
+        let read = if compute {
+            false
+        } else {
+            let tested = if self.depth_state == DEPTH_READ { self.depth } else { 0 };
+            // As the whole binding found it ([`State::bound`]).
+            let read = self.bound_read[kind];
+            TESTED_DEPTH.set((tested, read));
+            read
+        };
+        self.bound[kind] = Some((pso, epoch, read));
         true
     }
 
