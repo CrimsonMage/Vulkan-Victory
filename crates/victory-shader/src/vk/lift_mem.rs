@@ -145,36 +145,21 @@ impl Lift<'_> {
     fn typed_shape(&mut self, w3: V) -> V {
         let k12 = self.k32(12);
         let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[w3, k12]);
-        if std::env::var("VICTORY_VK_TYPED").as_deref() == Ok("switch") {
-            let k7f = self.k32(0x7F);
-            return self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
-        }
         self.emit(Op::Call(Helper::TypedShape), Ty::U32, vec![f])
     }
 
-    /// Whether a V# holds `kb` bytes at all, and whether it holds them at
-    /// byte offset `o`.
-    fn in_bounds(&mut self, vs: &VSharp, o: V, kb: V) -> (V, V) {
+    /// Whether a V# holds `kb` bytes at byte offset `o`.
+    fn in_bounds(&mut self, vs: &VSharp, o: V, kb: V) -> V {
         let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
         let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
         let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
-        let ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le]);
-        (room, ok)
+        self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le])
     }
 
     /// The device address for `kb` bytes at byte offset `o` of a V#; out
-    /// of bounds the zero (loads) or sink (stores) block. EXPERIMENT
-    /// (`VICTORY_VK_EXP` f or e): the offset clamped into the V# instead
-    /// (min, no select).
+    /// of bounds the zero (loads) or sink (stores) block.
     pub(super) fn access_addr(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
-        if matches!(std::env::var("VICTORY_VK_EXP").as_deref(), Ok("e" | "f")) {
-            let top = self.gl(glsl::U_MAX, Ty::U32, &[vs.limit, kb]);
-            let lim = self.spv(op::I_SUB, Ty::U32, &[top, kb]);
-            let oc = self.gl(glsl::U_MIN, Ty::U32, &[o, lim]);
-            let o64 = self.spv(op::U_CONVERT, Ty::U64, &[oc]);
-            return self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
-        }
-        let (_, ok) = self.in_bounds(vs, o, kb);
+        let ok = self.in_bounds(vs, o, kb);
         let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
         let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
         let fallback = self.fallback(store);

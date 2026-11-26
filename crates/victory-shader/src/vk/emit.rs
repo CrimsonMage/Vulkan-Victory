@@ -168,8 +168,6 @@ pub struct Emit<'a> {
     guard_fn: Id,
     /// The wave64 halves' exchange (emit_xchg.rs).
     xv: xchg::XchgVars,
-    /// Variant e: the range buffers by element type (emit_ssbo.rs).
-    ssbo_vars: HashMap<S, Id>,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -177,6 +175,11 @@ pub struct Emit<'a> {
     input_locations: Vec<(u8, usize)>,
     frag: bool,
 }
+
+/// Memory semantics of a group barrier and of the wave64 halves' meetings:
+/// workgroup, buffer and image memory (`s_waitcnt_vscnt` before
+/// `s_barrier` is the console's device-memory barrier with group sync).
+const SEM_GROUP: u32 = en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY | en::SEM_UNIFORM_MEMORY | en::SEM_IMAGE_MEMORY;
 
 /// Jump codes: construct at stack position i; continue (loop) or exit.
 fn code(i: usize, cont: bool) -> u32 {
@@ -242,7 +245,6 @@ impl<'a> Emit<'a> {
             spent_var: 0,
             guard_fn: 0,
             xv: Default::default(),
-            ssbo_vars: HashMap::new(),
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -319,7 +321,7 @@ impl<'a> Emit<'a> {
             Op::Push(k) => self.push_load(k),
             Op::MapField(k) => {
                 let q = self.t.u64_;
-                if ssbo::ssbo_mode() { self.m.c_u64(ssbo::UNMAPPED) } else { self.map_load(q, &[k]) }
+                self.map_load(q, &[k])
             }
             Op::Builtin(b) => self.builtin(b),
             Op::Input { loc, comp, interp } => self.input(loc, comp, interp, ty),
@@ -353,7 +355,7 @@ impl<'a> Emit<'a> {
             Op::Xchg => self.xchg(args[0]),
             Op::Barrier => {
                 let wg = self.c32(en::SCOPE_WORKGROUP);
-                let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
+                let sem = self.c32(SEM_GROUP);
                 self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
                 0
             }
@@ -524,7 +526,7 @@ impl<'a> Emit<'a> {
         self.xchg_init();
         if self.f.nodes.iter().any(|n| matches!(n.op, Op::Store { .. } | Op::Atomic(_))) {
             let q = self.t.u64_;
-            self.sink = if ssbo::ssbo_mode() { self.m.c_u64(ssbo::UNMAPPED) } else { self.map_load(q, &[1]) };
+            self.sink = self.map_load(q, &[1]);
         }
         // record header labels for continue targets lazily: we need the
         // header of each construct when closing it; keep a map cont -> header
@@ -605,7 +607,4 @@ mod guard;
 mod xchg;
 #[path = "emit_typed.rs"]
 mod typed;
-#[path = "emit_typed_switch.rs"]
-pub(crate) mod typed_switch;
-#[path = "emit_ssbo.rs"]
-pub(crate) mod ssbo;
+

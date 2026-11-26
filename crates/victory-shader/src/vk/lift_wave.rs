@@ -38,6 +38,17 @@ impl Lift<'_> {
         self.exchange(z);
     }
 
+    /// At the console's memory barrier (`s_waitcnt_vscnt`): the halves meet
+    /// (the meeting orders buffer and image memory too).
+    pub(super) fn memory_meet(&mut self) {
+        if !self.xwave {
+            return;
+        }
+        self.close();
+        let z = self.k32(0);
+        self.exchange(z);
+    }
+
     /// The two dwords of a wave64 mask: exchanged once per block (masks
     /// read inside a guard keep the per-half value: a guard is not reached
     /// by every invocation).

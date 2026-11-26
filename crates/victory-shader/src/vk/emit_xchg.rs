@@ -64,7 +64,7 @@ impl Emit<'_> {
         let mine = self.m.op(op::ACCESS_CHAIN, p, &[self.xv.slots, half]);
         self.m.op_void(op::STORE, &[mine, own]);
         let wg = self.c32(en::SCOPE_WORKGROUP);
-        let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
+        let sem = self.c32(super::SEM_GROUP);
         self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
         let (k0, k1) = (self.c32(0), self.c32(1));
         let p0 = self.m.op(op::ACCESS_CHAIN, p, &[self.xv.slots, k0]);
@@ -138,7 +138,7 @@ impl Emit<'_> {
         // every invocation's workgroup memory accesses before the meeting
         // happen before the partner's after it
         let wg = self.c32(en::SCOPE_WORKGROUP);
-        let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
+        let sem = self.c32(super::SEM_GROUP);
         self.m.op_void(op::MEMORY_BARRIER, &[wg, sem]);
         let sg = self.builtin(Builtin::SubgroupId);
         let half = self.m.op(op::BITWISE_AND, u, &[sg, one]);
