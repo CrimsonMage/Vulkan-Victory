@@ -1742,6 +1742,9 @@ pub(crate) fn let_go_idle() {
             0
         }
     });
+    // And what the card's page cache of pool pages is short of for a block
+    // (`crate::memory`): idle copies make room for pages lists read.
+    let wanted = wanted.max(crate::memory::room_wanted());
     let all = textures();
     // Candidates: (last use, texture, freed).
     let mut chosen: Vec<(u64, usize, bool)> = Vec::new();

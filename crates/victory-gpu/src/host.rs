@@ -583,6 +583,39 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     /// Bounded indirect records (`crate::indirect`).
     indirect: Mutex<crate::indirect::Window>,
+    /// Pool memory the list names by directory, without a lock
+    /// ([`HostList::first_pool_name`]).
+    pool: PoolNames,
+}
+
+/// What a list names of the pool by directory, seen to without a lock: a
+/// draw names the same views over and over, on whatever worker translates
+/// it.
+struct PoolNames {
+    /// Keys named since the reset, by hash: key | recording << 44 (a key
+    /// that loses its place to another may be named again: harmless).
+    seen: Box<[std::sync::atomic::AtomicU64]>,
+    /// The recording (resets so far, from 1).
+    recording: std::sync::atomic::AtomicU64,
+    /// Bytes of pool views named since the last submission (the frame line).
+    bytes: std::sync::atomic::AtomicU64,
+    /// The heap's unordered access views last noted for shaders that pick
+    /// buffers by index ([`HostList::wrote_heap`]).
+    heap: std::sync::atomic::AtomicUsize,
+}
+
+/// Places of [`PoolNames::seen`].
+const POOL_SEEN: usize = 4096;
+
+impl Default for PoolNames {
+    fn default() -> PoolNames {
+        PoolNames {
+            seen: (0..POOL_SEEN).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            recording: std::sync::atomic::AtomicU64::new(1),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            heap: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1938,6 +1971,7 @@ impl Host {
                 list7: OnceLock::new(),
                 epoch: std::sync::atomic::AtomicU64::new(0),
                 indirect: Mutex::default(),
+                pool: PoolNames::default(),
             })
         }
     }
@@ -2435,6 +2469,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.pool.recording.fetch_add(1, Ordering::Relaxed);
+        self.pool.heap.store(0, Ordering::Relaxed);
         self.indirect().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2516,12 +2552,15 @@ impl HostList {
     pub(crate) fn wrote_heap(&self, uavs: Option<&[(u64, u64)]>) {
         self.indirect().wrote_heap(uavs);
         // Pool pages there are not cached on the card while such shaders
-        // write them (`crate::memory`).
+        // write them (`crate::memory`); once per heap's list of views, with
+        // no lock.
         match uavs {
-            Some(uavs) if self.first_use(uavs.as_ptr() as usize | 1 << 60) => {
-                self.deferred().pool_heap.extend_from_slice(uavs);
+            Some(uavs) => {
+                let key = uavs.as_ptr() as usize ^ uavs.len();
+                if self.pool.heap.swap(key, Ordering::Relaxed) != key {
+                    self.deferred().pool_heap.extend_from_slice(uavs);
+                }
             }
-            Some(_) => {}
             None => crate::memory::heap_written_unknown(),
         }
     }
@@ -2982,16 +3021,40 @@ impl HostList {
         self.deferred().windows.push(shadow.clone());
     }
 
+    /// Whether the list names pool memory under `key` (a title address,
+    /// with a bit above 40 for the kind of naming) for the first time since
+    /// its reset: one atomic swap, no lock. A key that lost its place to
+    /// another is named again.
+    pub(crate) fn first_pool_name(&self, key: u64) -> bool {
+        let tag = key | self.pool.recording.load(Ordering::Relaxed) << 44;
+        let place = (key >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - POOL_SEEN.trailing_zeros());
+        self.pool.seen[place as usize].swap(tag, Ordering::Relaxed) != tag
+    }
+
+    /// Bytes of pool views named, for the frame line (summed at submission).
+    pub(crate) fn pool_bytes(&self, bytes: u64) {
+        self.pool.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// At submission: the bytes of pool views named since go to the frame
+    /// line.
+    pub(crate) fn count_pool_bytes(&self) {
+        crate::frametime::add(crate::frametime::Sum::PoolBytes, self.pool.bytes.swap(0, Ordering::Relaxed));
+    }
+
     /// The list names pool memory by directory (`crate::memory::named`):
-    /// `[address, address + cache)` for the card's page cache, and with
-    /// `writes` its shaders write `[address, address + writes)` that way.
-    pub(crate) fn name_pool(&self, address: u64, cache: u64, writes: Option<u64>) {
+    /// `[address, address + cache)` for the card's page cache.
+    pub(crate) fn name_pool(&self, address: u64, cache: u64) {
+        self.deferred().pool.push((address, cache));
+    }
+
+    /// [`HostList::defer_gpu_write`] for a pool view written by directory,
+    /// noted for the card's page cache as such.
+    pub(crate) fn defer_pool_write(&self, address: usize, len: usize) {
         let mut deferred = self.deferred();
-        if cache > 0 {
-            deferred.pool.push((address, cache));
-        }
-        if let Some(len) = writes {
-            deferred.pool_writes.push((address, len));
+        if deferred.declared.insert((address, len)) {
+            deferred.copies.push(Step::GpuWrite(address, len));
+            deferred.pool_writes.push((address as u64, len as u64));
         }
     }
 

@@ -567,11 +567,24 @@ on plus the probe at the first sweep; `3`, also the probe's tile-mapping test. T
     may write (the heap's unordered access views; not declared view by
     view) are evicted before such a list and not cached for 120 frames:
     their writes go to the section page, as before.
-  - *Room*: blocks are made while the card's memory in use stays under 90%
-    of the layer's budget (`memcap`; the line where idle texture copies
-    start to go), and one block is given back per submission while it is
-    over 95% (its pages evicted; its copy number's views nulled once that
-    submission has finished, then reused). With no room, the least
+  - *Room*: blocks are made while the layer's use of the card stays under
+    90% of memcap's ceiling (`memcap::card_cap`, from the adapter's real
+    memory; the system's budget figure falls as the card fills under vkd3d,
+    and gated on it the cache never opened in run p21) and the driver keeps
+    256 MiB free besides; short of that, the sweep lets idle host copies of
+    textures (unused for 5 s) go for the bytes missing, and growth is asked
+    again a second later. One block is given back per submission while use
+    is over 95% of the ceiling or the driver has less than 128 MiB free
+    (its pages evicted; its copy number's views nulled once that
+    submission has finished, then reused).
+  - *Naming is nearly free*: a list notes a view once, by a per-list table
+    of atomics keyed by address and the list's recording (one swap, no
+    lock); while the cache has no block nothing is noted for it (only the
+    frame line's bytes, per list, summed at submission), and a submission
+    tries to make the first block. Declared writes are kept always (the
+    cache may hold the pages by the time the list runs), as before the
+    cache; the heap's unordered access views for index-picking writers
+    once per list of views, by an atomic. With no room, the least
     recently named page goes (a clock by frame), never one named in this
     frame or the last: a working set larger than the cache keeps what it
     holds and reads the rest from the sections instead of churning. A slot

@@ -634,13 +634,22 @@ pub(crate) fn heap_gone(key: usize) {
 pub(crate) fn flush(runs: &[&HostList], submission: u64) -> (Option<ID3D12CommandList>, Vec<Option<ID3D12CommandList>>) {
     // Read before the directory's lock (the lists' own locks are taken
     // after it only while recording).
-    let named: Vec<Named> = runs.iter().map(|l| l.pool_names()).collect();
+    for list in runs {
+        list.count_pool_bytes();
+    }
+    // Nothing named is read while the cache has no block: it tries to make
+    // one first (names follow from the next lists recorded on).
+    let named: Vec<Named> = if cache::live() || with(|m| m.cache_wake()) {
+        runs.iter().map(|l| l.pool_names()).collect()
+    } else {
+        Vec::new()
+    };
     let mut guard = memory();
     let Some(m) = guard.as_mut() else {
         return (None, Vec::new());
     };
     m.make_copies();
-    let plan = m.cache_plan(&named, submission);
+    let plan = if named.is_empty() { cache::Plan::default() } else { m.cache_plan(&named, submission) };
     // Blocks the cache made are copies too.
     m.make_copies();
     let needed = m.any_dirty || !plan.is_empty();
@@ -763,8 +772,13 @@ static RESERVATIONS: RwLock<BTreeMap<u64, (u64, bool)>> = RwLock::new(BTreeMap::
 pub fn page_reservation(at: usize, len: usize) {
     if len > 0 {
         RESERVATIONS.write().unwrap_or_else(|e| e.into_inner()).insert(at as u64, (at as u64 + len as u64, false));
+        RESERVED.fetch_add(1, Ordering::Release);
     }
 }
+
+/// Changes of [`RESERVATIONS`] so far: what [`covers`] remembers per thread
+/// holds while it stays.
+static RESERVED: AtomicU64 = AtomicU64::new(1);
 
 /// The reservation holding `address`: its start, end and whether it is a
 /// GPU view.
@@ -777,8 +791,33 @@ fn reservation(address: u64) -> Option<(u64, u64, bool)> {
 /// Whether title memory at `address` is pool memory: in a page reservation,
 /// where the title maps physical pages (one at a time, scattered), so the
 /// GPU reaches it by directory.
+/// Asked by every draw of each root view it reads: the thread's last
+/// reservation found, and its last address found in none, are remembered
+/// until the reservations change (no lock then).
 pub(crate) fn covers(address: u64) -> bool {
-    reservation(address).is_some()
+    thread_local! {
+        // (start, end, changes) of the last found; (page, changes) of the
+        // last not found.
+        static LAST: std::cell::Cell<((u64, u64, u64), (u64, u64))> = const { std::cell::Cell::new(((0, 0, 0), (u64::MAX, 0))) };
+    }
+    let changes = RESERVED.load(Ordering::Acquire);
+    let ((start, end, seen), (page, missed)) = LAST.get();
+    if seen == changes && (start..end).contains(&address) {
+        return true;
+    }
+    if missed == changes && page == address / PAGE {
+        return false;
+    }
+    match reservation(address) {
+        Some((start, end, _)) => {
+            LAST.set(((start, end, changes), (page, missed)));
+            true
+        }
+        None => {
+            LAST.set(((start, end, seen), (address / PAGE, changes)));
+            false
+        }
+    }
 }
 
 /// A page of the GPU view of the pool: the section, the byte offset in it,
@@ -831,6 +870,7 @@ pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
             // Not a reservation `xmem` told: the range itself.
             None => {
                 r.insert(to, (to + len, true));
+                RESERVED.fetch_add(1, Ordering::Release);
             }
         }
         ANY_GPU_VIEW.store(true, Ordering::Relaxed);
@@ -896,8 +936,20 @@ pub(crate) fn demand(address: u64, len: u64) {
 /// Pages [`reach`] has seen to (one bit each), read without the lock.
 static REACHED: [AtomicU64; MEMORY_PAGES as usize / 64] = [const { AtomicU64::new(0) }; MEMORY_PAGES as usize / 64];
 
-fn reached(page: u64) -> bool {
-    REACHED[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64) & 1 != 0
+/// Whether every page of `[first, end)` was seen to by [`reach`]: a word
+/// of the bits at a time (a root view's reach is 256 pages).
+fn all_reached(first: u64, end: u64) -> bool {
+    let mut page = first;
+    while page < end {
+        let word = page / 64;
+        let (lo, hi) = (page % 64, (end - word * 64).min(64));
+        let mask = (if hi == 64 { u64::MAX } else { (1 << hi) - 1 }) & !((1u64 << lo) - 1);
+        if REACHED[word as usize].load(Ordering::Relaxed) & mask != mask {
+            return false;
+        }
+        page = (word + 1) * 64;
+    }
+    true
 }
 
 /// Shaders read and write `[address, address + len)` by directory (a root
@@ -911,7 +963,7 @@ fn reached(page: u64) -> bool {
 pub(crate) fn reach(address: u64, len: u64) {
     let last = u64::from(MEMORY_PAGES) - 1;
     let (first, end) = (address / PAGE, address.saturating_add(len.max(1)).div_ceil(PAGE).min(last));
-    if (first..end).all(reached) {
+    if all_reached(first, end) {
         return;
     }
     with(|m| {
@@ -994,26 +1046,32 @@ pub(crate) fn named_root(list: &HostList, address: u64, reach: u64, writes: bool
 /// card's page cache only where it has room (nothing tells which views
 /// such a shader reads).
 pub(crate) fn named_heap(list: &HostList, address: u64, len: u64) {
-    if list.first_use((address as usize) | 1 << 59) {
-        if !list.used_already((address as usize) | 1 << 62) {
-            crate::frametime::add(crate::frametime::Sum::PoolBytes, len);
+    if list.first_pool_name(address | NAMED_HEAP) {
+        list.pool_bytes(len);
+        if cache::live() {
+            list.name_pool_maybe(address, len);
         }
-        list.name_pool_maybe(address, len);
     }
 }
 
+/// Kinds of pool naming, above the 40 bits of a title address
+/// (`HostList::first_pool_name`).
+const NAMED_READ: u64 = 1 << 41;
+const NAMED_HEAP: u64 = 1 << 42;
+
 fn named_as(list: &HostList, address: u64, len: u64, cached: u64, writes: bool) {
-    // Title addresses lie below bit 40: another key than any object's.
-    let first = list.first_use((address as usize) | 1 << 62);
-    if first {
-        crate::frametime::add(crate::frametime::Sum::PoolBytes, len);
-    }
-    let first_write = writes && list.first_use((address as usize) | 1 << 61);
-    if first || first_write {
-        list.name_pool(address, if first { cached } else { 0 }, first_write.then_some(len));
-    }
+    // Declared always (the cache may hold the pages by the time the list
+    // runs; what it writes must reach them): as before the cache.
     if writes {
-        list.defer_gpu_write(address as usize, len as usize);
+        list.defer_pool_write(address as usize, len as usize);
+    }
+    // Once per view and list, with no lock; for the cache only while it has
+    // a block.
+    if list.first_pool_name(address | NAMED_READ) {
+        list.pool_bytes(len);
+        if cache::live() {
+            list.name_pool(address, cached);
+        }
     }
 }
 
@@ -1030,6 +1088,12 @@ pub(crate) fn written(at: u64, len: u64) {
 /// the card's page cache holds may be lost (counted in the frame line).
 pub(crate) fn heap_written_unknown() {
     cache::heap_written_unknown();
+}
+
+/// Bytes of idle host copies of textures the card's page cache wants let go
+/// of for a block (`crate::resource::let_go_idle`); taken by the asking.
+pub(crate) fn room_wanted() -> u64 {
+    cache::room_wanted()
 }
 
 /// For the frame line: the card's page cache (`cache.rs`).

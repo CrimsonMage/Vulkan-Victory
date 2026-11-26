@@ -84,15 +84,20 @@ const PER_BLOCK: u32 = (BLOCK_BYTES / PAGE) as u32;
 const TWIN: u64 = u64::MAX;
 /// No slot.
 const NONE: u32 = u32::MAX;
-/// Blocks are made while the card's memory in use stays under this share
-/// of the layer's budget (percent): the line at which idle host copies of
-/// textures start to go (`crate::release`).
+/// Blocks are made while the layer's use of the card stays under this
+/// share of memcap's ceiling (percent; `memcap::card_cap`, from the
+/// adapter's real memory: not the system's budget figure, which under
+/// vkd3d falls as the card fills).
 const GROW: u64 = 90;
-/// Over this share a block is given back per submission.
+/// Over this share of the ceiling a block is given back per submission.
 const SHRINK: u64 = 95;
+/// What of the card stays free besides (the driver's budget less its use):
+/// blocks are made only while this much would be left, and given back
+/// below half of it.
+const FREE_KEEP: u64 = 256 << 20;
 /// Blocks at most (6 GiB; the Series S pool is 3,977 MiB, plus twins).
 const MOST_BLOCKS: usize = 96;
-/// Blocks at most when the card's budget is not known.
+/// Blocks at most when the card's ceiling is not known.
 const BLOCKS_UNKNOWN: usize = 16;
 /// Pages newly taken in by one submission at most (the rest is read from
 /// the pages this time); pages taken in again because they changed always
@@ -396,9 +401,40 @@ pub(super) fn record_after(after: &After) -> Option<ID3D12CommandList> {
 
 // Announced writes, between submissions.
 
-/// Whether the directory has a section copy (before that nothing can be
-/// cached and announced writes are not kept).
-static ON: AtomicBool = AtomicBool::new(false);
+/// Whether the cache has a block: before that (and whenever it has none)
+/// lists name nothing for it and announced writes are not kept.
+static LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the cache has a block ([`LIVE`]).
+pub(super) fn live() -> bool {
+    LIVE.load(Ordering::Relaxed)
+}
+
+/// Bytes of idle host copies of textures the cache asks the sweep to let go
+/// of for its room (`crate::resource::let_go_idle`); taken by the sweep.
+static ROOM_WANTED: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn room_wanted() -> u64 {
+    ROOM_WANTED.swap(0, Ordering::Relaxed)
+}
+
+/// The card's room for the cache: whether a block may be made, whether one
+/// must be given back, and what is short for a block (bytes); `None` if the
+/// card's memory is not known.
+fn room() -> Option<(bool, bool, u64)> {
+    let host = crate::host::host()?;
+    let cap = crate::memcap::card_cap()?;
+    let (used, _) = crate::memcap::card_used(host)?;
+    let [budget, ..] = host.video_memory_raw()?;
+    // What the driver still has (its budget is our use plus what is free).
+    let free = budget.saturating_sub(used);
+    let under = (cap / 100 * GROW).saturating_sub(used);
+    let left = free.saturating_sub(FREE_KEEP);
+    let grow = under >= BLOCK_BYTES && left >= BLOCK_BYTES;
+    let shrink = used > cap / 100 * SHRINK || free < FREE_KEEP / 2;
+    let short = if grow { 0 } else { BLOCK_BYTES.saturating_sub(under.min(left)) };
+    Some((grow, shrink, short))
+}
 /// Announced writes since the last submission: section, offset, bytes.
 static QUEUED: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
 /// More were announced than kept: every cached page is taken in again.
@@ -409,7 +445,7 @@ static OVERFLOW: AtomicBool = AtomicBool::new(false);
 /// views' and units' locks (`crate::unified::spans`), then the queue's
 /// alone; not the directory's.
 pub(super) fn written(at: u64, len: u64) {
-    if !ON.load(Ordering::Relaxed) || len == 0 {
+    if !live() || len == 0 {
         return;
     }
     let mut spans = Vec::new();
@@ -442,7 +478,7 @@ static NOW: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// A shader that picks buffers from the heap by index writes, and the
 /// heap's unordered access views are not known yet.
 pub(super) fn heap_written_unknown() {
-    if ON.load(Ordering::Relaxed) && SUMS[5].fetch_add(1, Ordering::Relaxed) == 0 {
+    if live() && SUMS[5].fetch_add(1, Ordering::Relaxed) == 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!("card page cache: a shader writes buffers it picks from the heap by index, whose views are not known yet: what it writes into cached pool pages may be lost")
@@ -571,14 +607,17 @@ impl Memory {
         if crate::host::now_ms() < self.cache.grow_after {
             return false;
         }
-        match crate::memcap::card_used(host) {
-            Some((used, budget)) if budget > 0 => {
-                if used + BLOCK_BYTES > budget / 100 * GROW {
-                    return false;
-                }
+        match room() {
+            Some((true, _, _)) => {}
+            Some((false, _, short)) => {
+                // Idle host copies of textures make room first (the sweep,
+                // once a second); asked again after it.
+                ROOM_WANTED.fetch_max(short, Ordering::Relaxed);
+                self.cache.grow_after = crate::host::now_ms() + 1_000;
+                return false;
             }
-            _ if live >= BLOCKS_UNKNOWN => return false,
-            _ => {}
+            None if live >= BLOCKS_UNKNOWN => return false,
+            None => {}
         }
         let number = match self.cache.spare.last() {
             Some(&n) => Some(n),
@@ -613,6 +652,7 @@ impl Memory {
             }
         };
         self.cache.blocks[b] = Some(Block { copy, buffer, gpu });
+        LIVE.store(true, Ordering::Relaxed);
         let first = b as u32 * PER_BLOCK;
         self.cache.free.extend((first..first + PER_BLOCK).rev());
         if live == 0 {
@@ -651,10 +691,7 @@ impl Memory {
         if self.cache.blocks.iter().all(Option::is_none) {
             return;
         }
-        let Some((used, budget)) = crate::host::host().and_then(crate::memcap::card_used) else {
-            return;
-        };
-        if budget == 0 || used <= budget / 100 * SHRINK {
+        if !matches!(room(), Some((_, true, _))) {
             return;
         }
         let per = PER_BLOCK as usize;
@@ -681,11 +718,22 @@ impl Memory {
             // The heaps' views hold the buffer until no list can use it.
             self.cache.released.push((block.copy, submission));
             tracing::info!(
-                used_mb = used >> 20,
-                budget_mb = budget >> 20,
+                blocks = self.cache.blocks.iter().filter(|b| b.is_some()).count(),
                 "card page cache: a block given back, the card is short of room"
             );
         }
+        LIVE.store(self.cache.blocks.iter().any(Option::is_some), Ordering::Relaxed);
+    }
+
+    /// While the cache has no block: makes one if the card has room (lists
+    /// name pool memory for the cache from then on). Whether it has one.
+    pub(super) fn cache_wake(&mut self) -> bool {
+        if self.sections.is_empty() {
+            return false;
+        }
+        self.cache.no_grow = false;
+        self.grow();
+        live()
     }
 
     /// Numbers of blocks given back whose last user has finished: their
@@ -750,7 +798,6 @@ impl Memory {
         if self.sections.is_empty() {
             return plan;
         }
-        ON.store(true, Ordering::Relaxed);
         self.cache.no_grow = false;
         // Frames from 2 on: a page taken in ahead (named at "0") may go at
         // once.
