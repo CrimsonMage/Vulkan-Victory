@@ -77,7 +77,7 @@ fn thread_cpu_us() -> u64 {
 
 /// Images and samplers the global descriptor sets hold (ABI v1).
 const IMAGE_SLOTS: u32 = 1 << 20;
-const SAMPLER_SLOTS: u32 = 4096;
+pub(crate) const SAMPLER_SLOTS: u32 = 4096;
 /// Push constants: one 256-byte block for every stage (ABI v1).
 const PUSH_BYTES: u32 = 256;
 

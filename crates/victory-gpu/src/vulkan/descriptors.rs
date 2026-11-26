@@ -14,6 +14,13 @@
 //! timeline passes what may read them). Slot 0 of both is a null image
 //! (one transparent black texel) and a plain linear sampler. Set 3 holds
 //! the memory map's uniform-buffer descriptor, one per map generation.
+//!
+//! **Every slot holds a valid descriptor at all times** (vk41: a graphics
+//! shader faulted with "Illegal Instruction Parameter"): every slot of
+//! bindings 0-2 and of the samplers starts as slot 0's null descriptor;
+//! a slot taken for a view is set back to null on all three bindings
+//! before its own are written; and a slot whose image goes is set back to
+//! null at once (title descriptors may still carry it).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +53,8 @@ pub(crate) struct Heaps {
     maps: Buffer,
     zero_sink: Buffer,
     state: Mutex<State>,
+    /// Slot 0's descriptor bytes: sampled, storage, cube, sampler.
+    nulls: OnceLock<[Vec<u8>; 4]>,
 }
 
 // SAFETY: the mapped pointers are written at distinct slots, under the
@@ -156,8 +165,10 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
             next: 1,
             ..State::default()
         }),
+        nulls: OnceLock::new(),
     };
     heaps.make_null(b)?;
+    heaps.fill_null();
     tracing::info!(
         sampled_bytes = heaps.sizes[0],
         storage_bytes = heaps.sizes[1],
@@ -238,6 +249,44 @@ impl Heaps {
         Ok(())
     }
 
+    /// Slot 0's descriptors copied into every other slot of bindings 0-2
+    /// and of the samplers.
+    fn fill_null(&self) {
+        let take = |base: *mut u8, at: u64, size: usize| -> Vec<u8> {
+            // SAFETY: slot 0 of a mapped descriptor range, just written.
+            unsafe { std::slice::from_raw_parts(base.add(at as usize), size).to_vec() }
+        };
+        let nulls = [
+            take(self.resource.mapped, self.sampled_at, self.sizes[0]),
+            take(self.resource.mapped, self.storage_at, self.sizes[1]),
+            take(self.resource.mapped, self.cube_at, self.sizes[0]),
+            take(self.sampler.mapped, self.sampler_at, self.sizes[2]),
+        ];
+        let spread = |base: *mut u8, at: u64, bytes: &[u8], slots: u32| {
+            for slot in 1..slots as usize {
+                // SAFETY: the slot lies inside the mapped range of its binding.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at as usize + slot * bytes.len()), bytes.len()) };
+            }
+        };
+        spread(self.resource.mapped, self.sampled_at, &nulls[0], IMAGE_SLOTS);
+        spread(self.resource.mapped, self.storage_at, &nulls[1], IMAGE_SLOTS);
+        spread(self.resource.mapped, self.cube_at, &nulls[2], IMAGE_SLOTS);
+        spread(self.sampler.mapped, self.sampler_at, &nulls[3], stages::SAMPLER_SLOTS);
+        let _ = self.nulls.set(nulls);
+    }
+
+    /// `slot` back to the null image on bindings 0, 1 and 2.
+    fn null_slot(&self, slot: u32) {
+        let Some(n) = self.nulls.get() else { return };
+        if slot == 0 {
+            return;
+        }
+        for (bytes, at) in [(&n[0], self.sampled_at), (&n[1], self.storage_at), (&n[2], self.cube_at)] {
+            // SAFETY: the slot lies inside the mapped set-0 range.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.resource.mapped.add(at as usize + slot as usize * bytes.len()), bytes.len()) };
+        }
+    }
+
     fn write_image(&self, b: &Backend, slot: u32, view: vk::ImageView, binding: Binding) {
         let Some(db) = b.host.descriptor_buffer.as_ref() else { return };
         let info = vk::DescriptorImageInfo::default()
@@ -308,6 +357,8 @@ impl Heaps {
             }
             None => return None,
         };
+        // Nothing of the slot's last image is left on any binding.
+        self.null_slot(slot);
         self.write_image(b, slot, sampled, Binding::Sampled);
         if let Some(st) = storage {
             self.write_image(b, slot, st, Binding::Storage);
@@ -451,6 +502,9 @@ pub(crate) fn image_gone(id: u64) {
     let mut s = lock(&h.state);
     if let Some(slots) = s.by_image.remove(&id) {
         for slot in slots {
+            // Title descriptors may still carry the slot: it reads the null
+            // image from now on, never a view of an image that is gone.
+            h.null_slot(slot);
             s.deferred.push((value, slot));
         }
     }
