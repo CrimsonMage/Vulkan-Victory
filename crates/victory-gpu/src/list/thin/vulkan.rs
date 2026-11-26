@@ -117,7 +117,7 @@ fn plain_work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool 
     } else if is(Plain::EXECUTE_INDIRECT) {
         rec.not_yet(record::NotYet::Indirect);
     } else if is(Plain::RESOLVE_QUERIES) {
-        rec.not_yet(record::NotYet::Queries);
+        rec.resolve_queries(b, list, u(0) as This, u(1) as u32, u(2) as u32, u(3) as u32, u(4) as This, u(5));
     } else {
         if is(Plain::WAIT_VALUE) || is(Plain::WAIT_VALUE64) {
             // What was recorded so far goes before the wait.
@@ -182,8 +182,13 @@ fn work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool {
             uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
         }
         // SAFETY: made by `own`, named once (nothing of ours records into
-        // Vulkan lists this way yet).
+        // Vulkan lists this way: `OWN_VULKAN` does).
         OWN => drop(*unsafe { Box::from_raw(c.u(0) as *mut Own) }),
+        OWN_VULKAN => {
+            // SAFETY: made by `record_vulkan`, named once.
+            let f = *unsafe { Box::from_raw(c.u(0) as *mut OwnVulkan) };
+            f(rec, b);
+        }
         BARRIER | BARRIER_GROUPS => rec.barrier(b),
         CLEAR_RTV => rec.clear_color(b, &c.read::<RtvRecord>(1), c.read::<[f32; 4]>(1 + RECORD), c.items::<Rect>(1 + RECORD + 2, n)),
         CLEAR_DSV => {
@@ -196,7 +201,9 @@ fn work(rec: &mut Rec, b: &'static Backend, list: This, c: &Call) -> bool {
             let (dst, src) = (c.read::<CopyLocation>(2), c.read::<CopyLocation>(2 + step));
             rec.copy_texture(b, &dst, c.u(0) as u32, (c.u(0) >> 32) as u32, c.u(1) as u32, &src, boxed);
         }
-        _ => {}
+        op => {
+            super::console::record(rec, b, list, op, c.w);
+        }
     }
     false
 }

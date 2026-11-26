@@ -36,6 +36,7 @@
 //! lists at once, as the title's threads did before; what lists share was
 //! made for that then.
 
+mod console;
 mod vulkan;
 
 use std::collections::VecDeque;
@@ -368,7 +369,7 @@ plain! {
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
-    RESOLVE_QUERIES resolve_queries = super::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
+    RESOLVE_QUERIES resolve_queries = super::console::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
     EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
@@ -397,6 +398,7 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const OWN: u64 = after(17);
+const OWN_VULKAN: u64 = after(18);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -613,6 +615,19 @@ pub(super) fn own(this: This, f: Own) {
     front(this).put(OWN, &[Box::into_raw(Box::new(f)) as u64]);
 }
 
+/// Work of ours recorded into a title list's Vulkan command buffer where its
+/// recording stands, run by the worker in its place in the stream.
+pub(crate) type OwnVulkan = Box<dyn FnOnce(&mut crate::vulkan::record::Rec, &'static crate::vulkan::Backend)>;
+
+/// [`OwnVulkan`] work into `this`; false if `this` is no list of ours.
+pub(crate) fn record_vulkan(this: This, f: OwnVulkan) -> bool {
+    if this.is_null() || !is_thin(this) {
+        return false;
+    }
+    front(this).put(OWN_VULKAN, &[Box::into_raw(Box::new(f)) as u64]);
+    true
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether one of them
 /// was a reset (what the draw state kept of the stream before is let go).
 fn translate(list: This, stream: &[u64]) -> (u64, bool) {
@@ -625,7 +640,7 @@ fn translate(list: This, stream: &[u64]) -> (u64, bool) {
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
-        if run_plain(op, list, w) {
+        if run_plain(op, list, w) || console::run(op, list, w) {
             continue;
         }
         let n = w.first().map_or(0, |&n| n as usize);
@@ -721,6 +736,12 @@ const fn table(newer: bool) -> [*const (); 160] {
     let mut i = 0;
     while i < MINE.len() {
         let (slot, method) = MINE[i];
+        f[if newer { newer_slot(slot) } else { slot }] = method;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < console::METHODS.len() {
+        let (slot, method) = console::METHODS[i];
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }

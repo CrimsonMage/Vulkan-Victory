@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+/// Whether `this` is one of our fences (`this` readable).
+pub(crate) fn is_fence(this: This) -> bool {
+    object::has_table(this, &FUNCTIONS)
+}
+
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
     guid(
         0x0a753dcf,

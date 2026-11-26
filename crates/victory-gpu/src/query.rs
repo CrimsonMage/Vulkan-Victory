@@ -1,5 +1,7 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Query heaps: the heap remembers its description. Under
+//! `VICTORY_GPU=vulkan` occlusion and timestamp heaps get a query pool of
+//! the card's (`vulkan/record/query.rs`); otherwise results are plausible
+//! values (`list/console.rs`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -70,3 +72,14 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+/// The type and count of query heap `this`, if it is one of ours.
+#[cfg(windows)]
+pub(crate) fn desc(this: This) -> Option<(u32, u32)> {
+    if this.is_null() || !object::has_table(this, &FUNCTIONS) {
+        return None;
+    }
+    // SAFETY: one of our heaps.
+    let d = unsafe { (*this.cast::<Heap>()).desc };
+    Some((d.kind, d.count))
+}

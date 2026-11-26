@@ -978,7 +978,7 @@ vk19 or vk19b):
 - The caller (title+0x52479f6) takes the object from a handle table while
   streaming loads.
 - No GPU result or query feeds it: queries are unused, `not_yet
-  queries=0`.
+  queries=0` (queries are measured since; see below).
 - Both crashes came about 0.1 s after a 512 MB section import ("a section
   imported in place"), at about frame 1030.
 - Crashes at varying title sites appear in D3D12 runs too, before and
@@ -1087,16 +1087,13 @@ range. The helpers moved to `vulkan/loose.rs`.
      the module notes, `spirv-as`, words embedded) or with the translator's
      `vk::spirv` builder.
    - Indirect rectangles (tiled lighting) take the rectangle part.
-3. **FSR4 on Vulkan.** `ffx.rs` / `upscale.rs` are D3D12-only, so the
-   Series S world will be black on Vulkan. Make it one small linear scale
-   pass. Gate it on the DLL and its API version, not this title's offsets.
-4. Missing list slots (#53/54 UAV clears, #61–63 FillMemoryWith*, #81
-   DrawIndexedX, #85 predication, #88/89/90 top/bottom-of-pipe writes,
-   #93 KickoffX, #94 RSSetDepthBiasX). Real occlusion and timestamp
-   queries with resolves into title memory. The slot layout detected at
-   run time. PresentX with its plane count (up to 8). 2D-array views of
-   cube images and the T# tag bits, once the translator sets them in
-   `docs/vulkan-abi.md`.
+3. Done (branch `worktree-agent-a8169a5f3c8e04704`, below): FSR4 on
+   Vulkan as a blit, gated on the upscaler DLL and its version.
+4. Done (same branch, below): the missing list slots, measured occlusion
+   and timestamp queries, the slot layout found at run time, PresentX
+   with its plane count (up to 8). Still open from this item: 2D-array
+   views of cube images and the T# tag bits, once the translator sets
+   them in `docs/vulkan-abi.md`.
 5. The rest of the earlier list: imports of committed runs only, one held
    line, `AllocateUploadMemory` blocks, MSAA draws.
 6. Done: the clears moved to `record/clear.rs` (record.rs at 916 lines).
@@ -1105,6 +1102,120 @@ range. The helpers moved to `vulkan/loose.rs`.
    pipelines bound. `VK_KHR_pipeline_executable_properties` reports bogus
    figures. No cheap way to measure it in the process was found; the
    translator should cut the spills (per-lane arrays).
+
+### M2b: console slots, queries, FSR4, layouts, planes (2026-11-26, branch `worktree-agent-a8169a5f3c8e04704`)
+
+Built (`cargo xwin build --profile diag --features diagnostics`), quality
+gate clean; not run yet. Commits 295f7e2, d589b17, f4511be.
+
+- **FSR4 on Vulkan** (`vulkan/record/upscale.rs`, `upscale.rs`,
+  `victory-hle/src/modules/ffx.rs`).
+  - `ffxDispatchDescUpscale` is read as a `#[repr(C)]` struct in the
+    FidelityFX API's `ffx_upscale.h` layout (offset asserts:
+    colour 0x18, output 0x138, render size 0x178, flags 0x1ac, size
+    0x1b0). The title's offsets are no longer named anywhere.
+  - Gate: `amd_fidelityfx_upscaler_xbox.dll` beside the loader, with a
+    `VS_FIXEDFILEINFO` file version of 3.1.x to 4.x (the FidelityFX API
+    upscalers; this title's is 3.1.5). Anything else is logged as an
+    error, and the upscale is left to the title's upscaler.
+  - Vulkan: one `vkCmdBlitImage` (linear if the format filters, else
+    nearest) from the colour's rendered rectangle to the output's
+    upscale rectangle, recorded where the title dispatched it. That
+    uses a new stream op, `OWN_VULKAN`
+    (`list::record_vulkan(list, closure(&mut Rec, &Backend))`).
+- **Console list slots** (older numbering; the newer layout adds 2 from
+  59 on). The title-side writers are in `list/thin/console.rs`; Vulkan
+  recording in `vulkan/record/console.rs`; the D3D12 path in
+  `list/console.rs`, where the D3D12 path only does CPU fills and CPU
+  writes, and logs the rest once.
+  - #53/#54 ClearUnorderedAccessView Uint/Float: the descriptor at the
+    CPU handle is copied at the call. For a texture, `vkCmdClearColorImage`
+    of the T#'s base mip and its layers. For a buffer, `vkCmdFillBuffer`
+    of the V#'s range. Rectangles: the whole view (logged once).
+  - #61-63 FillMemoryWith{32,64,128}BitValueX: `vkCmdFillBuffer` when the
+    pattern is one repeated dword. Otherwise `vkCmdUpdateBuffer` of the
+    first 64 KiB, then doubling copies.
+  - #81 DrawIndexedX: an indexed draw from the given address and format;
+    the bound index buffer stays.
+  - #85 SetPredicationBufferX: `VK_EXT_conditional_rendering`, now
+    `Wanted`, with its feature enabled in `victory-vk`
+    (`Caps::conditional_rendering`).
+    - The predicate's low dword is copied, when it is set, into a ring of
+      ours, then `INVERTED` for operation 1. Predication ends at a cut of
+      the list.
+    - Without the extension, predicated work always runs (logged once).
+  - #88/#89 Write*TopOfPipeX and #90 Write32BitValueBottomOfShaderX:
+    done by the card.
+    - `vkCmdUpdateBuffer` into imported title memory. Bottom-of-shader
+      writes take a barrier first.
+    - #89's timestamp flag (4) writes `vkCmdWriteTimestamp2` (TOP_OF_PIPE)
+      into a ring of our own and copies it in.
+    - Pool memory (card pages the CPU does not see) and the system
+      timestamp flag (8) are written on the CPU when the list has run
+      (`list_write`).
+  - #93 KickoffX: the command buffer so far goes to the list's part (it
+    still runs at the list's submission).
+  - #94 RSSetDepthBiasX: overrides the pipeline's depth bias in the
+    dynamic state (`Rec::console.depth_bias`, part of `state_key`).
+- **Queries** (`vulkan/record/query.rs`).
+  - Each occlusion or timestamp query heap gets a `VkQueryPool` at its
+    first use, keyed by heap address and description.
+  - Begin/End reset and begin/end the query outside rendering (precise
+    for occlusion if the device has it). A query begun while another is
+    active ends that one, which then resolves as visible (XCL's nesting
+    rule). So does a query still active at a cut.
+  - Timestamps: `vkCmdWriteTimestamp2`, ALL_COMMANDS.
+  - Resolves: `vkCmdCopyQueryPoolResults` (64-bit, WAIT) into title memory
+    through `buffer_of`, for the queries issued in the run. Occlusion
+    queries never issued, or ended early, are filled with a nonzero count.
+  - Pipeline-statistics and stream-output queries keep their plausible
+    values.
+  - `GetTimestampFrequency` is the card's (1e9 / `timestamp_period`)
+    under Vulkan.
+  - Risk: WAIT stalls the queue if a resolve runs before the list that
+    ended its query is submitted.
+- **Slot layout at run time** (`layout.rs`).
+  - `ID3D12Device11` at creation is now only a hint. Calls decide, after
+    XCL `real.rs:6972-7030`:
+    - a fence passed to the older queue's slot 16 or 17 means newer; to
+      the newer queue's 14 or 15, older;
+    - a command signature passed to the older list's slot 61 means newer
+      (`ExecuteIndirect`, else `FillMemoryWith32BitValueX`);
+    - a copy location of a resource passed to the older list's slot 85
+      means newer (`CopyTextureRegionX`, else `SetPredicationBufferX`).
+  - Pointers are checked readable (`texture::committed`) before they are
+    looked at.
+  - Live queues and lists are registered with their older/newer table
+    pair and take the decided table at once. The older queue's slot 17
+    (GetClockCalibration) answers.
+- **PresentX planes** (`queue.rs`). The 0x48-byte struct is
+  `D3D12XBOX_PRESENT_PLANE_PARAMETERS`, which XCL reads the same way for
+  other titles. Up to 8 planes (was 4) on both paths. A change in the
+  plane count is logged. The Vulkan compose already draws later planes
+  over earlier ones with premultiplied alpha.
+
+**To run** (the coordinator): the gate run on Series S with
+`VICTORY_GPU=vulkan VICTORY_CONSOLE=series-s`, plus the usual autorun
+arguments. Look for these lines:
+- `FidelityFX upscaler: its upscales run as a linear scale` with
+  `version=3.1.5`, then once `Vulkan: the title's upscale (AMD
+  FidelityFX) runs as a linear scale from=1280x720 ... to=1920x1080`.
+  The world captures should be lit, not black. An `error` line naming the
+  upscaler means the gate refused.
+- `D3D12.X layouts: newer, as the device was created as ID3D12Device11`,
+  then `D3D12.X layouts: decided by a call newer=true why="a fence passed
+  to queue slot 16"`. A `contradicts` warning would mean a detection is
+  wrong.
+- `PresentX: the number of planes changed planes=2`.
+- `Vulkan: a console list method done approximately`: each shortcut,
+  once.
+- `Vulkan device lacks ... conditional_rendering` should not appear on
+  the 5060 Ti.
+- No new validation errors or driver errors; no stall at a query resolve.
+  The `not_yet_reasons` line no longer counts queries.
+- Windows-target unit tests build (`cargo xwin test --no-run`), not run:
+  `layout::tests`, `list::console::tests`, `vulkan::record::query::tests`,
+  `modules::ffx::tests`.
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 

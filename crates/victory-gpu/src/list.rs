@@ -21,6 +21,8 @@ use crate::resource::PAGEABLE_IIDS;
 /// List calls written down on the title's threads, translated by workers.
 #[cfg(windows)]
 mod thin;
+#[cfg(windows)]
+pub(crate) use thin::record_vulkan;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
@@ -668,7 +670,10 @@ fn new_list(
     // The stream names the list by its address, which stays from here on.
     #[cfg(windows)]
     {
-        list.thin = thin::Front::new(std::ptr::from_ref::<List>(&list) as usize);
+        let at = std::ptr::from_ref::<List>(&list) as usize;
+        list.thin = thin::Front::new(at);
+        let (older, newer) = if thin { (&thin::TABLE, &thin::NEWER_TABLE) } else { (&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS) };
+        crate::layout::born(at, older.0.as_ptr(), newer.0.as_ptr());
     }
     #[cfg(not(windows))]
     let _ = (pipeline, thin);
@@ -698,6 +703,9 @@ extern "system" fn list_release(this: This) -> u32 {
     #[cfg(windows)]
     if crate::vulkan::on() && object::references(this) <= 1 {
         crate::vulkan::list_released(this);
+    }
+    if object::references(this) <= 1 {
+        crate::layout::gone(this as usize);
     }
     object::release_boxed::<List>(this)
 }
@@ -1605,55 +1613,6 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
-
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
-extern "system" fn resolve_queries(
-    this: This,
-    _heap: This,
-    kind: u32,
-    _first: u32,
-    count: u32,
-    buffer: This,
-    offset: u64,
-) {
-    timed!(Copy);
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
-    const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
-    };
-    let (what, bytes) = match kind {
-        OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
-        PIPELINE_STATISTICS => (Written::Value(0), 88),
-        _ => (Written::Value(0), 16),
-    };
-    if offset + u64::from(count) * bytes > size {
-        return;
-    }
-    for i in 0..u64::from(count) {
-        // Wider results are written as 8-byte pieces.
-        for piece in 0..bytes / 8 {
-            // SAFETY: inside the buffer, checked above.
-            let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
-            defer_write(this, at as u64, what, 8);
-        }
-    }
-}
-
 /// IUnknown 3, object 4, device child 1, allocator 2.
 static ALLOCATOR_FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<ALLOCATOR, 24>());
@@ -2207,6 +2166,10 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     what.write(address as *mut u8, bytes);
 }
 
+/// The console's own methods past the PC's, and the queries.
+mod console;
+pub(crate) use console::{pattern, resolve_queries};
+
 /// The list methods by their slot in older titles' lists (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
@@ -2267,9 +2230,9 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),        // 0xf0
+    (28, console::query_mark as *const ()),      // 0xe0 BeginQuery
+    (29, console::query_mark as *const ()),      // 0xe8 EndQuery
+    (30, console::resolve_queries as *const ()), // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
@@ -2304,19 +2267,23 @@ const NEWER_METHODS: [(usize, *const ()); 3] = [
 
 const fn list_table(newer: bool) -> [*const (); 160] {
     let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
-    let mut i = 0;
-    while i < METHODS.len() + MORE_METHODS.len() {
-        let (slot, method) = if i < METHODS.len() {
-            METHODS[i]
-        } else {
-            MORE_METHODS[i - METHODS.len()]
-        };
-        f[if newer { newer_slot(slot) } else { slot }] = method;
-        i += 1;
-    }
+    f = place(f, &METHODS, newer);
+    f = place(f, &MORE_METHODS, newer);
+    f = place(f, &console::METHODS, newer);
     let mut i = 0;
     while newer && i < NEWER_METHODS.len() {
         f[NEWER_METHODS[i].0] = NEWER_METHODS[i].1;
+        i += 1;
+    }
+    f
+}
+
+/// `methods` (by their older slot) into the table `f`.
+const fn place<const N: usize>(mut f: [*const (); 160], methods: &[(usize, *const ()); N], newer: bool) -> [*const (); 160] {
+    let mut i = 0;
+    while i < N {
+        let (slot, method) = methods[i];
+        f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
     f

@@ -2,7 +2,7 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -284,6 +284,7 @@ pub(crate) extern "system" fn create(
         #[cfg(windows)]
         held: Default::default(),
     });
+    crate::layout::born(std::ptr::from_ref::<Queue>(&queue) as usize, FUNCTIONS.0.as_ptr(), NEWER_FUNCTIONS.0.as_ptr());
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
 
@@ -329,6 +330,9 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    if object::references(this) <= 1 {
+        crate::layout::gone(this as usize);
+    }
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
@@ -378,12 +382,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// A present plane, 72 bytes, as the title fills them (title+0x248232d,
-/// presented at title+0x24824c1: up to two, 0x48 apart): frame token, the
-/// plane's resources, per resource the rectangle of it shown (left, top,
-/// right, bottom texels), where the plane goes on the screen (left, top,
-/// right, bottom as fractions of it; the title passes 0, 0, 1, 1), then a
-/// word from the title's plane record and words it leaves zero.
+/// A present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`), 72 bytes, the
+/// planes 0x48 apart (as the title fills them, and as XCL reads other
+/// titles'): frame token, the plane's resources, per resource the
+/// rectangle of it shown (left, top, right, bottom texels), where the plane
+/// goes on the screen (left, top, right, bottom as fractions of it; the
+/// title passes 0, 0, 1, 1), then its colour space and flags. The first
+/// resource of each plane is shown; later planes go over earlier ones with
+/// premultiplied alpha.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
@@ -395,6 +401,23 @@ pub(crate) struct Plane {
     rest: [u32; 7],
 }
 const _: () = assert!(size_of::<Plane>() == 0x48);
+/// The console's display composes up to this many planes.
+const MOST_PLANES: u32 = 8;
+
+/// The `count` planes the title passes at `planes` (up to [`MOST_PLANES`]);
+/// a change of their number is logged.
+fn given_planes<'a>(count: u32, planes: *const Plane) -> &'a [Plane] {
+    if planes.is_null() {
+        return &[];
+    }
+    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+    if LAST.swap(count, Ordering::Relaxed) != count {
+        tracing::info!(planes = count, shown = count.min(MOST_PLANES), "PresentX: the number of planes changed");
+    }
+    // SAFETY: the title passes `count` plane descriptions.
+    unsafe { std::slice::from_raw_parts(planes, count.min(MOST_PLANES) as usize) }
+}
+
 /// The planes as the Vulkan backend shows them.
 #[cfg(windows)]
 fn shown(given: &[Plane]) -> Vec<crate::vulkan::Shown> {
@@ -429,7 +452,7 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+pub(crate) extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -459,7 +482,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// reached is nothing; otherwise what the queue is given next is held
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
-extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+pub(crate) extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -514,21 +537,31 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
-extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
+pub(crate) extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(timestamp_frequency_now()) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// Ticks per second of GPU timestamps: the card's under the Vulkan backend
+/// (its queries write its own ticks), else [`TIMESTAMP_FREQUENCY`].
+pub(crate) fn timestamp_frequency_now() -> u64 {
+    #[cfg(windows)]
+    if let Some(f) = crate::vulkan::record::timestamp_frequency() {
+        return f;
+    }
+    TIMESTAMP_FREQUENCY
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
     Value(u64),
-    /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
+    /// The GPU clock: [`timestamp_frequency_now`] ticks per second since the
     /// process started (our GPU work is done on the CPU's timeline).
     GpuTimestamp,
     /// The CPU's performance counter.
@@ -543,7 +576,7 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                (elapsed.as_nanos() * u128::from(timestamp_frequency_now()) / 1_000_000_000) as u64
             }
             Written::SystemTimestamp => system_timestamp(),
         };
@@ -631,12 +664,7 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if crate::vulkan::on() {
-        let given: &[Plane] = if plane_parameters.is_null() {
-            &[]
-        } else {
-            // SAFETY: the title passes `planes` plane descriptions.
-            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
-        };
+        let given = given_planes(planes, plane_parameters);
         let size = given
             .iter()
             .filter(|p| p.count > 0 && !p.resources.is_null())
@@ -652,12 +680,7 @@ extern "system" fn present(
         // A state the host texture is not left in: what it was in comes
         // back, and goes back after.
         const COPY_SOURCE: u32 = 0x800;
-        let given: &[Plane] = if plane_parameters.is_null() {
-            &[]
-        } else {
-            // SAFETY: the title passes `planes` plane descriptions.
-            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(4) as usize) }
-        };
+        let given = given_planes(planes, plane_parameters);
         log_planes(frame, given);
         let mut shown: Vec<(This, crate::host::Shown)> = Vec::new();
         for plane in given {
@@ -873,6 +896,15 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
         let (slot, method) = METHODS[i];
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
+    }
+    // The slots whose calls tell the layouts apart (`crate::layout`).
+    #[cfg(windows)]
+    if newer {
+        f[14] = crate::layout::queue_14 as *const ();
+        f[15] = crate::layout::queue_15 as *const ();
+    } else {
+        f[16] = crate::layout::queue_16 as *const ();
+        f[17] = crate::layout::queue_17 as *const ();
     }
     f
 }

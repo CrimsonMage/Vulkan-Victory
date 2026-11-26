@@ -141,6 +141,16 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: Vulkan genericity (branch `worktree-agent-a8169a5f3c8e04704`,
+  `docs/vulkan-host.md`):
+  - FSR4 upscale as one blit, read by the FidelityFX API layout and gated
+    on the upscaler DLL's version, not on this title's offsets;
+  - the console list slots XCL found (#53/54, #61-63, #81, #85, #88-90,
+    #93, #94) as plain Vulkan;
+  - measured occlusion and timestamp queries;
+  - the queue/list layout decided by call shapes (Device11 only a hint);
+  - PresentX takes up to 8 planes.
+  - Built, not yet run.
 - 2026-11-25: stock Proton install; a current vkd3d-proton beside the exe
   (the bundled converter fails on ~18% of shaders). No patched wineserver.
 - 2026-11-25: memory ceilings plus an external GPU-memory watchdog (the

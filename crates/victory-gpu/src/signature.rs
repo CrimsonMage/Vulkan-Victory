@@ -65,6 +65,11 @@ pub(crate) extern "system" fn create(
     object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
 }
 
+/// Whether `this` is one of our signatures (`this` readable).
+pub(crate) fn is_signature(this: This) -> bool {
+    object::has_table(this, &FUNCTIONS)
+}
+
 /// A signature's record stride and arguments (type, then up to three
 /// fields each).
 pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {

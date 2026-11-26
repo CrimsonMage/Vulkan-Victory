@@ -155,21 +155,16 @@ pub extern "system" fn create(
         return S_FALSE;
     }
     if *iid == LEVEL_IIDS[8] {
-        NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::layout::hint_newer();
     }
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 
-/// Set when the title creates the device as `ID3D12Device11`. Its lists and
-/// queues then have the newer layouts (two more methods each; see
-/// `list` and `queue`), although the interface version stays 2.4.
-/// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (the title, April 2026, versus Minecraft, March 2022);
-/// look for a better one if a title breaks the rule.
-static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+/// Whether lists and queues made now have the newer layouts (two more
+/// methods each; see `list` and `queue`), although the interface version
+/// stays 2.4: found at run time (`crate::layout`).
 pub(crate) fn newer() -> bool {
-    NEWER.load(std::sync::atomic::Ordering::Relaxed)
+    crate::layout::newer()
 }
 
 /// The device, or its DXGI side.

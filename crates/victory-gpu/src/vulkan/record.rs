@@ -16,8 +16,9 @@
 //! - **Dynamic rendering** begins at the first draw after the targets
 //!   change and ends at anything that is not a draw. Every image lives in
 //!   `GENERAL`; a title barrier is a full memory barrier.
-//! - **Not yet** (counted in the 10 s line): indirect execution, query
-//!   resolves, MSAA draws, tessellation and geometry stages, line loops
+//! - **Console methods** past the PC's (`console.rs`) and **queries**
+//!   (`query.rs`); the FidelityFX upscale as a scale (`upscale.rs`).
+//! - **Not yet** (counted in the 10 s line): indirect execution, MSAA draws, tessellation and geometry stages, line loops
 //!   and quads.
 
 use std::collections::HashMap;
@@ -37,9 +38,15 @@ use crate::object::This;
 use victory_shader::{HwStage, RootType};
 
 mod clear;
+mod console;
 mod copy;
 mod link;
+mod query;
 mod state;
+pub(crate) mod upscale;
+
+pub(crate) use console::ValueWrite;
+pub(crate) use query::timestamp_frequency;
 
 use state::d3d_flip;
 
@@ -145,6 +152,8 @@ pub(crate) struct Rec {
     last_inputs: (usize, usize),
     last_user: String,
     last_layout: String,
+    /// What the console's own methods keep (`console.rs`, `query.rs`).
+    console: console::State,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -186,6 +195,7 @@ impl Default for Rec {
             last_inputs: (0, 0),
             last_user: String::new(),
             last_layout: String::new(),
+            console: console::State::default(),
         }
     }
 }
@@ -323,6 +333,7 @@ impl Rec {
     pub(crate) fn cut(&mut self, list: This, b: &Backend) {
         self.end_pass(b);
         if let Some(rec) = self.cmd.take() {
+            self.console_cut(b, rec.cmd);
             if let Some(slot) = self.query.take() {
                 // SAFETY: outside rendering, before the buffer ends.
                 unsafe { super::gpu_stats::end(b, rec.cmd, slot, true) };
@@ -334,6 +345,7 @@ impl Rec {
     pub(crate) fn abandon(&mut self, b: &Backend) {
         self.end_pass(b);
         if let Some(rec) = self.cmd.take() {
+            self.console_cut(b, rec.cmd);
             if let Some(slot) = self.query.take() {
                 // SAFETY: outside rendering, before the buffer ends.
                 unsafe { super::gpu_stats::end(b, rec.cmd, slot, false) };
@@ -811,19 +823,18 @@ impl Rec {
 #[derive(Clone, Copy)]
 pub(crate) enum NotYet {
     Indirect,
-    Queries,
     Msaa,
     /// Tessellation, geometry and amplification stages.
     Stages,
     Topology,
 }
 
-static NOT_YET: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static NOT_YET: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 impl NotYet {
     fn text() -> String {
         let n = |i: usize| NOT_YET[i].load(Ordering::Relaxed);
-        format!("indirect={} queries={} msaa={} stages={} topology={}", n(0), n(1), n(2), n(3), n(4))
+        format!("indirect={} msaa={} stages={} topology={}", n(0), n(1), n(2), n(3))
     }
 }
 

@@ -49,6 +49,7 @@ mod warp_tests;
 mod views;
 #[cfg(windows)]
 pub mod mapstat;
+mod layout;
 pub mod list;
 pub mod object;
 pub mod pipeline;
