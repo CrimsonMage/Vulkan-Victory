@@ -209,7 +209,7 @@ static MADE: AtomicU64 = AtomicU64::new(0);
 static BOUNDED: AtomicU64 = AtomicU64::new(0);
 static UNBOUNDED: AtomicU64 = AtomicU64::new(0);
 static ENDED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-static PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The parts of an indirect execution's recording, timed for the frame
 /// line.
@@ -223,6 +223,11 @@ pub(crate) enum Part {
     Execute = 2,
     /// Finding the records' buffers and the signature, before.
     Find = 3,
+    /// From the call's timing on to the list's draw state taken (its lock).
+    Lock = 4,
+    /// Letting go of what the execution held (the copy buffer, the
+    /// signature, the host copies), after.
+    After = 5,
 }
 
 /// Adds the ticks since `began` to `part`; the ticks now.
@@ -245,7 +250,7 @@ pub(crate) fn frame_text(frames: f64) -> String {
     let parts = PARTS.each_ref().map(ms);
     format!(
         "indirect bounding per frame: passes at executions {:.1} at barriers {:.1} ({:.1} ms), copy buffers made {:.1}, executions bounded {:.0} unbounded {:.0}, \
-         windows ended by root UAV {:.1} table UAV {:.1} by address {:.1} heap {:.1} card copy {:.1}; indirect call parts ms: find {:.1} bound {:.1} bind {:.1} ExecuteIndirect {:.1}",
+         windows ended by root UAV {:.1} table UAV {:.1} by address {:.1} heap {:.1} card copy {:.1}; indirect call parts ms: lock {:.1} find {:.1} bound {:.1} bind {:.1} ExecuteIndirect {:.1} after {:.1}",
         take(&PASSES[0]),
         take(&PASSES[1]),
         ms(&PASS_TICKS),
@@ -257,10 +262,12 @@ pub(crate) fn frame_text(frames: f64) -> String {
         ended[2],
         ended[3],
         ended[4],
+        parts[4],
         parts[3],
         parts[0],
         parts[1],
-        parts[2]
+        parts[2],
+        parts[5]
     )
 }
 
@@ -335,10 +342,23 @@ impl Window {
         self.end(Cause::ByAddress, |&(.., (from, to))| crate::memory::reachable(from, to));
     }
 
-    /// A shader recorded from now on writes buffers it picks from the heap.
-    /// shortcut: which ones is not known; every window ends.
-    pub(crate) fn wrote_heap(&mut self) {
-        self.end(Cause::Heap, |_| true);
+    /// A shader recorded from now on writes buffers it picks from the heap:
+    /// the windows over memory an unordered access view of the heap names
+    /// end (`uavs`: their title memory, sorted and joined; every window
+    /// without it).
+    pub(crate) fn wrote_heap(&mut self, uavs: Option<&[(u64, u64)]>) {
+        if self.bounded.is_empty() {
+            return;
+        }
+        self.end(Cause::Heap, |&(.., (from, to))| {
+            let Some(uavs) = uavs else {
+                return true;
+            };
+            // The first span that ends past `from`: it holds some of the
+            // window if it starts before `to`.
+            let k = uavs.partition_point(|&(_, end)| end <= from);
+            uavs.get(k).is_some_and(|&(start, _)| start < to)
+        });
     }
 
     /// The list is reset: its buffer was left common when it closed.

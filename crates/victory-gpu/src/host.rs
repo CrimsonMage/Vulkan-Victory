@@ -2490,8 +2490,8 @@ impl HostList {
 
     /// A shader recorded from now on writes buffers it picks from the heap
     /// by index (`crate::indirect`).
-    pub(crate) fn wrote_heap(&self) {
-        self.indirect().wrote_heap();
+    pub(crate) fn wrote_heap(&self, uavs: Option<&[(u64, u64)]>) {
+        self.indirect().wrote_heap(uavs);
     }
 
     /// The list's bounded indirect records (`crate::indirect`).

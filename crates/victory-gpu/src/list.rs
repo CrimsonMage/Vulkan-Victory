@@ -1959,7 +1959,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let entered = crate::fast::ticks();
         with_state_as(this, crate::frametime::Call::Indirect, |list, s| {
+            crate::indirect::timed(crate::indirect::Part::Lock, entered);
             let writable = crate::resource::shader_writable(arguments);
             ran = s.execute_indirect(list, (kind, stride, max), (address, writable), counter);
         });

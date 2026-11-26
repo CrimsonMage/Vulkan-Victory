@@ -357,6 +357,11 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Per host view heap: the title memory its unordered access buffer views
+/// name, sorted and joined ([`State::heap_uavs`]).
+type HeapUavs = crate::fast::FastMap<usize, std::sync::Arc<Vec<(u64, u64)>>>;
+static HEAP_UAVS: std::sync::Mutex<Option<HeapUavs>> = std::sync::Mutex::new(None);
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -890,7 +895,7 @@ impl State {
                 list.wrote(address, len, cause);
             }
             if self.untracked[kind] {
-                list.wrote_heap();
+                list.wrote_heap(self.heap_uavs().as_deref().map(Vec::as_slice));
             }
             if compute {
                 part(Part::Skipped, began);
@@ -969,7 +974,7 @@ impl State {
             // which.
             if t.stores && t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES) {
                 UNTRACKED.set(true);
-                list.wrote_heap();
+                list.wrote_heap(self.heap_uavs().as_deref().map(Vec::as_slice));
             }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1600,16 +1605,19 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = crate::fast::FastMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<crate::fast::FastMap<usize, (u64, Ranges)>>> =
+        // And per slot of an unordered access view, the title memory it names.
+        type UavRanges = crate::fast::FastMap<u32, (u64, u64)>;
+        static RANGES: std::sync::Mutex<Option<crate::fast::FastMap<usize, (u64, Ranges, UavRanges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, uav_ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::default()));
+            .or_insert_with(|| (0, Ranges::default(), UavRanges::default()));
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
+            uav_ranges.clear();
             host.buffer_slots()
         } else {
             changed
@@ -1622,6 +1630,7 @@ impl State {
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
+            uav_ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
@@ -1643,9 +1652,13 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
+            let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
             // A pool view is read by directory (`crate::memory`).
             if let Some((address, len)) = crate::descriptor::host::pool_range(&view) {
                 crate::memory::named(list, address, len, false);
+                if uav {
+                    uav_ranges.insert(index, (address, address + len));
+                }
                 continue;
             }
             // The copy the slot shows (`buffer_copy`), not the one the
@@ -1657,9 +1670,29 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
+            if uav {
+                uav_ranges.insert(index, (address, address + len));
+            }
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        // The title memory the heap's unordered access views name, sorted
+        // and joined: what a shader that picks buffers by index may write
+        // (`crate::indirect`).
+        let mut uavs: Vec<(u64, u64)> = uav_ranges.values().copied().collect();
+        uavs.sort_unstable();
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(uavs.len());
+        for (from, to) in uavs {
+            match joined.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => joined.push((from, to)),
+            }
+        }
+        HEAP_UAVS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(std::ptr::from_ref(host) as usize, std::sync::Arc::new(joined));
         // Per host copy, the span its picked views cover.
         let mut spans: crate::fast::FastMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             crate::fast::FastMap::default();
@@ -2121,6 +2154,22 @@ impl State {
     /// point into). A program that does not translate has no bindings to
     /// list; these say which memory it would have read and written (the
     /// ray-tracing structure builder passes its buffers this way).
+
+    /// The title memory the bound view heap's unordered access views name,
+    /// as of its last pass over buffer views ([`State::heap_buffers`]);
+    /// `None` before one.
+    /// shortcut: views written into the heap since that pass (at most a
+    /// frame) are not in it.
+    fn heap_uavs(&self) -> Option<std::sync::Arc<Vec<(u64, u64)>>> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let key = std::ptr::from_ref(heap.host()?) as usize;
+        HEAP_UAVS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&key).cloned()
+    }
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
@@ -3031,12 +3080,14 @@ impl State {
                 count_offset,
             )
         };
-        timed(Part::Execute, at);
+        let at = timed(Part::Execute, at);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        drop((bounded, signature, args, counter));
+        timed(Part::After, at);
         true
     }
 }
