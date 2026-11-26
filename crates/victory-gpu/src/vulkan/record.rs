@@ -651,7 +651,7 @@ impl Rec {
         let output = part(b, &[], formats, count, depth, true)?;
         let vertex_input = if mesh { None } else { Some(part(b, &inputs, [vk::Format::UNDEFINED; 8], 0, vk::Format::UNDEFINED, false)?) };
         let key = LinkKey {
-            pre: if draw_test() >= 3 && !mesh { fullscreen_vertex(b)? } else { pre.part? },
+            pre: pre_part(b, &pre, self.topology, mesh)?,
             fragment,
             colors: formats,
             count,
@@ -892,18 +892,53 @@ fn not_yet(why: NotYet) {
     NOT_YET[why as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-/// A D3D topology as Vulkan's (mesh programs draw triangles).
+/// The console's rectangle list: three corners a rectangle.
+const RECTANGLES: u32 = 17;
+
+/// A D3D topology as Vulkan's (mesh programs draw triangles; rectangle
+/// lists go as triangle lists to the rectangle geometry stage).
 fn topology(t: u32, mesh: bool) -> Option<vk::PrimitiveTopology> {
     use vk::PrimitiveTopology as P;
     Some(match t {
         1 => P::POINT_LIST,
         2 => P::LINE_LIST,
         3 => P::LINE_STRIP,
-        4 => P::TRIANGLE_LIST,
+        4 | RECTANGLES => P::TRIANGLE_LIST,
         5 => P::TRIANGLE_STRIP,
+        6 => P::TRIANGLE_FAN,
         _ if mesh => P::TRIANGLE_LIST,
-        _ => return None,
+        _ => {
+            once_topology(t);
+            return None;
+        }
     })
+}
+
+/// Diagnostics: each topology the recording does not draw, once.
+fn once_topology(t: u32) {
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut seen = lock(&SEEN);
+    if !seen.contains(&t) {
+        seen.push(t);
+        tracing::info!(topology = t, "Vulkan: a topology not drawn yet (counted under not_yet topology)");
+    }
+}
+
+/// The pre-rasterisation part of a draw: the vertex or mesh program's,
+/// the rectangle part for rectangle lists, the test's full-screen
+/// triangle under `VICTORY_VK_DRAW_TEST=3`.
+fn pre_part(b: &'static Backend, pre: &Stage, topology: u32, mesh: bool) -> Option<vk::Pipeline> {
+    if draw_test() >= 3 && !mesh {
+        return fullscreen_vertex(b);
+    }
+    if topology == RECTANGLES && !mesh {
+        let part = pre.rect_part(b);
+        if part.is_none() {
+            not_yet(NotYet::Topology);
+        }
+        return part;
+    }
+    pre.part
 }
 
 /// The pre-rasterisation and pixel stages of a draw, ready; `None` (counted)

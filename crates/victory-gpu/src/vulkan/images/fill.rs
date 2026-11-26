@@ -159,9 +159,10 @@ fn plan_all(pending: &[Arc<Image>]) -> (Vec<(Arc<Image>, Vec<Sub>, u64)>, u64) {
     let mut total = 0u64;
     for img in pending {
         img.pending.store(false, Ordering::Relaxed);
-        if img.card_written() {
+        if img.card_written() && !img.cpu_changed.load(Ordering::Relaxed) {
             continue;
         }
+        img.cpu_changed.store(false, Ordering::Relaxed);
         match plan(img) {
             Ok(subs) => {
                 let start = total;
@@ -390,11 +391,15 @@ pub(crate) fn format_bytes(f: vk::Format) -> u32 {
 
 /// Textures the title fills that changed without an API call saying so
 /// (movie frames, glyph atlases: the CPU writes them in place). At each
-/// present their memory's fingerprint (three 16 KiB windows,
-/// `texture::fingerprint`) is compared: every texture that changed in the
-/// last 120 frames, and up to [`ROUND`] others in turn. A changed one is
-/// filled again at the next flush. (The D3D12 path watched pages for this;
-/// a fingerprint of a few windows is the cheap form of the same check.)
+/// present their memory's fingerprint (three 16 KiB windows read through
+/// the CPU view, [`fingerprint`]) is compared: every texture that changed
+/// in the last 120 frames, and up to [`ROUND`] others in turn. A changed
+/// one is filled again at the next flush. Pool memory is read through the
+/// pool's CPU view (the GPU view's pages have no CPU mapping at their
+/// address: the Bink planes, vk17's green frames). Images the card writes
+/// as well are checked too: the card never changes title memory under an
+/// image, so a changed fingerprint is the CPU's write. (The D3D12 path
+/// watched pages for this; a fingerprint is the cheap form of the check.)
 pub(crate) fn refresh(b: &Backend, frame: u64) {
     const ROUND: usize = 256;
     static CURSOR: Mutex<Option<Key>> = Mutex::new(None);
@@ -405,7 +410,7 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
         let mut out: Vec<Arc<Image>> = r
             .images
             .values()
-            .filter(|i| !i.card_written() && i.hot_until.load(Ordering::Relaxed) >= frame)
+            .filter(|i| !i.attachment() && i.hot_until.load(Ordering::Relaxed) >= frame)
             .cloned()
             .collect();
         let start = cursor.unwrap_or(Key {
@@ -420,7 +425,7 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
             depth: false,
         });
         let mut last = None;
-        for (k, i) in r.images.range(start..).filter(|(_, i)| !i.card_written()).take(ROUND) {
+        for (k, i) in r.images.range(start..).filter(|(_, i)| !i.attachment()).take(ROUND) {
             out.push(i.clone());
             last = Some(*k);
         }
@@ -438,14 +443,12 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
         if img.bytes == 0 || img.pending.load(Ordering::Relaxed) {
             continue;
         }
-        // Only memory with a CPU view at its own address.
-        if !super::super::cpu_readable(b, img.key.address, img.bytes) {
-            continue;
-        }
-        let h = crate::texture::fingerprint(img.key.address, img.bytes).max(1);
+        let Some(h) = fingerprint(b, img.key.address, img.bytes) else { continue };
         let was = img.hash.swap(h, Ordering::Relaxed);
         if was != 0 && was != h {
             img.hot_until.store(frame + 120, Ordering::Relaxed);
+            img.cpu_changed.store(true, Ordering::Relaxed);
+            changed_once(&img);
             if !img.pending.swap(true, Ordering::Relaxed) {
                 changed.push(img);
             }
@@ -459,3 +462,37 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
     }
 }
 
+
+/// A fingerprint (never 0) of three 16 KiB windows of `[at, at + len)`
+/// read through its CPU view (`read_title`: pool pages through the pool's
+/// CPU view); `None` where there is none.
+fn fingerprint(b: &Backend, at: u64, len: u64) -> Option<u64> {
+    const WINDOW: u64 = 16 << 10;
+    if !super::super::cpu_readable(b, at, len) {
+        return None;
+    }
+    let windows = if len <= 3 * WINDOW { vec![(0, len)] } else { vec![(0, WINDOW), ((len / 2) & !0xfff, WINDOW), (len - WINDOW, WINDOW)] };
+    let mut hasher = blake3::Hasher::new();
+    for (from, n) in windows {
+        hasher.update(&super::super::read_title(b, at + from, n).ok()?);
+    }
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    Some(u64::from_le_bytes(first).max(1))
+}
+
+/// Diagnostics: the first images the CPU changed, once each.
+fn changed_once(img: &Image) {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if cfg!(feature = "diagnostics") && img.hot_until.load(Ordering::Relaxed) != 0 && img.written[3].load(Ordering::Relaxed) <= 1 && LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+        tracing::info!(
+            image = img.id,
+            at = format_args!("{:#x}", img.key.address),
+            format = ?img.format,
+            width = img.extent.width,
+            height = img.extent.height,
+            card_written = img.card_written(),
+            "Vulkan: a texture the CPU changed (filled again)"
+        );
+    }
+}

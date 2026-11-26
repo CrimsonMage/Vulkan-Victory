@@ -74,7 +74,19 @@ pub(crate) fn write(handle: u64, view: &View) {
             d.encode(h.sampler_slot(b, &d)).to_vec()
         }
         View::Constant(address, size) => {
-            let mut w = gfx10::Buffer::raw(*address, *size).encode().to_vec();
+            // As the console's CBVs: records of 16 bytes (float4). Its code
+            // indexes constant arrays with idxen and the V#'s stride (the
+            // title's Scaleform batch programs: a stride of 0 read every
+            // row from row 0, their quads collapsed onto the diagonal).
+            let cbv = gfx10::Buffer {
+                address: *address,
+                stride: 16,
+                records: size.div_ceil(16),
+                format: 77,
+                swizzle: gfx10::IDENTITY,
+                oob: gfx10::Oob::Structured,
+            };
+            let mut w = cbv.encode().to_vec();
             w.resize(8, 0);
             w
         }

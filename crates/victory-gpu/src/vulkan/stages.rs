@@ -184,8 +184,30 @@ pub(crate) struct Stage {
     /// Vertex attributes read as inputs (fetch-shader programs, ABI
     /// section 6): semantic, index, location.
     pub(crate) inputs: Vec<(String, u32, u8)>,
+    /// Immediate samplers (the part's specialisation).
+    samplers: Vec<[u32; 4]>,
+    /// The vertex part with the rectangle geometry stage behind it, made
+    /// at the first rectangle-list draw (`rect.rs`).
+    rect: std::sync::OnceLock<Option<vk::Pipeline>>,
     #[allow(dead_code)]
     words: usize,
+}
+
+impl Stage {
+    /// The pre-rasterisation part that draws rectangle lists (console
+    /// topology 17): this vertex program, then the rectangle geometry
+    /// stage. Made once, on the recording thread (a small compile).
+    pub(crate) fn rect_part(&self, b: &Backend) -> Option<vk::Pipeline> {
+        *self.rect.get_or_init(|| {
+            if self.stage != HwStage::Vs {
+                return None;
+            }
+            let gs = super::rect::module(b)?;
+            compile(b, self.stage, self.module, &self.samplers, Some(gs))
+                .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "Vulkan: the rectangle part does not compile"))
+                .ok()
+        })
+    }
 }
 
 /// What a draw finds for a stage.
@@ -518,7 +540,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
             let _ = std::io::stderr().flush();
         }
         let t = Instant::now();
-        let p = compile(b, vs.stage, module, &vs.samplers);
+        let p = compile(b, vs.stage, module, &vs.samplers, None);
         if cfg!(feature = "diagnostics") {
             tracing::info!(
                 stage = ?vs.stage,
@@ -566,6 +588,8 @@ fn make(b: &Backend, shader: &Shader) -> State {
         part,
         user_data: vs.user_data.clone(),
         inputs,
+        samplers: vs.samplers.clone(),
+        rect: std::sync::OnceLock::new(),
         words: vs.spirv.len(),
     }))
 }
@@ -636,13 +660,15 @@ fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {
     out
 }
 
-/// Compiles one stage: a library part (vertex: pre-rasterisation; pixel:
-/// fragment shader) or a compute pipeline.
+/// Compiles one stage: a library part (vertex: pre-rasterisation, with
+/// `geometry` behind it if given; pixel: fragment shader) or a compute
+/// pipeline.
 fn compile(
     b: &Backend,
     stage: HwStage,
     module: vk::ShaderModule,
     samplers: &[[u32; 4]],
+    geometry: Option<vk::ShaderModule>,
 ) -> anyhow::Result<vk::Pipeline> {
     let layout = layout(b).ok_or_else(|| anyhow::anyhow!("no pipeline layout"))?;
     let d = &b.host.device;
@@ -716,11 +742,14 @@ fn compile(
         };
         let states = dynamic(b, fragment);
         let dyn_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
-        let stages = [vk::PipelineShaderStageCreateInfo::default()
+        let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
             .stage(vk_stage)
             .module(module)
             .name(name)
             .specialization_info(&spec)];
+        if let Some(gs) = geometry {
+            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::GEOMETRY).module(gs).name(name));
+        }
         let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(flags);
         let mut rendering = vk::PipelineRenderingCreateInfo::default();
         let viewport = vk::PipelineViewportStateCreateInfo::default();

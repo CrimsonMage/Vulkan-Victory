@@ -112,6 +112,18 @@ pub(crate) struct Image {
     /// lately: a movie frame, a glyph atlas).
     hash: AtomicU64,
     hot_until: AtomicU64,
+    /// Its title memory changed under the CPU since the last fill (the
+    /// fingerprint): filled again even over memory the card also writes
+    /// (the CPU's write is the newer content, as on the console).
+    cpu_changed: AtomicBool,
+}
+
+impl Image {
+    /// Drawn into (a target or depth): its title memory is never its
+    /// content, so it is not fingerprinted.
+    pub(crate) fn attachment(&self) -> bool {
+        self.usage.intersects(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+    }
 }
 
 impl Image {
@@ -458,6 +470,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         written: [const { AtomicU64::new(0) }; 4],
         hash: AtomicU64::new(0),
         hot_until: AtomicU64::new(0),
+        cpu_changed: AtomicBool::new(false),
     })
 }
 

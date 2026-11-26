@@ -42,6 +42,7 @@ mod compose;
 mod descriptors;
 mod gpu_stats;
 mod present;
+mod rect;
 mod images;
 pub(crate) mod record;
 mod stage_cache;
@@ -925,12 +926,15 @@ fn map_reaches(b: &Backend, at: u64) -> bool {
     memory(b).map.range_of(at).is_some()
 }
 
-/// Whether `[at, at + len)` is title memory the CPU reads at its own
-/// address (not the pool's GPU view, whose pages live elsewhere).
+/// Whether `[at, at + len)` is title memory the CPU reads: a title
+/// allocation at its own address, or the pool's GPU view through the
+/// pool's CPU view.
 fn cpu_readable(b: &Backend, at: u64, len: u64) -> bool {
     let m = memory(b);
-    !m.pools.iter().any(|p| at < p.title_start + p.len && at + len > p.title_start)
-        && m.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| at + len <= (a + r.len) as u64)
+    // Pool memory: `read_title` reads each page through the pool's CPU view
+    // (and refuses pages with no home).
+    m.pools.iter().any(|p| p.contains(at) && p.contains(at + len.max(1) - 1))
+        || m.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| at + len <= (a + r.len) as u64)
 }
 
 /// The buffer and offset of title address `title`.
