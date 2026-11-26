@@ -10,6 +10,9 @@ pub struct Graph {
     pub header: Vec<bool>,
     pub merge: Vec<bool>,
     pub children: Vec<Vec<usize>>,
+    pub idom: Vec<usize>,
+    /// Dominator-tree preorder number and the last number in the subtree.
+    pre: Vec<(usize, usize)>,
     /// Per loop header: the exit placed at the loop construct's merge (a
     /// merge child of the header outside the loop, the most entered), so
     /// leaving the loop for it is a plain break.
@@ -48,8 +51,36 @@ impl Graph {
             exit[h] = y;
             after_exit[h] = after;
         }
-        Ok(Graph { rpo, header, merge, children, exit, after_exit })
+        let pre = preorder(&children);
+        Ok(Graph { rpo, header, merge, children, idom, pre, exit, after_exit })
     }
+
+    /// Whether block `a` dominates block `b`.
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
+        let (pa, ea) = self.pre[a];
+        let pb = self.pre[b].0;
+        pa <= pb && pb <= ea
+    }
+}
+
+/// Dominator-tree preorder intervals from the entry.
+fn preorder(children: &[Vec<usize>]) -> Vec<(usize, usize)> {
+    let mut pre = vec![(usize::MAX, 0); children.len()];
+    let mut n = 0;
+    let mut st = vec![(0usize, 0usize)];
+    pre[0].0 = 0;
+    while let Some(&mut (b, ref mut k)) = st.last_mut() {
+        if let Some(&c) = children[b].get(*k) {
+            *k += 1;
+            n += 1;
+            pre[c].0 = n;
+            st.push((c, 0));
+        } else {
+            pre[b].1 = n;
+            st.pop();
+        }
+    }
+    pre
 }
 
 /// Immediate dominators (Cooper, Harvey and Kennedy); the entry is its own.

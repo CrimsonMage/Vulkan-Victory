@@ -53,6 +53,8 @@ enum Ctx {
     Block(usize),
     /// A selection whose merge is the node (the branch's join).
     Sel(usize),
+    /// A dispatch loop over the node's merge children.
+    Disp(usize),
 }
 
 struct Construct {
@@ -62,13 +64,29 @@ struct Construct {
     header: Id,
     merge: Id,
     cont: Id,
-    passes: bool,
-    /// Jumps from inner constructs that arrive here: bit 0 exit, bit 1 continue.
-    wanted: u8,
     /// Jumps passing out through this construct's merge: they bring the
     /// jump's code and the values for its target's phis (a ladder of phis,
     /// no variables).
     arrivals: Vec<Arrival>,
+    /// A dispatch loop's cases.
+    disp: Option<Box<Disp>>,
+}
+
+/// A dispatch loop: the merge children of a block with many as cases of one
+/// loop, chosen by a state phi; a jump to one sets the state and its phis'
+/// values (in slots by type) and continues the loop.
+struct Disp {
+    /// The cases' blocks (state j + 1) and per phi its slot.
+    cases: Vec<(usize, Vec<usize>)>,
+    slot_tys: Vec<Id>,
+    /// The header's phis: the state, then the slots.
+    state: Id,
+    slots: Vec<Id>,
+    /// The continue target's phis (made when it closes) and its edges:
+    /// (state, slot values, block).
+    cstate: Id,
+    cslots: Vec<Id>,
+    conts: Vec<(Id, Vec<Id>, Id)>,
 }
 
 /// A jump to an outer construct arriving at a merge it passes.
@@ -101,6 +119,11 @@ pub struct Emit<'a> {
     st: &'a Stage,
     t: Types,
     ids: Vec<Id>,
+    /// The graph block whose code defined an id (values only: the phis a
+    /// ladder makes are not here).
+    def_at: HashMap<Id, usize>,
+    /// The graph block being emitted.
+    cur: usize,
     block: Id,
     interface: Vec<Id>,
     push: Id,
@@ -148,6 +171,15 @@ fn code(i: usize, cont: bool) -> u32 {
     (2 * i + 1 + usize::from(cont)) as u32
 }
 
+/// Jump codes into case j of the dispatch loop at stack position i.
+fn code_case(i: usize, j: usize) -> u32 {
+    (1 << 31) | ((j as u32) << 16) | i as u32
+}
+
+/// Blocks with at least this many merge children place them as the cases
+/// of a dispatch loop (nested block constructs otherwise).
+const DISPATCH_MIN: usize = 8;
+
 impl<'a> Emit<'a> {
     pub fn new(f: &'a Func, g: &'a Graph, iface: &'a Interface, st: &'a Stage) -> Self {
         let mut m = Module::new();
@@ -168,6 +200,8 @@ impl<'a> Emit<'a> {
             st,
             t,
             ids: vec![0; f.nodes.len()],
+            def_at: HashMap::new(),
+            cur: 0,
             block: 0,
             interface: Vec::new(),
             push: 0,
@@ -472,7 +506,15 @@ impl<'a> Emit<'a> {
                 self.m.op(op::LOAD, u, &[ptr])
             }
         };
+        self.set_id(v, id);
+    }
+
+    /// The id of a value, defined in the block being emitted.
+    fn set_id(&mut self, v: V, id: Id) {
         self.ids[v as usize] = id;
+        if id != 0 {
+            self.def_at.entry(id).or_insert(self.cur);
+        }
     }
 
     fn constant(&mut self, ty: Ty, bits: u64) -> Id {
@@ -520,7 +562,7 @@ impl<'a> Emit<'a> {
                         let t = self.ty(n.ty);
                         let (a, b) = (self.id(inner), self.id(outer));
                         let id = self.m.op(op::SELECT, t, &[c, a, b]);
-                        self.ids[p as usize] = id;
+                        self.set_id(p, id);
                     }
                 }
                 Item::Guard { cond, body, phis } => {
@@ -542,7 +584,7 @@ impl<'a> Emit<'a> {
                         let t = self.ty(n.ty);
                         let (a, b) = (self.id(inner), self.id(outer));
                         let id = self.m.op(op::PHI, t, &[a, end, b, header]);
-                        self.ids[p as usize] = id;
+                        self.set_id(p, id);
                     }
                 }
             }
@@ -582,6 +624,7 @@ impl<'a> Emit<'a> {
     /// A function variable (declared at the entry later).
 
     pub fn run(mut self) -> Result<Emitted, &'static str> {
+
         let fid = self.m.id();
         let void = self.t.void;
         // pick arrays
@@ -695,3 +738,5 @@ mod cfg;
 mod iface;
 #[path = "emit_image.rs"]
 mod image;
+#[path = "emit_disp.rs"]
+mod disp;
