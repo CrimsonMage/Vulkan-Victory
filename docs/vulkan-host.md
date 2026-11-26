@@ -841,6 +841,72 @@ yet. The translator is merged at b252e39 (ABI 1, structural self-check).
 - **CPU reads of the pool's GPU view** after card writes still see the
   section's home, not the card page (M2a shortcut).
 
+### M2b after the first runs (vk4–vk16, 2026-11-26)
+
+The UI renders on Vulkan from vk16 (f9b0165) on. What the runs found, in
+order:
+
+- **vk4/vk5:** a translator module crashed the driver. winevulkan ends the
+  process silently with `ExitProcess(3)`. Fixed in the translator. The host
+  keeps per-part logging, the limits check and `VICTORY_VK_DUMP`.
+- **vk7–vk13, black planes:** the planes' images were black because draws
+  produced no fragments: their positions collapsed.
+  - The pipeline statistics showed vertices running, primitives passing
+    clipping, and no fragment shaded.
+  - The vertex programs' constants were unreachable. The title's placed
+    descriptor heap (38 MB) lies across several mappings: an allocation of
+    10 MB and a big section view. Only the first piece was in the memory map.
+  - Two bugs:
+    - Loose memory was imported only from the touched page forward, and an
+      overlapping run was refused.
+    - An address inside a big section view counted as mapped even when its
+      section was never imported.
+  - Now:
+    - Loose runs start at their allocation's base, and overlapping runs merge.
+    - Views of unimported sections are imported as loose memory.
+    - Every MiB of a shader-visible heap is imported at its creation.
+    - A command buffer binds a newer map before a draw or dispatch if one
+      appeared since it began.
+- **vk12/vk13, a crash in report():** ash's `get_query_pool_results` takes
+  the element type as the stride. Four queries were written into 32 bytes of
+  stack. Fixed. The 10 s lines are written by a thread of ours.
+- **Images:** one card memory per title memory. An image of another shape
+  over memory that already has an image is bound to the first image's
+  memory, without a clear, and is never filled if any alias is card-written.
+- **CPU-written textures** (movie frames, glyph atlases): fingerprinted at
+  each present (three 16 KiB windows). Recently changed ones are checked
+  every frame, others 256 a frame in turn. Changed ones are refilled.
+- **Clears** clear only the view's mip and slice, and only the given
+  rectangles (vk17).
+- **Translations** are kept on disk (`vulkan-stages/`). A warm launch
+  translates nothing. The pipeline cache is saved every minute.
+- **Diagnostics** (diagnostics builds):
+  - `VICTORY_VK_COMPOSE_TEST=1` (magenta under the planes);
+  - `VICTORY_VK_DRAW_TEST=1|2|3` (state off / constant magenta / full-screen
+    vertices);
+  - per-pipeline draw descriptions (push constants, user data, input layout,
+    vertex bytes, first table and its V#, map reach);
+  - plane texels at captured frames;
+  - `gpu_*` statistics;
+  - `not_yet_reasons`;
+  - stages a draw waited for.
+- **The unmap hook** `title_memory_unmapped` drops the views and imports in
+  the range, and the images over it.
+
+**Open (from the coordinator's audit, in its order):**
+- one timeline per title queue, with bottom-of-pipe values and timestamps
+  written by the card;
+- the leaks: the Vulkan image on resource release, imports of committed runs
+  only;
+- per-draw CPU cost: link cache per pipeline and formats, state set only on
+  change, pool fills batched;
+- one mechanism each: queue.rs's held line, cache.rs, the live memory budget,
+  the D3D12-only hooks under Vulkan;
+- ExecuteIndirect with one bounding pass;
+- the compile backlog (compute parts at ~300 ms average);
+- `AllocateUploadMemory` blocks the card cannot reach;
+- MSAA draws.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
