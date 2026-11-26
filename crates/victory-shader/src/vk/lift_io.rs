@@ -104,10 +104,16 @@ impl Lift<'_> {
             StageIo::Cs(cs) => u32::from(cs.user_sgprs()),
             _ => 32,
         };
-        // a compute program's spilled user-data table (spill.rs): its
-        // entries at index 16 and above arrive in push dwords too
+        // A compute program's spilled user-data table (spill.rs): its
+        // entries at index 16 and above arrive in push dwords too. Only a
+        // compute program: it has the push constants to itself, while a
+        // draw's stages share them (a mesh program's entry 28 would be the
+        // pixel program's entry 0: run vk63 faulted on such pointers).
         let spilled = |k: u32| {
-            k >= 16 && self.native.layout.iter().any(|e| k >= u32::from(e.user_data) && k < u32::from(e.user_data) + e.sgprs)
+            stage == HwStage::Cs
+                && k >= 16
+                && push_window(stage) + k < 64
+                && self.native.layout.iter().any(|e| k >= u32::from(e.user_data) && k < u32::from(e.user_data) + e.sgprs)
         };
         if c >= base && (c - base < users || spilled(c - base)) && c - base < 60 {
             return self.f.global(Op::Push(push_window(stage) + (c - base)), Ty::U32);
