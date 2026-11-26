@@ -198,6 +198,10 @@ pub(crate) struct State {
     /// Of the whole binding under way: a stage before the last made fresh
     /// tables (their offsets are not kept for [`State::constants_only`]).
     any_made: bool,
+    /// Table entries made ready in this list ([`State::table_entry`]): by
+    /// (title heap, slot, kind), the record they were made from and the
+    /// list's epoch then.
+    ready_slots: crate::fast::FastMap<(usize, u32, u8), (u64, u64)>,
     /// Per kind: a root view was set since the last whole binding. Root
     /// views read by directory are user data like root constants
     /// (`HostShader::root_memory`), so they keep [`State::consts`]; a
@@ -265,6 +269,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.ready_slots.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.root_pool_slots.clear();
@@ -647,6 +652,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // Another host list: its own states and epoch.
+        self.ready_slots.clear();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -2623,7 +2630,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2645,14 +2652,42 @@ impl State {
             }
             return;
         }
+        // A view this list made ready already, from the same record, with
+        // nothing recorded since that prepares differently (the list's
+        // epoch, as for a whole binding: `bound_already`): as it was.
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = u64::from(generation) << 32 | u64::from(i);
+        let kind = match u.kind {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(_) => 4,
+        };
+        let key = (std::ptr::from_ref(heap) as usize, index, kind);
+        if self.ready_slots.get(&key) == Some(&(record, list.epoch())) {
+            return;
+        }
         if let Some(view) = host.mirror(index, handle, true) {
-            if crate::descriptor::host::is_buffer_view(&view) {
+            let buffer = crate::descriptor::host::is_buffer_view(&view);
+            if buffer {
                 crate::frametime::add(crate::frametime::Sum::TableHost, 1);
             }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            }
+            // Not what a shader writes into buffers (declared at every
+            // call: indirect records over it are bounded again), nor a view
+            // of the depth target the draw only tests (its states are the
+            // draw's to say).
+            let tested = TESTED_DEPTH.get().0;
+            let of_tested = tested != 0
+                && matches!(view, View::Shader(r, _) | View::Unordered(r, _, _) if r == tested);
+            if !(buffer && u.kind == ResourceType::Uav && STORES.get()) && !of_tested {
+                self.ready_slots.insert(key, (record, list.epoch()));
             }
         }
     }
