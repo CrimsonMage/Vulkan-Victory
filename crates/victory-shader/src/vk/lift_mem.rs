@@ -573,21 +573,7 @@ impl Lift<'_> {
                 self.def(inst, Reg::V(need_d()?), R::D(v));
             }
             "ds_read_u16_d16" | "ds_read_u16_d16_hi" | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" => {
-                // into one half of the destination; the other half stays
-                let base = name.split("_d16").next().unwrap_or(name);
-                let v = self.lds_read_small(inst, &addr, o16, base)?;
-                let d = need_d()?;
-                let old = match inst.read(Reg::V(d)) {
-                    Some(o) => {
-                        let r = self.value(o, off)?;
-                        let x = self.data(r);
-                        self.u32v(x)
-                    }
-                    None => self.k32(0),
-                };
-                let (at, w) = (self.k32(if name.ends_with("_hi") { 16 } else { 0 }), self.k32(16));
-                let r = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[old, v, at, w]);
-                self.def(inst, Reg::V(d), R::D(r));
+                self.lds_read_half(inst, &addr, o16, name, need_d()?)?
             }
             "ds_write_b16" | "ds_write_b8" | "ds_write_b16_d16_hi" | "ds_write_b8_d16_hi" => {
                 self.lds_write_small(inst, &addr, o16, &data[0], name)?
@@ -652,6 +638,24 @@ impl Lift<'_> {
         let width = self.k32(if name.ends_with("16") { 16 } else { 8 });
         let opc = if name.contains("_i") { op::BIT_FIELD_S_EXTRACT } else { op::BIT_FIELD_U_EXTRACT };
         Ok(self.spv(opc, Ty::U32, &[w, sh, width]))
+    }
+
+    /// A small LDS read into one half of `d`; the other half stays.
+    fn lds_read_half(&mut self, inst: &Inst, addr: &Option<Operand>, o16: u32, name: &str, d: u8) -> Res<()> {
+        let base = name.split("_d16").next().unwrap_or(name);
+        let v = self.lds_read_small(inst, addr, o16, base)?;
+        let old = match inst.read(Reg::V(d)) {
+            Some(o) => {
+                let r = self.value(o, inst.machine.offset)?;
+                let x = self.data(r);
+                self.u32v(x)
+            }
+            None => self.k32(0),
+        };
+        let (at, w) = (self.k32(if name.ends_with("_hi") { 16 } else { 0 }), self.k32(16));
+        let r = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[old, v, at, w]);
+        self.def(inst, Reg::V(d), R::D(r));
+        Ok(())
     }
 
     /// A half or byte of a dword: clear it, then set it (two atomics, so
