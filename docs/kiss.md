@@ -252,6 +252,14 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: real NVIDIA compile times (native Vulkan, cache off, 68
+  compute modules by size): new SPIR-V path (pre-OpPhi) p50 25 ms, p90
+  538, max 1,043; old path (dxil-spirv) p50 84, p90 414, max 2,447. The
+  bake's 7.7 s a pipeline was mostly our re-translation and vkd3d's
+  DXIL->SPIR-V conversion, not NVIDIA. Vulkan M2a under Proton (run vk1):
+  device, present, sparse pool view and imports work, the title reached
+  frame 256, then the device was lost (present waits timed out, then
+  vkQueueBindSparse: device lost); being fixed before M2b.
 - 2026-11-26: the D3D12 bake measured the real problem: 2,024 used
   pipelines took 1,110 s on 14 threads (~7.7 s of NVIDIA compile each,
   4.3 CPU-hours, 6 GB peak). Bake stopped (user): the translator is the
