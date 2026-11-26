@@ -19,6 +19,14 @@ use super::{Backend, lock, read_title};
 const ONE_IN: u64 = 8;
 const MOST: usize = 4096;
 
+/// `VICTORY_VK_POOL_RESYNC=1` (an experiment): every page is followed, and
+/// the 10 s line has the card copy each stale one again. If the world
+/// appears with it, stale pool pages are what hides it.
+fn resync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VK_POOL_RESYNC").is_some())
+}
+
 /// Sampled page (its address in the GPU view) -> its home's fingerprint
 /// when the card last copied it.
 static SAMPLES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
@@ -38,13 +46,14 @@ pub(super) fn copied(b: &Backend, at: u64, len: u64) {
     }
     let first = at / PAGE;
     let last = (at + len.max(1) - 1) / PAGE;
-    for n in (first..=last).filter(|n| n % ONE_IN == 0) {
+    let (one_in, most) = if resync() { (1, usize::MAX) } else { (ONE_IN, MOST) };
+    for n in (first..=last).filter(|n| n % one_in == 0) {
         let page = n * PAGE;
         // read before the lock: `read_title` takes the memory lock
         let h = fingerprint(b, page);
         let mut s = lock(&SAMPLES);
         match h {
-            Some(h) if s.len() < MOST || s.contains_key(&page) => {
+            Some(h) if s.len() < most || s.contains_key(&page) => {
                 s.insert(page, h);
             }
             _ => {
@@ -78,4 +87,9 @@ pub(super) fn report(b: &Backend) {
         first = %first.join(" "),
         "Vulkan: pool pages the CPU changed after the card copied them, unannounced (a sample: one page in 8)"
     );
+    if resync() {
+        for page in stale {
+            super::title_memory_written(page as usize, PAGE as usize);
+        }
+    }
 }
