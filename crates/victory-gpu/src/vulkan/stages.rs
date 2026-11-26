@@ -296,7 +296,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
     let speaks = victory_shader::vk::ABI_VERSION >= HOST_ABI;
     let part = if speaks {
         let t = Instant::now();
-        let p = compile(b, vs.stage, module);
+        let p = compile(b, vs.stage, module, &vs.samplers);
         STATS[7].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         match p {
             Ok(p) => {
@@ -317,6 +317,33 @@ fn make(b: &Backend, shader: &Shader) -> State {
         part,
         words: vs.spirv.len(),
     })
+}
+
+/// The first of the sampler heap's slots kept for immediate samplers
+/// (proposal 8): set 1 holds 4,096 samplers, the last 256 are these.
+pub(crate) const IMMEDIATE_FIRST: u32 = SAMPLER_SLOTS - 256;
+
+/// Immediate samplers by their words, and the heap slot each has.
+pub(crate) static IMMEDIATE: Mutex<Vec<[u32; 4]>> = Mutex::new(Vec::new());
+
+/// The heap slot of an immediate sampler (one per distinct words; the
+/// sampler itself is written into set 1 when descriptors are made, step
+/// (a)). Past 256 distinct ones the last slot is shared (logged once).
+fn immediate_slot(words: [u32; 4]) -> u32 {
+    let mut list = IMMEDIATE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match list.iter().position(|w| *w == words) {
+        Some(i) => i,
+        None if list.len() < 256 => {
+            list.push(words);
+            list.len() - 1
+        }
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("Vulkan: more than 256 distinct immediate samplers; the rest share the last slot"));
+            255
+        }
+    };
+    IMMEDIATE_FIRST + at as u32
 }
 
 /// Dynamic states of the pre-rasterisation and fragment parts
@@ -355,7 +382,12 @@ fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {
 
 /// Compiles one stage: a library part (vertex: pre-rasterisation; pixel:
 /// fragment shader) or a compute pipeline.
-fn compile(b: &Backend, stage: HwStage, module: vk::ShaderModule) -> anyhow::Result<vk::Pipeline> {
+fn compile(
+    b: &Backend,
+    stage: HwStage,
+    module: vk::ShaderModule,
+    samplers: &[[u32; 4]],
+) -> anyhow::Result<vk::Pipeline> {
     let layout = layout(b).ok_or_else(|| anyhow::anyhow!("no pipeline layout"))?;
     let d = &b.host.device;
     let db = if b.host.caps.descriptor_buffer {
@@ -364,6 +396,28 @@ fn compile(b: &Backend, stage: HwStage, module: vk::ShaderModule) -> anyhow::Res
         vk::PipelineCreateFlags::empty()
     };
     let name = c"main";
+    // Specialisation (ABI v1): constant 0 false (the map has more than one
+    // range), constant 100 + n the heap slot of immediate sampler n.
+    let mut data: Vec<u32> = vec![vk::FALSE];
+    let mut entries = vec![
+        vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(4),
+    ];
+    for (n, words) in samplers.iter().enumerate() {
+        entries.push(
+            vk::SpecializationMapEntry::default()
+                .constant_id(100 + n as u32)
+                .offset(4 * data.len() as u32)
+                .size(4),
+        );
+        data.push(immediate_slot(*words));
+    }
+    let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let spec = vk::SpecializationInfo::default()
+        .map_entries(&entries)
+        .data(&bytes);
     // SAFETY: valid create infos over a live module and layout.
     unsafe {
         if stage == HwStage::Cs {
@@ -373,7 +427,8 @@ fn compile(b: &Backend, stage: HwStage, module: vk::ShaderModule) -> anyhow::Res
                     vk::PipelineShaderStageCreateInfo::default()
                         .stage(vk::ShaderStageFlags::COMPUTE)
                         .module(module)
-                        .name(name),
+                        .name(name)
+                        .specialization_info(&spec),
                 )
                 .layout(layout.pipeline);
             return d
@@ -396,6 +451,11 @@ fn compile(b: &Backend, stage: HwStage, module: vk::ShaderModule) -> anyhow::Res
                 vk::ShaderStageFlags::FRAGMENT,
                 true,
             ),
+            HwStage::Ms => (
+                vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS,
+                vk::ShaderStageFlags::MESH_EXT,
+                false,
+            ),
             other => anyhow::bail!("no library part for a {other:?} program"),
         };
         let states = dynamic(b, fragment);
@@ -403,7 +463,8 @@ fn compile(b: &Backend, stage: HwStage, module: vk::ShaderModule) -> anyhow::Res
         let stages = [vk::PipelineShaderStageCreateInfo::default()
             .stage(vk_stage)
             .module(module)
-            .name(name)];
+            .name(name)
+            .specialization_info(&spec)];
         let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(flags);
         let mut rendering = vk::PipelineRenderingCreateInfo::default();
         let viewport = vk::PipelineViewportStateCreateInfo::default();
