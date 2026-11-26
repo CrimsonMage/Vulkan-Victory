@@ -277,6 +277,13 @@ pub(crate) struct RtvRecord {
     pub(crate) resource: This,
     desc: [u32; 6],
 }
+
+impl RtvRecord {
+    /// The view description the title gave, if it gave one.
+    pub(crate) fn words(&self) -> Option<[u32; 6]> {
+        (self.described != 0).then_some(self.desc)
+    }
+}
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
@@ -766,6 +773,12 @@ pub(crate) fn make_landed() {
 
 fn record(handle: u64, view: View) {
     if handle == 0 {
+        return;
+    }
+    // `VICTORY_GPU=vulkan`: the console's own descriptor goes into the slot.
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::write_descriptor(handle, &view);
         return;
     }
     let [i, generation] = words_for(view);

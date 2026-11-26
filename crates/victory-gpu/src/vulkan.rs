@@ -36,8 +36,11 @@ use victory_vk::map::{MemoryMap, Range};
 use victory_vk::memory::Imported;
 use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 use victory_vk::swapchain::Swapchain;
-use victory_vk::timeline::Timeline;
+use victory_vk::timeline::{Recording, Timeline};
 
+mod descriptors;
+mod images;
+pub(crate) mod record;
 mod stages;
 
 use crate::list::ValueWait;
@@ -63,7 +66,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-struct Backend {
+pub(crate) struct Backend {
     host: Host,
     timeline: Timeline,
     memory: Mutex<Memory>,
@@ -116,6 +119,12 @@ fn backend() -> Option<&'static Backend> {
 // ---------------------------------------------------------------------------
 // Title memory
 
+struct Region {
+    len: usize,
+    import: Option<Imported>,
+    refused: bool,
+}
+
 struct Section {
     len: u64,
     /// The whole view `xmem` keeps of it (known from the first page shown).
@@ -126,9 +135,10 @@ struct Section {
 
 #[derive(Default)]
 struct Memory {
-    /// `XMemVirtualAlloc` regions: first address -> bytes (imported in M2b,
-    /// when programs read them).
-    regions: BTreeMap<usize, usize>,
+    /// `XMemVirtualAlloc` regions: first address -> bytes, and the import
+    /// once made (at the first recording after the region appears: shaders
+    /// read descriptors, constants and buffers there).
+    regions: BTreeMap<usize, Region>,
     sections: HashMap<usize, Section>,
     /// Large views of sections (one run of one section): title address ->
     /// (bytes, section, offset). Ranges of the memory map.
@@ -184,6 +194,64 @@ impl Memory {
         })
     }
 
+    /// Imports the regions not imported yet (their pages committed first,
+    /// as the D3D12 path opens them); whether any was.
+    fn import_regions(&mut self, host: &Host) -> bool {
+        let mut any = false;
+        for (&at, r) in self.regions.iter_mut() {
+            if r.import.is_some() || r.refused {
+                continue;
+            }
+            // SAFETY: the region as `xmem` reserved it; committed whole here.
+            let ready = unsafe { crate::unified::ready_region(at, r.len) };
+            let made = ready.map_err(|e| anyhow::anyhow!(e)).and_then(|()| {
+                // SAFETY: committed read-write pages that stay mapped until
+                // the region is released (`title_memory_released`).
+                unsafe { Imported::new(host, at as *mut _, r.len as u64, vk::BufferUsageFlags::empty()) }
+            });
+            match made {
+                Ok(i) => {
+                    tracing::info!(
+                        at = format_args!("{at:#x}"),
+                        mb = r.len >> 20,
+                        device = format_args!("{:#x}", i.device_base),
+                        "Vulkan: a region imported in place"
+                    );
+                    r.import = Some(i);
+                    any = true;
+                }
+                Err(e) => {
+                    r.refused = true;
+                    tracing::warn!(at = format_args!("{at:#x}"), mb = r.len >> 20, error = %format!("{e:#}"), "Vulkan: a region was not imported; the card reads zeros there");
+                }
+            }
+        }
+        any
+    }
+
+    /// The buffer and offset of a title address, for copies, index and
+    /// vertex buffers.
+    fn buffer_of(&self, title: u64) -> Option<(vk::Buffer, u64)> {
+        for p in &self.pools {
+            if p.contains(title) {
+                return Some((p.buffer, title - p.title_start));
+            }
+        }
+        if let Some((&at, r)) = self.regions.range(..=title as usize).next_back()
+            && title < (at + r.len) as u64
+            && let Some(i) = &r.import
+        {
+            return Some((i.buffer, title - at as u64));
+        }
+        if let Some((&at, &(len, section, offset))) = self.views.range(..=title as usize).next_back()
+            && title < (at + len) as u64
+            && let Some(i) = self.sections.get(&section).and_then(|s| s.import.as_ref())
+        {
+            return Some((i.buffer, offset + (title - at as u64)));
+        }
+        None
+    }
+
     /// The memory map from what is imported and the pool views.
     fn rebuild_map(&mut self) {
         let mut map = MemoryMap::default();
@@ -196,6 +264,15 @@ impl Memory {
                 title_size: p.len,
                 device_base: p.device_base,
             });
+        }
+        for (&at, r) in &self.regions {
+            if let Some(i) = &r.import {
+                add(Range {
+                    title_start: at as u64,
+                    title_size: r.len as u64,
+                    device_base: i.device_base,
+                });
+            }
         }
         for (&at, &(len, section, offset)) in &self.views {
             if let Some(i) = self.sections.get(&section).and_then(|s| s.import.as_ref()) {
@@ -230,7 +307,14 @@ fn memory(b: &Backend) -> MutexGuard<'_, Memory> {
 
 pub(crate) fn title_region(at: usize, len: usize) {
     if let Some(b) = backend() {
-        memory(b).regions.insert(at, len);
+        memory(b).regions.insert(
+            at,
+            Region {
+                len,
+                import: None,
+                refused: false,
+            },
+        );
     }
 }
 
@@ -380,6 +464,8 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
         return;
     };
+    // Card images over the memory are filled again.
+    images::written(at as u64, len as u64);
     let mut guard = memory(b);
     let m = &mut *guard;
     let (at, len) = (at as u64, len as u64);
@@ -413,9 +499,27 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
 
 pub(crate) fn title_memory_released(at: usize, len: usize) {
     let Some(b) = backend() else { return };
+    images::released(b, at as u64, len as u64);
     let mut m = memory(b);
-    m.regions
-        .retain(|&a, &mut l| !(a >= at && a + l <= at + len));
+    let gone: Vec<usize> = m
+        .regions
+        .iter()
+        .filter(|&(&a, r)| a >= at && a + r.len <= at + len)
+        .map(|(&a, _)| a)
+        .collect();
+    let mut dropped = false;
+    for a in gone {
+        if let Some(Region { import: Some(i), .. }) = m.regions.remove(&a) {
+            // The card may still read it.
+            b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
+            // SAFETY: the card has finished everything given so far.
+            unsafe { i.destroy(&b.host) };
+            dropped = true;
+        }
+    }
+    if dropped {
+        m.rebuild_map();
+    }
     let tick = m.tick;
     for view in &mut m.pools {
         let lo = (at as u64).max(view.title_start);
@@ -455,6 +559,8 @@ pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader
 struct Part {
     waits: Vec<ValueWait>,
     writes: Vec<(u64, Written, usize)>,
+    /// The part's recorded command buffers (M2b).
+    cmds: Vec<Recording>,
 }
 
 enum Item {
@@ -537,13 +643,18 @@ impl Engine {
                                 if !ready {
                                     FORCED.fetch_add(1, Ordering::Relaxed);
                                 }
-                                // M2a: a part carries no commands yet, so one
-                                // without writes has nothing to run (from M2b
-                                // on its command buffers go here).
-                                if part.writes.is_empty() {
+                                // A part with neither commands nor writes has
+                                // nothing to run.
+                                if part.writes.is_empty() && part.cmds.is_empty() {
                                     continue;
                                 }
-                                match b.timeline.submit(&b.host, &[]) {
+                                let submitted = if part.cmds.is_empty() {
+                                    b.timeline.submit(&b.host, &[])
+                                } else {
+                                    images::flush(b);
+                                    b.timeline.submit_recordings(&b.host, part.cmds)
+                                };
+                                match submitted {
                                     Ok(value) => self.flights.push_back(Flight {
                                         value,
                                         writes: part.writes,
@@ -615,12 +726,24 @@ pub(crate) fn list_wait(list: This, wait: ValueWait) {
     let mut e = engine(b);
     let parts = e.lists.entry(list as usize).or_default();
     match parts.last_mut() {
-        Some(p) if p.writes.is_empty() => p.waits.push(wait),
+        Some(p) if p.writes.is_empty() && p.cmds.is_empty() => p.waits.push(wait),
         _ => parts.push(Part {
             waits: vec![wait],
-            writes: Vec::new(),
+            ..Part::default()
         }),
     }
+}
+
+/// A list's recorded command buffer, into its current part (at a cut or
+/// its close).
+pub(crate) fn part_commands(list: This, rec: Recording) {
+    let Some(b) = backend() else { return };
+    let mut e = engine(b);
+    let parts = e.lists.entry(list as usize).or_default();
+    if parts.is_empty() {
+        parts.push(Part::default());
+    }
+    parts.last_mut().expect("part").cmds.push(rec);
 }
 
 /// A list's bottom-of-pipe write.
@@ -641,7 +764,12 @@ pub(crate) fn list_write(list: This, at: u64, what: Written, bytes: usize) {
 /// A list's reset (or release): what it recorded and did not submit goes.
 pub(crate) fn list_reset(list: This) {
     if let Some(b) = backend() {
-        engine(b).lists.remove(&(list as usize));
+        let parts = engine(b).lists.remove(&(list as usize));
+        for part in parts.into_iter().flatten() {
+            for rec in part.cmds {
+                b.timeline.abandon(&b.host, rec);
+            }
+        }
     }
 }
 
@@ -660,8 +788,82 @@ pub(crate) fn execute(queue: This, lists: &[This]) {
         .entry(queue as usize)
         .or_default()
         .push_back(Item::Run(parts));
+    images::flush(b);
     e.pump(b, false);
     b.changed.notify_all();
+}
+
+// ---------------------------------------------------------------------------
+// For the recording (M2b)
+
+/// The backend, for the list workers' recording.
+pub(crate) fn backend_for_recording() -> Option<&'static Backend> {
+    backend().filter(|b| !b.timeline.lost())
+}
+
+/// The memory map as it is now (regions imported first), for a command
+/// buffer about to bind it: its generation and block.
+fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
+    let mut m = memory(b);
+    if m.import_regions(&b.host) {
+        m.rebuild_map();
+    }
+    (m.map.generation, m.map.block(zero, sink))
+}
+
+/// The buffer and offset of title address `title`.
+fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
+    memory(b).buffer_of(title)
+}
+
+/// Reads `len` bytes of title memory at `at` for the CPU (pages of the
+/// pool's GPU view from their homes).
+fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    let m = memory(b);
+    let mut out = vec![0u8; len as usize];
+    let mut done = 0u64;
+    while done < len {
+        let here = at + done;
+        let page_left = PAGE - (here % PAGE);
+        let n = page_left.min(len - done);
+        let (cpu, _) = m.cpu_of(here).ok_or_else(|| anyhow::anyhow!("title memory at {here:#x} has no CPU view"))?;
+        // SAFETY: committed title memory (or a section page's home).
+        unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, out.as_mut_ptr().add(done as usize), n as usize) };
+        done += n;
+    }
+    Ok(out)
+}
+
+fn eds3(b: &Backend) -> Option<&'static victory_vk::ash::ext::extended_dynamic_state3::Device> {
+    static E: OnceLock<Option<victory_vk::ash::ext::extended_dynamic_state3::Device>> = OnceLock::new();
+    E.get_or_init(|| {
+        (b.host.caps.dynamic_blend || b.host.caps.dynamic_raster)
+            .then(|| victory_vk::ash::ext::extended_dynamic_state3::Device::new(&b.host.instance, &b.host.device))
+    })
+    .as_ref()
+}
+
+fn mesh(b: &Backend) -> Option<&'static victory_vk::ash::ext::mesh_shader::Device> {
+    static M: OnceLock<Option<victory_vk::ash::ext::mesh_shader::Device>> = OnceLock::new();
+    M.get_or_init(|| {
+        b.host
+            .caps
+            .mesh_shader
+            .then(|| victory_vk::ash::ext::mesh_shader::Device::new(&b.host.instance, &b.host.device))
+    })
+    .as_ref()
+}
+
+/// `Create*View` / `CreateSampler`: the descriptor into the title's slot.
+pub(crate) fn write_descriptor(handle: u64, view: &crate::descriptor::View) {
+    descriptors::write(handle, view);
+}
+
+/// Saves the pipeline cache (at the end of a run).
+pub(crate) fn save_cache() {
+    if let Some(b) = backend() {
+        stages::save_cache(b);
+    }
 }
 
 pub(crate) fn signal(queue: This, fence: This, value: u64) {
@@ -903,4 +1105,5 @@ fn report(b: &Backend, frame: u64) {
         "Vulkan: queues, timeline and title memory"
     );
     stages::report();
+    record::report();
 }

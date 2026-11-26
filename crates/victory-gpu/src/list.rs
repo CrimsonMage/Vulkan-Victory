@@ -623,7 +623,7 @@ fn new_list(
     }
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
-    let thin = crate::host::host().is_some();
+    let thin = crate::host::host().is_some() || crate::vulkan::on();
     #[cfg(not(windows))]
     let thin = false;
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -696,8 +696,9 @@ extern "system" fn list_release(this: This) -> u32 {
     #[cfg(windows)]
     thin::release(this);
     #[cfg(windows)]
-    if crate::vulkan::on() {
+    if crate::vulkan::on() && object::references(this) <= 1 {
         crate::vulkan::list_reset(this);
+        crate::vulkan::record::forget(this);
     }
     object::release_boxed::<List>(this)
 }
@@ -751,11 +752,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Barrier {
-    kind: u32,
-    flags: u32,
-    first: This,
-    second: u64,
-    last: u64,
+    pub(crate) kind: u32,
+    pub(crate) flags: u32,
+    pub(crate) first: This,
+    pub(crate) second: u64,
+    pub(crate) last: u64,
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
@@ -1110,9 +1111,9 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLocation {
-    resource: This,
-    kind: u32,
-    footprint: crate::resource::PlacedFootprint,
+    pub(crate) resource: This,
+    pub(crate) kind: u32,
+    pub(crate) footprint: crate::resource::PlacedFootprint,
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -1451,10 +1452,10 @@ extern "system" fn resolve(
 
 #[repr(C)]
 pub(crate) struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
 }
 
 extern "system" fn clear_rtv(

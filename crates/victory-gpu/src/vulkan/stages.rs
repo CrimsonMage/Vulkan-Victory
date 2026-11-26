@@ -166,21 +166,104 @@ pub(crate) fn layout(b: &Backend) -> Option<&'static Layout> {
 }
 
 /// What became of a stage.
-#[allow(dead_code)] // the stages are linked from M2b's draws on
 enum State {
     Queued,
-    Done(Stage),
+    Done(Arc<Stage>),
     Failed,
 }
 
-#[allow(dead_code)] // kept for M2b's draws
-struct Stage {
-    stage: HwStage,
+/// A stage translated and compiled, as draws link it.
+pub(crate) struct Stage {
+    pub(crate) stage: HwStage,
+    #[allow(dead_code)] // kept while the part lives
     module: vk::ShaderModule,
-    /// The compiled part (library part or compute pipeline), once the
-    /// translator speaks the host's ABI.
-    part: Option<vk::Pipeline>,
+    /// The compiled part (library part or compute pipeline).
+    pub(crate) part: Option<vk::Pipeline>,
+    /// Push dword <- root parameter (ABI section 2).
+    pub(crate) user_data: Vec<victory_shader::emit::UserData>,
+    /// Vertex attributes read as inputs (fetch-shader programs, ABI
+    /// section 6): semantic, index, location.
+    pub(crate) inputs: Vec<(String, u32, u8)>,
+    #[allow(dead_code)]
     words: usize,
+}
+
+/// What a draw finds for a stage.
+pub(crate) enum Lookup {
+    Ready(Arc<Stage>),
+    /// Queued or being compiled: the draw is skipped and counted.
+    Waiting,
+    /// It does not translate or compile: draws with it are skipped.
+    Failed,
+}
+
+/// The stage of `shader` for a draw: queued at the front if nothing asked
+/// for it before (pipelines the catalog did not know at creation).
+pub(crate) fn lookup(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
+    let mut guard = queue();
+    let q = guard.get_or_insert_with(|| {
+        start(b);
+        Queue {
+            states: HashMap::new(),
+            todo: VecDeque::new(),
+        }
+    });
+    match q.states.get(&shader.full) {
+        Some(State::Done(s)) if s.part.is_some() => Lookup::Ready(s.clone()),
+        Some(State::Done(_) | State::Failed) => Lookup::Failed,
+        Some(State::Queued) => Lookup::Waiting,
+        None => {
+            q.states.insert(shader.full, State::Queued);
+            q.todo.push_front(shader.clone());
+            WORK.notify_one();
+            Lookup::Waiting
+        }
+    }
+}
+
+/// The one `VkPipelineCache` of the run, loaded from the cache folder
+/// (one file per `pipelineCacheUUID`), saved at the end ([`save_cache`]).
+pub(crate) fn cache(b: &Backend) -> vk::PipelineCache {
+    static CACHE: OnceLock<vk::PipelineCache> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let data = cache_file(b).and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
+        // SAFETY: valid create info; a blob of another driver is ignored by
+        // the driver (its header names the device).
+        let made = unsafe {
+            b.host.device.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(&data),
+                None,
+            )
+        };
+        match made {
+            Ok(c) => {
+                tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache");
+                c
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Vulkan: no pipeline cache");
+                vk::PipelineCache::null()
+            }
+        }
+    })
+}
+
+fn cache_file(b: &Backend) -> Option<std::path::PathBuf> {
+    let uuid: String = b.host.caps.pipeline_cache_uuid.iter().map(|x| format!("{x:02x}")).collect();
+    Some(crate::pipeline::cache_dir()?.join(format!("vulkan-{uuid}.bin")))
+}
+
+/// Saves the pipeline cache (at the end of a run).
+pub(crate) fn save_cache(b: &Backend) {
+    let c = cache(b);
+    if c == vk::PipelineCache::null() {
+        return;
+    }
+    // SAFETY: a live cache.
+    if let (Ok(data), Some(f)) = (unsafe { b.host.device.get_pipeline_cache_data(c) }, cache_file(b)) {
+        let _ = std::fs::write(f, &data);
+        tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache saved");
+    }
 }
 
 struct Queue {
@@ -434,12 +517,20 @@ fn make(b: &Backend, shader: &Shader) -> State {
     } else {
         None
     };
-    State::Done(Stage {
+    let inputs = vs
+        .interface
+        .iter()
+        .filter(|i| i.input && vs.stage != HwStage::Ps)
+        .map(|i| (i.semantic.clone(), i.index, i.location))
+        .collect();
+    State::Done(Arc::new(Stage {
         stage: vs.stage,
         module,
         part,
+        user_data: vs.user_data.clone(),
+        inputs,
         words: vs.spirv.len(),
-    })
+    }))
 }
 
 /// The first of the sampler heap's slots kept for immediate samplers
@@ -555,7 +646,7 @@ fn compile(
                 )
                 .layout(layout.pipeline);
             return d
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(cache(b), &[info], None)
                 .map(|p| p[0])
                 .map_err(|(_, e)| anyhow::anyhow!("vkCreateComputePipelines: {e}"));
         }
@@ -612,7 +703,7 @@ fn compile(
         } else {
             info.viewport_state(&viewport).rasterization_state(&raster)
         };
-        d.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        d.create_graphics_pipelines(cache(b), &[info], None)
             .map(|p| p[0])
             .map_err(|(_, e)| anyhow::anyhow!("vkCreateGraphicsPipelines (library part): {e}"))
     }

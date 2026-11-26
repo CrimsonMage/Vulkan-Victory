@@ -85,17 +85,17 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
+    pub(crate) dimension: u32,
+    pub(crate) alignment: u64,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) sample_quality: u32,
+    pub(crate) layout: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
@@ -631,11 +631,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
