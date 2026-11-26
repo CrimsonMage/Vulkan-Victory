@@ -1386,6 +1386,114 @@ began: the process went 3,105 → 6,442 MiB in ~3 s.
   GPU view were not mapped". Idle images are not evicted: dropping one
   would leave the descriptors that name it empty.
 
+### vk28: the hang at world load, the pool and images (2026-11-26, branch `worktree-agent-a3b7585e2bcbe1a37`)
+
+vk28 (b4465d1): FSR4 ran, the world began loading, then `NVRM: Xid 109
+… CTX SWITCH TIMEOUT` at 10:55:12 UTC. The first world frame (1098,
+10:55:08: 1,290 first binds, most new compute stages skipped as not
+compiled yet) was the last one recorded.
+
+**What the log says about the hang.**
+
+- Indirect: `executions=0` through frame 1023. No 10 s line covers
+  1024–1098, so whether indirect ran in frame 1098 is unknown (the world
+  issues ~780 executions a frame on D3D12).
+- The pool view went wrong before it: 1,487 "pages of the pool's GPU view
+  were not mapped" and 28 "an announced write was not taken" (10:54:41 to
+  10:55:03). That error path **left the view's books unlike the card**: a
+  call evicted and reassigned pages in its books, then returned at the
+  first page it found no room for, without submitting the unbinds, fills
+  and binds made so far. From then on title pages showed other pages'
+  bytes: garbage, not zeros.
+- The D3D12 path rendered the world with the same indirect bounds and the
+  same skipping of stages not ready, but its translated shaders had loop
+  limits. The Vulkan translator removed its per-loop cap (f02fac3).
+- Most likely chain: garbage pool pages (c, made worse by the error path)
+  feed a loop with no cap (b) in one of the first world frame's shaders.
+  (a) is less likely: the bounding pass rejects random words (≥ 2^23
+  vertices, > 2^26 vertex instances, > 65,535 or > 2^21 groups), and zeros
+  run nothing. (d) does not give Xid 109.
+- The bounding pass (iii): the count is `min(count, records)`, records ≤
+  `max` ≤ the buffer's records ≤ 65,536 (256 for dispatches); strides are
+  checked (≥ 4 × words, multiple of 4); a zero count runs nothing. No
+  zero or garbage count or stride makes a huge count. What is left: no
+  budget per execution (65,536 records each just inside the bounds, or 256
+  dispatches of 2^21 groups, would still run for seconds).
+
+**Built** (commits fcd2d4a, 333ad9e; `cargo xtask quality` clean).
+
+- **The pool view takes what images leave** (`victory-vk/src/pool.rs`,
+  `vulkan/paging.rs`, `vulkan/budget.rs`). It grows a 64 MiB block while
+  everything of ours stays under the limit (the 4.5 GiB ceiling, less the
+  card budget's last 1 GiB), always up to 256 MiB (`pool::LEAST`). Past
+  it, it evicts its least recently touched page (a `BTreeSet` LRU; pages
+  of the current frame last). **A map never fails** and never stops half
+  way. Images come first: they may cross the limit by 512 MiB, and every
+  frame a view over what images leave gives back its coldest blocks
+  (`follow_budget`, down to 256 MiB). No fixed pool share any more.
+- **Evicted pages come back when a recording names them**
+  (`PoolView::ensure`): root views (`touch`), vertex, index and indirect
+  buffers, indirect counts, buffer copies (`buffer_over`, `device_of`).
+  Their binds go to the host line, which the recording's submission waits
+  for. Pages read only through descriptors in tables are not seen named;
+  they come back at the title's next mapping or announced write.
+- **Texture quality on Vulkan** (`vulkan/images.rs`). The setting was
+  decided only when the D3D12 host was made, so Vulkan images were always
+  full size. Now the backend decides it from the device-local heap
+  (medium under 10 GB), and an image of a texture the title fills
+  (2D, one sample, a layout the detiling reads, not an alias) leaves out
+  its largest level: a quarter of its memory. Fills detile from the
+  console's level; views start that many levels lower; copies map console
+  subresources and skip levels left out; T#s keep the console's width,
+  height and level count. Shortcut, as on D3D12: `image_get_resinfo`
+  answers the image's (halved) size.
+- **Hang report** (diagnostics builds): every command buffer keeps its
+  last 64 notes (draws, dispatches with sizes, indirect executions with
+  kind, max, count address and records address, bounding passes, with the
+  shader names at each pipeline change). A title submission the card has
+  not finished within 1.5 s is reported once: "Vulkan: a submission has
+  not finished (a hang?)" with `line`, `value`, `reached`, `host_reached`,
+  `host_given`, `waited_ms` and `trail`.
+- **Bisect switch** (diagnostics builds only): `VICTORY_DIAG_NO_INDIRECT=1`
+  skips every indirect execution (counted as `skipped`).
+- **Where image memory goes** (diagnostics): after the 10 s images line,
+  "Vulkan: where image memory goes" with the 8 biggest live images and card
+  memory by format.
+
+**Images in vk28.** `images_mb` climbed 2,560 → 4,608 at world load
+(10:54:37–44); 21,099 live images, 47,976 made by views, 26,859 dropped as
+remapped, `images_refused` 19,480, `views_without_image` 40,198,
+`not_fitting_aliases` 1,784 (each takes memory of its own). Most were made
+at 0x590000000–0x5bfffffff, inside the pool reservation
+(0x540b10000 + 16 GiB): streamed textures in pool pages. Why so much: no
+texture quality on Vulkan (fixed above), every view's texture is made
+whether a draw samples it or not, and alias misfits. The pool pages
+under those textures are also held in the pool view, a second copy. Next
+step if memory is still short: leave pool pages under live title-filled
+images out of the pool view.
+
+**To run** (vk29): the gate run, `VICTORY_GPU=vulkan
+VICTORY_CONSOLE=series-s`, captures every 60 frames, 480 s, on this
+branch's diag build. If it hangs again, vk29b with
+`VICTORY_DIAG_NO_INDIRECT=1` added. Look for:
+
+- `texture quality medium` at the start;
+- no "pages of the pool's GPU view were not mapped" (that error cannot
+  happen any more) and no "evicted pages … were not brought back";
+- the card-memory line: `images_mb` well under vk28's 4,608, `pool_mb`
+  growing into what is left; the 10 s line's `pool_shown_mb` (the title's
+  working set in the view) against `pool_card_mb`, and `pool_evicted`,
+  `pool_refilled`;
+- "Vulkan: where image memory goes": the biggest images and formats;
+- on a hang: "a submission has not finished (a hang?)". The first such
+  line of the line whose `reached` stopped names the submission; the last
+  notes of its `trail` name the shader and whether it was an indirect
+  execution. An `indirect` note last points at (a), a plain draw or
+  dispatch at (b);
+- the host line's share and `n=/frame` in `lines` (the record-time
+  refills are host-line operations);
+- textures half as sharp as vk28's at medium (expected).
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

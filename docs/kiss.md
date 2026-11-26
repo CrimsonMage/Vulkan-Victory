@@ -141,6 +141,12 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: vk28 hung the card (Xid 109) at the first world frame
+  (`docs/vulkan-host.md`, "vk28"). The pool view's error path had left its
+  pages showing other pages' bytes; the translator has no loop cap since
+  f02fac3. The pool view now takes what images leave and never fails a
+  map; Vulkan images follow texture quality; a hang report names the
+  submission. Built, not yet run.
 - 2026-11-26: Vulkan genericity (branch `worktree-agent-a8169a5f3c8e04704`,
   `docs/vulkan-host.md`):
   - FSR4 upscale as one blit, read by the FidelityFX API layout and gated
