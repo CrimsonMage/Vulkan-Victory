@@ -259,6 +259,17 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: FIRST IMAGE ON VULKAN (run vk16, host f9b0165, translator
+  b252e39): the loading art renders through victory's own Vulkan path (no
+  vkd3d). Black-screen causes found on the way: separate VkImages per view
+  of one memory (now one image per memory), vertex attributes at
+  APPEND_ALIGNED all read at offset 0, a pipeline-statistics query writing
+  4x its buffer (report() stack corruption), and the 38 MB descriptor heap
+  imported only in its first committed 10 MB (the tables sat in a section
+  view behind it, so every transform read zeros and gpu_fs was 0). Still
+  missing against D3D12: the background fill and panel mask (frame 960),
+  the star logo (frame 450 shows solid green), early startup content.
+  Translated SPIR-V now cached on disk (warm launch: from_disk=376).
 - 2026-11-26: KISS audit of the kept "console side" (partly true):
   KISS as is: gfx10 decoder (sp3.rs aside), native.rs, io.rs, spill.rs,
   wave SSA + lift, frame.rs, fence.rs (once its Signal pumps Vulkan),
