@@ -1,5 +1,8 @@
 # Ray tracing in this fork: what the title does and what has been built
 
+> **Historical (2026-11-26).** This describes the D3D12 back end, which
+> is gone: victory is Vulkan only (`docs/vulkan-host.md`, `docs/kiss.md`).
+
 Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
 machinery translates and is unit-tested; it has not yet run end to end in the
 game. Everything here is off by default.

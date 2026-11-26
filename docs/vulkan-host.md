@@ -1,9 +1,10 @@
 # The Vulkan host
 
 Victory turns the title's D3D12.X into **Vulkan directly** (the user's
-decision, 2026-11-25). Today `victory-gpu` turns it into D3D12, which
-vkd3d-proton turns into Vulkan, and the translator's DXIL is turned into
-SPIR-V on the way. The console GPU is closer to Vulkan than to D3D12:
+decision, 2026-11-25). Since 2026-11-26 this is the only GPU back end: the
+D3D12 path (D3D12 on vkd3d-proton, with the DXIL translator) is deleted
+(section "M4: D3D12 removed"). The console GPU is closer to Vulkan than to
+D3D12:
 
 - its shaders use raw 64-bit addresses. With buffer device address, a
   title address becomes `base + offset`, with no 64 KiB page directory in
@@ -533,9 +534,9 @@ vkprobe: 11 of 11 required steps passed
 
 ## 5. Milestones
 
-The D3D12 path keeps working until Vulkan reaches parity. During the
-migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
-`d3d12`) picks the backend at device creation.
+The D3D12 path kept working until the user's decision of 2026-11-26 to
+drop it; during the migration `VICTORY_GPU=d3d12|vulkan` picked the
+backend. Both are gone (M4 below).
 
 | # | Work | Size | Gate |
 |---|---|---|---|
@@ -543,7 +544,7 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
 | M2a | **Queues, fences, title memory and present on Vulkan, no draws** (built: see "M2a as built"). | ~2,100 lines | the title boots and runs to the menus under `VICTORY_GPU=vulkan` with no hang; cleared frames presented (the planes need M2b's draws) |
 | M2b | **Menus' draws and dispatches** through the new translator (ABI v0). The workers record `VkCommandBuffer`s. Stages compiled once at PSO creation as library parts (or shader objects, per vkprobe), fast link at the first draw, optimised link in the background, the persisted cache; a skipped-draw count for parts not ready. Dynamic rendering, barriers and layouts. Descriptor buffers with T#/S# slots. Host textures (detile and upload as today), clears, copies, resolves, queries. | ~5,000 lines | menus at ≥30 fps (D3D12: ~26), captures match, no driver error in the 5-minute gate run up to the world's door |
 | M3 | **The world.** Bounded indirect, mesh shaders at scale, levels on demand as sparse images, streamed-once promotion by re-binding window pages, depth and UAV twins, the upscale and ambient stand-ins, the BVH builder's programs, the frame-time line with Vulkan timestamps, the memory ceiling from the budget. | ~5,000 lines | the gate run reaches the world with no Xid, card memory ≤ D3D12's, frame time ≤ D3D12's (~95 ms in run p28) |
-| M4 | **Parity, then deletion.** Default `VICTORY_GPU=vulkan`; one gate run of each; then the D3D12 path goes (section 3.7, ~20,000 lines). vkd3d-proton, `d3dcompiler_47` and DXC are no longer shipped beside the exe. The switch goes. | −20,000 lines | gate, binary size and build time down |
+| M4 | **Deletion** (done 2026-11-26, by decision before parity). The D3D12 path goes, and the switch; vkd3d-proton, `d3dcompiler_47` and DXC are no longer needed beside the exe. | −76,500 lines | build green; gate run by the coordinator |
 | M5 | **60 fps work.** Async compute on its queue, big lists split into secondary command buffers, GPU detiling from the window, present wait. | measured | `docs/kiss.md` workstream 10 |
 
 ### M2a as built (`VICTORY_GPU=vulkan`)
@@ -1520,6 +1521,50 @@ Host side of ABI v3 (translator ab78299):
   1.0 s old, the oldest unfinished submission of every line still running
   is printed with its trail.
 
+### M4: D3D12 removed (2026-11-26)
+
+`VICTORY_GPU` and every `vulkan::on()` branch are gone; the Vulkan side
+of each stays. What went, and what was kept for the Vulkan path:
+
+- **victory-gpu** (56,679 → 19,065 lines). Deleted: the D3D12 device and
+  host (submission line, relay, presenter, retirement), the draw binding
+  (`draw.rs` keeps the vertex and index views), `descriptor/host.rs` and
+  the descriptor record registry (slots hold the console's descriptors,
+  written by `vulkan::write_descriptor`), `memory.rs` and its card page
+  cache (`GpuPage` moved to `vulkan/paging.rs`), `unified*`, `views`,
+  `shadow`, `gather`, `indirect`, `watch.rs`'s write watch and guards
+  (it keeps the remapping lock), `texture*`, `tiles`, `memcap`,
+  `compose` (D3D12 planes), `frametime`, `procmem`, `release`, the warp
+  tests, `shader_cache` (DXIL), `pipeline/{catalog,bake,library,make}`
+  and `pipeline/host.rs` (its graphics state moved to
+  `pipeline/state.rs`), the queue's held line (`vulkan/engine.rs` is the
+  one line), the D3D12 FSR pass (`upscale.rs` keeps the FidelityFX layout
+  and hands the scale to `vulkan/record/upscale.rs`), the D3D12 capture
+  read-back. `host.rs` keeps the window, the failure report and title
+  memory reads; the list's base table keeps its lifetime, wait and write
+  methods; every recording call goes through `list/thin.rs` into
+  `list/thin/vulkan.rs`.
+- **Pipelines at creation.** The D3D12 catalog decided which created
+  pipelines got their stages made ahead of the draws. Now: a pipeline
+  whose stage cache (`vulkan-stages`) already holds a translation of one
+  of its containers goes to the stage workers at creation
+  (`stage_cache::known`, the folder listed once); others are made at
+  their first draw, as before.
+- **victory-shader** (58,151 → 20,038). Deleted: `emit/` (the DXIL
+  encoder, its lowering and tests), `hlsl/` (and the dxc glue),
+  `resource.rs`, `structure.rs`, `bvh.rs`. Kept: `gfx10`, `native.rs`,
+  `ir.rs`, `io.rs`, `spill.rs`, `vk/`, `dxbc.rs`/`dxil.rs` (the container),
+  `sampler.rs` (immediate samplers, read by `vulkan/descriptors.rs`),
+  `translation_fingerprint` (the stage cache key, now in `lib.rs`), and
+  `wave.rs` (the whole-wave section simulation from `emit/wave.rs`, unused
+  until its port into `vk/`).
+- **victory-hle.** xmem's write watch, canary pages and kernel-write
+  guards went; every region and section goes to the Vulkan backend.
+- **apps/victory.** `victory bake` went; `victory translate` runs the
+  SPIR-V translator (`--list`, `--jobs`).
+- Still on the host's `d3d12.dll`: the title's root signature
+  serialization (`root.rs`), which the title calls itself.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
@@ -1583,8 +1628,7 @@ Host side of ABI v3 (translator ab78299):
    embedded in Rust (the policy allows `.hlsl`, not `.glsl` or `.spv`).
    Is a build step acceptable instead (dxc in `build.rs`)? Proposal: no,
    embedded words plus an xtask to regenerate them.
-4. **The switch** `VICTORY_GPU`: a user-facing choice during M2–M3, gone
-   at M4. Agreed?
+4. **The switch** `VICTORY_GPU`: gone with the D3D12 path (2026-11-26).
 5. **The driver's disk cache under Proton.** The `victory-proton`
    launcher (outside the repository) should set
    `__GL_SHADER_DISK_CACHE=1`, `__GL_SHADER_DISK_CACHE_SIZE` (several

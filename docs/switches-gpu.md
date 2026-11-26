@@ -9,40 +9,21 @@ Note: several comments said "off by default" for things the code had on.
 The relay (`VICTORY_RELAY`) was ON by default (stage 2), and with it
 `VICTORY_LATE_WAIT` stage 3. That is the path that was kept.
 
-## Kept (user-facing)
+## Read now (2026-11-26, Vulkan only)
+
+The D3D12 back end and every switch it read are gone (`docs/kiss.md`,
+decisions log). What victory-gpu still reads:
 
 | Switch | Default | What it does |
 |---|---|---|
 | `VICTORY_CAPTURE` | unset | folder for frame PNGs (diagnostics builds) |
-| `VICTORY_CAPTURE_FRAMES` | unset | extra frames to save, with their command lists |
-| `VICTORY_AMBIENT` | unset | ambient light override |
-| `VICTORY_BVH_BUILDER` | off | lets the ray-tracing structure builder run |
-| `VICTORY_CARD_CAP_MB` | from adapter | ceiling on card memory the layer uses |
-| `VICTORY_SHARED_CAP_MB` | from adapter | ceiling on PC memory mapped for the card |
-| `VICTORY_TEXTURE_QUALITY` | `medium` under 10 GB of card memory, else `high` | `high`, `medium`, `low`: host copies of textures the title fills leave out 0, 1 or 2 of their largest levels (`quality.rs`) |
-| `VICTORY_D3D12_DEBUG` | off | D3D12 debug layer (diagnostics builds) |
-| `VICTORY_PC_DXC` | SDK dxc | test-only: dxc.exe for pipeline tests |
-| `VICTORY_LIST_WORKERS` | fast physical cores, 2-16 (8 on an i7-14700) | workers that translate the list calls the title's threads write down (`list/thin.rs`); `0` translates each call at once on the title's thread, through the same stream (for A/B and bisecting only; to delete once the gate is passed) |
+| `VICTORY_CAPTURE_FRAMES` | unset | extra frames to save |
+| `VICTORY_TEXTURE_QUALITY` | `medium` under 10 GB of card memory, else `high` | `high`, `medium`, `low`: card images of textures the title fills leave out 0, 1 or 2 of their largest levels (`quality.rs`) |
+| `VICTORY_LIST_WORKERS` | fast physical cores, 2-16 | workers that record the list calls the title's threads write down (`list/thin.rs`); `0` records each call at once on the title's thread |
+| `VICTORY_DISPLAY_MODE` | the PC's screen | display mode the title is told (`dxgi.rs`) |
+| `VICTORY_VK_DUMP`, `VICTORY_VK_STAGES`, `VICTORY_VK_DRAW_TEST`, `VICTORY_VK_COMPOSE_TEST`, `VICTORY_DIAG_NO_INDIRECT` | off | Vulkan backend diagnostics (`docs/vulkan-host.md`) |
 
-## Not done (still read; left for the memory rework or a later pass)
-
-| Switch | Default | Where |
-|---|---|---|
-| `VICTORY_ASK_ONCE` | on | watch.rs |
-| `VICTORY_VIEW_ASK`, `VICTORY_GUARD_ASK` | off | watch.rs |
-| `VICTORY_VIEW_KNOWN` | off | watch.rs |
-| `VICTORY_GUARD_HOLES` | on | watch.rs |
-| `VICTORY_VIEW_GUARD` | on | watch.rs |
-| `VICTORY_PAGE_WRITES` | `guards` (bit 1) | watch.rs |
-| `VICTORY_TILES_TEST_CARD` | off | tiles.rs (test) |
-| `VICTORY_DISPLAY_MODE` | unset | dxgi.rs |
-| `VICTORY_SHADER_CACHE_KEY` | content | shader_cache.rs |
-| `VICTORY_LIST_SLOTS` | none | draw.rs (diagnostics listing) |
-
-(`VICTORY_SHADER_LOOP_LIMIT` appears in a victory-gpu log line but is read
-by victory-shader.)
-
-## Removed
+## Removed (before the D3D12 back end went)
 
 | Switch | Default | What it did | Decision |
 |---|---|---|---|
