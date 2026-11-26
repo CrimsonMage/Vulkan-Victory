@@ -78,7 +78,40 @@ impl Lift<'_> {
                 Ok(self.u32v(x))
             })
             .collect::<Res<_>>()?;
-        Ok(self.vsharp_of(&w))
+        if let Some(&vs) = self.vsharps.get(&w) {
+            return Ok(vs);
+        }
+        // the deepest block that defines a word dominates every access
+        // (prelude values and constants: the entry block; a word made inside
+        // a guard, or of unknown birth: no sharing)
+        let homes: Vec<usize> = w
+            .iter()
+            .filter(|&&v| self.f.as_const(v).is_none() && !self.f.prelude.contains(&v))
+            .map(|v| self.born.get(v).copied().unwrap_or(usize::MAX))
+            .collect();
+        if homes.contains(&usize::MAX) {
+            return Ok(self.vsharp_of(&w));
+        }
+        let home = homes.into_iter().max_by_key(|&b| self.depth[b]).unwrap_or(0);
+        let home = if self.done[home].is_some() { home } else { self.cur_block };
+        let vs = if home == self.cur_block {
+            // before an open guard, with the block's other scalar values
+            let g = std::mem::replace(&mut self.guarded, false);
+            let vs = self.vsharp_of(&w);
+            self.guarded = g;
+            vs
+        } else {
+            let saved = std::mem::take(&mut self.cur);
+            let (g, nc, cb) = (self.guarded, self.no_cse, self.cur_block);
+            self.cur = std::mem::take(&mut self.done[home].as_mut().unwrap().body);
+            (self.guarded, self.no_cse, self.cur_block) = (false, true, home);
+            let vs = self.vsharp_of(&w);
+            self.done[home].as_mut().unwrap().body = std::mem::replace(&mut self.cur, saved);
+            (self.guarded, self.no_cse, self.cur_block) = (g, nc, cb);
+            vs
+        };
+        self.vsharps.insert(w, vs);
+        Ok(vs)
     }
 
     pub(super) fn vsharp_of(&mut self, w: &[V]) -> VSharp {
@@ -104,42 +137,44 @@ impl Lift<'_> {
         let mapped = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[dev, zero]);
         let z = self.k32(0);
         let limit = self.spv(op::SELECT, Ty::U32, &[mapped, bytes, z]);
-        VSharp { dev, limit, stride, w3: w[3] }
+        let shape = self.typed_shape(w[3]);
+        VSharp { shape, dev, limit, stride }
     }
 
-    /// Device address for `bytes` at byte offset `o` of a V#, or the zero
-    /// (loads) / sink (stores) block when out of bounds.
-    pub(super) fn buffer_addr(&mut self, vs: &VSharp, o: V, bytes: u32, store: bool) -> V {
-        // in bounds: o + bytes <= limit, as o < (limit >= bytes ? limit - bytes + 1 : 0)
-        // (the bound is shared by the accesses of a V#)
-        let kb = self.k32(bytes);
+    /// The shape (emit_typed.rs) of a V#'s FORMAT, once per V#.
+    fn typed_shape(&mut self, w3: V) -> V {
+        let k12 = self.k32(12);
+        let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[w3, k12]);
+        self.emit(Op::Call(Helper::TypedShape), Ty::U32, vec![f])
+    }
+
+    /// Whether a V# holds `kb` bytes at byte offset `o`.
+    fn in_bounds(&mut self, vs: &VSharp, o: V, kb: V) -> V {
         let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
-        let k1 = self.k32(bytes.wrapping_sub(1));
-        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, k1]);
-        let z = self.k32(0);
-        let lim = self.spv(op::SELECT, Ty::U32, &[room, lim, z]);
-        let ok = self.spv(op::U_LESS_THAN, Ty::BOOL, &[o, lim]);
+        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
+        let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
+        self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le])
+    }
+
+    /// The device address for `kb` bytes at byte offset `o` of a V#; out
+    /// of bounds the zero (loads) or sink (stores) block.
+    pub(super) fn access_addr(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
+        let ok = self.in_bounds(vs, o, kb);
         let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
         let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
         let fallback = self.fallback(store);
         self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
+    }
+
+    /// A store's (or atomic's) address for `bytes` at byte offset `o`.
+    pub(super) fn buffer_addr(&mut self, vs: &VSharp, o: V, bytes: u32) -> V {
+        let kb = self.k32(bytes);
+        self.access_addr(vs, o, kb, true)
     }
 
     pub(super) fn fallback(&mut self, store: bool) -> V {
         // the memory map's zero and sink blocks
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
-    }
-
-    /// As [`buffer_addr`](Self::buffer_addr) with a computed size.
-    pub(super) fn buffer_addr_dyn(&mut self, vs: &VSharp, o: V, kb: V, store: bool) -> V {
-        let room = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[vs.limit, kb]);
-        let lim = self.spv(op::I_SUB, Ty::U32, &[vs.limit, kb]);
-        let le = self.spv(op::U_LESS_THAN_EQUAL, Ty::BOOL, &[o, lim]);
-        let ok = self.spv(op::LOGICAL_AND, Ty::BOOL, &[room, le]);
-        let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
-        let a = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
-        let fallback = self.fallback(store);
-        self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
     }
 
     /// d16 results: values (f32 bits) as f16, two per dword.
@@ -162,7 +197,8 @@ impl Lift<'_> {
     }
 
     pub(super) fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
-        let a = self.buffer_addr(vs, o, 4 * n, false);
+        let kb = self.k32(4 * n);
+        let a = self.access_addr(vs, o, kb, false);
         Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
     }
 
@@ -197,17 +233,19 @@ impl Lift<'_> {
         if let Kind::VFormat(ch, d16) = kind {
             return self.buffer_vformat(inst, &vs, o, reg, ch, d16);
         }
-        let a = self.buffer_addr(&vs, o, size, !load);
         if load {
             let kind = match kind {
                 Kind::Dwords(n) if self.floats(inst, (0..n).map(|k| Reg::V(reg + k as u8))) => Kind::Floats(n),
                 k => k,
             };
+            let kb = self.k32(size);
+            let a = self.access_addr(&vs, o, kb, false);
             let vals = self.load_kind(a, kind)?;
             for (i, v) in vals.into_iter().enumerate() {
                 self.def(inst, Reg::V(reg + i as u8), R::D(v));
             }
         } else {
+            let a = self.buffer_addr(&vs, o, size);
             let vals: Vec<V> = (0..dwords).map(|i| self.opnd_dw(inst, &src, i, false)).collect::<Res<_>>()?;
             self.store_kind(a, kind, &vals)?;
         }
@@ -243,7 +281,7 @@ impl Lift<'_> {
         let off = inst.machine.offset;
         let glc = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
         let opc = atomic_op(name).ok_or(unsupported(off, name))?;
-        let a = self.buffer_addr(vs, o, 4, true);
+        let a = self.buffer_addr(vs, o, 4);
         let x = self.opnd_dw(inst, src, 0, false)?;
         let x = self.u32v(x);
         let mut args = vec![a, x];
@@ -298,12 +336,8 @@ impl Lift<'_> {
     fn buffer_vformat(&mut self, inst: &Inst, vs: &VSharp, o: V, reg: u8, ch: u32, d16: bool) -> Res<()> {
         let four = self.k32(4);
         let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
-        let a = self.buffer_addr_dyn(vs, o, bytes, false);
-        let k12 = self.k32(12);
-        let f = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[vs.w3, k12]);
-        let k7f = self.k32(0x7F);
-        let f = self.spv(op::BITWISE_AND, Ty::U32, &[f, k7f]);
-        let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, f]);
+        let a = self.access_addr(vs, o, bytes, false);
+        let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, vs.shape]);
         let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
         let vals = if d16 { self.pack_d16(&vals) } else { vals };
         for (i, v) in vals.into_iter().enumerate() {
@@ -766,10 +800,11 @@ impl Lift<'_> {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VSharp {
+    /// The FORMAT's shape for typed loads (emit_typed.rs).
+    pub(super) shape: V,
     pub(super) dev: V,
     pub(super) limit: V,
     pub(super) stride: V,
-    pub(super) w3: V,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

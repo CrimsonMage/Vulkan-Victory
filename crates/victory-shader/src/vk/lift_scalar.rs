@@ -33,7 +33,13 @@ impl Lift<'_> {
             // the call of the vertex fetch shader: its results are inputs;
             // a far jump (the block's exit already goes there)
             "swappc" | "setpc" => Ok(()),
-            "setreg" | "setreg_imm32" | "setprio" | "version" | "waitcnt_vscnt" | "waitcnt_vmcnt" | "waitcnt_expcnt"
+            // the console's memory barrier: the halves of a wave64 meet, so
+            // buffer and image writes before it are seen by the other half
+            "waitcnt_vscnt" => {
+                self.memory_meet();
+                Ok(())
+            }
+            "setreg" | "setreg_imm32" | "setprio" | "version" | "waitcnt_vmcnt" | "waitcnt_expcnt"
             | "waitcnt_lgkmcnt" => Ok(()),
             "getreg" => {
                 let z = self.k32(0);

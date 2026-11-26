@@ -176,6 +176,11 @@ pub struct Emit<'a> {
     frag: bool,
 }
 
+/// Memory semantics of a group barrier and of the wave64 halves' meetings:
+/// workgroup, buffer and image memory (`s_waitcnt_vscnt` before
+/// `s_barrier` is the console's device-memory barrier with group sync).
+const SEM_GROUP: u32 = en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY | en::SEM_UNIFORM_MEMORY | en::SEM_IMAGE_MEMORY;
+
 /// Jump codes: construct at stack position i; continue (loop) or exit.
 fn code(i: usize, cont: bool) -> u32 {
     (2 * i + 1 + usize::from(cont)) as u32
@@ -350,7 +355,7 @@ impl<'a> Emit<'a> {
             Op::Xchg => self.xchg(args[0]),
             Op::Barrier => {
                 let wg = self.c32(en::SCOPE_WORKGROUP);
-                let sem = self.c32(en::SEM_ACQUIRE_RELEASE | en::SEM_WORKGROUP_MEMORY);
+                let sem = self.c32(SEM_GROUP);
                 self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
                 0
             }
@@ -600,3 +605,6 @@ mod ops;
 mod guard;
 #[path = "emit_xchg.rs"]
 mod xchg;
+#[path = "emit_typed.rs"]
+mod typed;
+

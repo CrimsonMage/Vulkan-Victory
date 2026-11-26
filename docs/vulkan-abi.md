@@ -374,8 +374,11 @@ Known gaps (the program translates; the result differs from the console):
   access, when either half may have made another since they last met, the
   halves meet (the console's wave runs its LDS accesses in order across all
   64 lanes). A mask read inside a lane guard stays per half (listed in
-  `VkShader::approximate`). Global memory written by one half and read by
-  the other within one console wave, without a barrier, is not ordered.
+  `VkShader::approximate`). Global memory: at the console's memory
+  barrier (`s_waitcnt_vscnt`) the halves meet too, and every meeting and
+  group barrier orders buffer and image memory as well as workgroup
+  memory; buffer writes one half reads back from the other without such a
+  barrier are not ordered (nor are they in the HLSL the program came from).
 - Cube samples with derivatives or offsets read the faces as a 2D array:
   no filtering across face edges.
 
