@@ -17,15 +17,21 @@
 //! keeps `ash` out of the D3D12 path until the switch-over (M2 onward wires
 //! it in behind `VICTORY_GPU`).
 
+pub use ash;
+
 pub mod compute;
 pub mod descriptors;
 pub mod graphics;
 pub mod host;
+pub mod map;
 pub mod memory;
+pub mod pool;
 #[cfg(windows)]
 pub mod present;
 #[cfg(windows)]
 mod probe;
+pub mod swapchain;
+pub mod timeline;
 
 /// `victory vkprobe`: runs every step and prints one line per step.
 /// `Ok(true)` when every required step passed.
