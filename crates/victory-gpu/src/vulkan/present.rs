@@ -163,6 +163,9 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         }
         return;
     }
+    if super::targets::pending(frame) && idle(b) {
+        super::targets::save_pending(b, frame);
+    }
     if let Some((_, mapped, size)) = capture
         && idle(b)
     {
@@ -174,8 +177,8 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         if let Some((_, mapped)) = probe {
             log_texels(frame, &probes, mapped);
         }
-        if let Some(p) = &dump {
-            super::targets::save(frame, p);
+        if let Some(p) = dump {
+            super::targets::save(b, frame, p);
         }
     }
 }

@@ -626,6 +626,13 @@ impl Rec {
             return None;
         };
         let cmd = self.cmd(b)?;
+        for s in shaders {
+            if super::targets::wants(&s.name) {
+                self.end_pass(b);
+                // SAFETY: outside rendering, in our command buffer.
+                unsafe { super::targets::before(b, cmd, &s.name) };
+            }
+        }
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
@@ -862,6 +869,12 @@ impl Rec {
         self.guard_id = stage.guard_id;
         self.end_pass(b);
         let cmd = self.cmd(b)?;
+        for s in shaders {
+            if super::targets::wants(&s.name) {
+                // SAFETY: outside rendering, in our command buffer.
+                unsafe { super::targets::before(b, cmd, &s.name) };
+            }
+        }
         self.indirect.clear();
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);

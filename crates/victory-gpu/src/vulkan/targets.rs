@@ -16,14 +16,74 @@ use super::{Backend, lock};
 
 /// Images a dump holds at most, and its bytes.
 const MOST: usize = 64;
-const ROOM: u64 = 768 << 20;
-
-static BUFFER: Mutex<Option<Buffer>> = Mutex::new(None);
+const ROOM: u64 = 512 << 20;
 
 pub(super) struct Plan {
+    /// Its own readback buffer, destroyed after the save.
+    held: Buffer,
     buffer: vk::Buffer,
     mapped: usize,
     items: Vec<(Arc<Image>, u64)>,
+    /// What it is named after: "" at a present, else the program it was
+    /// taken before.
+    label: String,
+    /// The frame it was recorded in.
+    born: u64,
+}
+
+// SAFETY: the mapped pointer is read only at the save, under `PENDING`'s lock or by the presenter.
+unsafe impl Send for Plan {}
+
+/// Dumps taken in the middle of a frame, saved at the next present.
+static PENDING: Mutex<Vec<Plan>> = Mutex::new(Vec::new());
+
+/// `VICTORY_VK_DUMP_AT=<program>[,<program>...]`: the first time each of
+/// these programs is used in a frame the dump covers, the images are
+/// read back just before it (what the pass is about to read).
+fn at_names() -> &'static Mutex<Vec<String>> {
+    static AT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    AT.get_or_init(|| Mutex::new(std::env::var("VICTORY_VK_DUMP_AT").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default()))
+}
+
+/// Before a draw or dispatch of program `name`: if a dump was asked for
+/// there, it is recorded now (the caller is outside rendering when this
+/// returns true: it ends its pass first when `wants` says so).
+pub(super) fn wants(name: &str) -> bool {
+    cfg!(feature = "diagnostics")
+        && from().is_some_and(|f| super::present::FRAME.load(Ordering::Relaxed) >= f)
+        && lock(at_names()).iter().any(|n| n == name)
+}
+
+/// # Safety
+/// Recording into `cmd`, outside rendering.
+pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, name: &str) {
+    lock(at_names()).retain(|n| n != name);
+    let Some(mut p) = make(b) else { return };
+    p.label = format!("before-{name}-");
+    // SAFETY: as the caller says.
+    unsafe {
+        images::full_barrier(&b.host.device, cmd);
+        record(&b.host.device, cmd, &p);
+        images::full_barrier(&b.host.device, cmd);
+    }
+    lock(&PENDING).push(p);
+}
+
+/// Whether a mid-frame dump of an earlier frame waits to be saved (its
+/// list has been executed by now).
+pub(super) fn pending(frame: u64) -> bool {
+    lock(&PENDING).iter().any(|p| p.born < frame)
+}
+
+/// At a present with the queue idle: the mid-frame dumps of earlier
+/// frames are saved.
+pub(super) fn save_pending(b: &Backend, frame: u64) {
+    let (ready, later): (Vec<Plan>, Vec<Plan>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born < frame);
+    lock(&PENDING).extend(later);
+    for p in ready {
+        let born = p.born;
+        save(b, born, p);
+    }
 }
 
 /// Dumps a run makes at most.
@@ -53,11 +113,11 @@ pub(super) fn plan(b: &Backend, frame: u64) -> Option<Plan> {
     if from().is_none_or(|f| frame < f) || DONE.fetch_add(1, Ordering::Relaxed) >= DUMPS {
         return None;
     }
-    let mut buffer = lock(&BUFFER);
-    if buffer.is_none() {
-        *buffer = Buffer::new(&b.host, ROOM, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback).ok();
-    }
-    let buf = buffer.as_ref()?;
+    make(b)
+}
+
+fn make(b: &Backend) -> Option<Plan> {
+    let buf = Buffer::new(&b.host, ROOM, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback).ok()?;
     let (mut items, mut at) = (Vec::new(), 0u64);
     for img in images::card_written_images() {
         let bytes = u64::from(img.extent.width) * u64::from(img.extent.height) * texel(&img);
@@ -70,7 +130,7 @@ pub(super) fn plan(b: &Backend, frame: u64) -> Option<Plan> {
             break;
         }
     }
-    Some(Plan { buffer: buf.buffer, mapped: buf.mapped as usize, items })
+    Some(Plan { buffer: buf.buffer, mapped: buf.mapped as usize, held: buf, items, label: String::new(), born: super::present::FRAME.load(Ordering::Relaxed) })
 }
 
 /// # Safety
@@ -87,8 +147,8 @@ pub(super) unsafe fn record(d: &victory_vk::ash::Device, cmd: vk::CommandBuffer,
     }
 }
 
-/// Saves what [`record`] copied (the queue is idle).
-pub(super) fn save(frame: u64, p: &Plan) {
+/// Saves what [`record`] copied and frees the dump (the queue is idle).
+pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
     for (n, (img, at)) in p.items.iter().enumerate() {
         let (w, h, t) = (img.extent.width as usize, img.extent.height as usize, texel(img) as usize);
         // SAFETY: the mapped readback buffer; the copy into it has finished.
@@ -98,7 +158,8 @@ pub(super) fn save(frame: u64, p: &Plan) {
             rgba.extend(shown(img, px));
         }
         let name = format!(
-            "frame-{frame}-t{n:02}-{:?}-{w}x{h}-{:x}-draws{}-clears{}",
+            "frame-{frame}-{}t{n:02}-{:?}-{w}x{h}-{:x}-draws{}-clears{}",
+            p.label,
             img.format,
             img.key.address,
             img.written[0].load(Ordering::Relaxed),
@@ -119,7 +180,9 @@ pub(super) fn save(frame: u64, p: &Plan) {
         tracing::info!(frame, at = format_args!("{:#x}", img.key.address), width = img.extent.width, height = img.extent.height, min = lo, max = hi, not_zero = some, "Vulkan: a depth image's values at the dump");
     }
     tell_depth_uses();
-    tracing::info!(frame, images = p.items.len(), "Vulkan: the card-written images dumped beside the frame");
+    tracing::info!(frame, images = p.items.len(), label = %p.label, "Vulkan: the card-written images dumped beside the frame");
+    // SAFETY: the queue is idle and nothing else names the buffer.
+    unsafe { p.held.destroy(&b.host) };
 }
 
 /// Draws by depth target and the state that decides depth (the dump tells
