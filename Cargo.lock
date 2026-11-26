@@ -921,11 +921,15 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
+ "memchr",
  "proc-macro2",
  "serde",
  "syn 2.0.119",
  "toml",
+ "victory-game",
+ "victory-shader",
  "walkdir",
 ]
 

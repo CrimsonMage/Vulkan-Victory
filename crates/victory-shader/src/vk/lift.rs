@@ -40,6 +40,15 @@ enum R {
     B(V),
 }
 
+/// An approximation the translation took (`docs/vulkan-abi.md` section 9):
+/// what, and the opcode of the instruction it was taken at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Approx {
+    pub note: &'static str,
+    /// Decoder name; empty when no instruction is being lifted.
+    pub opcode: &'static str,
+}
+
 /// What the stage's interface needs, found while lifting.
 #[derive(Debug, Clone, Default)]
 pub struct Interface {
@@ -51,7 +60,7 @@ pub struct Interface {
     pub samplers: Vec<[u32; 4]>,
     /// Workgroup memory in dwords.
     pub lds_dwords: u32,
-    pub approximate: Vec<&'static str>,
+    pub approximate: Vec<Approx>,
     /// Pixel: depth / stencil / sample mask exported.
     pub depth: bool,
     pub demotes: bool,
@@ -535,9 +544,12 @@ impl<'a> Lift<'a> {
         self.wave64 && !self.xwave
     }
 
-    fn approx(&mut self, what: &'static str) {
-        if !self.iface.approximate.contains(&what) {
-            self.iface.approximate.push(what);
+    fn approx(&mut self, note: &'static str) {
+        let (b, i) = self.site;
+        let opcode = self.p.blocks.get(b).and_then(|b| b.insts.get(i)).map_or("", |i| i.name());
+        let a = Approx { note, opcode };
+        if !self.iface.approximate.contains(&a) {
+            self.iface.approximate.push(a);
         }
     }
 

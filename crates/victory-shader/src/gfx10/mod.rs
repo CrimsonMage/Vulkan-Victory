@@ -326,6 +326,20 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         .map(|i| table[i].1)
 }
 
+/// Every opcode name the decoder knows (and `exp`), sorted, once each.
+pub fn known_names() -> Vec<&'static str> {
+    use opcodes as t;
+    let tables = [
+        t::SOP2, t::SOPK, t::SOP1, t::SOPC, t::SOPP, t::SMEM, t::VOP2, t::VOP1, t::VOPC, t::VOP3, t::VOP3P,
+        t::VINTRP, t::DS, t::MUBUF, t::MTBUF, t::MIMG, t::FLAT, t::GLOBAL, t::SCRATCH,
+    ];
+    let mut out: Vec<&'static str> = tables.iter().flat_map(|t| t.iter().map(|e| e.1)).collect();
+    out.push("exp");
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
     ShaderError::Isa { offset, reason }
 }

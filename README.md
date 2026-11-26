@@ -386,6 +386,11 @@ victory vkprobe
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+The translation index, `docs/translation-index.md` (what the shader
+translator does with every program of a dump: opcode coverage, refusals,
+approximations), is regenerated natively on Linux or Windows with
+`cargo xtask translation-index --pack <shaders file or directory> [--out <md>] [--jobs N]`.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

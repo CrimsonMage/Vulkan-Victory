@@ -347,9 +347,14 @@ pub struct VkShader {
     pub samplers: Vec<[u32; 4]>,         // immediate sampler n: set 1 binding 0 at spec constant 100 + n
     pub interface: Vec<Interface>,       // semantics and locations (information only)
     pub local_size: [u32; 3],            // compute / mesh
-    pub approximate: Vec<&'static str>,  // wave64 operations taken per half
+    pub approximate: Vec<Approx>,        // approximations taken (note, opcode), section 9
 }
 ```
+
+`vk::report` (an opt-in for tools) translates a container and adds the
+opcodes its code uses and the opcode a refusal stops at. `cargo xtask
+translation-index --pack <pack>` runs it over a whole dump and writes
+`docs/translation-index.md`: opcode coverage, refusals, approximations.
 
 ## 9. Known gaps and open points
 
