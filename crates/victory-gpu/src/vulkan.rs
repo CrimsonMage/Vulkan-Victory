@@ -115,7 +115,10 @@ fn backend() -> Option<&'static Backend> {
             }
         })
         .as_ref()
-        .inspect(|_| start_landing())
+        .inspect(|_| {
+            start_landing();
+            start_reports();
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -966,16 +969,39 @@ impl Memory {
 }
 
 /// The committed read-write run of pages holding `at` (one allocation).
+/// From the allocation's base, so that an address below one touched
+/// earlier in the same allocation is in it too.
 fn committed_run(at: u64) -> Option<(usize, usize)> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data, filled by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a query into our own structure.
-    if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
-        return None;
+    let at = at as usize;
+    let here = page_info(at).filter(usable)?;
+    let base = here.AllocationBase as usize;
+    let (mut p, mut start) = (base, None);
+    while let Some(i) = page_info(p).filter(|i| i.AllocationBase as usize == base) {
+        let (lo, hi) = (i.BaseAddress as usize, i.BaseAddress as usize + i.RegionSize);
+        if usable(&i) {
+            start.get_or_insert(lo);
+        } else if hi <= at {
+            start = None;
+        } else {
+            break;
+        }
+        p = hi;
     }
-    let rw = matches!(info.Protect & 0x1ff, 0x04 | 0x40);
-    (info.State == MEM_COMMIT && rw).then_some((info.BaseAddress as usize, info.RegionSize))
+    start.map(|s| (s, p - s))
+}
+
+type PageInfo = windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
+
+fn page_info(p: usize) -> Option<PageInfo> {
+    // SAFETY: plain data, filled by the query.
+    let mut info: PageInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: a query into our own structure.
+    let ok = unsafe { windows_sys::Win32::System::Memory::VirtualQuery(p as *const _, &mut info, size_of::<PageInfo>()) } != 0;
+    ok.then_some(info)
+}
+
+fn usable(i: &PageInfo) -> bool {
+    i.State == windows_sys::Win32::System::Memory::MEM_COMMIT && matches!(i.Protect & 0x1ff, 0x04 | 0x40)
 }
 
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
@@ -1358,19 +1384,29 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     }
     drop(sc);
     split(Split::Present, presented);
-    report(b, frame);
+    FRAME.store(frame, Ordering::Relaxed);
+}
+
+/// The last frame presented, for the 10 s line.
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// The 10 s lines are written by a thread of ours: the title's presenting
+/// thread may be deep in its own stack (vk12 overflowed in `report`).
+fn start_reports() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-vk-report".into()).spawn(|| {
+            let Some(b) = backend() else { return };
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                report(b, FRAME.load(Ordering::Relaxed));
+            }
+        });
+    });
 }
 
 /// One line every 10 s: the queues, the timeline, title memory.
 fn report(b: &Backend, frame: u64) {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    {
-        let mut last = lock(&LAST);
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
-            return;
-        }
-        *last = Some(Instant::now());
-    }
     // Per frame since the last line, in ms.
     static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
     let frames = frame.saturating_sub(LAST_FRAME.swap(frame, Ordering::Relaxed)).max(1);

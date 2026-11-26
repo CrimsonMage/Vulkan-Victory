@@ -122,6 +122,7 @@ pub(crate) struct Rec {
     last_push: [u32; 64],
     last_inputs: (usize, usize),
     last_user: String,
+    last_layout: String,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -157,6 +158,7 @@ impl Default for Rec {
             last_push: [0; 64],
             last_inputs: (0, 0),
             last_user: String::new(),
+            last_layout: String::new(),
         }
     }
 }
@@ -488,6 +490,23 @@ fn attributes(pre: &Stage, gs: &crate::pipeline::host::GraphicsState) -> Vec<(u3
         }
     }
     out
+}
+
+/// Diagnostics: the program's attribute inputs, the title's input layout
+/// and the attributes made of them.
+fn layout_text(pre: &Stage, gs: &crate::pipeline::host::GraphicsState, made: &[(u32, u32, vk::Format, u32)]) -> String {
+    let wants: Vec<String> = pre.inputs.iter().map(|(s, i, l)| format!("{s}{i}@{l}")).collect();
+    let elements: Vec<String> = gs
+        .inputs
+        .iter()
+        .map(|e| {
+            // SAFETY: the element's name points into the state's names.
+            let name = unsafe { e.SemanticName.to_string() }.unwrap_or_default();
+            format!("{name}{} fmt{} slot{} off{:#x} class{}", e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0)
+        })
+        .collect();
+    let attrs: Vec<String> = made.iter().map(|(l, b, f, o)| format!("loc{l} bind{b:#x} {f:?} +{o}")).collect();
+    format!("program wants [{}]; layout [{}]; attributes [{}]", wants.join(", "), elements.join(", "), attrs.join(", "))
 }
 
 /// `VICTORY_VK_DRAW_TEST` (diagnostics): 1 draws with depth, stencil,
@@ -1016,6 +1035,9 @@ impl Rec {
         self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
         let inputs = attributes(&pre, gs);
+        if cfg!(feature = "diagnostics") {
+            self.last_layout = layout_text(&pre, gs, &inputs);
+        }
         let fragment = match &pixel {
             _ if draw_test() >= 2 => solid_fragment(b)?,
             Some(p) => p.part?,
@@ -1172,6 +1194,16 @@ impl Rec {
         }
     }
 
+    /// Diagnostics: the first 48 bytes of vertex view 0.
+    fn vertex_bytes(&self) -> String {
+        let Some(v) = self.vertex[0] else { return String::new() };
+        let Some(b) = super::backend() else { return String::new() };
+        match super::read_title(b, v.address, 48) {
+            Ok(bytes) => bytes.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect::<Vec<_>>().join(" "),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
     /// Draw test state: nothing hidden, every channel written.
     ///
     /// # Safety
@@ -1240,6 +1272,8 @@ impl Rec {
                 what,
                 push = ?push,
                 user_data = %self.last_user,
+                layout = %self.last_layout,
+                vertex_bytes = %self.vertex_bytes(),
                 attributes = self.last_inputs.0 % 1000,
                 bindings = self.last_inputs.0 / 1000,
 
