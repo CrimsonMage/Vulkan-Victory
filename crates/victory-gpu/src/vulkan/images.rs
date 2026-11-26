@@ -735,6 +735,13 @@ pub(crate) fn describe(b: &Backend, resource: This) -> String {
 }
 
 /// Images alive, for the 10 s line.
+/// Diagnostics: the images the card writes, the most drawn first.
+pub(crate) fn card_written_images() -> Vec<Arc<Image>> {
+    let mut out: Vec<Arc<Image>> = registry().as_ref().map_or_else(Vec::new, |r| r.images.values().filter(|i| i.card_written()).cloned().collect());
+    out.sort_by_key(|i| std::cmp::Reverse(i.written[0].load(Ordering::Relaxed) + i.written[1].load(Ordering::Relaxed)));
+    out
+}
+
 pub(crate) fn count() -> usize {
     registry().as_ref().map_or(0, |r| r.images.len())
 }

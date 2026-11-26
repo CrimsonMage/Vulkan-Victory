@@ -41,6 +41,11 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png` in the capture folder.
+pub(crate) fn save_named(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+    save_as(name, width, height, pitch, bgra, rows);
+}
+
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };

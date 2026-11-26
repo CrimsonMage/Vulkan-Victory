@@ -135,6 +135,7 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         Vec::new()
     };
     let probe = (!probes.is_empty()).then(|| probe_buffer(b)).flatten();
+    let dump = wanted.then(|| super::targets::plan(b, frame)).flatten();
     let (extent, format) = (s.extent, s.format);
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         // SAFETY: the image is in TRANSFER_DST_OPTIMAL while recording;
@@ -146,6 +147,9 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
             }
             if let Some((pbuf, _)) = probe {
                 copy_texels(d, cmd, &probes, pbuf);
+            }
+            if let Some(p) = &dump {
+                super::targets::record(d, cmd, p);
             }
             if let Some((buffer, _, _)) = capture {
                 copy_target(d, cmd, t, buffer);
@@ -169,6 +173,9 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
         crate::capture::save(frame, extent.width, extent.height, extent.width as usize * 4, bgra, rows);
         if let Some((_, mapped)) = probe {
             log_texels(frame, &probes, mapped);
+        }
+        if let Some(p) = &dump {
+            super::targets::save(frame, p);
         }
     }
 }
