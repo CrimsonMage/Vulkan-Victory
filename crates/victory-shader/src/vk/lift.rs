@@ -66,67 +66,13 @@ fn float_uses(p: &Program) -> HashMap<Value, i32> {
     let mut moves: Vec<(Value, Value)> = Vec::new();
     for b in &p.blocks {
         for phi in &b.phis {
-            for &a in &phi.args {
-                moves.push((phi.value, a));
-            }
+            moves.extend(phi.args.iter().map(|&a| (phi.value, a)));
         }
         for inst in &b.insts {
-            let name = inst.name();
-            let mut regs = ir::operand_reads(p, inst);
-            if name.contains("mac_") {
-                regs.extend(inst.writes.iter().map(|w| w.0).filter(|r| matches!(r, Reg::V(_))));
-            }
-            let val = |r: Reg| inst.read(r);
-            let w = match &inst.fields {
-                Fields::Valu(_) => {
-                    if matches!(name, "v_mov_b32" | "v_cndmask_b32") {
-                        if let Some((_, d)) = inst.writes.iter().find(|w| matches!(w.0, Reg::V(_))) {
-                            for &r in &regs {
-                                if let (Reg::V(_) | Reg::S(_), Some(v)) = (r, val(r)) {
-                                    moves.push((*d, v));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let src = if let Some(rest) = name.strip_prefix("v_cvt_") {
-                        rest.rsplit('_').next().unwrap_or("")
-                    } else {
-                        name.rsplit('_').next().unwrap_or("")
-                    };
-                    match src {
-                        "f32" => 1,
-                        "u32" | "i32" | "b32" | "u24" | "i24" | "u64" | "i64" | "b64" | "ubyte0" | "ubyte1" | "ubyte2"
-                        | "ubyte3" => -1,
-                        _ => 0,
-                    }
-                }
-                Fields::Image { addr, .. } if name.starts_with("image_sample") || name.starts_with("image_gather") => {
-                    for a in addr {
-                        if let Operand::Vector { reg, dwords } = *a {
-                            for k in 0..dwords {
-                                if let Some(v) = val(Reg::V(reg + k)) {
-                                    *score.entry(v).or_default() += 1;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                _ => 0,
-            };
-            if w == 0 {
-                continue;
-            }
-            for r in regs {
-                if matches!(r, Reg::V(_) | Reg::S(_))
-                    && let Some(v) = val(r)
-                {
-                    *score.entry(v).or_default() += w;
-                }
-            }
+            score_inst(p, inst, &mut score, &mut moves);
         }
     }
+    // a copy's source is read the way its destination is
     for _ in 0..3 {
         for &(d, s) in moves.iter().rev() {
             let x = score.get(&d).copied().unwrap_or(0);
@@ -136,6 +82,94 @@ fn float_uses(p: &Program) -> HashMap<Value, i32> {
         }
     }
     score
+}
+
+/// One instruction's reads: +1 per float read, -1 per integer read; moves
+/// and selects are copies (scored by their destinations).
+fn score_inst(p: &Program, inst: &Inst, score: &mut HashMap<Value, i32>, moves: &mut Vec<(Value, Value)>) {
+    let name = inst.name();
+    let mut regs = ir::operand_reads(p, inst);
+    if name.contains("mac_") {
+        regs.extend(inst.writes.iter().map(|w| w.0).filter(|r| matches!(r, Reg::V(_))));
+    }
+    let reads = regs.into_iter().filter(|r| matches!(r, Reg::V(_) | Reg::S(_))).filter_map(|r| inst.read(r));
+    let w = match &inst.fields {
+        Fields::Valu(_) if matches!(name, "v_mov_b32" | "v_cndmask_b32") => {
+            if let Some(&(_, d)) = inst.writes.iter().find(|w| matches!(w.0, Reg::V(_))) {
+                moves.extend(reads.map(|v| (d, v)));
+            }
+            return;
+        }
+        Fields::Valu(_) => valu_read_kind(name),
+        Fields::Image { addr, .. } if name.starts_with("image_sample") || name.starts_with("image_gather") => {
+            // sample coordinates are floats
+            for a in addr {
+                let Operand::Vector { reg, dwords } = *a else { continue };
+                for v in (0..dwords).filter_map(|k| inst.read(Reg::V(reg + k))) {
+                    *score.entry(v).or_default() += 1;
+                }
+            }
+            return;
+        }
+        _ => 0,
+    };
+    if w != 0 {
+        for v in reads {
+            *score.entry(v).or_default() += w;
+        }
+    }
+}
+
+/// A VALU instruction's source type by its name: 1 float, -1 integer.
+fn valu_read_kind(name: &str) -> i32 {
+    let src = match name.strip_prefix("v_cvt_") {
+        Some(rest) => rest.rsplit('_').next().unwrap_or(""),
+        None => name.rsplit('_').next().unwrap_or(""),
+    };
+    match src {
+        "f32" => 1,
+        "u32" | "i32" | "b32" | "u24" | "i24" | "u64" | "i64" | "b64" | "ubyte0" | "ubyte1" | "ubyte2" | "ubyte3" => -1,
+        _ => 0,
+    }
+}
+
+/// The blocks in dominator-tree preorder, and the immediate dominators.
+fn dom_preorder(p: &Program) -> (Vec<usize>, Vec<usize>) {
+    let order = ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        index[b] = i;
+    }
+    let idom = ir::idoms(&p.blocks, &order, &index);
+    let mut children = vec![Vec::new(); p.blocks.len()];
+    for &b in order.iter().skip(1) {
+        if idom[b] != usize::MAX {
+            children[idom[b]].push(b);
+        }
+    }
+    let mut pre = Vec::new();
+    let mut stack = vec![order[0]];
+    while let Some(b) = stack.pop() {
+        pre.push(b);
+        stack.extend(children[b].iter().rev());
+    }
+    (pre, idom)
+}
+
+/// A 32-bit operation of two constants.
+fn fold_u32_op(o: u16, x: u32, y: u32) -> Option<u32> {
+    Some(match o {
+        op::I_ADD => x.wrapping_add(y),
+        op::I_SUB => x.wrapping_sub(y),
+        op::I_MUL => x.wrapping_mul(y),
+        op::BITWISE_AND => x & y,
+        op::BITWISE_OR => x | y,
+        op::BITWISE_XOR => x ^ y,
+        op::SHIFT_LEFT_LOGICAL if y < 32 => x << y,
+        op::SHIFT_RIGHT_LOGICAL if y < 32 => x >> y,
+        op::SHIFT_RIGHT_ARITHMETIC if y < 32 => ((x as i32) >> y) as u32,
+        _ => return None,
+    })
 }
 
 /// Built-in output slots.
@@ -397,132 +431,109 @@ impl<'a> Lift<'a> {
         let a = c.first().copied().flatten();
         let b = c.get(1).copied().flatten();
         let ty = n.ty;
-        let u32r = |s: &mut Self, x: u64| Some(s.f.konst(Ty::U32, x & 0xFFFF_FFFF));
-        if ty == Ty::U32 && n.args.len() == 2 {
-            if let (Some(x), Some(y)) = (a, b) {
-                let (x, y) = (x as u32, y as u32);
+        let r = match o {
+            _ if ty == Ty::U32 && n.args.len() == 2 => self.fold_u32(o, n, a, b),
+            op::I_ADD if ty == Ty::U64 && n.args.len() == 2 => self.fold_add64(n, a, b),
+            _ if ty == Ty::BOOL => self.fold_bool(o, n, a, b),
+            _ => None,
+        };
+        if r.is_some() {
+            return r;
+        }
+        match o {
+            op::U_CONVERT | op::S_CONVERT => a.map(|x| self.fold_convert(o, n, x)),
+            op::SELECT if a.is_some() => Some(if a != Some(0) { n.args[1] } else { n.args[2] }),
+            op::SELECT if n.args[1] == n.args[2] => Some(n.args[1]),
+            op::BITCAST if n.args.len() == 1 => self.fold_bitcast(n),
+            _ => None,
+        }
+    }
+
+    /// 32-bit integer operations of constants, and identities.
+    fn fold_u32(&mut self, o: u16, n: &Node, a: Option<u64>, b: Option<u64>) -> Option<V> {
+        if let (Some(x), Some(y)) = (a, b) {
+            let r = fold_u32_op(o, x as u32, y as u32)?;
+            return Some(self.f.konst(Ty::U32, u64::from(r)));
+        }
+        let (l, r) = (n.args[0], n.args[1]);
+        let zero = |s: &mut Self| Some(s.f.konst(Ty::U32, 0));
+        match (o, a.map(|x| x as u32), b.map(|x| x as u32)) {
+            (op::I_ADD | op::BITWISE_OR | op::BITWISE_XOR, Some(0), _) => Some(r),
+            (op::I_ADD | op::BITWISE_OR | op::BITWISE_XOR | op::I_SUB, _, Some(0)) => Some(l),
+            (op::SHIFT_LEFT_LOGICAL | op::SHIFT_RIGHT_LOGICAL | op::SHIFT_RIGHT_ARITHMETIC, _, Some(0)) => Some(l),
+            (op::BITWISE_AND, Some(0), _) | (op::BITWISE_AND, _, Some(0)) => zero(self),
+            (op::BITWISE_AND, Some(u32::MAX), _) => Some(r),
+            (op::BITWISE_AND, _, Some(u32::MAX)) => Some(l),
+            (op::I_MUL, Some(1), _) => Some(r),
+            (op::I_MUL, _, Some(1)) => Some(l),
+            (op::I_MUL, Some(0), _) | (op::I_MUL, _, Some(0)) => zero(self),
+            _ => None,
+        }
+    }
+
+    fn fold_add64(&mut self, n: &Node, a: Option<u64>, b: Option<u64>) -> Option<V> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(self.f.konst(Ty::U64, x.wrapping_add(y))),
+            (_, Some(0)) => Some(n.args[0]),
+            (Some(0), _) => Some(n.args[1]),
+            _ => None,
+        }
+    }
+
+    /// Logic and compares of constants; and/or with a constant or twice
+    /// the same value; double negation.
+    fn fold_bool(&mut self, o: u16, n: &Node, a: Option<u64>, b: Option<u64>) -> Option<V> {
+        let same = n.args.len() == 2 && n.args[0] == n.args[1];
+        match o {
+            op::LOGICAL_AND | op::LOGICAL_OR => {
+                // the absorbing constant: 0 for and, 1 for or
+                let absorb = u64::from(o == op::LOGICAL_OR);
+                match (a, b) {
+                    (Some(x), _) | (_, Some(x)) if x == absorb => Some(self.kb(absorb != 0)),
+                    (Some(_), _) => Some(n.args[1]),
+                    (_, Some(_)) => Some(n.args[0]),
+                    _ if same => Some(n.args[0]),
+                    _ => None,
+                }
+            }
+            op::LOGICAL_NOT => match (a, &self.f.node(n.args[0]).op) {
+                (Some(x), _) => Some(self.kb(x == 0)),
+                (_, Op::Spv(op::LOGICAL_NOT)) => Some(self.f.node(n.args[0]).args[0]),
+                _ => None,
+            },
+            op::LOGICAL_NOT_EQUAL => match (a, b) {
+                (Some(x), Some(y)) => Some(self.kb(x != y)),
+                (Some(0), _) => Some(n.args[1]),
+                (_, Some(0)) => Some(n.args[0]),
+                _ => None,
+            },
+            op::I_EQUAL | op::I_NOT_EQUAL | op::U_LESS_THAN | op::U_GREATER_THAN_EQUAL => {
+                let (x, y) = (a?, b?);
                 let r = match o {
-                    op::I_ADD => x.wrapping_add(y),
-                    op::I_SUB => x.wrapping_sub(y),
-                    op::I_MUL => x.wrapping_mul(y),
-                    op::BITWISE_AND => x & y,
-                    op::BITWISE_OR => x | y,
-                    op::BITWISE_XOR => x ^ y,
-                    op::SHIFT_LEFT_LOGICAL if y < 32 => x << y,
-                    op::SHIFT_RIGHT_LOGICAL if y < 32 => x >> y,
-                    op::SHIFT_RIGHT_ARITHMETIC if y < 32 => ((x as i32) >> y) as u32,
-                    _ => return None,
+                    op::I_EQUAL => x == y,
+                    op::I_NOT_EQUAL => x != y,
+                    op::U_LESS_THAN => x < y,
+                    _ => x >= y,
                 };
-                return u32r(self, u64::from(r));
+                Some(self.kb(r))
             }
-            // identities
-            let (l, r) = (n.args[0], n.args[1]);
-            match (o, a.map(|x| x as u32), b.map(|x| x as u32)) {
-                (op::I_ADD | op::BITWISE_OR | op::BITWISE_XOR, Some(0), _) => return Some(r),
-                (op::I_ADD | op::BITWISE_OR | op::BITWISE_XOR | op::I_SUB, _, Some(0)) => return Some(l),
-                (op::SHIFT_LEFT_LOGICAL | op::SHIFT_RIGHT_LOGICAL | op::SHIFT_RIGHT_ARITHMETIC, _, Some(0)) => {
-                    return Some(l);
-                }
-                (op::BITWISE_AND, Some(0), _) | (op::BITWISE_AND, _, Some(0)) => return u32r(self, 0),
-                (op::BITWISE_AND, Some(u32::MAX), _) => return Some(r),
-                (op::BITWISE_AND, _, Some(u32::MAX)) => return Some(l),
-                (op::I_MUL, Some(1), _) => return Some(r),
-                (op::I_MUL, _, Some(1)) => return Some(l),
-                (op::I_MUL, Some(0), _) | (op::I_MUL, _, Some(0)) => return u32r(self, 0),
-                _ => {}
-            }
+            _ => None,
         }
-        if ty == Ty::U64 && n.args.len() == 2 && o == op::I_ADD {
-            if let (Some(x), Some(y)) = (a, b) {
-                return Some(self.f.konst(Ty::U64, x.wrapping_add(y)));
-            }
-            if b == Some(0) {
-                return Some(n.args[0]);
-            }
-            if a == Some(0) {
-                return Some(n.args[1]);
-            }
-        }
-        if ty == Ty::BOOL {
-            match o {
-                op::LOGICAL_AND => match (a, b) {
-                    (Some(0), _) | (_, Some(0)) => return Some(self.kb(false)),
-                    (Some(_), _) => return Some(n.args[1]),
-                    (_, Some(_)) => return Some(n.args[0]),
-                    _ if n.args[0] == n.args[1] => return Some(n.args[0]),
-                    _ => {}
-                },
-                op::LOGICAL_OR => match (a, b) {
-                    (Some(1), _) | (_, Some(1)) => return Some(self.kb(true)),
-                    (Some(_), _) => return Some(n.args[1]),
-                    (_, Some(_)) => return Some(n.args[0]),
-                    _ if n.args[0] == n.args[1] => return Some(n.args[0]),
-                    _ => {}
-                },
-                op::LOGICAL_NOT => {
-                    if let Some(x) = a {
-                        return Some(self.kb(x == 0));
-                    }
-                    if let Op::Spv(op::LOGICAL_NOT) = self.f.node(n.args[0]).op {
-                        return Some(self.f.node(n.args[0]).args[0]);
-                    }
-                }
-                op::LOGICAL_NOT_EQUAL => {
-                    if let (Some(x), Some(y)) = (a, b) {
-                        return Some(self.kb(x != y));
-                    }
-                    if a == Some(0) {
-                        return Some(n.args[1]);
-                    }
-                    if b == Some(0) {
-                        return Some(n.args[0]);
-                    }
-                }
-                op::I_EQUAL | op::I_NOT_EQUAL | op::U_LESS_THAN | op::U_GREATER_THAN_EQUAL => {
-                    if let (Some(x), Some(y)) = (a, b) {
-                        let r = match o {
-                            op::I_EQUAL => x == y,
-                            op::I_NOT_EQUAL => x != y,
-                            op::U_LESS_THAN => x < y,
-                            _ => x >= y,
-                        };
-                        return Some(self.kb(r));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if (o == op::U_CONVERT || o == op::S_CONVERT)
-            && let Some(x) = a
-        {
-            let from = self.f.ty(n.args[0]);
-            let bits = match from.s {
-                S::U8 => 8,
-                S::U16 => 16,
-                S::U32 => 32,
-                _ => 64,
-            };
-            let x = if o == op::S_CONVERT && bits < 64 && (x >> (bits - 1)) & 1 != 0 { x | (!0u64 << bits) } else { x };
-            let mask = match ty.s {
-                S::U8 => 0xFF,
-                S::U16 => 0xFFFF,
-                S::U32 => 0xFFFF_FFFF,
-                _ => u64::MAX,
-            };
-            return Some(self.f.konst(ty, x & mask));
-        }
-        if o == op::SELECT {
-            if let Some(cv) = a {
-                return Some(if cv != 0 { n.args[1] } else { n.args[2] });
-            }
-            if n.args[1] == n.args[2] {
-                return Some(n.args[1]);
-            }
-        }
-        if o == op::BITCAST && n.args.len() == 1 {
-            return self.fold_bitcast(n);
-        }
-        None
+    }
+
+    /// A width conversion of a constant.
+    fn fold_convert(&mut self, o: u16, n: &Node, x: u64) -> V {
+        let bits = |s: S| match s {
+            S::U8 => 8,
+            S::U16 => 16,
+            S::U32 => 32,
+            _ => 64,
+        };
+        let from = bits(self.f.ty(n.args[0]).s);
+        let x = if o == op::S_CONVERT && from < 64 && (x >> (from - 1)) & 1 != 0 { x | (!0u64 << from) } else { x };
+        let to = bits(n.ty.s);
+        let mask = if to == 64 { u64::MAX } else { (1u64 << to) - 1 };
+        self.f.konst(n.ty, x & mask)
     }
 
     /// A bitcast of a value of the same type, of a scalar constant, or of a
@@ -1052,26 +1063,7 @@ impl<'a> Lift<'a> {
         let p = self.p;
         // Blocks in dominator-tree preorder: a block's dominators first, so
         // pure values are shared down the tree (one CSE scope per block).
-        let order = ir::reverse_postorder(&p.blocks);
-        let mut index = vec![usize::MAX; p.blocks.len()];
-        for (i, &b) in order.iter().enumerate() {
-            index[b] = i;
-        }
-        let idom = ir::idoms(&p.blocks, &order, &index);
-        let mut children = vec![Vec::new(); p.blocks.len()];
-        for &b in order.iter().skip(1) {
-            if idom[b] != usize::MAX {
-                children[idom[b]].push(b);
-            }
-        }
-        let mut pre = Vec::new();
-        let mut stack = vec![order[0]];
-        while let Some(b) = stack.pop() {
-            pre.push(b);
-            for &c in children[b].iter().rev() {
-                stack.push(c);
-            }
-        }
+        let (pre, idom) = dom_preorder(p);
         self.done = vec![None; p.blocks.len()];
         let mut scopes: Vec<(usize, usize)> = Vec::new();
         for &b in &pre {
@@ -1083,99 +1075,120 @@ impl<'a> Lift<'a> {
                 scopes.pop();
             }
             scopes.push((b, self.undo.len()));
-            self.cur = Vec::new();
-            // loads are not shared across blocks
-            self.epoch += 1;
-            // Phis: lane masks and SCC as booleans, data as f32 when every
-            // value known so far is f32 (back edges convert), else u32.
-            let mut phis = Vec::new();
-            for phi in &p.blocks[b].phis {
-                let mask = matches!(phi.reg, Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1)
-                    || phi.reg == Reg::Scc;
-                let known: Vec<R> = phi.args.iter().filter_map(|a| self.vals.get(a).copied()).collect();
-                let mask = mask || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
-                let ty = if mask {
-                    Ty::BOOL
-                } else if self.floaty.get(&phi.value).copied().unwrap_or(0) > 0 {
-                    Ty::F32
-                } else {
-                    Ty::U32
-                };
-                let x = self.f.push(Node { op: Op::Phi, ty, args: vec![u32::MAX; phi.args.len()], imm: Vec::new() });
-                phis.push(x);
-                let r = if phi.reg == Reg::Scc {
-                    R::B(x)
-                } else if mask {
-                    let half = match phi.reg {
-                        Reg::S(c) if c == ir::VCC + 1 || c == ir::EXEC + 1 => Half::Hi,
-                        _ => Half::Lo,
-                    };
-                    R::M(x, if self.wave64 { half } else { Half::Lo })
-                } else {
-                    R::D(x)
-                };
-                self.vals.insert(phi.value, r);
-            }
-            self.all_phis[b] = phis;
-            self.made[b] = true;
-            // Edges from blocks lifted before: their values, converted at
-            // the end of each source.
-            for (k, &q) in p.blocks[b].preds.iter().enumerate() {
-                if self.done[q].is_some() {
-                    let saved_cur = std::mem::take(&mut self.cur);
-                    self.cur = std::mem::take(&mut self.done[q].as_mut().unwrap().body);
-                    self.no_cse = true;
-                    let r = self.edge_k(q, b, k);
-                    self.no_cse = false;
-                    self.done[q].as_mut().unwrap().body = std::mem::replace(&mut self.cur, saved_cur);
-                    r?;
-                }
-            }
-        let n = p.blocks[b].insts.len();
-            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                self.site = (b, i);
-                if i + 1 == n && matches!(p.blocks[b].exit, Exit::Branch { .. }) {
-                    break;
-                }
-                self.inst(inst)?;
-            }
-            self.close();
-            // terminator
-            let term = match p.blocks[b].exit {
-                Exit::Jump(t) => {
-                    self.edge(b, t)?;
-                    Term::Jump(t)
-                }
-                Exit::Branch { taken, not_taken } => {
-                    let inst = p.blocks[b].insts.last().unwrap();
-                    self.site = (b, n - 1);
-                    let c = self.branch_cond(inst)?;
-                    self.edge(b, taken)?;
-                    self.edge(b, not_taken)?;
-                    Term::Branch(c, taken, not_taken)
-                }
-                Exit::End => {
-                    if self.native.stage == HwStage::Ps && !self.f.blocks.is_empty() || self.native.stage == HwStage::Ps
-                    {
-                        // Lanes not in EXEC at the end are killed.
-                        if let Some(inst) = p.blocks[b].insts.last() {
-                            if inst.read(Reg::S(ir::EXEC)).is_some() {
-                                let a = self.active(inst)?;
-                                self.kill_inactive(a);
-                            }
-                        }
-                    }
-                    Term::Return
-                }
-                Exit::Indirect => {
-                    return Err(unsupported(p.blocks[b].offset, "an indirect jump (s_setpc_b64)"));
-                }
-            };
-            let body = std::mem::take(&mut self.cur);
-            self.done[b] = Some(tir::Block { phis: self.all_phis[b].clone(), preds: p.blocks[b].preds.clone(), body, term });
+            self.lift_block(b)?;
         }
-        // Phi args of edges from blocks never reached.
-        for b in 0..p.blocks.len() {
+        self.fill_unreached();
+        // Unreachable blocks (none from reverse postorder) become returns.
+        self.f.blocks = std::mem::take(&mut self.done)
+            .into_iter()
+            .map(|b| b.unwrap_or(tir::Block { phis: Vec::new(), preds: Vec::new(), body: Vec::new(), term: Term::Return }))
+            .collect();
+        Ok((self.f, self.iface))
+    }
+
+    fn lift_block(&mut self, b: usize) -> Res<()> {
+        let p = self.p;
+        self.cur = Vec::new();
+        // loads are not shared across blocks
+        self.epoch += 1;
+        self.block_phis(b);
+        self.made[b] = true;
+        // Edges from blocks lifted before: their values, converted at
+        // the end of each source.
+        for (k, &q) in p.blocks[b].preds.iter().enumerate() {
+            if self.done[q].is_some() {
+                let saved_cur = std::mem::take(&mut self.cur);
+                self.cur = std::mem::take(&mut self.done[q].as_mut().unwrap().body);
+                self.no_cse = true;
+                let r = self.edge_k(q, b, k);
+                self.no_cse = false;
+                self.done[q].as_mut().unwrap().body = std::mem::replace(&mut self.cur, saved_cur);
+                r?;
+            }
+        }
+        let n = p.blocks[b].insts.len();
+        let branch = matches!(p.blocks[b].exit, Exit::Branch { .. });
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            self.site = (b, i);
+            if i + 1 == n && branch {
+                break;
+            }
+            self.inst(inst)?;
+        }
+        self.close();
+        let term = self.terminator(b)?;
+        let body = std::mem::take(&mut self.cur);
+        self.done[b] = Some(tir::Block { phis: self.all_phis[b].clone(), preds: p.blocks[b].preds.clone(), body, term });
+        Ok(())
+    }
+
+    /// Phis: lane masks and SCC as booleans, data as f32 when every value
+    /// known so far is f32 (back edges convert), else u32.
+    fn block_phis(&mut self, b: usize) {
+        let mut phis = Vec::new();
+        let p = self.p;
+        for phi in &p.blocks[b].phis {
+            let mask = matches!(phi.reg, Reg::S(c) if c == ir::EXEC || c == ir::EXEC + 1 || c == ir::VCC || c == ir::VCC + 1)
+                || phi.reg == Reg::Scc;
+            let known: Vec<R> = phi.args.iter().filter_map(|a| self.vals.get(a).copied()).collect();
+            let mask = mask || (!known.is_empty() && known.iter().all(|r| matches!(r, R::M(..))));
+            let ty = if mask {
+                Ty::BOOL
+            } else if self.floaty.get(&phi.value).copied().unwrap_or(0) > 0 {
+                Ty::F32
+            } else {
+                Ty::U32
+            };
+            let x = self.f.push(Node { op: Op::Phi, ty, args: vec![u32::MAX; phi.args.len()], imm: Vec::new() });
+            phis.push(x);
+            let half = match phi.reg {
+                Reg::S(c) if self.wave64 && (c == ir::VCC + 1 || c == ir::EXEC + 1) => Half::Hi,
+                _ => Half::Lo,
+            };
+            let r = match (phi.reg == Reg::Scc, mask) {
+                (true, _) => R::B(x),
+                (false, true) => R::M(x, half),
+                _ => R::D(x),
+            };
+            self.vals.insert(phi.value, r);
+        }
+        self.all_phis[b] = phis;
+    }
+
+    /// A block's terminator, after the values its edges give lifted targets.
+    fn terminator(&mut self, b: usize) -> Res<Term> {
+        let p = self.p;
+        Ok(match p.blocks[b].exit {
+            Exit::Jump(t) => {
+                self.edge(b, t)?;
+                Term::Jump(t)
+            }
+            Exit::Branch { taken, not_taken } => {
+                let inst = p.blocks[b].insts.last().unwrap();
+                self.site = (b, p.blocks[b].insts.len() - 1);
+                let c = self.branch_cond(inst)?;
+                self.edge(b, taken)?;
+                self.edge(b, not_taken)?;
+                Term::Branch(c, taken, not_taken)
+            }
+            Exit::End => {
+                // pixels: lanes not in EXEC at the end are killed
+                let last = p.blocks[b].insts.last();
+                if self.native.stage == HwStage::Ps
+                    && let Some(inst) = last.filter(|i| i.read(Reg::S(ir::EXEC)).is_some())
+                {
+                    let a = self.active(inst)?;
+                    self.kill_inactive(a);
+                }
+                Term::Return
+            }
+            Exit::Indirect => return Err(unsupported(p.blocks[b].offset, "an indirect jump (s_setpc_b64)")),
+        })
+    }
+
+    /// Phi args of edges from blocks never reached: undefined.
+    fn fill_unreached(&mut self) {
+        for b in 0..self.p.blocks.len() {
             for j in 0..self.all_phis[b].len() {
                 let node = self.all_phis[b][j];
                 let ty = self.f.ty(node);
@@ -1187,12 +1200,6 @@ impl<'a> Lift<'a> {
                 }
             }
         }
-        // Unreachable blocks (none from reverse postorder) become returns.
-        self.f.blocks = std::mem::take(&mut self.done)
-            .into_iter()
-            .map(|b| b.unwrap_or(tir::Block { phis: Vec::new(), preds: Vec::new(), body: Vec::new(), term: Term::Return }))
-            .collect();
-        Ok((self.f, self.iface))
     }
 
     fn kill_inactive(&mut self, a: V) {
