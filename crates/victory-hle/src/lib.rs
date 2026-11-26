@@ -6,6 +6,7 @@
 //! |------|----------|------------|
 //! | Windows API sets the console shares with PC | `api-ms-win-core-synch-*`, `ws2_32.dll` | host pass-through, overridden here where console behaviour differs (paths, memory) |
 //! | console-only system APIs | `xgameruntime.dll`, `xmem.dll`, `d3d12_xs.dll` | implemented here, in [`modules`] |
+//! | console DLLs that are PC DLLs under another name | `kernelx.dll` | looked up as its PC twins (`modules::twins`) |
 //! | anything else | | an unimplemented-import stub from the loader |
 //!
 //! Resolution order for every import: an implementation in [`modules`],
@@ -48,15 +49,23 @@ impl ImportResolver for HleResolver {
         // Ordinal imports look up `#n`. A title DLL's export we replace
         // comes before the DLL's own (`WithTitleDlls` asks us first).
         let name = symbol.to_string();
-        if let Some(address) =
-            registry::lookup(dll, &name).or_else(|| registry::title_override(dll, &name))
+        // A console DLL that is PC DLLs under another name (`kernelx.dll`)
+        // is looked up under those too; by name only, as ordinals differ.
+        let twins = match symbol {
+            ImportSymbol::Name { .. } => modules::twins(dll),
+            ImportSymbol::Ordinal(_) => &[],
+        };
+        let dlls = || std::iter::once(dll).chain(twins.iter().copied());
+        if let Some(address) = dlls()
+            .find_map(|d| registry::lookup(d, &name))
+            .or_else(|| registry::title_override(dll, &name))
         {
             return Resolution::Found {
                 address,
                 provenance: Provenance::Hle,
             };
         }
-        match self.host.resolve(dll, symbol) {
+        match dlls().find_map(|d| self.host.resolve(d, symbol)) {
             Some(address) => Resolution::Found {
                 address,
                 provenance: Provenance::Host,
@@ -109,6 +118,25 @@ mod tests {
             r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
             None
         );
+    }
+
+    #[test]
+    fn kernelx_imports_go_to_our_modules_then_the_pc_kernel() {
+        let r = HleResolver::default();
+        let kernelx = |n: &str| r.classify("kernelx.dll", &name(n));
+        assert_eq!(kernelx("GetModuleHandleW"), Some(Provenance::Hle));
+        assert_eq!(kernelx("CreateFileW"), Some(Provenance::Hle));
+        assert_eq!(kernelx("XMemAlloc"), Some(Provenance::Hle));
+        assert_eq!(
+            kernelx("RegisterAppStateChangeNotification"),
+            Some(Provenance::Hle)
+        );
+        assert_eq!(kernelx("Sleep"), Some(Provenance::Host));
+        assert_eq!(kernelx("RegOpenKeyExW"), Some(Provenance::Hle));
+        assert_eq!(kernelx("NotAnExport"), None);
+        // No pass-through, no host twin.
+        let strict = HleResolver::new(HostPolicy::none());
+        assert_eq!(strict.classify("kernelx.dll", &name("Sleep")), None);
     }
 
     #[test]

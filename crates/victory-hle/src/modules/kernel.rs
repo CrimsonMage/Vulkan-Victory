@@ -325,8 +325,9 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
             }
         }
     }
-    if let Some(base) = runtime::image_named(&file) {
-        return Some(base as *mut c_void);
+    let image = runtime::image_named(&file).map(|base| base as *mut c_void);
+    if let Some(module) = image.or_else(|| twin_module(&file)) {
+        return Some(module);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
     let host_dll = HostPolicy::default().allows(&file);
@@ -344,6 +345,18 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     refuse(&file);
     host::set_last_error(ERROR_MOD_NOT_FOUND);
     Some(std::ptr::null_mut())
+}
+
+/// A console DLL that is PC DLLs under another name (`kernelx.dll`) is the
+/// first of them, always loaded; `GetProcAddress` finds our overrides
+/// behind it as for any host module.
+fn twin_module(file: &str) -> Option<*mut c_void> {
+    let twin: Vec<u16> = super::twins(file)
+        .first()?
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    Some(host::get_module_handle_w(twin.as_ptr()))
 }
 
 /// Logs a DLL name the title is refused, once.
@@ -583,6 +596,8 @@ mod tests {
             ERROR_MOD_NOT_FOUND
         );
         assert!(!LoadLibraryW(w("kernel32").as_ptr()).is_null());
+        // The console's kernelx is the PC's kernel32.
+        assert_eq!(LoadLibraryA(c"kernelx.dll".as_ptr().cast()), kernel32);
         // By ordinal too (ws2_32 #4 is `connect`).
         let ws2 = LoadLibraryW(w("ws2_32.dll").as_ptr());
         assert_eq!(

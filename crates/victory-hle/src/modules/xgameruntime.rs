@@ -5,8 +5,10 @@
 //! the `*ApiImpl` functions and `XErrorReport` with `GetProcAddress`, and
 //! initialises. Each runtime API call then asks `QueryApiImpl` for a COM-style
 //! object of its area (provider and interface GUIDs), calls one method and
-//! releases it. Until an area is implemented its query fails, and the call
-//! returns that error without touching the object. An area's interface id
+//! releases it. An area we lack is asked of the PC's own runtime (the
+//! twin, `xgameruntime.dll` from Gaming Services) when there is one; Proton
+//! ships none, so there its query fails, and the call returns that error
+//! without touching the object. An area's interface id
 //! changes when its method table does, so each object answers only the ids
 //! whose slots we know. Implemented, as an offline retail console with one
 //! signed-in user: task queues and async blocks (`xasync`), the user
@@ -21,8 +23,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use super::{
     display, speech, storage, xasync, xgame, xgamesave, xgameui, xnetworking, xpackage, xstore,
@@ -217,13 +219,18 @@ pub extern "system" fn XGameRuntimeUninitialize() {
 }
 
 /// The arguments identify the title's build of the stub; not checked.
+/// The PC's runtime, if any, is initialised the same way (`pc_initialize`).
 pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
     tracing::info!(version, build, "InitializeApiImpl");
+    type Init = extern "system" fn(u64, u64) -> HRESULT;
+    pc_initialize("InitializeApiImpl", |f: Init| f(version, build));
     S_OK
 }
 
 pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
     tracing::info!(version, build, flags, "InitializeApiImplEx");
+    type Init = extern "system" fn(u64, u64, u64) -> HRESULT;
+    pc_initialize("InitializeApiImplEx", |f: Init| f(version, build, flags));
     S_OK
 }
 
@@ -237,21 +244,66 @@ pub extern "system" fn InitializeApiImplEx2(
     options: *const c_void,
 ) -> HRESULT {
     tracing::info!(version, build, flags, ?options, "InitializeApiImplEx2");
+    type Init = extern "system" fn(u64, u64, u64, *const c_void) -> HRESULT;
+    pc_initialize("InitializeApiImplEx2", |f: Init| {
+        f(version, build, flags, options)
+    });
     S_OK
 }
 
 pub extern "system" fn UninitializeApiImpl() {
     tracing::info!("UninitializeApiImpl");
+    if PC_QUERY.is_some()
+        && let Some(f) = pc::<extern "system" fn()>("UninitializeApiImpl")
+    {
+        f();
+    }
 }
 
-/// The object for an implemented (provider, interface id); others fail,
-/// each pair logged once.
+/// An export of the PC's own runtime, `xgameruntime.dll` in System32
+/// (installed with Gaming Services; Proton ships none).
+fn pc<F: Copy>(name: &str) -> Option<F> {
+    let address = crate::host::function("xgameruntime.dll", name)?;
+    // SAFETY: the caller names the export's signature (the GDK's); `F` is
+    // a function pointer, the size of an address.
+    Some(unsafe { std::mem::transmute_copy(&address) })
+}
+
+type Query = extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
+
+/// The PC runtime's `QueryApiImpl`, asked for the classes we lack; looked
+/// for once.
+static PC_QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
+    let query = pc::<Query>("QueryApiImpl");
+    match query {
+        Some(_) => tracing::info!("runtime classes we lack come from the PC's xgameruntime.dll"),
+        None => tracing::info!("no PC xgameruntime.dll: runtime classes we lack fail"),
+    }
+    query
+});
+
+/// Initialises the PC's runtime as the title initialises ours, through the
+/// same entry point with the same arguments, so that its classes work.
+fn pc_initialize<F: Copy>(name: &str, init: impl FnOnce(F) -> HRESULT) {
+    let Some(f) = PC_QUERY.and_then(|_| pc::<F>(name)) else {
+        return;
+    };
+    let hr = init(f);
+    if hr < 0 {
+        let hr = format_args!("{:#010x}", hr as u32);
+        tracing::warn!(hr, name, "the PC runtime's initialisation failed");
+    }
+}
+
+/// The object for an implemented (provider, interface id); others go to
+/// the PC's runtime if there is one, else fail. Each class (provider) we
+/// lack is logged once.
 pub extern "system" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
+    static QUERIED: Mutex<Vec<Guid>> = Mutex::new(Vec::new());
     // SAFETY: the title passes pointers to GUIDs (null is tolerated).
     let (Some(&provider), Some(&iid)) = (unsafe { provider.as_ref() }, unsafe { iid.as_ref() })
     else {
@@ -268,12 +320,14 @@ pub extern "system" fn QueryApiImpl(
         unsafe { out.write((object as *const Object).cast_mut().cast()) };
         return S_OK;
     }
+    let hr = PC_QUERY.map_or(NOT_SUPPORTED, |query| query(&provider, &iid, out));
     let mut queried = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
-    if !queried.contains(&(provider, iid)) {
-        queried.push((provider, iid));
-        tracing::warn!(%provider, %iid, "runtime API area not implemented");
+    if !queried.contains(&provider) {
+        queried.push(provider);
+        let from_pc = hr >= 0;
+        tracing::warn!(%provider, %iid, from_pc, "runtime API class not implemented here");
     }
-    NOT_SUPPORTED
+    hr
 }
 
 pub extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
