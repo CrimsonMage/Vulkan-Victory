@@ -309,7 +309,8 @@ impl Lift<'_> {
         let b = self.usrc(inst, v, 1)?;
         let s = self.usrc(inst, v, 2)?;
         let Some(sel) = self.f.as_const(s) else {
-            return Err(unsupported(off, "v_perm_b32 with a computed selector"));
+            let x = self.perm_dynamic(a, b, s);
+            return f(self, x);
         };
         // bytes 0-3 from b, 4-7 from a
         let mut x = self.k32(0);
@@ -413,10 +414,16 @@ impl Lift<'_> {
         let old = self.u32v(old);
         let lane = self.lane();
         let k31 = self.k32(31);
-        if self.wave64 && self.f.as_const(l).is_none_or(|c| c >= 32) {
+        if self.wave64_halves() && self.f.as_const(l).is_none_or(|c| c >= 32) {
             self.approx("v_writelane_b32 of a lane in the other half of a wave64");
         }
-        let lm = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);
+        // the console lane in a wave of exchanging halves
+        let (lane, lm) = if self.xwave {
+            let k63 = self.k32(63);
+            (self.console_lane(), self.spv(op::BITWISE_AND, Ty::U32, &[l, k63]))
+        } else {
+            (lane, self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]))
+        };
         let me = self.spv(op::I_EQUAL, Ty::BOOL, &[lane, lm]);
         let x = self.spv(op::SELECT, Ty::U32, &[me, s, old]);
         self.def(inst, Reg::V(reg), R::D(x));
@@ -452,7 +459,53 @@ impl Lift<'_> {
         };
         let from = self.spv(op::BITWISE_OR, Ty::U32, &[row, nib]);
         let _ = k3;
-        let r = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, from]);
+        let r = self.shuffle_live(x, from);
         f(self, r)
+    }
+
+    /// v_perm_b32 with a selector known at run time: per result byte, a
+    /// byte of {a, b} (0-7), the sign of a 16-bit half (8-11), 0 (12) or
+    /// 0xFF (13 and up).
+    fn perm_dynamic(&mut self, a: V, b: V, s: V) -> V {
+        let a64 = self.spv(op::U_CONVERT, Ty::U64, &[a]);
+        let b64 = self.spv(op::U_CONVERT, Ty::U64, &[b]);
+        let k32 = self.k32(32);
+        let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U64, &[a64, k32]);
+        let c = self.spv(op::BITWISE_OR, Ty::U64, &[hi, b64]);
+        let (k8, kff, z) = (self.k32(8), self.k32(0xFF), self.k32(0));
+        let mut x = z;
+        for k in 0..4u32 {
+            let ko = self.k32(8 * k);
+            let sb = self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[s, ko, k8]);
+            // a byte of {a, b}
+            let sh = self.spv(op::I_MUL, Ty::U32, &[sb, k8]);
+            let k63 = self.k32(63);
+            let sh = self.spv(op::BITWISE_AND, Ty::U32, &[sh, k63]);
+            let byte = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U64, &[c, sh]);
+            let byte = self.spv(op::U_CONVERT, Ty::U32, &[byte]);
+            let byte = self.spv(op::BITWISE_AND, Ty::U32, &[byte, kff]);
+            // the sign of half (sb - 8): bit 16 * (sb - 8) + 15
+            let k16 = self.k32(16);
+            let k15 = self.k32(15);
+            let k3 = self.k32(3);
+            let hsel = self.spv(op::BITWISE_AND, Ty::U32, &[sb, k3]);
+            let bit = self.spv(op::I_MUL, Ty::U32, &[hsel, k16]);
+            let bit = self.spv(op::I_ADD, Ty::U32, &[bit, k15]);
+            let sgn = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U64, &[c, bit]);
+            let sgn = self.spv(op::U_CONVERT, Ty::U32, &[sgn]);
+            let one = self.k32(1);
+            let sgn = self.spv(op::BITWISE_AND, Ty::U32, &[sgn, one]);
+            let sgn_set = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[sgn, z]);
+            let sign = self.spv(op::SELECT, Ty::U32, &[sgn_set, kff, z]);
+            let (k12, k13) = (self.k32(12), self.k32(13));
+            let is_byte = self.spv(op::U_LESS_THAN, Ty::BOOL, &[sb, k8]);
+            let is_sign = self.spv(op::U_LESS_THAN, Ty::BOOL, &[sb, k12]);
+            let is_ff = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[sb, k13]);
+            let rest = self.spv(op::SELECT, Ty::U32, &[is_ff, kff, z]);
+            let rest = self.spv(op::SELECT, Ty::U32, &[is_sign, sign, rest]);
+            let v = self.spv(op::SELECT, Ty::U32, &[is_byte, byte, rest]);
+            x = self.spv(op::BIT_FIELD_INSERT, Ty::U32, &[x, v, ko, k8]);
+        }
+        x
     }
 }

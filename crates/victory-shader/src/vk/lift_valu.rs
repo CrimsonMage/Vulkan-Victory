@@ -13,6 +13,7 @@ impl Lift<'_> {
                 name,
                 "v_readlane_b32" | "v_readfirstlane_b32" | "v_writelane_b32" | "v_permlanex16_b32" | "v_permlane16_b32"
             );
+        self.prefetch_masks(inst, name, v);
         if sgpr_out || cross {
             self.need(inst);
             let a = self.active(inst)?;
@@ -784,7 +785,11 @@ impl Lift<'_> {
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => self.op_mbcnt_lo_u32_b32(inst, name, v, a_exec),
             "v_readfirstlane_b32" => {
                 let x = self.usrc(inst, v, 0)?;
-                let r = if self.f.as_const(a_exec) == Some(1) {
+                let first = self.mask_words(a_exec).map(|(lo, hi)| self.ff1_64(lo, hi));
+                let exact = first.and_then(|l| self.wave_readlane(x, l));
+                let r = if let Some(r) = exact {
+                    r
+                } else if self.f.as_const(a_exec) == Some(1) {
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_BROADCAST_FIRST, u32::MAX), Ty::U32, vec![x])
                 } else {
                     let b = self.ballot(a_exec);
@@ -799,12 +804,16 @@ impl Lift<'_> {
             "v_readlane_b32" => {
                 let x = self.usrc(inst, v, 0)?;
                 let l = self.usrc(inst, v, 1)?;
-                if self.wave64 && self.f.as_const(l).is_none_or(|c| c >= 32) {
+                if let Some(r) = self.wave_readlane(x, l) {
+                    self.sdst(inst, &v.dst, 0, R::D(r));
+                    return Ok(());
+                }
+                if self.wave64_halves() && self.f.as_const(l).is_none_or(|c| c >= 32) {
                     self.approx("v_readlane_b32 of a lane in the other half of a wave64");
                 }
                 let k31 = self.k32(31);
                 let l = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);
-                let r = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, l]);
+                let r = self.readlane_live(x, l);
                 self.sdst(inst, &v.dst, 0, R::D(r));
                 Ok(())
             }
