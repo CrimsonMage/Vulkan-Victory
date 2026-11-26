@@ -19,6 +19,7 @@ use super::tir::{Builtin, Func, Helper, ImageClass, ImageKind, Interp, Item, Op,
 use crate::native::HwStage;
 
 /// What the module needs to know about the stage.
+#[derive(Clone)]
 pub struct Stage {
     pub stage: HwStage,
     pub local_size: [u32; 3],
@@ -27,8 +28,10 @@ pub struct Stage {
     /// Interface rows and channels to (location, component): the fixed
     /// location of each semantic (the semantic registry).
     pub locs: HashMap<(u8, u8), (u8, u8)>,
-    /// Mesh: maximum vertices and primitives.
+    /// Mesh: maximum vertices and primitives (the console's).
     pub mesh: (u32, u32),
+    /// Mesh: the console group run as several host groups.
+    pub mesh_split: Option<MeshSplit>,
     /// Iterations after which a loop gives up (the loop guard).
     pub loop_limit: u32,
     /// What the loop guard writes to identify the program.
@@ -141,7 +144,8 @@ pub struct Emit<'a> {
     /// at each.
     base: Vec<usize>,
     map_var: Id,
-    cull: Id,
+    /// Mesh split: this part's set of blocks.
+    mesh_part: Id,
     /// Inside a flat guard: its condition (effects go to the sink).
     pred: Option<Id>,
     sink: Id,
@@ -168,6 +172,9 @@ pub struct Emit<'a> {
     guard_fn: Id,
     /// The wave64 halves' exchange (emit_xchg.rs).
     xv: xchg::XchgVars,
+    /// Counted console barriers (emit_bar.rs), when `bar_counted`.
+    bar: bar::BarVars,
+    bar_counted: bool,
     g: &'a Graph,
     ctx: Vec<Ctx>,
     cons: Vec<Construct>,
@@ -228,7 +235,7 @@ impl<'a> Emit<'a> {
             bad_sel: Vec::new(),
             base: Vec::new(),
             map_var: 0,
-            cull: 0,
+            mesh_part: 0,
             pred: None,
             sink: 0,
             fwd: HashMap::new(),
@@ -245,6 +252,8 @@ impl<'a> Emit<'a> {
             spent_var: 0,
             guard_fn: 0,
             xv: Default::default(),
+            bar: Default::default(),
+            bar_counted: false,
             g,
             ctx: Vec::new(),
             cons: Vec::new(),
@@ -352,11 +361,9 @@ impl<'a> Emit<'a> {
                 self.m.op_void(op::DEMOTE_TO_HELPER_INVOCATION, &[]);
                 0
             }
-            Op::Xchg => self.xchg(args[0]),
+            Op::Xchg => self.xchg(args[0], v),
             Op::Barrier => {
-                let wg = self.c32(en::SCOPE_WORKGROUP);
-                let sem = self.c32(SEM_GROUP);
-                self.m.op_void(op::CONTROL_BARRIER, &[wg, wg, sem]);
+                self.barrier();
                 0
             }
             Op::Phi => unreachable!("guard phis are written by their guard"),
@@ -546,6 +553,7 @@ impl<'a> Emit<'a> {
         self.write_helpers();
         self.write_guard_fn();
         self.write_xchg_fn();
+        self.write_bar_fn();
         // entry point and modes
         let (model, name) = match self.st.stage {
             HwStage::Ps => (en::EXEC_FRAGMENT, "main"),
@@ -574,7 +582,7 @@ impl<'a> Emit<'a> {
                 self.m.capability(en::CAP_MESH_SHADING_EXT);
                 let [x, y, z] = self.st.local_size;
                 self.m.execution_mode(fid, en::EM_LOCAL_SIZE, &[x.max(1), y.max(1), z.max(1)]);
-                self.m.execution_mode(fid, en::EM_OUTPUT_VERTICES, &[self.st.mesh.0.max(1)]);
+                self.m.execution_mode(fid, en::EM_OUTPUT_VERTICES, &[self.mesh_vertices()]);
                 self.m.execution_mode(fid, en::EM_OUTPUT_PRIMITIVES_EXT, &[self.st.mesh.1.max(1)]);
                 self.m.execution_mode(fid, en::EM_OUTPUT_TRIANGLES_EXT, &[]);
             }
@@ -603,8 +611,13 @@ mod disp;
 mod ops;
 #[path = "emit_guard.rs"]
 mod guard;
+#[path = "emit_mesh.rs"]
+mod mesh;
+pub use mesh::MeshSplit;
 #[path = "emit_xchg.rs"]
 mod xchg;
+#[path = "emit_bar.rs"]
+mod bar;
 #[path = "emit_typed.rs"]
 mod typed;
 #[path = "emit_bvh.rs"]

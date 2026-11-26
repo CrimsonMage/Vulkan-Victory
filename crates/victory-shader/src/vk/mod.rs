@@ -16,6 +16,7 @@ pub mod pack16;
 pub mod semantics;
 pub mod spirv;
 pub mod tir;
+pub mod usage;
 
 use std::collections::HashMap;
 
@@ -25,7 +26,7 @@ use crate::{ShaderError, io};
 pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// (row, channel) -> (location, component) for the user-semantic rows of
 /// a signature part (`locs`: each row's location, from the registry).
@@ -72,6 +73,10 @@ pub struct VkShader {
     /// What the loop guard writes to the guard buffer's dword 1 when a
     /// loop of this program gives up (FNV-1a of the container).
     pub guard_id: u32,
+    /// Mesh: host groups per console group (1, or a split's parts: the
+    /// host dispatches y × `mesh_parts` groups in y, `docs/vulkan-abi.md`
+    /// section 6).
+    pub mesh_parts: u32,
 }
 
 struct SigRow {
@@ -183,11 +188,12 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         out_types,
         locs: locations(&user, &locs),
         mesh,
+        mesh_split: None,
         loop_limit: loop_limit(native.stage),
         guard_id: guard_id(container),
         no_sel: Default::default(),
     };
-    let e = emit_retrying(&f, &iface, st)?;
+    let (e, mesh_parts) = emit_mesh_fitting(&f, &iface, st)?;
     let mut interface = Vec::new();
     if native.stage == HwStage::Vs {
         interface = vertex_inputs(&isg, &e.vertex_inputs);
@@ -210,7 +216,35 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         approximate: iface.approximate.clone(),
         ir_insts,
         guard_id: guard_id(container),
+        mesh_parts,
     })
+}
+
+/// Emits the module; a mesh module over the output budget
+/// ([`usage::MESH_OUTPUT_BUDGET`]) again as a split with a window of 96
+/// vertices, then 64 (`emit_mesh.rs`). Returns the module and the host
+/// groups per console group; a module still over is returned whole (the
+/// host refuses it with the reason).
+fn emit_mesh_fitting(f: &tir::Func, iface: &lift::Interface, st: emit::Stage) -> Result<(emit::Emitted, u32), ShaderError> {
+    let budget = usage::MESH_OUTPUT_BUDGET;
+    let fits = |e: &emit::Emitted| usage::usage(&e.words).mesh_output_bytes(budget) <= u64::from(budget.bytes);
+    let e = emit_retrying(f, iface, st.clone())?;
+    // each part runs the whole program: one that writes memory cannot split
+    let writes = f.nodes.iter().any(|n| {
+        matches!(n.op, tir::Op::Store { .. } | tir::Op::Atomic(_))
+            || matches!(n.op, tir::Op::Image { kind: tir::ImageKind::Store { .. } | tir::ImageKind::Atomic(_), .. })
+    });
+    if st.stage != HwStage::Ms || writes || fits(&e) {
+        return Ok((e, 1));
+    }
+    for window in [96, 64] {
+        let Some(split) = emit::MeshSplit::for_window(st.mesh.0, window) else { continue };
+        let split_e = emit_retrying(f, iface, emit::Stage { mesh_split: Some(split), ..st.clone() })?;
+        if fits(&split_e) {
+            return Ok((split_e, split.parts()));
+        }
+    }
+    Ok((e, 1))
 }
 
 /// Loop iterations (all loops of an invocation together) after which the

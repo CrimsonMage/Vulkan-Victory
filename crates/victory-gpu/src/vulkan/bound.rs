@@ -9,7 +9,8 @@
 //! if t == 0: dst[0] = n
 //! h0, h1, h2 = src[r * stride + 0, 4, 8]; v = src[r * stride + 4 w]
 //! draws (kind 0, 1): bad if h0 >= 2^23 or h1 > 2^26 / max(h0, 1) with h0 != 0
-//! groups (kind 2, 10; mesh cuts y and z to 1):
+//! groups (kind 2, 10; mesh cuts y to min(y, 1) * parts and z to 1, parts
+//! in kind's high half: VkShader::mesh_parts, ABI v4 section 6):
 //!     bad if any count > 65535 or h0 * y > 2^21 / max(z, 1) with z != 0
 //! dst[16 + 4 t] = (r < n && !bad) ? v : 0   // records packed, words * 4 apart
 //! ```
@@ -132,9 +133,15 @@ fn bounded_word(m: &mut Module, t: &T, base: Id, w: Id, r: Id, n: Id, kind: Id) 
     let h2 = load(m, t, a2);
     let aw = word_at(m, t, base, w);
     let v = load(m, t, aw);
+    // the kind in the low half, a mesh program's parts in the high half
+    let (low, sixteen) = (m.c_u32(0xffff), m.c_u32(16));
+    let high = m.op(op::SHIFT_RIGHT_LOGICAL, t.u32, &[kind, sixteen]);
+    let parts = m.ext(glsl::U_MAX, t.u32, &[high, one]);
+    let kind = m.op(op::BITWISE_AND, t.u32, &[kind, low]);
     let mesh_k = m.c_u32(MESH);
     let mesh = m.op(op::I_EQUAL, t.bool, &[kind, mesh_k]);
-    let cut1 = m.ext(glsl::U_MIN, t.u32, &[h1, one]);
+    let y1 = m.ext(glsl::U_MIN, t.u32, &[h1, one]);
+    let cut1 = m.op(op::I_MUL, t.u32, &[y1, parts]);
     let cut2 = m.ext(glsl::U_MIN, t.u32, &[h2, one]);
     let g1 = m.op(op::SELECT, t.u32, &[mesh, cut1, h1]);
     let g2 = m.op(op::SELECT, t.u32, &[mesh, cut2, h2]);
@@ -147,7 +154,8 @@ fn bounded_word(m: &mut Module, t: &T, base: Id, w: Id, r: Id, n: Id, kind: Id) 
     let keep = m.op(op::LOGICAL_AND, t.bool, &[live, good]);
     let later = m.op(op::U_GREATER_THAN_EQUAL, t.bool, &[w, one]);
     let cut_w = m.op(op::LOGICAL_AND, t.bool, &[mesh, later]);
-    let cut_v = m.ext(glsl::U_MIN, t.u32, &[v, one]);
+    let is_y = m.op(op::I_EQUAL, t.bool, &[w, one]);
+    let cut_v = m.op(op::SELECT, t.u32, &[is_y, cut1, cut2]);
     let value = m.op(op::SELECT, t.u32, &[cut_w, cut_v, v]);
     m.op(op::SELECT, t.u32, &[keep, value, zero])
 }

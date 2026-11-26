@@ -142,6 +142,24 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: the black world: the host refused the world's and the
+  characters' mesh programs (`MS_VS_Transform*`, `MS_VS_PedTransform*`)
+  before compiling, their output memory over NVIDIA's 32 KiB. Their maxima
+  are already the true ones (128/128 in the record and in `PSV0`; one
+  vertex per thread), and Vulkan counts outputs by whole locations, so
+  narrowing vec4s or fp16 saves nothing. What was done (ABI v4): one count
+  of output memory, the specification's (primitive indices left out), in
+  `victory_shader::vk::usage`, used by the translator and the host's
+  check; culled primitives as degenerate triangles (no `CullPrimitiveEXT`);
+  programs still over (position + 16 or more locations: 810 of the 8,765
+  mesh programs, 24 of the 29 refused in runs) split into 4 host groups of
+  96 vertex slots (35 of 63 slots for the 14 with 21 locations), each
+  running the whole console group. Every mesh program now counts at most
+  32,768 bytes. Mesh groups of several waves count their console
+  barriers per subgroup (the NGG code for a culled group has its first
+  wave take an extra `s_barrier`, which an `OpControlBarrier` left waiting
+  for waves that had ended: the likely hang of `MS_VS_OctaSLODFire`, vk43b),
+  and exchanges wait at most 2^10 polls, once per pair.
 - 2026-11-26: the zeros in streamed resources (vk17, vk35: `m_PageMap`
   0, a vtable 0) traced to xmem's filler pages. Every run made ~1,348
   fresh pages "fillers" at startup (zeros, shown at 8+ places counting

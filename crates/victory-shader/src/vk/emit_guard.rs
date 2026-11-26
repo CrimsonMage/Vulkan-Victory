@@ -48,6 +48,7 @@ impl Emit<'_> {
         self.m.label(lr);
         self.block = lr;
         self.guard_write();
+        self.leave();
         self.m.op_void(op::RETURN, &[]);
         self.m.label(lc);
         self.block = lc;

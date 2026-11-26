@@ -739,7 +739,9 @@ yet. The translator is merged at b252e39 (ABI 1, structural self-check).
     device limits before it compiles: mesh and compute group size, shared
     memory, mesh output memory and components, capabilities. A module
     over a limit is refused with a reason (`over the device: ...` in the
-    stage line).
+    stage line). The module is read, and its mesh output memory counted,
+    by the translator's own `victory_shader::vk::usage` (the count the
+    translator keeps its modules under, ABI v4 section 6).
   - `VK_EXT_shader_stencil_export` is now enabled; the translator emits
     it. `VK_KHR_fragment_shader_barycentric` is enabled when present.
   - Diagnostics builds log `Vulkan part: compiling` (flushed) and

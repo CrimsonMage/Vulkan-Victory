@@ -78,6 +78,17 @@ struct Spec {
     room: u32,
     /// Title address of the count.
     count: Option<u64>,
+    /// Mesh: host groups per console group of the program (the bounded
+    /// y count is multiplied by it), 1 otherwise.
+    parts: u32,
+}
+
+impl Spec {
+    /// The kind the bounding pass and the windows take: the parts in the
+    /// high half.
+    fn bound_kind(&self) -> u32 {
+        self.kind | self.parts << 16
+    }
 }
 
 /// Bounded records in the command buffer's scratch.
@@ -105,7 +116,7 @@ impl Windows {
     fn find(&self, spec: &Spec) -> Option<(vk::Buffer, u64)> {
         self.0.iter().find_map(|w| {
             let step = u64::from(spec.stride);
-            let inside = (w.kind, w.stride) == (spec.kind, spec.stride)
+            let inside = (w.kind, w.stride) == (spec.bound_kind(), spec.stride)
                 && spec.src >= w.first
                 && (spec.src - w.first).is_multiple_of(step)
                 && (spec.src - w.first) / step + u64::from(spec.max) <= u64::from(w.records);
@@ -168,6 +179,7 @@ fn spec(
         max: max.min(room).min(most),
         room,
         count,
+        parts: 1,
     })
 }
 
@@ -251,7 +263,7 @@ impl Rec {
         (arguments, offset): (This, u64),
         (count, count_offset): (This, u64),
     ) {
-        let Some(spec) = spec(signature, max, arguments, offset, count, count_offset) else {
+        let Some(mut spec) = spec(signature, max, arguments, offset, count, count_offset) else {
             not_yet(NotYet::Indirect);
             return;
         };
@@ -263,6 +275,13 @@ impl Rec {
             tally(3);
             skipped(false);
             return;
+        }
+        if spec.kind == MESH {
+            let Some(parts) = self.mesh_parts(b) else {
+                tally(3);
+                return;
+            };
+            spec.parts = parts;
         }
         let Some((buffer, at, counted)) = self.bounded(b, &spec) else {
             tally(3);
@@ -331,7 +350,7 @@ impl Rec {
         for v in [src, at.address, count] {
             push.extend(v.to_le_bytes());
         }
-        for v in [spec.words, spec.stride, records, spec.kind] {
+        for v in [spec.words, spec.stride, records, spec.bound_kind()] {
             push.extend(v.to_le_bytes());
         }
         let d = &b.host.device;
@@ -366,7 +385,7 @@ impl Rec {
                 self.indirect.0.remove(0);
             }
             self.indirect.0.push(Window {
-                kind: spec.kind,
+                kind: spec.bound_kind(),
                 stride: spec.stride,
                 first: spec.src,
                 records,
@@ -424,6 +443,27 @@ impl Rec {
             }
         }
         self.drawn(&format!("indirect {max} indexed {indexed}"));
+    }
+
+    /// Host groups per console group of the bound pipeline's mesh program
+    /// (`VkShader::mesh_parts`, for direct and indirect mesh draws);
+    /// `None`, counted as skipped, while it is not ready.
+    pub(super) fn mesh_parts(&self, b: &'static Backend) -> Option<u32> {
+        let Some((shaders, _)) = crate::pipeline::parts(self.pipeline) else {
+            skipped(false);
+            return None;
+        };
+        match super::link::stage_of(b, shaders, "mesh") {
+            Ok(Some(s)) => Some(s.mesh_parts.max(1)),
+            Ok(None) => {
+                skipped(false);
+                None
+            }
+            Err(waiting) => {
+                skipped(waiting);
+                None
+            }
+        }
     }
 
     fn mesh_indirect(

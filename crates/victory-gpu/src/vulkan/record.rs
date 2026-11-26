@@ -805,9 +805,12 @@ impl Rec {
             return;
         };
         // A dispatch of no groups draws nothing (it ran one group before);
+        // a split program takes `parts` host groups in y per console group;
         // counts stay within the device's mesh limits.
+        let Some(parts) = self.mesh_parts(b) else { return };
         let l = super::stages::limits(b);
-        let [x, y, z] = [x.min(l.mesh_groups[0]), y.min(l.mesh_groups[1]), z.min(l.mesh_groups[2])];
+        let y_most = l.mesh_groups[1] / parts * parts;
+        let [x, y, z] = [x.min(l.mesh_groups[0]), y.saturating_mul(parts).min(y_most), z.min(l.mesh_groups[2])];
         if x == 0 || y == 0 || z == 0 || u64::from(x) * u64::from(y) * u64::from(z) > u64::from(l.mesh_groups_total) {
             skipped(false);
             return;
