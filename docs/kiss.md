@@ -276,6 +276,15 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26: world load on Vulkan hangs the GPU (Xid 109), also with
+  indirect off. Pool garbage fixed (a map failing halfway left pages
+  showing other pages' bytes); texture quality now applied on Vulkan. The
+  per-loop guard is back (ABI v3: 2^18 compute / 2^16 other iterations,
+  a guard buffer naming the program): removing it was a mistake. Run vk31
+  named 16 looping programs, led by the *_BatchCull meshlet-culling
+  family, PS_Textured_Eight and DefragHeap; suspect the skipped wave64
+  cross-half approximations (64-bit mask ops reading one half). Still an
+  Xid 109 at ~frame 1,380.
 - 2026-11-26: merged into integrate (720b18b): per-title-queue lines on 3
   queues with card-written bottom-of-pipe values and timestamps,
   ExecuteIndirect with a bounding pass built by vk::spirv, FSR4 as a linear
