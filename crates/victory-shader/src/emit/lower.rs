@@ -2868,8 +2868,12 @@ impl<'a> Lower<'a> {
     }
 
     /// `n` dwords (1 to 4) of title memory from `lo`, `hi` (4-byte
-    /// aligned) through the directory: one load, or one per dword where
-    /// they cross a 64 KiB page edge (the next page lies anywhere).
+    /// aligned) through the directory: one load, and where they cross a
+    /// 64 KiB page edge (the next page lies anywhere) one more of the
+    /// next page's first `n - 1` dwords, from which the dwords past the
+    /// edge are taken. (One lookup of the next page, not one per dword: the
+    /// split was about 30% of the translated code of the shaders a run
+    /// uses.)
     fn pool_load(&mut self, lo: V, hi: V, n: u32) -> Vec<V> {
         let load = |l: &mut Self, lo: V, hi: V, n: u32| -> Vec<V> {
             let (h, byte) = l.pool_dword(lo, hi);
@@ -2890,13 +2894,33 @@ impl<'a> Lower<'a> {
         }
         let cross = self.page_cross(lo, n);
         let at = self.begin_guarded(Some(cross));
-        let mut split = Vec::new();
-        for k in 0..n {
-            let (lo_k, hi_k) = self.address_plus(lo, hi, 4 * k as i32);
-            split.push(load(self, lo_k, hi_k, 1)[0]);
+        // The edge (the next page's first byte), with the carry.
+        let c = self.cur;
+        let page = self.s.m.i32(0xFFFF_0000);
+        let base = self.s.m.bin(c, Bin::And, lo, page);
+        let (elo, ehi) = self.address_plus(base, hi, 0x1_0000);
+        let next = load(self, elo, ehi, n - 1);
+        // `d` dwords lie before the edge (1 to n - 1 here): dword k >= d
+        // is the next page's dword k - d.
+        let c = self.cur;
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let room = self.s.m.i32(0x1_0000);
+        let left = self.s.m.bin(c, Bin::Sub, room, within);
+        let two = self.s.m.i32(2);
+        let d = self.s.m.bin(c, Bin::LShr, left, two);
+        let mut pairs = Vec::new();
+        for k in 1..n {
+            let mut x = whole[k as usize];
+            for dk in 1..=k {
+                let at_d = self.s.m.i32(dk);
+                let is = self.s.m.cmp(c, pred::EQ, d, at_d);
+                x = self.s.m.select(c, is, next[(k - dk) as usize], x);
+            }
+            pairs.push((x, whole[k as usize]));
         }
-        let pairs: Vec<(V, V)> = split.into_iter().zip(whole).collect();
-        self.end_guarded(at, &pairs)
+        let joined = self.end_guarded(at, &pairs);
+        std::iter::once(whole[0]).chain(joined).collect()
     }
 
     /// Whether `n` dwords from the address whose low dword is `lo` cross a
@@ -2934,10 +2958,34 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(Some(whole));
         store(self, lo, hi, vals);
         self.end_guarded(at, &[]);
+        // Across the edge: this page and the next looked up once each, and
+        // each dword stored where it lies.
         let at = self.begin_guarded(Some(cross));
+        let faults = self.fault_reads;
+        let (slot_a, byte_a) = self.lookup(lo, hi, None, faults);
+        let c = self.cur;
+        let page = self.s.m.i32(0xFFFF_0000);
+        let base = self.s.m.bin(c, Bin::And, lo, page);
+        let (elo, ehi) = self.address_plus(base, hi, 0x1_0000);
+        let (slot_b, byte_b) = self.lookup(elo, ehi, None, faults);
+        let c = self.cur;
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
         for (k, &x) in vals.iter().enumerate() {
-            let (lo_k, hi_k) = self.address_plus(lo, hi, 4 * k as i32);
-            store(self, lo_k, hi_k, &[x]);
+            let k4 = self.s.m.i32(4 * k as u32);
+            let on_a = self.s.m.bin(c, Bin::Add, byte_a, k4);
+            // within + 4k - 64 KiB bytes into the next page
+            let past = self.s.m.bin(c, Bin::Add, within, k4);
+            let edge = self.s.m.i32(0x1_0000);
+            let is_b = self.s.m.cmp(c, pred::IUGE, past, edge);
+            let past = self.s.m.bin(c, Bin::Sub, past, edge);
+            let on_b = self.s.m.bin(c, Bin::Add, byte_b, past);
+            let slot = self.s.m.select(c, is_b, slot_b, slot_a);
+            let byte = self.s.m.select(c, is_b, on_b, on_a);
+            let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+            self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, iu, x, iu, iu, iu, mask, align]);
         }
         self.end_guarded(at, &[]);
     }
