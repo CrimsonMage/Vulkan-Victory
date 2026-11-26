@@ -232,6 +232,16 @@ driver errors and no new crash, and the captures look no worse.
   stops the game on any NVIDIA Xid.
 - 2026-11-25: the title's ray-tracing builder stays off: 3 of its 53 programs
   don't translate (wave64 first-lane reads); being fixed.
+- 2026-11-25: the world had rendered black since run p25: draws whose
+  pipeline was not made were dropped (3 ms budget), skipping one-off and
+  temporal passes (exposure). Never dropping stalled the title, whose own
+  watchdog crashed it ~30 s on. Answer: bake used pipelines (first-use
+  order, light: <=4 threads in game, ~1 GB RAM, released after caching),
+  before launch (`victory bake`) and at start; a bounded wait at draws.
+- 2026-11-25: DECISION (user): Vulkan direct. Translator rewritten to
+  emit SPIR-V (buffer device address for raw title addresses, descriptor
+  buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
+  until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
 - 2026-11-25: runs p21-p28. Pipeline waits (500 ms a frame) removed:
   menus ~26 fps. The physical-vs-DXGI card gap (~2.2 GB) was NVIDIA local
   memory for per-lane code-constant tables (up to 21 KB a lane x 55k
