@@ -1099,8 +1099,12 @@ range. The helpers moved to `vulkan/loose.rs`.
    `docs/vulkan-abi.md`.
 5. The rest of the earlier list: imports of committed runs only, one held
    line, `AllocateUploadMemory` blocks, MSAA draws.
-6. `record.rs` is at 1,001 lines (plan: split; the clears and the
-   diagnostics descriptions could move to `record/`).
+6. Done: the clears moved to `record/clear.rs` (record.rs at 916 lines).
+7. Card memory outside heapUsage (vk23: nvidia-smi 6.8 GB, heapUsage
+   2.9 GB). Probably shader local memory for spills, which follows the
+   pipelines bound. `VK_KHR_pipeline_executable_properties` reports bogus
+   figures. No cheap way to measure it in the process was found; the
+   translator should cut the spills (per-lane arrays).
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
