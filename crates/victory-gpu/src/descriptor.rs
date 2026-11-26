@@ -1037,6 +1037,10 @@ pub(crate) extern "system" fn create_heap(
         }
     };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::heap_created(start, size, desc.kind, visible, placed);
+    }
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
@@ -1047,7 +1051,7 @@ pub(crate) extern "system" fn create_heap(
         #[cfg(windows)]
         pending: Default::default(),
         #[cfg(windows)]
-        written: (placed && visible)
+        written: (placed && visible && !crate::vulkan::on())
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });

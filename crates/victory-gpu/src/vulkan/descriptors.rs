@@ -618,6 +618,7 @@ pub(crate) fn write(handle: u64, view: &View) {
     }
     let Some(b) = super::backend() else { return };
     let Some(h) = heaps(b) else { return };
+    let started = std::time::Instant::now();
     // The heap the slot is in, and the memory a buffer view names, are read
     // by the card.
     super::touch(handle);
@@ -674,6 +675,7 @@ pub(crate) fn write(handle: u64, view: &View) {
     };
     // SAFETY: the handle is a descriptor slot (views 32 bytes, samplers 16).
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), handle as *mut u32, words.len()) };
+    super::split(super::Split::Views, started);
 }
 
 /// A V# for a buffer view of `len` bytes at `base` (SRV or UAV words).
@@ -806,7 +808,7 @@ fn texture_words(
         let aspect = if stencil { vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
         (image.format, aspect, stencil)
     } else {
-        let f = images::color_format(view_format).unwrap_or(image.format);
+        let f = images::color_format(view_format, image.card_written).unwrap_or(image.format);
         let f = if images::format_bytes(f) == images::format_bytes(image.format) { f } else { image.format };
         (f, vk::ImageAspectFlags::COLOR, false)
     };

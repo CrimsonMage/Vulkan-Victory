@@ -590,6 +590,14 @@ struct Engine {
 }
 
 static FORCED: AtomicU64 = AtomicU64::new(0);
+/// `VICTORY_VK_COMPOSE_TEST=1` (diagnostics): the swapchain is cleared
+/// magenta under the planes, so a capture tells undrawn planes (magenta)
+/// from black plane images.
+fn compose_test() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_VK_COMPOSE_TEST").is_ok_and(|v| v == "1"))
+}
+
 /// The buffer captures are read back into.
 static READBACK: Mutex<Option<victory_vk::memory::Buffer>> = Mutex::new(None);
 /// Presents that showed at least one plane.
@@ -785,6 +793,10 @@ pub(crate) fn list_reset(list: This) {
 
 pub(crate) fn execute(queue: This, lists: &[This]) {
     let Some(b) = backend() else { return };
+    // What the title's threads wrote down into them is recorded first.
+    let t = Instant::now();
+    crate::list::join(lists);
+    split(Split::Join, t);
     let mut e = engine(b);
     let mut parts = VecDeque::new();
     for &l in lists {
@@ -798,9 +810,37 @@ pub(crate) fn execute(queue: This, lists: &[This]) {
         .entry(queue as usize)
         .or_default()
         .push_back(Item::Run(parts));
+    let t = Instant::now();
     images::flush(b);
+    split(Split::Flush, t);
+    let t = Instant::now();
     e.pump(b, false);
+    split(Split::Submit, t);
     b.changed.notify_all();
+}
+
+/// Where the title's submitting and presenting threads, the list workers
+/// and the view-creating threads spend time (the 10 s line, per frame).
+#[derive(Clone, Copy)]
+pub(crate) enum Split {
+    /// `ExecuteCommandLists` waiting for its lists to be recorded.
+    Join,
+    /// New images set up and textures filled (detiling, staging).
+    Flush,
+    /// Parts submitted.
+    Submit,
+    /// The present: planes composed, acquire, submit and present.
+    Present,
+    /// Recording on the list workers (summed over workers).
+    Record,
+    /// Descriptor writes at view creation (summed over threads).
+    Views,
+}
+
+static SPLIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn split(what: Split, since: Instant) {
+    SPLIT[what as usize].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -846,17 +886,84 @@ pub(crate) fn touch(at: u64) {
     }
 }
 
+/// A descriptor heap was made: the card reads shader-visible ones (ABI
+/// section 2: tables are the low 32 bits of their address).
+pub(crate) fn heap_created(start: u64, size: u64, kind: u32, visible: bool, placed: bool) {
+    if !visible {
+        return;
+    }
+    let below_4g = start + size <= 1 << 32;
+    if below_4g {
+        tracing::info!(start = format_args!("{start:#x}"), kb = size >> 10, kind, placed, "Vulkan: a shader-visible descriptor heap");
+    } else {
+        tracing::warn!(start = format_args!("{start:#x}"), kb = size >> 10, kind, placed, "Vulkan: a shader-visible descriptor heap above 4 GiB: tables (32-bit addresses) cannot reach it");
+    }
+    touch(start);
+}
+
 impl Memory {
-    /// Marks the region holding `at` wanted; whether it is still to import.
+    /// Marks the memory holding `at` wanted: its region, or for memory in
+    /// no region, view or pool (a committed block of the title's own
+    /// allocator, the Rust heap) the committed run of pages holding it,
+    /// as a region of its own (the D3D12 path's "loose" heaps). Whether
+    /// something is still to import.
     fn want(&mut self, at: u64) -> bool {
         match self.regions.range_mut(..=at as usize).next_back() {
-            Some((&base, r)) if at < (base + r.len) as u64 && r.import.is_none() && !r.refused => {
-                r.wanted = true;
-                true
+            Some((&base, r)) if at < (base + r.len) as u64 => {
+                if r.import.is_none() && !r.refused {
+                    r.wanted = true;
+                    return true;
+                }
+                return false;
             }
-            _ => false,
+            _ => {}
         }
+        if self.pools.iter().any(|p| p.contains(at)) {
+            return false;
+        }
+        if let Some((&v, &(len, ..))) = self.views.range(..=at as usize).next_back()
+            && at < (v + len) as u64
+        {
+            return false;
+        }
+        // Loose memory: the run of committed read-write pages around it.
+        let Some((base, len)) = committed_run(at) else {
+            if self.warned < 24 {
+                self.warned += 1;
+                tracing::warn!(at = format_args!("{at:#x}"), "Vulkan: an address the card reads is in no title memory the host knows");
+            }
+            return false;
+        };
+        // Not over a neighbour already known.
+        let clash = self.regions.range(..(base + len)).next_back().is_some_and(|(&a, r)| a + r.len > base);
+        if clash {
+            return false;
+        }
+        tracing::info!(at = format_args!("{at:#x}"), base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
+        self.regions.insert(
+            base,
+            Region {
+                len,
+                import: None,
+                refused: false,
+                wanted: true,
+            },
+        );
+        true
     }
+}
+
+/// The committed read-write run of pages holding `at` (one allocation).
+fn committed_run(at: u64) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data, filled by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a query into our own structure.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return None;
+    }
+    let rw = matches!(info.Protect & 0x1ff, 0x04 | 0x40);
+    (info.State == MEM_COMMIT && rw).then_some((info.BaseAddress as usize, info.RegionSize))
 }
 
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
@@ -1026,10 +1133,15 @@ pub(crate) use compose::Shown;
 pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     let Some(b) = backend() else { return };
     {
+        let t = Instant::now();
         images::flush(b);
+        split(Split::Flush, t);
+        let t = Instant::now();
         let mut e = engine(b);
         e.pump(b, true);
+        split(Split::Submit, t);
     }
+    let presented = Instant::now();
     memory(b).tick = frame;
     let mut sc = lock(&b.present);
     if sc.is_none() {
@@ -1098,9 +1210,10 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
     .flatten();
     let extent = s.extent;
     let bgra = matches!(s.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
+    let test = compose_test();
     let r = s.frame(&b.host, &b.timeline, |d, cmd, t| {
         let color = vk::ClearColorValue {
-            float32: [0.0, 0.0, 0.0, 1.0],
+            float32: if test { [1.0, 0.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] },
         };
         // SAFETY: the image is in TRANSFER_DST_OPTIMAL while recording;
         // the planes are drawn over the clear and leave it so.
@@ -1169,6 +1282,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[Shown]) {
         }
     }
     drop(sc);
+    split(Split::Present, presented);
     report(b, frame);
 }
 
@@ -1182,6 +1296,21 @@ fn report(b: &Backend, frame: u64) {
         }
         *last = Some(Instant::now());
     }
+    // Per frame since the last line, in ms.
+    static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+    let frames = frame.saturating_sub(LAST_FRAME.swap(frame, Ordering::Relaxed)).max(1);
+    let per = |i: usize| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames as f64;
+    let ms = [per(0), per(1), per(2), per(3), per(4), per(5)];
+    tracing::info!(
+        frames,
+        join_ms = format_args!("{:.1}", ms[0]),
+        flush_ms = format_args!("{:.1}", ms[1]),
+        submit_ms = format_args!("{:.1}", ms[2]),
+        present_ms = format_args!("{:.1}", ms[3]),
+        record_ms = format_args!("{:.1}", ms[4]),
+        views_ms = format_args!("{:.1}", ms[5]),
+        "Vulkan: frame time split (ms a frame; record and views summed over threads)"
+    );
     let (flights, held) = {
         let e = engine(b);
         (

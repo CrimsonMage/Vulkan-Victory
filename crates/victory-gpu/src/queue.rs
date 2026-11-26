@@ -347,8 +347,6 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::vulkan::on() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        // What the title's threads wrote down into them is recorded first.
-        crate::list::join(lists);
         crate::vulkan::execute(this, lists);
         return;
     }

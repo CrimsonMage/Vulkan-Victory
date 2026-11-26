@@ -721,6 +721,7 @@ fn translate_vulkan(list: This, stream: &[u64]) -> (u64, bool) {
     let Some(b) = crate::vulkan::backend_for_recording() else {
         return (0, false);
     };
+    let started = std::time::Instant::now();
     let mut rec = record::take(list);
     let (mut i, mut calls, mut reset) = (0, 0, false);
     let slice = |w: &[u64], from: usize, n: usize| -> &[u32] {
@@ -859,6 +860,7 @@ fn translate_vulkan(list: This, stream: &[u64]) -> (u64, bool) {
         }
     }
     record::put(list, rec);
+    crate::vulkan::split(crate::vulkan::Split::Record, started);
     (calls, reset)
 }
 

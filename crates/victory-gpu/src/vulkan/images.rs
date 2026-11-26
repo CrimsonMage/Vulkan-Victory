@@ -193,16 +193,19 @@ pub(crate) fn reads_stencil(dxgi: u32) -> bool {
     matches!(dxgi, 21 | 47 | 120)
 }
 
-/// The Vulkan format of a title (colour) format, with the stand-ins the
-/// card needs (`resource::target_format`).
-pub(crate) fn color_format(dxgi: u32) -> Option<vk::Format> {
+/// The Vulkan format of a title (colour) format; for textures the card
+/// writes (`stand_in`), with the stand-ins the card needs to render to
+/// them (`resource::target_format`). Textures the title fills keep their
+/// own format, so their texels copy as they are.
+pub(crate) fn color_format(dxgi: u32, stand_in: bool) -> Option<vk::Format> {
     let pc = crate::resource::pc_format(dxgi);
-    let stand_in = match pc {
-        86 | 115 => 28,
-        67 => 10,
+    let pc = match pc {
+        86 | 115 if stand_in => 28,
+        67 if stand_in => 10,
+        115 => return Some(vk::Format::A4R4G4B4_UNORM_PACK16),
         other => other,
     };
-    victory_vk::gfx10::from_dxgi(stand_in)
+    victory_vk::gfx10::from_dxgi(pc)
 }
 
 #[derive(Default)]
@@ -382,10 +385,11 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc) -> Option<Arc<I
 
 fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc) -> Option<Image> {
     let depth = key.depth;
+    let card_written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0;
     let format = if depth {
         depth_format(desc.format)?
     } else {
-        color_format(desc.format)?
+        color_format(desc.format, card_written)?
     };
     let (kind, extent, layers) = match desc.dimension {
         TEXTURE_1D => (vk::ImageType::TYPE_1D, vk::Extent3D { width: key.width, height: 1, depth: 1 }, u32::from(key.depth_or_array)),
@@ -401,7 +405,6 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc) -> Option<
         0 => full,
         n => u32::from(n).min(full),
     };
-    let card_written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0;
     let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
     if depth {
         usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
@@ -860,7 +863,8 @@ pub(crate) fn format_bytes(f: vk::Format) -> u32 {
         | F::R16_SINT
         | F::D16_UNORM
         | F::R5G6B5_UNORM_PACK16
-        | F::A1R5G5B5_UNORM_PACK16 => 2,
+        | F::A1R5G5B5_UNORM_PACK16
+        | F::A4R4G4B4_UNORM_PACK16 => 2,
         F::R8_UNORM | F::R8_UINT | F::R8_SNORM | F::R8_SINT => 1,
         _ => 0,
     }

@@ -211,7 +211,16 @@ pub(crate) fn lookup(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
     match q.states.get(&shader.full) {
         Some(State::Done(s)) if s.part.is_some() => Lookup::Ready(s.clone()),
         Some(State::Done(_) | State::Failed) => Lookup::Failed,
-        Some(State::Queued) => Lookup::Waiting,
+        Some(State::Queued) => {
+            // Queued at creation, behind the catalog: a draw wants it now.
+            if let Some(i) = q.todo.iter().position(|s| s.full == shader.full)
+                && i > 0
+                && let Some(s) = q.todo.remove(i)
+            {
+                q.todo.push_front(s);
+            }
+            Lookup::Waiting
+        }
         None => {
             q.states.insert(shader.full, State::Queued);
             q.todo.push_front(shader.clone());
@@ -281,6 +290,8 @@ fn queue() -> std::sync::MutexGuard<'static, Option<Queue>> {
 /// Totals since the start: translated, failed, unsupported, modules,
 /// parts, translate µs, module µs, part µs, SPIR-V words.
 static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Per kind (pre-rasterisation, fragment, compute): parts, µs, slowest µs.
+static KINDS: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
 /// Failure reasons and how often.
 static REASONS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
@@ -503,7 +514,19 @@ fn make(b: &Backend, shader: &Shader) -> State {
                 "Vulkan part: compiled"
             );
         }
-        STATS[7].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let us = t.elapsed().as_micros() as u64;
+        STATS[7].fetch_add(us, Ordering::Relaxed);
+        let kind = match vs.stage {
+            HwStage::Ps => 1,
+            HwStage::Cs => 2,
+            _ => 0,
+        };
+        KINDS[kind][0].fetch_add(1, Ordering::Relaxed);
+        KINDS[kind][1].fetch_add(us, Ordering::Relaxed);
+        KINDS[kind][2].fetch_max(us, Ordering::Relaxed);
+        if us > 2_000_000 {
+            tracing::info!(stage = ?vs.stage, hash = %hash, ms = us / 1000, words = vs.spirv.len(), "Vulkan: a slow part compile");
+        }
         match p {
             Ok(p) => {
                 STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -690,8 +713,10 @@ fn compile(
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .flags(
-                db | vk::PipelineCreateFlags::LIBRARY_KHR
-                    | vk::PipelineCreateFlags::RETAIN_LINK_TIME_OPTIMIZATION_INFO_EXT,
+                // No RETAIN_LINK_TIME_OPTIMIZATION_INFO: no optimised link is
+                // made yet, and keeping that information costs the driver
+                // a full compile per part.
+                db | vk::PipelineCreateFlags::LIBRARY_KHR,
             )
             .stages(&stages)
             .layout(layout.pipeline)
@@ -740,6 +765,10 @@ pub(crate) fn report() {
         translate_ms_avg = format_args!("{:.2}", per(s[5], s[0] + s[1])),
         module_ms_avg = format_args!("{:.2}", per(s[6], s[3])),
         part_ms_avg = format_args!("{:.2}", per(s[7], s[4])),
+        pre_raster_ms_avg = format_args!("{:.1}", per(KINDS[0][1].load(Ordering::Relaxed), KINDS[0][0].load(Ordering::Relaxed))),
+        fragment_ms_avg = format_args!("{:.1}", per(KINDS[1][1].load(Ordering::Relaxed), KINDS[1][0].load(Ordering::Relaxed))),
+        compute_ms_avg = format_args!("{:.1}", per(KINDS[2][1].load(Ordering::Relaxed), KINDS[2][0].load(Ordering::Relaxed))),
+        slowest_ms = [0, 1, 2].map(|k| KINDS[k][2].load(Ordering::Relaxed) / 1000).iter().max().copied().unwrap_or(0),
         spirv_kwords = s[8] / 1000,
         translator_abi = victory_shader::vk::ABI_VERSION,
         host_abi = HOST_ABI,

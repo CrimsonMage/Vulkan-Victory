@@ -237,7 +237,7 @@ fn target_view(b: &Backend, r: &RtvRecord, depth: bool) -> Option<(Arc<Image>, v
     let format = if image.depth() {
         image.format
     } else {
-        let f = if format_word == 0 { None } else { images::color_format(format_word) };
+        let f = if format_word == 0 { None } else { images::color_format(format_word, image.card_written) };
         f.filter(|f| images::format_bytes(*f) == images::format_bytes(image.format)).unwrap_or(image.format)
     };
     let mip = mip.min(image.mips - 1);
@@ -276,7 +276,7 @@ static PARTS: Mutex<Option<HashMap<(Vec<(u32, u32, vk::Format, u32)>, [vk::Forma
     Mutex::new(None);
 
 fn library_flags(b: &Backend) -> vk::PipelineCreateFlags {
-    let mut f = vk::PipelineCreateFlags::LIBRARY_KHR | vk::PipelineCreateFlags::RETAIN_LINK_TIME_OPTIMIZATION_INFO_EXT;
+    let mut f = vk::PipelineCreateFlags::LIBRARY_KHR;
     if b.host.caps.descriptor_buffer {
         f |= vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT;
     }
