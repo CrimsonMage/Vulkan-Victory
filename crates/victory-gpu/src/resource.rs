@@ -809,6 +809,14 @@ pub(crate) struct ResourceDesc1 {
 }
 const _: () = assert!(size_of::<ResourceDesc1>() == 72);
 
+impl ResourceDesc {
+    /// Width and height in texels (a buffer's width is its bytes).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn extent(&self) -> (u32, u32) {
+        (self.width.min(u64::from(u32::MAX)) as u32, self.height)
+    }
+}
+
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
 pub(crate) struct AllocationInfo1 {

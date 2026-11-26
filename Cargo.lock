@@ -701,6 +701,7 @@ dependencies = [
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
+ "victory-vk",
  "windows",
  "windows-sys",
  "zlib-rs",

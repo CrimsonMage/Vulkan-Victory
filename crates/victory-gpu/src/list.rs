@@ -362,6 +362,9 @@ fn cut(this: This, wait: ValueWait) {
     if this.is_null() {
         return;
     }
+    if crate::vulkan::on() {
+        return crate::vulkan::list_wait(this, wait);
+    }
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -692,6 +695,10 @@ extern "system" fn list_release(this: This) -> u32 {
     // until then. (Each release asks; an idle stream answers at once.)
     #[cfg(windows)]
     thin::release(this);
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::list_reset(this);
+    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -716,6 +723,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        crate::vulkan::list_reset(this);
+    }
     #[cfg(windows)]
     {
         // SAFETY: the title passes one of our lists, and neither records
@@ -2181,6 +2192,10 @@ fn value_written(this: This, address: u64, value: u64) {
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
+    }
+    #[cfg(windows)]
+    if crate::vulkan::on() {
+        return crate::vulkan::list_write(this, address, what, bytes);
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {

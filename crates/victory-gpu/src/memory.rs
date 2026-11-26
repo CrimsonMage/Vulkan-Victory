@@ -771,6 +771,9 @@ static RESERVATIONS: RwLock<BTreeMap<u64, (u64, bool)>> = RwLock::new(BTreeMap::
 
 /// `xmem` reserved `[at, at + len)` for physical pages (a placeholder).
 pub fn page_reservation(at: usize, len: usize) {
+    if crate::vulkan::on() {
+        return crate::vulkan::title_page_reservation(at, len);
+    }
     if len > 0 {
         RESERVATIONS.write().unwrap_or_else(|e| e.into_inner()).insert(at as u64, (at as u64 + len as u64, false));
         RESERVED.fetch_add(1, Ordering::Release);
@@ -859,6 +862,9 @@ pub(crate) fn gpu_view(at: u64, len: u64) -> bool {
 /// made there. The pages' entries follow; textures and windows over the
 /// range see it remapped, and unmapped memory is let go.
 pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
+    if crate::vulkan::on() {
+        return crate::vulkan::title_pages_aliased(to, pages);
+    }
     let (to, len) = (to as u64, pages.len() as u64 * PAGE);
     if len == 0 {
         return;

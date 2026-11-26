@@ -48,6 +48,9 @@ pub fn title_memory_released(at: usize, len: usize) {
     if len == 0 || (at as u64) >= 1 << 40 {
         return;
     }
+    if crate::vulkan::on() {
+        return crate::vulkan::title_memory_released(at, len);
+    }
     let [n, bytes, staged, held] = crate::resource::released(at, len);
     GONE[0].fetch_add(n, Relaxed);
     GONE[1].fetch_add(bytes, Relaxed);
