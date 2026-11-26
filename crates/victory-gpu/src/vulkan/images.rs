@@ -107,6 +107,10 @@ pub(crate) struct Image {
     views: Mutex<Vec<(ViewKey, vk::ImageView)>>,
     /// A fill is queued.
     pending: AtomicBool,
+    /// The ticket of the last submission of ours that names it (its
+    /// set-up and fills): it is destroyed only once the card is past both
+    /// that and the ticket it was dropped at.
+    pub(crate) last_use: AtomicU64,
     /// Not yet in GENERAL (the next flush moves and clears it).
     fresh: AtomicBool,
     /// Diagnostics: draws into it as an attachment, clears, copies into it,
@@ -641,6 +645,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         bytes,
         views: Mutex::new(Vec::new()),
         pending: AtomicBool::new(false),
+        last_use: AtomicU64::new(0),
         fresh: AtomicBool::new(true),
         written: [const { AtomicU64::new(0) }; 4],
         hash: AtomicU64::new(0),

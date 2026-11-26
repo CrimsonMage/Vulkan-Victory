@@ -67,10 +67,27 @@ pub(crate) fn flush(b: &Backend) {
     for img in done {
         destroy(b, &img);
     }
-    if !pending.is_empty() {
-        set_up(b, &pending);
+    // At most FILL_BATCH bytes of fills a submission: one submission of a
+    // world load's thousands of fills held the card for over a second
+    // (vk60, vk61: the title's next submission waited on it).
+    let mut batch: Vec<Arc<Image>> = Vec::new();
+    let mut bytes = 0u64;
+    for img in pending {
+        bytes += img.bytes;
+        batch.push(img);
+        if bytes >= FILL_BATCH {
+            set_up(b, &std::mem::take(&mut batch));
+            bytes = 0;
+        }
+    }
+    if !batch.is_empty() {
+        set_up(b, &batch);
     }
 }
+
+/// Bytes of fills one set-up submission takes at most (one image may be
+/// bigger).
+const FILL_BATCH: u64 = 32 << 20;
 
 /// Staging buffers the card is done with go.
 fn free_staging(b: &Backend, r: &mut super::Registry, completed: u64) {
@@ -87,7 +104,10 @@ fn free_staging(b: &Backend, r: &mut super::Registry, completed: u64) {
 fn finished(b: &Backend, r: &mut super::Registry, completed: u64) -> Vec<Arc<Image>> {
     let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut r.dropped)
         .into_iter()
-        .partition(|(v, i)| *v <= completed && Arc::strong_count(i) == 1);
+        // Past the drop and past its last fill: a fill submitted after the
+        // drop (the image was still pending then) must not land in freed
+        // memory (vk61: the copy engine faulted on an unmapped page).
+        .partition(|(v, i)| (*v).max(i.last_use.load(Ordering::Relaxed)) <= completed && Arc::strong_count(i) == 1);
     r.dropped = kept;
     let done: Vec<Arc<Image>> = done.into_iter().map(|(_, i)| i).collect();
     for img in &done {
@@ -129,6 +149,11 @@ fn set_up(b: &Backend, pending: &[Arc<Image>]) {
         // SAFETY: recording into the timeline's one-shot buffer.
         unsafe { record_set_up(d, cmd, &fresh, buffer, &copies) }
     });
+    if let Ok(v) = value {
+        for img in pending {
+            img.last_use.fetch_max(v, Ordering::Relaxed);
+        }
+    }
     match (value, staging) {
         (Ok(v), Some(st)) => {
             if let Some(r) = registry().as_mut() {
