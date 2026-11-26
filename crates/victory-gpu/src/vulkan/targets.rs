@@ -192,6 +192,36 @@ pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
         }
         tracing::info!(frame, at = format_args!("{:#x}", img.key.address), width = img.extent.width, height = img.extent.height, min = lo, max = hi, not_zero = some, "Vulkan: a depth image's values at the dump");
     }
+    for (n, (img, at)) in p.items.iter().enumerate().filter(|(_, (i, _))| i.format == vk::Format::R16G16B16A16_SFLOAT && i.extent.width >= 480) {
+        let count = img.extent.width as usize * img.extent.height as usize;
+        // SAFETY: as above.
+        let src = unsafe { std::slice::from_raw_parts((p.mapped as *const u8).add(*at as usize), count * 8) };
+        let (mut lo, mut hi, mut odd) = ([f32::MAX; 4], [f32::MIN; 4], [0u64; 4]);
+        for px in src.chunks_exact(8) {
+            for c in 0..4 {
+                let bits = u16::from_le_bytes([px[2 * c], px[2 * c + 1]]);
+                if bits & 0x7c00 == 0x7c00 {
+                    odd[c] += 1;
+                } else {
+                    let v = half(bits);
+                    (lo[c], hi[c]) = (lo[c].min(v), hi[c].max(v));
+                }
+            }
+        }
+        let mid = &src[(count / 2 + img.extent.width as usize / 2) * 8..][..8];
+        tracing::info!(
+            frame,
+            label = %p.label,
+            n,
+            at = format_args!("{:#x}", img.key.address),
+            width = img.extent.width,
+            min = ?lo,
+            max = ?hi,
+            inf_or_nan = ?odd,
+            centre = %mid.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "Vulkan: a half-float image's channels at the dump"
+        );
+    }
     tell_depth_uses();
     let order = std::mem::take(&mut *lock(&ORDER));
     for (n, part) in order.chunks(40).enumerate() {
