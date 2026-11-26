@@ -25,7 +25,7 @@ pub struct Stage {
     /// Output types per location: 0 float, 1 uint, 2 int.
     pub out_types: HashMap<u16, u8>,
     /// Interface rows and channels to (location, component): the fixed
-    /// location of each semantic (`super::SEMANTIC_LOCATIONS`).
+    /// location of each semantic (the semantic registry).
     pub locs: HashMap<(u8, u8), (u8, u8)>,
     /// Mesh: maximum vertices and primitives.
     pub mesh: (u32, u32),
@@ -151,7 +151,7 @@ pub struct Emit<'a> {
     cphi: HashMap<usize, Vec<Id>>,
     /// Every edge into a construct's merge so far.
     merge_preds: HashMap<Id, Vec<Id>>,
-    images: HashMap<(u8, bool, bool, bool, bool, bool, u32), Id>,
+    images: HashMap<(u8, bool, bool, bool, u32, bool, u32), Id>,
     samplers: Id,
     spec_samplers: HashMap<u32, Id>,
     helpers: HashMap<Helper, Id>,

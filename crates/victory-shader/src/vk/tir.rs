@@ -153,6 +153,9 @@ pub struct ImageClass {
     /// Sampled type and binding chosen at run time from the T#'s word 7
     /// (INTEGER, STORAGE bits).
     pub dynamic: bool,
+    /// A cube read as its six-layer 2D array (set 0 binding 2): for
+    /// derivatives and offsets, which apply per face.
+    pub cube_layers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

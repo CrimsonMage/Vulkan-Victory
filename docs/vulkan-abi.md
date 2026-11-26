@@ -1,7 +1,9 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v1** (2026-11-26; v0 2026-11-25; v1 amended the same day:
-immediate samplers in set 1 by specialization constant, change 8). v1 takes the host's
+Status: **v2** (2026-11-26: semantic registry, six-layer 2D-array views of
+cubes on set 0 binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
+amended the same day: immediate samplers in set 1 by specialization
+constant, change 8). v1 takes the host's
 proposals (`docs/vulkan-host.md` section 6). Owner of the translator side:
 `crates/victory-shader/src/vk/`. Owner of the host side: the Vulkan host
 (branch `worktree-agent-a5b010d38d592dbd0`). Change this file first, then
@@ -25,7 +27,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 1`
+`ABI_VERSION = 2`
 
 ## 1. Vulkan requirements
 
@@ -165,6 +167,7 @@ the shader.
 |---|---|---|---|
 | 0 | 0 | `SAMPLED_IMAGE[1 << 20]` | image views, indexed by a T#'s slot |
 | 0 | 1 | `STORAGE_IMAGE[1 << 20]` | storage views of UAV textures, indexed by the same slot |
+| 0 | 2 | `SAMPLED_IMAGE[1 << 20]` | cube and cube-array images as `VK_IMAGE_VIEW_TYPE_2D_ARRAY` views (6 × N layers), indexed by the same slot; other slots may stay unwritten |
 | 1 | 0 | `SAMPLER[4096]` | heap samplers, indexed by an S#'s slot; immediate samplers in slots the host reserves |
 | 3 | 0 | `UNIFORM_BUFFER` | the memory map (section 3) |
 
@@ -181,7 +184,18 @@ past them.
 The translator declares several variables on bindings 0 and 1, one per
 image type it uses (1D, 2D, 3D, cube, arrays, multisampled; float or
 uint sampled type), aliasing the same descriptors. The host writes the
-view whose `viewType` matches the T#'s TYPE.
+view whose `viewType` matches the T#'s TYPE. For a cube (TYPE cube) it also
+writes binding 2 with the image's 2D-array view: the translator reads a
+cube there as `OpTypeImage %float 2D Depth=0|1 Arrayed=1 MS=0 Sampled=1`
+where a cube cannot serve: samples with derivatives (`_d`, `_cd`) or texel
+offsets (`_o`), at (s − 1, t − 1, slice · 6 + face) from the console's
+(s, t in [1, 2], face = slice · 8 + face), and image loads (texel fetches).
+Other cube samples use binding 0's cube view (filtering across faces stays
+exact there).
+
+**Slot 0 is the null image** on bindings 0, 1 and 2 (a null descriptor, or
+a 1 × 1 black view where `nullDescriptor` is missing); the host never
+hands it out. A T# that fails the check word (5.2) reads slot 0.
 
 ### 5.2 T# (8 dwords)
 
@@ -189,7 +203,7 @@ The host writes image views as RDNA2 T#s (Mesa's
 `ac_build_gfx10_texture_descriptor` field positions, as Leonida's
 `gfx10_descriptors.h` `encode(const Image&)`): base address, format,
 width, height, depth, levels, layers, swizzle, type are real (the code may
-read them as numbers). WORD6 is 0. **WORD7 is the host's:**
+read them as numbers). **WORD6 and WORD7 are the host's:**
 
 ```
 WORD7  SLOT[23:0]    index into set 0 bindings 0 and 1
@@ -201,7 +215,13 @@ WORD7  SLOT[23:0]    index into set 0 bindings 0 and 1
                      (coherent with stores in the same dispatch); 0:
                      loads use OpImageFetch on binding 0.
        [31:26]       0
+WORD6  WORD7 ^ 0x7A3C5E91 (the check word)
 ```
+
+The translator uses WORD7 only when `WORD6 ^ WORD7 == 0x7A3C5E91`;
+otherwise it reads WORD7 as 0 (slot 0, the null image, float, sampled).
+T#s the title builds itself, or garbage, therefore read the null image
+instead of an arbitrary slot; a T# the title copies keeps both words.
 
 Sampling (`image_sample*`, `image_gather*`) always uses binding 0; stores
 and atomics binding 1; `image_get_resinfo` queries binding 0 (binding 1
@@ -227,15 +247,25 @@ at pipeline creation.
 
 ## 6. Stage interface
 
-- **Locations are fixed per semantic, pack-wide.** Every vertex/mesh
-  output and pixel input with semantic (name, index) has the location
-  `vk::SEMANTIC_LOCATIONS` gives it, found offline from the whole pack:
-  37 distinct semantics, at most 23 in one program, coloured so that no
-  two semantics one program uses share a location: 27 locations
-  (0..26). A semantic outside the table takes location 31. Each
-  semantic is a vec4 at its location, components as the console
-  signature's mask columns. No module is rewritten per vertex/pixel pair;
-  a pixel input no vertex output writes reads an undefined value.
+- **Locations come from the title's semantic registry.** Every
+  vertex/mesh output and pixel input with semantic (name, index) has the
+  location `vk::Semantics` assigns it: the location it got the first time
+  any program of the title used it, so every vertex/pixel pair agrees and
+  no module is rewritten per pair. A new semantic takes a location no
+  semantic holds yet (0..30), else (more than 31 in the title) the lowest
+  one no other semantic of that program holds; a program two of whose
+  semantics share a location is refused ("two semantics of the program
+  share a location in the registry"), as is one past 31 locations. The
+  registry is seeded with the first title's colouring (37 semantics in 27
+  locations) and only grows. **The host keeps it per title next to the
+  stage cache** (`Semantics::save` / `Semantics::load` on
+  `Semantics::global()`, which `vk::translate` uses; or its own registry
+  through `vk::translate_with`), loads it before the first translation and
+  saves it when it grew; `vk::semantics::SEMANTICS_VERSION` goes into the
+  cache key, and the registry and the cache are kept or dropped together.
+  Each semantic is a vec4 at its location, components as the console
+  signature's mask columns; a pixel input no vertex output writes reads an
+  undefined value.
 - **Vertex.** Most vertex programs fetch their vertices themselves with
   buffer loads (no vertex input bindings). A vertex program that calls a
   console fetch shader (`s_swappc_b64` at its start) instead reads
@@ -294,7 +324,23 @@ pub struct VkShader {
 }
 ```
 
-## 9. Open points (v0)
+## 9. Known gaps and open points
+
+Known gaps (the program translates; the result differs from the console):
+
+- Position exports past the first (`exp pos1..3`: clip and cull
+  distances) are dropped.
+- Ray/node tests (`image_bvh*_intersect_ray`) miss every node.
+- Typed buffer stores through a V#'s format are written as 32-bit
+  channels.
+- Wave64 programs run as two host subgroups: a 64-bit mask read as a
+  number (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, the high half), and
+  `v_readlane`/`v_writelane` of a lane in the other half, are taken per
+  half (`VkShader::approximate` lists them).
+- Cube samples with derivatives or offsets read the faces as a 2D array:
+  no filtering across face edges.
+
+Open points:
 
 - Typed buffer formats decoded in the shader: which formats (the title's
   `buffer_load_format_*` / `tbuffer_*` set) is measured as the backend

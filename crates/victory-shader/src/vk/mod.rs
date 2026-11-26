@@ -12,6 +12,7 @@ pub mod emit;
 pub mod graph;
 pub mod lift;
 pub mod pack16;
+pub mod semantics;
 pub mod spirv;
 pub mod tir;
 
@@ -20,69 +21,17 @@ use std::collections::HashMap;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io};
+pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
-pub const ABI_VERSION: u32 = 1;
-
-/// The location of each interface semantic (name, index), the same in
-/// every program of the pack: 37 semantics, at most 23 in one program,
-/// coloured so that no two semantics one program uses share a location
-/// (found offline from the whole pack). Others take location 31.
-pub const SEMANTIC_LOCATIONS: &[(&str, u32, u8)] = &[
-    ("TEXCOORD", 0, 0),
-    ("TEXCOORD", 1, 1),
-    ("TEXCOORD", 3, 2),
-    ("COLOR", 0, 3),
-    ("TEXCOORD", 4, 4),
-    ("COLOR", 1, 5),
-    ("TEXCOORD", 2, 6),
-    ("TEXCOORD", 9, 7),
-    ("TEXCOORD", 6, 8),
-    ("TEXCOORD", 5, 9),
-    ("TEXCOORD", 10, 10),
-    ("TEXCOORD", 7, 11),
-    ("TEXCOORD", 8, 12),
-    ("COLOR", 2, 13),
-    ("TEXCOORD", 15, 14),
-    ("TEXCOORD", 11, 15),
-    ("TEXCOORD", 20, 16),
-    ("TEXCOORD", 21, 17),
-    ("TEXCOORD", 13, 18),
-    ("TEXCOORD", 17, 19),
-    ("TEXCOORD", 14, 20),
-    ("COLOR", 3, 21),
-    ("TEXCOORD", 19, 22),
-    ("TEXCOORD", 22, 23),
-    ("TEXCOORD", 12, 24),
-    ("TEXCOORD", 16, 25),
-    ("TEXCOORD", 23, 26),
-    ("TEXCOORD", 18, 7),
-    ("NORMAL", 2, 18),
-    ("NORMAL", 0, 3),
-    ("TANGENT", 0, 10),
-    ("TEXCOORD", 24, 15),
-    ("NORMAL", 1, 5),
-    ("POSITION", 1, 7),
-    ("INSTANCEID", 0, 6),
-    ("TANGENT", 1, 3),
-    ("POSITION", 0, 1),
-];
-
-/// The location of a semantic.
-pub fn semantic_location(name: &str, index: u32) -> u8 {
-    SEMANTIC_LOCATIONS
-        .iter()
-        .find(|s| s.0.eq_ignore_ascii_case(name) && s.1 == index)
-        .map_or(31, |s| s.2)
-}
+pub const ABI_VERSION: u32 = 2;
 
 /// (row, channel) -> (location, component) for the user-semantic rows of
-/// a signature part.
-fn locations(rows: &[SigRow]) -> HashMap<(u8, u8), (u8, u8)> {
+/// a signature part (`locs`: each row's location, from the registry).
+fn locations(rows: &[&SigRow], locs: &[u8]) -> HashMap<(u8, u8), (u8, u8)> {
     let mut out = HashMap::new();
-    for r in rows.iter().filter(|r| r.sv == 0 && r.reg < 32) {
+    for (r, &loc) in rows.iter().zip(locs).filter(|(r, _)| r.reg < 32) {
         let first = r.mask.trailing_zeros().min(3) as u8;
-        let loc = semantic_location(&r.name, r.index);
         for c in 0..4u8 {
             if r.mask >> c & 1 != 0 {
                 out.insert((r.reg as u8, c), (loc, c - first));
@@ -181,8 +130,15 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates a console shader container to SPIR-V.
+/// Translates a console shader container to SPIR-V, with the process-wide
+/// semantic registry.
 pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
+    translate_with(container, Semantics::global())
+}
+
+/// Translates a console shader container to SPIR-V; interface semantics
+/// take their locations from `semantics`.
+pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShader, ShaderError> {
     let (c, native) = native(container)?;
     let p = crate::spill::build(&native)?;
     // The branches that only skip code when no lane is left for it go: the
@@ -213,17 +169,20 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
         _ => ([1, 1, 1], (0, 0)),
     };
     let out_types = if ps { pixel_out_types(&osg) } else { HashMap::new() };
-    let st = emit::Stage { stage: native.stage, local_size, out_types, locs: locations(rows), mesh, no_sel: Default::default() };
+    let user: Vec<&SigRow> = rows.iter().filter(|r| r.sv == 0).collect();
+    let names: Vec<(&str, u32)> = user.iter().map(|r| (r.name.as_str(), r.index)).collect();
+    let locs = semantics.assign(&names).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+    let st = emit::Stage { stage: native.stage, local_size, out_types, locs: locations(&user, &locs), mesh, no_sel: Default::default() };
     let e = emit_retrying(&f, &iface, st)?;
     let mut interface = Vec::new();
     if native.stage == HwStage::Vs {
         interface = vertex_inputs(&isg, &e.vertex_inputs);
     }
     // the rest is information only: locations are fixed per semantic
-    interface.extend(rows.iter().filter(|r| r.sv == 0).map(|r| Interface {
+    interface.extend(user.iter().zip(&locs).map(|(r, &location)| Interface {
         semantic: r.name.clone(),
         index: r.index,
-        location: semantic_location(&r.name, r.index),
+        location,
         input: ps,
         word: None,
     }));

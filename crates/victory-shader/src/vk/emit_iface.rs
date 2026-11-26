@@ -376,9 +376,16 @@ impl Emit<'_> {
 
     /// The same with an image format (R32ui = 33 for atomics).
     pub(super) fn image_var_f(&mut self, c: ImageClass, uint: bool, storage: bool, depth: bool, format: u32) -> (Id, Id) {
-        // cube images cannot be fetched or stored: as 2D arrays then
-        let (dim, arrayed) = if c.dim == 3 && (storage || !c.storage && c.dynamic) { (1, true) } else { (c.dim, c.arrayed) };
-        let key = (dim, arrayed, c.ms, uint, storage, depth, format);
+        // cube images cannot be fetched or stored: as 2D arrays then (the
+        // sampled ones from binding 2, the six-layer views of cubes)
+        let flat = c.dim == 3 && (storage || !c.storage && c.dynamic);
+        let (dim, arrayed) = if flat || c.cube_layers { (1, true) } else { (c.dim, c.arrayed) };
+        let binding = match storage {
+            true => 1,
+            false if flat || c.cube_layers => 2,
+            false => 0,
+        };
+        let key = (dim, arrayed, c.ms, uint, binding, depth, format);
         let sty = if uint { self.t.u32_ } else { self.t.f32_ };
         let ity = self.m.t_image_df(sty, u32::from(dim), depth, arrayed, c.ms, if storage { 2 } else { 1 }, format);
         if let Some(&v) = self.images.get(&key) {
@@ -401,7 +408,7 @@ impl Emit<'_> {
         let p = self.m.t_ptr(en::SC_UNIFORM_CONSTANT, arr);
         let v = self.m.variable(p, en::SC_UNIFORM_CONSTANT);
         self.m.decorate(v, en::DEC_DESCRIPTOR_SET, &[0]);
-        self.m.decorate(v, en::DEC_BINDING, &[u32::from(storage)]);
+        self.m.decorate(v, en::DEC_BINDING, &[binding]);
         self.interface.push(v);
         self.images.insert(key, v);
         (v, ity)

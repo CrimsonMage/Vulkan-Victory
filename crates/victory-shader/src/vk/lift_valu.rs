@@ -149,11 +149,11 @@ impl Lift<'_> {
     }
 
     pub(super) fn valu_op(&mut self, inst: &Inst, name: &'static str, v: &Valu, a_exec: V) -> Res<()> {
-        if name.starts_with("v_cmp") {
-            return self.compare(inst, name, v, a_exec);
-        }
         if v.dpp.is_some() {
             return self.dpp(inst, name, v, a_exec);
+        }
+        if name.starts_with("v_cmp") {
+            return self.compare(inst, name, v, a_exec);
         }
         let Some(part) = valu_part(name) else {
             return Err(unsupported(inst.machine.offset, name));
