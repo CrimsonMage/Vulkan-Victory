@@ -831,10 +831,6 @@ impl Rec {
         Some(cmd)
     }
 
-    pub(crate) fn not_yet(&mut self, why: NotYet) {
-        not_yet(why);
-    }
-
 }
 
 /// What the recording does not do yet (counted by kind in the 10 s line).

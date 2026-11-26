@@ -16,7 +16,7 @@ use victory_vk::ash::vk;
 use victory_vk::timeline::Recording;
 
 use super::engine::Write;
-use super::{Backend, backend, images, memory};
+use super::{Backend, images, memory};
 use crate::queue::Written;
 
 /// Timestamp queries, used in turn (a slot is reused after this many).
@@ -128,9 +128,3 @@ unsafe fn timestamp(b: &Backend, cmd: vk::CommandBuffer, buffer: vk::Buffer, off
     }
 }
 
-/// Ticks per second of the card's timestamps (what the title's queues
-/// report under Vulkan).
-pub(crate) fn timestamp_frequency() -> Option<u64> {
-    let period = f64::from(backend()?.host.caps.timestamp_period);
-    (period > 0.0).then(|| (1e9 / period) as u64)
-}

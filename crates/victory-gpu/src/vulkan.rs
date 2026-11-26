@@ -693,7 +693,6 @@ pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader
 // Queues and fences (`engine.rs`)
 
 pub(crate) use engine::{execute, fence_signalled, list_released, list_reset, list_wait, list_write, part_commands, signal, wait, wait_for_fence};
-pub(crate) use writes::timestamp_frequency;
 use engine::{engine, lost_once, start_landing};
 
 /// Ranges the memory map could not take (full, or overlapping another
