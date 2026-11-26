@@ -121,4 +121,11 @@ pub fn vulkan_on() -> bool {
 /// The Vulkan backend prunes its memory map and imports here; a no-op until
 /// it does (the D3D12 path learns of it from `title_memory_remapped`).
 #[cfg(windows)]
-pub fn title_memory_unmapped(_at: usize, _len: usize) {}
+pub fn title_memory_unmapped(at: usize, len: usize) {
+    #[cfg(windows)]
+    if vulkan::on() {
+        vulkan::title_memory_unmapped(at, len);
+    }
+    #[cfg(not(windows))]
+    let _ = (at, len);
+}

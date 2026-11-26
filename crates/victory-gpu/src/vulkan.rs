@@ -373,6 +373,42 @@ pub(crate) fn title_memory_view(at: usize, len: usize, section: usize, offset: u
     }
 }
 
+/// `xmem` unmapped `[at, at + len)` (a view of physical pages, or a filler
+/// stand-in): the views and imports there leave the map, card images over it
+/// go. An import is dropped only after the card has finished everything
+/// given so far (its pages are gone from the process).
+pub(crate) fn title_memory_unmapped(at: usize, len: usize) {
+    let Some(b) = backend() else { return };
+    images::released(b, at as u64, len as u64);
+    let mut m = memory(b);
+    let end = at + len;
+    let before = m.views.len();
+    m.views.retain(|&a, &mut (l, ..)| a + l <= at || a >= end);
+    let gone: Vec<usize> = m.regions.range(..end).filter(|&(&a, r)| a + r.len > at && a >= at && a + r.len <= end).map(|(&a, _)| a).collect();
+    let mut imports = Vec::new();
+    for a in gone {
+        if let Some(Region { import: Some(i), .. }) = m.regions.remove(&a) {
+            imports.push(i);
+        }
+    }
+    let (stale, kept): (Vec<Imported>, Vec<Imported>) =
+        std::mem::take(&mut m.retired).into_iter().partition(|i| i.title_base >= at as u64 && i.title_base + i.len <= end as u64);
+    m.retired = kept;
+    imports.extend(stale);
+    if m.views.len() == before && imports.is_empty() {
+        return;
+    }
+    m.rebuild_map();
+    drop(m);
+    if !imports.is_empty() {
+        b.timeline.wait(&b.host, b.timeline.last(), 5_000_000_000);
+        for i in imports {
+            // SAFETY: the card has finished everything given so far.
+            unsafe { i.destroy(&b.host) };
+        }
+    }
+}
+
 pub(crate) fn title_page_reservation(at: usize, len: usize) {
     if let Some(b) = backend() {
         memory(b).reservations.insert(at, len);
