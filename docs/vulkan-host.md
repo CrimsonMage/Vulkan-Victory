@@ -538,11 +538,80 @@ migration, the user-facing switch `VICTORY_GPU=d3d12|vulkan` (default
 | # | Work | Size | Gate |
 |---|---|---|---|
 | M1 | Foundation and `victory vkprobe` (this) | ~4,000 lines (rustfmt-expanded tables and embedded SPIR-V included); done | vkprobe passes under Proton; the title window, descriptor-heap and pipeline-model answers recorded here |
-| M2a | **Menus' frame on Vulkan, 2D first.** `VICTORY_GPU=vulkan` makes a `victory-vk` device beside the title-facing objects. The swapchain goes on the title's window. xmem's announcements (`title_region`, `title_section`, `title_memory_view`, `title_pages_aliased`, releases) drive imports and window binds. Queues, timeline fences and fills of fence values come next, then the display planes composed from title memory and present. | ~3,000 lines | boot, intro video and menus' planes show, captures match D3D12 |
+| M2a | **Queues, fences, title memory and present on Vulkan, no draws** (built: see "M2a as built"). | ~2,100 lines | the title boots and runs to the menus under `VICTORY_GPU=vulkan` with no hang; cleared frames presented (the planes need M2b's draws) |
 | M2b | **Menus' draws and dispatches** through the new translator (ABI v0). The workers record `VkCommandBuffer`s. Stages compiled once at PSO creation as library parts (or shader objects, per vkprobe), fast link at the first draw, optimised link in the background, the persisted cache; a skipped-draw count for parts not ready. Dynamic rendering, barriers and layouts. Descriptor buffers with T#/S# slots. Host textures (detile and upload as today), clears, copies, resolves, queries. | ~5,000 lines | menus at ≥30 fps (D3D12: ~26), captures match, no driver error in the 5-minute gate run up to the world's door |
 | M3 | **The world.** Bounded indirect, mesh shaders at scale, levels on demand as sparse images, streamed-once promotion by re-binding window pages, depth and UAV twins, the upscale and ambient stand-ins, the BVH builder's programs, the frame-time line with Vulkan timestamps, the memory ceiling from the budget. | ~5,000 lines | the gate run reaches the world with no Xid, card memory ≤ D3D12's, frame time ≤ D3D12's (~95 ms in run p28) |
 | M4 | **Parity, then deletion.** Default `VICTORY_GPU=vulkan`; one gate run of each; then the D3D12 path goes (section 3.7, ~20,000 lines). vkd3d-proton, `d3dcompiler_47` and DXC are no longer shipped beside the exe. The switch goes. | −20,000 lines | gate, binary size and build time down |
 | M5 | **60 fps work.** Async compute on its queue, big lists split into secondary command buffers, GPU detiling from the window, present wait. | measured | `docs/kiss.md` workstream 10 |
+
+### M2a as built (`VICTORY_GPU=vulkan`)
+
+- **No D3D12 device.** `host::host()` answers `None`, so every D3D12 path
+  stands down as it does without a GPU. `crate::vulkan` (victory-gpu) and
+  `victory-vk` take over through a few hooks: queue execute, signal,
+  wait and present; list waits, writes and resets; fence waits; xmem's
+  announcements; CPU reads of the pool's GPU view.
+- **Queues and fences.**
+  - Each title queue has a line of waits, runs and signals.
+  - A list is cut into parts at its memory-value waits. A part whose
+    waits are met goes to the graphics queue behind everything before
+    it, signalling the next timeline value (`victory-vk/src/timeline.rs`).
+    A wait counts as met when memory holds the value, or when a write in
+    the air will put it there.
+  - A landing thread follows the timeline. At each value it does that
+    part's bottom-of-pipe writes, then the fence signals queued behind
+    it, then runs every line on.
+  - CPU fence waits block on it, for at most 10 s.
+  - At a present, waits that are still unmet are passed, as the D3D12
+    path does. The count is in the 10 s line.
+  - M2a parts carry no draws or dispatches. Parts without writes submit
+    nothing.
+- **The pool's GPU view** (`victory-vk/src/pool.rs`).
+  - It is one sparse buffer over the page reservation that
+    `CopyPageMappingsBatchX` maps into. Each title page is bound to the
+    card page of its physical page, with one card page per physical
+    page.
+  - A card page is filled from the section's import (its whole view,
+    imported by host pointer at first need) when first shown, and again
+    at every announced write that reaches the GPU view's addresses.
+    Announced writes are DirectStorage completion, file reads, title
+    copies and page mappings.
+  - Binds and fills go to the queue in call order.
+  - Bottom-of-pipe writes into the view go to the page's home in its
+    section, and the card page is filled again.
+- **Room** (the eviction policy).
+  - The view takes card memory in 64 MiB blocks. Its budget is the card
+    heap's budget at creation less 2 GiB, and at least 512 MiB.
+  - Past the budget, the page touched least recently is evicted. Touched
+    means mapped or written; the tick is the frame, and a page touched in
+    the current frame is never chosen. Every title page showing it is
+    bound to a zero page.
+  - An evicted page comes back, filled again, at its next announced
+    write or mapping. Shortcut: until then it reads zeros.
+- **Memory map.** It is built from the pool views and the large views
+  (≥ 16 MiB) of imported sections. Regions are noted, not imported:
+  nothing on the card reads them before M2b.
+- **Present.** A swapchain goes on the title's window (or one of ours, at
+  the planes' size), mailbox if offered. Each present waits for the
+  timeline's last value, then clears the image and presents.
+- **Gate for M2a (corrected).** The planes' images are what the title's
+  draws produce, and draws run from M2b on. So M2a shows cleared frames,
+  not the intro or menus. The gate is that the title boots and runs to
+  the menus under `VICTORY_GPU=vulkan` with no hang:
+  - fences and memory-value waits keep moving;
+  - the `frame presented` lines advance;
+  - the 10 s `Vulkan: queues, timeline and title memory` line shows the
+    timeline reached, few held items and forced waits, and the pool
+    view's binds and fills;
+  - no Vulkan error lines.
+
+  The visual gate moves to M2b.
+- **Shortcuts.**
+  - `CopyPageMappingsBatchX` binds at once, possibly ahead of
+    submissions its queue still holds (the D3D12 path does the same).
+  - A sparse buffer per page reservation covers the whole reservation.
+  - Regions freed while imported are not covered, because nothing
+    imports regions yet.
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
