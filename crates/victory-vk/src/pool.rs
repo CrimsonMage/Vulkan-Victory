@@ -10,16 +10,20 @@
 //! first shown and whenever the title announces it written (DirectStorage
 //! completion, title copies). Only pages actually shown get card memory.
 //!
-//! Room: card pages come in 64 MiB blocks while the view's use stays under
-//! its budget. Past it, the page touched least recently (mapped or written,
-//! never one touched in the current tick) is *evicted*: every title page
-//! showing it is unbound and its card page is freed. An evicted page comes
-//! back, filled again, at its next announced write or mapping. Until then
-//! it reads what an unbound sparse page reads (zeros on a driver with
-//! `residencyNonResidentStrict`; shortcut: a page the title never announces
-//! again stays so). Pages nothing shows are unbound, never bound to a page
-//! of zeros: binding a whole 16 GiB reservation page by page at creation
-//! stalled the queue for seconds in the first M2a run.
+//! Room: card pages come in 64 MiB blocks while everything of ours on the
+//! card stays under the view's [`PoolView::ceiling`] (the one card-memory
+//! ceiling the images share). Past it, the page touched least recently
+//! (mapped, written, or named by a recording: [`PoolView::ensure`]) is
+//! *evicted*: every title page showing it is unbound and its card page is
+//! taken. Pages touched in the current tick go last, but they go: a map
+//! never fails. An evicted page comes back, filled again from its home, at
+//! its next announced write, mapping or naming. Until then it reads what an
+//! unbound sparse page reads (zeros on a driver with
+//! `residencyNonResidentStrict`; shortcut: a page read only through
+//! descriptors the host never sees named stays so until the title touches
+//! it). Pages nothing shows are unbound, never bound to a page of zeros:
+//! binding a whole 16 GiB reservation page by page at creation stalled the
+//! queue for seconds in the first M2a run.
 //!
 //! Every bind is checked against the buffer's size and the block's before
 //! it goes to the queue, binds of one call are made once per page (the last
@@ -29,7 +33,7 @@
 //! Imported host memory cannot back a sparse buffer on NVIDIA (vkprobe,
 //! 2026-11-26), which is why the pages live in card memory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result, ensure};
 use ash::vk;
@@ -41,6 +45,8 @@ use crate::timeline::{BufferBinds, Timeline};
 pub const PAGE: u64 = 64 << 10;
 /// Pages per block of card memory (64 MiB).
 const BLOCK_PAGES: u32 = 1024;
+/// Card memory the view may always take, past the ceiling if it must.
+pub const LEAST: u64 = 256 << 20;
 
 /// A physical page: its section (an opaque key) and its offset there.
 pub type PageKey = (usize, u64);
@@ -97,8 +103,11 @@ pub struct PoolView {
     pages: HashMap<PageKey, Page>,
     /// Title page index -> the physical page it shows.
     bound: HashMap<u64, PageKey>,
-    /// Bytes of card memory the view may take.
-    pub budget: u64,
+    /// The pages that have a card page, least recently touched first.
+    lru: BTreeSet<(u64, PageKey)>,
+    /// The view takes another block only while everything of ours on the
+    /// card ([`crate::account::card_total`]) stays under this.
+    pub ceiling: u64,
     pub stats: Stats,
     /// Blocks given back, freed once the timeline passes the ticket.
     retired: Vec<(u64, usize)>,
@@ -112,7 +121,7 @@ impl PoolView {
         timeline: &Timeline,
         title_start: u64,
         len: u64,
-        budget: u64,
+        ceiling: u64,
     ) -> Result<PoolView> {
         let d = &host.device;
         let len = len.next_multiple_of(PAGE);
@@ -155,7 +164,8 @@ impl PoolView {
             blocks: Vec::new(),
             pages: HashMap::new(),
             bound: HashMap::new(),
-            budget,
+            lru: BTreeSet::new(),
+            ceiling,
             stats: Stats::default(),
             retired: Vec::new(),
         };
@@ -298,6 +308,12 @@ impl PoolView {
         Ok((unbind, bind))
     }
 
+    /// Physical pages the title shows in the view (its working set, on the
+    /// card or evicted).
+    pub fn shown_pages(&self) -> u64 {
+        self.pages.len() as u64
+    }
+
     /// Bytes of card memory the view's live blocks take.
     pub fn card_bytes(&self) -> u64 {
         self.blocks.iter().filter(|b| !b.dead).count() as u64 * u64::from(BLOCK_PAGES) * PAGE
@@ -312,15 +328,14 @@ impl PoolView {
         let mut binds = Vec::new();
         let mut emptied = Vec::new();
         while self.card_bytes() > target {
-            let Some(i) = (0..self.blocks.len())
-                .filter(|&i| !self.blocks[i].dead)
-                .max_by_key(|&i| self.blocks[i].free.len())
-            else {
+            let Some(i) = self.coldest_block() else {
                 break;
             };
-            for p in self.pages.values_mut() {
+            let lru = &mut self.lru;
+            for (key, p) in &mut self.pages {
                 if p.slot.is_some_and(|s| s.block as usize == i) {
                     p.slot = None;
+                    lru.remove(&(p.touched, *key));
                     binds.extend(p.shown.iter().map(|&t| (t, None)));
                     self.stats.evicted += 1;
                     self.stats.pages_in_card -= 1;
@@ -338,6 +353,21 @@ impl PoolView {
         self.retired
             .extend(emptied.into_iter().map(|i| (ticket, i)));
         Ok(())
+    }
+
+    /// The live block whose most recently touched page is the oldest (an
+    /// empty block is the coldest).
+    fn coldest_block(&self) -> Option<usize> {
+        let mut newest: Vec<Option<u64>> = vec![None; self.blocks.len()];
+        for p in self.pages.values() {
+            if let Some(s) = p.slot {
+                let n = &mut newest[s.block as usize];
+                *n = Some(n.map_or(p.touched, |t| t.max(p.touched)));
+            }
+        }
+        (0..self.blocks.len())
+            .filter(|&i| !self.blocks[i].dead)
+            .min_by_key(|&i| newest[i].map_or((0, 0), |t| (1, t)))
     }
 
     /// Frees the blocks given back whose unbinds the card has passed.
@@ -362,39 +392,55 @@ impl PoolView {
         self.retired.retain(|(t, _)| *t > done);
     }
 
-    /// A card page for a new physical page: a free one, a new block within
-    /// the budget, or the least recently touched page's (evicted).
+    /// A card page for a new physical page: a free one, a new block while
+    /// ours stays under the ceiling, or the least recently touched page's
+    /// (evicted; pages of the current tick last). The view may always take
+    /// [`LEAST`]. `None` only when it has no card page at all and the driver
+    /// gives no block: the page then stays evicted (it reads zeros) and
+    /// nothing is half done.
     fn slot(
         &mut self,
         host: &Host,
         timeline: &Timeline,
-        tick: u64,
         binds: &mut Vec<(u64, Option<Slot>)>,
-    ) -> Result<Slot> {
+    ) -> Option<Slot> {
         if let Some(s) = self.take() {
-            return Ok(s);
+            return Some(s);
         }
         self.free_retired(host, timeline);
-        let used = self.card_bytes();
-        if used + u64::from(BLOCK_PAGES) * PAGE <= self.budget.max(used + 1)
-            && self.grow(host).is_ok()
-        {
-            return self.take().context("a new block has no page");
+        let block = u64::from(BLOCK_PAGES) * PAGE;
+        let room = crate::account::card_total() + block <= self.ceiling
+            || self.card_bytes() + block <= LEAST;
+        if room && self.grow(host).is_ok() {
+            return self.take();
         }
-        // Evict the least recently touched page not touched this tick.
-        let victim = self
-            .pages
-            .iter()
-            .filter(|(_, p)| p.slot.is_some() && p.touched < tick)
-            .min_by_key(|(_, p)| p.touched)
-            .map(|(k, _)| *k)
-            .context("the pool view is out of card memory and every page is in use this tick")?;
-        let page = self.pages.get_mut(&victim).expect("victim");
-        let slot = page.slot.take().expect("victim has a page");
+        let (_, victim) = self.lru.pop_first()?;
+        let page = self.pages.get_mut(&victim).expect("a page in the LRU");
+        let slot = page.slot.take().expect("a page in the LRU has a card page");
         binds.extend(page.shown.iter().map(|&t| (t, None)));
         self.stats.evicted += 1;
         self.stats.pages_in_card -= 1;
-        Ok(slot)
+        Some(slot)
+    }
+
+    /// Marks `key` touched at `tick` (its place in the LRU follows).
+    fn touch(&mut self, key: PageKey, tick: u64) {
+        let Some(p) = self.pages.get_mut(&key) else { return };
+        if p.slot.is_some() {
+            self.lru.remove(&(p.touched, key));
+            self.lru.insert((tick, key));
+        }
+        p.touched = tick;
+    }
+
+    /// Gives `key` (evicted, or new) card page `s`: every title page
+    /// showing it is bound to it.
+    fn place(&mut self, key: PageKey, s: Slot, binds: &mut Vec<(u64, Option<Slot>)>) {
+        let p = self.pages.get_mut(&key).expect("a page to place");
+        p.slot = Some(s);
+        binds.extend(p.shown.iter().map(|&t| (t, Some(s))));
+        self.lru.insert((p.touched, key));
+        self.stats.pages_in_card += 1;
     }
 
     fn free(&mut self, slot: Slot) {
@@ -422,51 +468,52 @@ impl PoolView {
                 break;
             }
             // What it showed lets go of it.
-            if let Some(old) = self.bound.remove(&t)
-                && let Some(p) = self.pages.get_mut(&old)
-            {
-                p.shown.retain(|&x| x != t);
-                if p.shown.is_empty() {
-                    let gone = self.pages.remove(&old).expect("page");
-                    if let Some(s) = gone.slot {
-                        self.free(s);
-                        self.stats.pages_in_card -= 1;
-                    }
-                }
-            }
+            self.let_go(t);
             let Some((key, source)) = page else {
                 binds.push((t, None));
                 continue;
             };
-            let slot = match self.pages.get(key).and_then(|p| p.slot) {
-                Some(s) => s,
-                None => {
-                    let s = self.slot(host, timeline, tick, &mut binds)?;
-                    fills.push((*source, s));
-                    self.stats.pages_in_card += 1;
-                    let entry = self.pages.entry(*key).or_insert(Page {
-                        slot: None,
-                        shown: Vec::new(),
-                        touched: tick,
-                    });
-                    if !entry.shown.is_empty() {
-                        // Evicted, now back: its other title pages too.
-                        self.stats.refilled += 1;
-                        let others = entry.shown.clone();
-                        entry.slot = Some(s);
-                        binds.extend(others.iter().map(|&o| (o, Some(s))));
-                    }
-                    self.pages.get_mut(key).expect("page").slot = Some(s);
-                    s
-                }
-            };
-            let p = self.pages.get_mut(key).expect("page");
-            p.touched = tick;
+            let p = self.pages.entry(*key).or_insert(Page {
+                slot: None,
+                shown: Vec::new(),
+                touched: tick,
+            });
             p.shown.push(t);
             self.bound.insert(t, *key);
-            binds.push((t, Some(slot)));
+            self.touch(*key, tick);
+            if let Some(s) = self.pages[key].slot {
+                binds.push((t, Some(s)));
+                continue;
+            }
+            match self.slot(host, timeline, &mut binds) {
+                Some(s) => {
+                    if self.pages[key].shown.len() > 1 {
+                        // Evicted, now back: its other title pages too.
+                        self.stats.refilled += 1;
+                    }
+                    fills.push((*source, s));
+                    self.place(*key, s, &mut binds);
+                }
+                None => binds.push((t, None)),
+            }
         }
         self.flush(host, timeline, fills, binds)
+    }
+
+    /// Title page `t` shows nothing any more; a physical page nothing shows
+    /// gives its card page back.
+    fn let_go(&mut self, t: u64) {
+        let Some(old) = self.bound.remove(&t) else { return };
+        let Some(p) = self.pages.get_mut(&old) else { return };
+        p.shown.retain(|&x| x != t);
+        if p.shown.is_empty() {
+            let gone = self.pages.remove(&old).expect("page");
+            if let Some(s) = gone.slot {
+                self.lru.remove(&(gone.touched, old));
+                self.free(s);
+                self.stats.pages_in_card -= 1;
+            }
+        }
     }
 
     fn flush(
@@ -512,13 +559,41 @@ impl PoolView {
         &mut self,
         host: &Host,
         timeline: &Timeline,
-        at: u64,
-        len: u64,
+        range: (u64, u64),
         tick: u64,
         source: impl Fn(PageKey) -> Option<Source>,
     ) -> Result<()> {
+        self.refresh(host, timeline, range, (tick, true), source)
+    }
+
+    /// A recording names `[at, at + len)` (a root view, an index or
+    /// indirect buffer, a copy): its pages are touched, and evicted ones
+    /// come back, filled from `source`, before the recording runs (the
+    /// binds go to the host line, which every later submission waits for).
+    pub fn ensure(
+        &mut self,
+        host: &Host,
+        timeline: &Timeline,
+        range: (u64, u64),
+        tick: u64,
+        source: impl Fn(PageKey) -> Option<Source>,
+    ) -> Result<()> {
+        self.refresh(host, timeline, range, (tick, false), source)
+    }
+
+    /// The physical pages shown in `[at, at + len)`: touched at `tick`;
+    /// evicted ones filled and bound again; resident ones filled again if
+    /// `refill`.
+    fn refresh(
+        &mut self,
+        host: &Host,
+        timeline: &Timeline,
+        (at, len): (u64, u64),
+        (tick, refill): (u64, bool),
+        source: impl Fn(PageKey) -> Option<Source>,
+    ) -> Result<()> {
         let lo = at.max(self.title_start);
-        let hi = (at + len).min(self.title_start + self.len);
+        let hi = at.saturating_add(len).min(self.title_start + self.len);
         if lo >= hi {
             return Ok(());
         }
@@ -531,22 +606,25 @@ impl PoolView {
         let mut binds = Vec::new();
         let mut fills = Vec::new();
         for key in keys {
+            self.touch(key, tick);
+            let resident = self.pages[&key].slot;
+            if resident.is_some() && !refill {
+                continue;
+            }
             let Some(src) = source(key) else { continue };
-            let slot = match self.pages.get(&key).and_then(|p| p.slot) {
+            let slot = match resident {
                 Some(s) => s,
                 None => {
-                    let s = self.slot(host, timeline, tick, &mut binds)?;
-                    let p = self.pages.get_mut(&key).expect("bound page");
-                    p.slot = Some(s);
-                    let shown = p.shown.clone();
-                    binds.extend(shown.iter().map(|&t| (t, Some(s))));
+                    let Some(s) = self.slot(host, timeline, &mut binds) else { continue };
+                    self.place(key, s, &mut binds);
                     self.stats.refilled += 1;
-                    self.stats.pages_in_card += 1;
                     s
                 }
             };
-            self.pages.get_mut(&key).expect("bound page").touched = tick;
             fills.push((src, slot));
+        }
+        if fills.is_empty() && binds.is_empty() {
+            return Ok(());
         }
         self.flush(host, timeline, fills, binds)
     }

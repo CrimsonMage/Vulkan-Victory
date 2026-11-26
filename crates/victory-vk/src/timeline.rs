@@ -152,6 +152,28 @@ pub struct Recording {
     /// Its start timestamp's query (the end's is the next).
     pair: Option<u32>,
     scratch: Scratch,
+    /// Diagnostics: what was recorded into it, for a hang's report.
+    pub trail: Trail,
+}
+
+/// Diagnostics: the last [`Trail::MOST`] notes of a command buffer (what
+/// it draws and dispatches) and how many went before them.
+#[derive(Default)]
+pub struct Trail {
+    pub notes: VecDeque<String>,
+    pub earlier: u64,
+}
+
+impl Trail {
+    pub const MOST: usize = 64;
+
+    pub fn push(&mut self, note: String) {
+        if self.notes.len() == Self::MOST {
+            self.notes.pop_front();
+            self.earlier += 1;
+        }
+        self.notes.push_back(note);
+    }
 }
 
 impl Recording {
@@ -359,6 +381,12 @@ impl Timeline {
         }
     }
 
+    /// The last value given on `line` and its label.
+    pub fn line_given(&self, line: Line) -> (u64, String) {
+        let s = self.state();
+        (s.lines[line].last, s.lines[line].label.clone())
+    }
+
     /// The value `line` has reached on the card.
     pub fn line_completed(&self, host: &Host, line: Line) -> u64 {
         let sem = self.state().lines[line].semaphore;
@@ -467,6 +495,7 @@ impl Timeline {
             cmd,
             pair,
             scratch,
+            trail: Trail::default(),
         })
     }
 

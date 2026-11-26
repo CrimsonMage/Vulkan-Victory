@@ -41,6 +41,7 @@ mod descriptors;
 mod engine;
 mod gpu_stats;
 mod loose;
+mod paging;
 mod present;
 mod rect;
 mod images;
@@ -49,7 +50,7 @@ mod stage_cache;
 mod stages;
 mod writes;
 
-use crate::memory::GpuPage;
+pub(crate) use paging::{title_memory_written, title_pages_aliased};
 
 /// Whether the Vulkan backend runs (`VICTORY_GPU=vulkan`; `d3d12` or unset:
 /// the D3D12 path).
@@ -426,129 +427,6 @@ pub(crate) fn title_page_reservation(at: usize, len: usize) {
     }
 }
 
-pub(crate) fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
-    let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
-        return;
-    };
-    let to64 = to as u64;
-    // Images over pages that now show other memory (or none) go (before
-    // the memory lock): the title streams by mapping fresh pages under new
-    // textures and taking old ones away, so images follow its live ones.
-    images::released(b, to64, pages.len() as u64 * PAGE, images::Dropped::Remapped);
-    let mut m = memory(b);
-    let m = &mut *m;
-    if !m.pools.iter().any(|p| p.contains(to64)) {
-        let Some((&at, &len)) = m
-            .reservations
-            .range(..=to)
-            .next_back()
-            .filter(|(a, l)| to < *a + *l)
-        else {
-            if m.warned < 4 {
-                m.warned += 1;
-                tracing::warn!(
-                    to = format_args!("{to:#x}"),
-                    "Vulkan: pages mapped outside any page reservation are not shown"
-                );
-            }
-            return;
-        };
-        let budget = pool_start(&b.host);
-        match PoolView::new(&b.host, &b.timeline, at as u64, len as u64, budget) {
-            Ok(view) => {
-                tracing::info!(
-                    at = format_args!("{at:#x}"),
-                    mb = len >> 20,
-                    device = format_args!("{:#x}", view.device_base),
-                    budget_mb = budget >> 20,
-                    unbound_pages_read_zeros = b.host.caps.non_resident_strict,
-                    "Vulkan: the pool's GPU view is a sparse buffer of card pages"
-                );
-                m.pools.push(view);
-                m.rebuild_map();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "Vulkan: no sparse buffer for the pool's GPU view");
-                return;
-            }
-        }
-    }
-    let mut entries = Vec::with_capacity(pages.len());
-    let mut imported = false;
-    for page in pages {
-        entries.push(page.and_then(|g| {
-            let s = m.sections.get_mut(&g.section)?;
-            if s.whole == 0 {
-                s.whole = g.cpu - g.offset as usize;
-            }
-            let had = s.import.is_some();
-            let key = (g.section, g.offset);
-            let src = m.source(&b.host, key);
-            imported |= !had && src.is_some();
-            src.map(|s| (key, s))
-        }));
-    }
-    if imported {
-        m.rebuild_map();
-    }
-    let lost = pages
-        .iter()
-        .zip(&entries)
-        .filter(|(p, e)| p.is_some() && e.is_none())
-        .count();
-    if lost > 0 && m.warned < 8 {
-        m.warned += 1;
-        tracing::warn!(
-            lost,
-            to = format_args!("{to:#x}"),
-            "Vulkan: pages of an unknown or unimported section show zeros in the pool's GPU view"
-        );
-    }
-    let tick = m.tick;
-    if let Some(view) = m.pools.iter_mut().find(|p| p.contains(to64))
-        && let Err(e) = view.map(&b.host, &b.timeline, to64, &entries, tick)
-    {
-        tracing::error!(error = %format!("{e:#}"), "Vulkan: pages of the pool's GPU view were not mapped");
-    }
-}
-
-pub(crate) fn title_memory_written(at: usize, len: usize) {
-    let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
-        return;
-    };
-    // Card images over the memory are filled again.
-    images::written(at as u64, len as u64);
-    let mut guard = memory(b);
-    let m = &mut *guard;
-    let (at, len) = (at as u64, len as u64);
-    if !m
-        .pools
-        .iter()
-        .any(|p| at < p.title_start + p.len && at + len > p.title_start)
-    {
-        return;
-    }
-    let tick = m.tick;
-    // The sections are imported already (their pages were shown).
-    let sources: HashMap<usize, (vk::Buffer, u64)> = m
-        .sections
-        .iter()
-        .filter_map(|(&h, s)| s.import.as_ref().map(|i| (h, (i.buffer, i.len))))
-        .collect();
-    for view in &mut m.pools {
-        let r = view.written(&b.host, &b.timeline, at, len, tick, |key: PageKey| {
-            let &(buffer, len) = sources.get(&key.0)?;
-            (key.1.is_multiple_of(PAGE) && key.1 + PAGE <= len).then_some(Source {
-                buffer,
-                offset: key.1,
-            })
-        });
-        if let Err(e) = r {
-            tracing::error!(error = %format!("{e:#}"), "Vulkan: an announced write was not taken into the pool's GPU view");
-        }
-    }
-}
-
 /// The title released a texture resource (its last reference).
 pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDesc) {
     if on()
@@ -624,7 +502,7 @@ pub(crate) fn pipeline_created(shaders: &[std::sync::Arc<crate::pipeline::Shader
 // Queues and fences (`engine.rs`)
 
 pub(crate) use engine::{execute, fence_signalled, list_released, list_reset, list_wait, list_write, part_commands, signal, wait, wait_for_fence};
-use budget::{card_memory, follow_budget, pool_start};
+use budget::{card_memory, follow_budget};
 use engine::{engine, lost_once, start_landing};
 
 /// Ranges the memory map could not take (full, or overlapping another
@@ -698,9 +576,18 @@ fn cpu_readable(b: &Backend, at: u64, len: u64) -> bool {
         || m.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| at + len <= (a + r.len) as u64)
 }
 
-/// The buffer and offset of title address `title`.
+/// The buffer and offset of title address `title` (one page of it named:
+/// [`buffer_over`]).
 fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
+    buffer_over(b, title, 1)
+}
+
+/// The buffer and offset of title memory `[title, title + len)` a
+/// recording names; evicted pages of the pool's GPU view in it come back
+/// first.
+fn buffer_over(b: &Backend, title: u64, len: u64) -> Option<(vk::Buffer, u64)> {
     let mut m = memory(b);
+    paging::ensure(b, &mut m, title, len);
     if let Some(found) = m.buffer_of(title) {
         return Some(found);
     }
@@ -715,19 +602,22 @@ fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
 /// The device address of title memory `[title, title + len)`, if one
 /// range of the memory map holds it all (imported now if it must be).
 fn device_of(b: &Backend, title: u64, len: u64) -> Option<u64> {
-    buffer_of(b, title)?;
+    buffer_over(b, title, len)?;
     let r = memory(b).map.range_of(title)?;
     (title + len <= r.title_start + r.title_size).then(|| r.device_base + (title - r.title_start))
 }
 
 /// An API call named title address `at`: the region holding it is imported
-/// before the next command buffer binds the map.
+/// before the next command buffer binds the map; in the pool's GPU view,
+/// its page comes back if it was evicted (a root view: its first page).
 pub(crate) fn touch(at: u64) {
     if at == 0 {
         return;
     }
     if let Some(b) = backend() {
-        memory(b).want(at);
+        let mut m = memory(b);
+        m.want(at);
+        paging::ensure(b, &mut m, at, 1);
     }
 }
 
@@ -887,6 +777,7 @@ fn start_reports() {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 budget::steps(b);
+                engine::report_stalls(b);
                 if last.elapsed() >= Duration::from_secs(10) {
                     last = Instant::now();
                     report(b, FRAME.load(Ordering::Relaxed));
@@ -950,6 +841,7 @@ fn report(b: &Backend, frame: u64) {
         map_refused = MAP_REFUSED.load(Ordering::Relaxed),
         pool_views = m.pools.len(),
         pool_card_mb = (pool.pages_in_card * PAGE) >> 20,
+        pool_shown_mb = (m.pools.iter().map(|p| p.shown_pages()).sum::<u64>() * PAGE) >> 20,
         pool_blocks = pool.blocks,
         pool_filled = pool.filled,
         pool_evicted = pool.evicted,

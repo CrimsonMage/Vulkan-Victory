@@ -14,7 +14,7 @@ impl Rec {
     // ---- copies ----
 
     pub(super) fn copy_buffer(&mut self, b: &'static Backend, dst: u64, src: u64, len: u64) {
-        let (Some((db, doff)), Some((sb, soff))) = (super::super::buffer_of(b, dst), super::super::buffer_of(b, src)) else {
+        let (Some((db, doff)), Some((sb, soff))) = (super::super::buffer_over(b, dst, len), super::super::buffer_over(b, src, len)) else {
             return;
         };
         self.end_pass(b);

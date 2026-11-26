@@ -28,7 +28,7 @@ use victory_vk::memory::{Buffer, Place};
 use victory_vk::timeline::ScratchRange;
 
 use super::super::bound::{self, DISPATCH, DRAW, DRAW_INDEXED, MESH};
-use super::super::{Backend, buffer_of, device_of, mesh, stages};
+use super::super::{Backend, buffer_over, device_of, mesh, stages};
 use super::{NotYet, Rec, not_yet, skipped};
 use crate::object::This;
 
@@ -218,6 +218,20 @@ fn pipeline(b: &Backend) -> Option<vk::Pipeline> {
     })
 }
 
+/// Diagnostics, to bisect a hang: `VICTORY_DIAG_NO_INDIRECT=1` skips
+/// every execution (counted as skipped), as before indirect ran.
+fn skip_all() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let skip = cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_DIAG_NO_INDIRECT").is_ok_and(|v| v.trim() == "1");
+        if skip {
+            tracing::warn!("Vulkan: indirect executions are skipped (VICTORY_DIAG_NO_INDIRECT=1, diagnostics)");
+        }
+        skip
+    })
+}
+
 fn has_count_draws(b: &Backend) -> bool {
     b.host
         .caps
@@ -245,11 +259,22 @@ impl Rec {
             return;
         }
         tally(0);
+        if skip_all() {
+            tally(3);
+            skipped(false);
+            return;
+        }
         let Some((buffer, at, counted)) = self.bounded(b, &spec) else {
             tally(3);
             skipped(false);
             return;
         };
+        self.note(|| {
+            format!(
+                "indirect kind={} max={} count_at={:?} src={:#x}",
+                spec.kind, spec.max, spec.count, spec.src
+            )
+        });
         let size = 4 * spec.words;
         match spec.kind {
             DISPATCH => self.dispatch_indirect(b, buffer, at, spec.max),
@@ -311,6 +336,10 @@ impl Rec {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(cmd, layout.pipeline, vk::ShaderStageFlags::ALL, 0, &push);
             d.cmd_dispatch(cmd, (records * spec.words).div_ceil(bound::GROUP), 1, 1);
+        }
+        self.note(|| format!("bounding pass records={records}"));
+        // SAFETY: as above.
+        unsafe {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -352,7 +381,7 @@ impl Rec {
         let index = if indexed {
             let Some(found) = self
                 .index
-                .and_then(|i| buffer_of(b, i.address).map(|(buf, off)| (buf, off, i.format)))
+                .and_then(|i| buffer_over(b, i.address, u64::from(i.size)).map(|(buf, off)| (buf, off, i.format)))
             else {
                 skipped(false);
                 return;

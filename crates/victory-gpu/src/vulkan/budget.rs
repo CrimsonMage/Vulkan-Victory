@@ -5,13 +5,13 @@
 //! card's budget (`VK_EXT_memory_budget`: what the driver, the spills of
 //! shaders and other programs leave us).
 //!
-//! - The pool's GPU view takes a fixed share, at most [`POOL_MOST`], less
-//!   whatever the rest of ours takes past its part, at least
-//!   [`POOL_LEAST`]. Checked every 10 frames: a view over its budget gives
-//!   blocks back at once ([`PoolView::shrink`]); within it, a full view
-//!   evicts its least recently touched page.
-//! - Images take the rest. A new image block that would cross the limit
-//!   by more than half the room is refused (counted as `images_refused`).
+//! - Images come first. A new image block that would cross the limit by
+//!   more than half the room is refused (counted as `images_refused`).
+//! - The pool's GPU view takes what the images leave: it grows a block
+//!   while ours stays under the limit, and past it evicts its least
+//!   recently touched page (a map never fails). Every frame, a view over
+//!   what the images leave gives blocks back ([`PoolView::shrink`]: the
+//!   coldest blocks), down to [`LEAST`].
 //!
 //! **What tells** (diagnostics builds): every card allocation of 64 MiB or
 //! more as it happens (what, size, ours after it), and the card-memory
@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_vk::account::{self, Kind};
 use victory_vk::ash::vk;
 use victory_vk::host::Host;
+use victory_vk::pool::LEAST;
 
 use super::{Backend, images, memory};
 
@@ -32,9 +33,6 @@ use super::{Backend, images, memory};
 pub(super) const CEILING: u64 = 4608 << 20;
 /// The card's budget we never grow into.
 const ROOM: u64 = 1 << 30;
-/// The pool view's share at most, and at least.
-const POOL_MOST: u64 = 1536 << 20;
-const POOL_LEAST: u64 = 256 << 20;
 /// A move of this much prints the card-memory line.
 const STEP: u64 = 256 << 20;
 
@@ -74,27 +72,19 @@ pub(super) fn fits(host: &Host, bytes: u64) -> bool {
     fits
 }
 
-/// The pool view's budget at its start.
-pub(super) fn pool_start(host: &Host) -> u64 {
-    POOL_MOST.min(limit(host)).max(POOL_LEAST)
-}
-
-/// Every 10 frames: each pool view's budget is its share, less what the
-/// rest of ours takes past its part of the limit; a view over it gives
-/// blocks back now.
-pub(super) fn follow_budget(b: &Backend, frame: u64) {
-    if !frame.is_multiple_of(10) {
-        return;
-    }
+/// Every frame: each pool view's ceiling is the limit; ours over it
+/// gives pool blocks back now, down to [`LEAST`] a view.
+pub(super) fn follow_budget(b: &Backend) {
     let limit = limit(&b.host);
     let mut m = memory(b);
-    let pool: u64 = m.pools.iter().map(|p| p.card_bytes()).sum();
-    let rest = account::card_total().saturating_sub(pool);
-    let share = POOL_MOST.min(limit.saturating_sub(rest)).max(POOL_LEAST);
+    let mut over = account::card_total().saturating_sub(limit);
     for p in &mut m.pools {
-        p.budget = share;
-        if p.card_bytes() > share
-            && let Err(e) = p.shrink(&b.host, &b.timeline, share)
+        p.ceiling = limit;
+        let has = p.card_bytes();
+        let target = has.saturating_sub(over).max(LEAST);
+        over = over.saturating_sub(has - target.min(has));
+        if has > target
+            && let Err(e) = p.shrink(&b.host, &b.timeline, target)
         {
             tracing::warn!(error = %format!("{e:#}"), "Vulkan: the pool view could not give card memory back");
         }

@@ -47,6 +47,7 @@ mod indirect;
 mod link;
 mod query;
 mod state;
+mod trail;
 pub(crate) mod upscale;
 
 pub(crate) use console::ValueWrite;
@@ -160,6 +161,8 @@ pub(crate) struct Rec {
     last_layout: String,
     /// What the console's own methods keep (`console.rs`, `query.rs`).
     console: console::State,
+    /// Diagnostics: the pipeline the trail last named (`trail.rs`).
+    noted: This,
 }
 
 // SAFETY: a list is recorded by one worker at a time; the records hold
@@ -202,6 +205,7 @@ impl Default for Rec {
             last_inputs: (0, 0),
             last_user: String::new(),
             last_layout: String::new(),
+            noted: std::ptr::null(),
             console: console::State::default(),
         }
     }
@@ -648,7 +652,7 @@ impl Rec {
         for &slot in &made.bindings {
             let v = self.vertex.get(slot as usize).copied().flatten();
             if let Some(v) = v
-                && let Some((buf, off)) = super::buffer_of(b, v.address)
+                && let Some((buf, off)) = super::buffer_over(b, v.address, u64::from(v.size))
             {
                 // SAFETY: as the caller says; a title buffer.
                 unsafe { b.host.device.cmd_bind_vertex_buffers2(cmd, slot, &[buf], &[off], Some(&[u64::from(v.size)]), Some(&[u64::from(v.stride)])) };
@@ -698,7 +702,8 @@ impl Rec {
 
     /// Counts a recorded draw, on the attachments too; diagnostics builds
     /// describe the first ones.
-    fn drawn(&self, what: &str) {
+    fn drawn(&mut self, what: &str) {
+        self.note(|| what.to_owned());
         let n = STATS[0].fetch_add(1, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
             && self.last_push[12] != 0
@@ -756,7 +761,7 @@ impl Rec {
             skipped(false);
             return;
         };
-        let Some((buffer, offset)) = super::buffer_of(b, index.address) else {
+        let Some((buffer, offset)) = super::buffer_over(b, index.address, u64::from(index.size)) else {
             skipped(false);
             return;
         };
@@ -788,6 +793,7 @@ impl Rec {
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
             STATS[1].fetch_add(1, Ordering::Relaxed);
+            self.note(|| format!("dispatch {x}x{y}x{z}"));
         }
     }
 

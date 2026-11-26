@@ -46,7 +46,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::S
     split(Split::Submit, t);
     images::refresh(b, frame);
     super::stages::new_frame();
-    super::follow_budget(b, frame);
+    super::follow_budget(b);
     let presented = Instant::now();
     memory(b).tick = frame;
     let mut sc = lock(&b.present);

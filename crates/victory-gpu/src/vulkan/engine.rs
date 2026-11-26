@@ -63,6 +63,9 @@ struct Flight {
     /// The writes the CPU makes when it lands.
     cpu: Vec<Write>,
     signals: Vec<(usize, u64)>,
+    /// Diagnostics: when it was given, and what its command buffers record.
+    given: Instant,
+    trail: Vec<String>,
 }
 
 /// A title queue: its line of the host's, its items, and the semaphore
@@ -267,6 +270,7 @@ impl Engine {
             images::flush(b);
         }
         let cpu = super::writes::record(b, &mut cmds, &part.writes);
+        let trail = take_trails(&mut cmds);
         match b.timeline.submit_on(&b.host, line, cmds, &waits) {
             Ok(value) => self.flights.push_back(Flight {
                 line,
@@ -274,6 +278,8 @@ impl Engine {
                 writes: part.writes,
                 cpu,
                 signals: Vec::new(),
+                given: Instant::now(),
+                trail,
             }),
             Err(e) => {
                 if b.timeline.lost() {
@@ -495,6 +501,65 @@ pub(super) fn start_landing() {
             .name("victory-vk-landing".into())
             .spawn(landing);
     });
+}
+
+/// Diagnostics: the notes of a submission's command buffers.
+fn take_trails(cmds: &mut [Recording]) -> Vec<String> {
+    if !cfg!(feature = "diagnostics") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (k, r) in cmds.iter_mut().enumerate() {
+        let t = std::mem::take(&mut r.trail);
+        if t.notes.is_empty() {
+            continue;
+        }
+        out.push(format!("cmd {k} ({} notes before)", t.earlier));
+        out.extend(t.notes);
+    }
+    out
+}
+
+/// A submission the card has not finished this long is reported.
+const STALL: Duration = Duration::from_millis(1500);
+
+/// Diagnostics, polled every 250 ms: each line's oldest submission in the
+/// air that has not run within [`STALL`] is reported once, with what its
+/// command buffers record and the lines' values (a hang: the shader that
+/// runs too long is in the first such submission of the line that did not
+/// move; the others wait for it).
+pub(super) fn report_stalls(b: &Backend) {
+    static REPORTED: std::sync::Mutex<Vec<(Line, u64)>> = std::sync::Mutex::new(Vec::new());
+    if !cfg!(feature = "diagnostics") || b.timeline.lost() {
+        return;
+    }
+    let e = engine(b);
+    let mut seen: Vec<Line> = Vec::new();
+    for f in &e.flights {
+        if seen.contains(&f.line) {
+            continue;
+        }
+        seen.push(f.line);
+        let reached = b.timeline.line_completed(&b.host, f.line);
+        if reached >= f.value || f.given.elapsed() < STALL || lock(&REPORTED).contains(&(f.line, f.value)) {
+            continue;
+        }
+        lock(&REPORTED).push((f.line, f.value));
+        let (given, label) = b.timeline.line_given(f.line);
+        let (host_given, _) = b.timeline.line_given(HOST);
+        tracing::error!(
+            line = %label,
+            value = f.value,
+            reached,
+            given_last = given,
+            host_reached = b.timeline.line_completed(&b.host, HOST),
+            host_given,
+            waited_ms = f.given.elapsed().as_millis() as u64,
+            notes = f.trail.len(),
+            trail = %f.trail.join(" | "),
+            "Vulkan: a submission has not finished (a hang?)"
+        );
+    }
 }
 
 /// Says once, loudly, that the device was lost.
