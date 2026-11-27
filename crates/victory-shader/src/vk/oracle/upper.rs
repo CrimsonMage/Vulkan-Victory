@@ -162,6 +162,18 @@ fn a_compare_where_every_lane_runs_stays_listed() {
     assert_eq!(notes, ["a wave64 mask's high half read as a number"]);
 }
 
+/// VCC as a scratch register of numbers: `s_or_b32 vcc_lo, s0, 12`, read
+/// back as a number (a pixel program of the title reads a buffer at that
+/// offset). It was made a lane mask and read back as a ballot: in a
+/// subgroup that lacks lanes the number lost their bits.
+#[test]
+fn a_number_kept_in_vcc_is_read_back_whole() {
+    let scratch = pixel(&[sop2(0x10, 106, 0, 128 + 12), vop1(0x001, 0, sgpr(106))]); // s_or_b32 vcc_lo, s0, 12; v_mov_b32 v0, vcc_lo
+    for (live, s0) in LIVE.into_iter().flat_map(|l| [0xDEAD_BEEFu32, 0x100, 0].map(|x| (l, x))) {
+        assert_eq!(run(&scratch, &["s_or_b32"], [s0, 0], live), Ok((Some(s0 | 12), vec![])), "lanes {live:#x}, s0 {s0:#x}");
+    }
+}
+
 /// The lower dword of an inverted mask has the bits of the lanes the
 /// subgroup lacks (they hold no work: a compare gave them 0).
 #[test]

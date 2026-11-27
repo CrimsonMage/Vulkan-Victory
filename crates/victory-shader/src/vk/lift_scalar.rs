@@ -149,7 +149,13 @@ impl Lift<'_> {
     fn sop_logic(&mut self, s: &Sop) -> Res<()> {
         let (inst, base) = (s.inst, s.base);
         let off = inst.machine.offset;
-        let maskish = s.src.iter().any(|o| self.mask_like(inst, o)) || s.dst_exec;
+        // VCC as a scratch register of numbers (`s_or_b32 vcc_lo, s15, 12`,
+        // read back as a buffer offset): outside compute a subgroup may lack
+        // lanes, and a number made a mask loses their bits when it is read
+        // back as a ballot. It stays a number (and is a mask where one is
+        // read: `data_mask`).
+        let scratch = self.native.stage != HwStage::Cs && matches!(s.dst, Some(Operand::Scalar { code, .. }) if *code == ir::VCC);
+        let maskish = s.src.iter().any(|o| self.mask_like(inst, o)) || (s.dst_exec && !scratch);
         if maskish || base == "wqm" {
             let a = self.opnd_mask(inst, &s.src[0])?;
             let r = match base {
