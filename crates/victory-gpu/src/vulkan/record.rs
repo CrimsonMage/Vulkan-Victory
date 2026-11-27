@@ -883,6 +883,7 @@ impl Rec {
             if super::targets::wants(&s.name) {
                 // SAFETY: outside rendering, in our command buffer.
                 unsafe { super::targets::before(b, cmd, &s.name) };
+                super::targets::tables(b, &s.name, &self.compute.slots);
             }
         }
         self.indirect.clear();

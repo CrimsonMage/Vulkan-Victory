@@ -571,7 +571,8 @@ pub(crate) fn slot_view(slot: u32) -> String {
     let Some(h) = heaps(b) else { return "?".into() };
     let s = lock(&h.state);
     let found = s.views.iter().find(|(_, v)| **v == slot).map(|((id, k), _)| {
-        format!("image {id} view {:?} {:?} mips {}+{} layers {}+{} storage={}", k.kind, k.format, k.base_mip, k.mips, k.base_layer, k.layers, k.storage)
+        let image = s.keep.get(id).map(|i| format!(" at {:#x} {:?} {}x{}x{}", i.key.address, i.format, i.extent.width, i.extent.height, i.extent.depth)).unwrap_or_default();
+        format!("image {id}{image} view {:?} {:?} mips {}+{} layers {}+{} storage={}", k.kind, k.format, k.base_mip, k.mips, k.base_layer, k.layers, k.storage)
     });
     found.unwrap_or_else(|| if slot < s.next { "null (freed)".into() } else { "null (never given)".into() })
 }

@@ -84,6 +84,30 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, name: &str) {
     lock(&PENDING).push(p);
 }
 
+/// With a dump before a compute program: the image descriptors (T#s) in
+/// the first 128 places of each table its root names, with the view the
+/// host wrote at each one's slot (what the program reads and writes).
+pub(super) fn tables(b: &Backend, name: &str, roots: &[Vec<u32>]) {
+    for (param, r) in roots.iter().enumerate().filter(|(_, r)| r.len() == 2) {
+        let table = u64::from(r[0]) | u64::from(r[1]) << 32;
+        let Ok(bytes) = super::read_title(b, table, 128 * 32) else { continue };
+        for (k, d) in bytes.chunks_exact(32).enumerate() {
+            let w: Vec<u32> = d.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if w[6] ^ w[7] != 0x7A3C_5E91 {
+                continue;
+            }
+            tracing::info!(
+                program = name,
+                param,
+                offset = format_args!("{:#x}", k * 32),
+                console = format_args!("type {} format {:#x} {}x{}", w[3] >> 28, (w[1] >> 20) & 0x1ff, ((w[1] >> 30) | (w[2] & 0xfff) << 2) + 1, ((w[2] >> 14) & 0x3fff) + 1),
+                host = %super::descriptors::slot_view(w[7] & 0xff_ffff),
+                "Vulkan: a descriptor of the program dumped before"
+            );
+        }
+    }
+}
+
 /// Whether a mid-frame dump of an earlier frame waits to be saved (its
 /// list has been executed by now).
 pub(super) fn pending(frame: u64) -> bool {
