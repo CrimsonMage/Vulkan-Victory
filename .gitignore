@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Indices the tools write from the user's dump (program names, hashes,
+# sizes): derived data, generated locally, never committed.
+/docs/pipeline-index.md
+/docs/translation-index.md
+/docs/shader-golden.txt
