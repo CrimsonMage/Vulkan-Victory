@@ -147,10 +147,11 @@ fn make(b: &Backend) -> Option<Plan> {
     let buf = Buffer::new(&b.host, room, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback).ok()?;
     let (mut items, mut at) = (Vec::new(), 0u64);
     for img in images::card_written_images() {
-        let bytes = u64::from(img.extent.width) * u64::from(img.extent.height) * texel(&img);
+        let bytes = u64::from(img.extent.width) * u64::from(img.extent.height) * u64::from(img.extent.depth.max(1)) * texel(&img);
         // shadow maps (D16) are left out: there are dozens, and compute
         // outputs (no draws: last in the order) must fit
-        if img.samples > 1 || img.extent.width < 128 || texel(&img) == 0 || at + bytes > room || img.format == vk::Format::D16_UNORM {
+        let volume = img.extent.depth > 1;
+        if img.samples > 1 || (img.extent.width < 128 && !volume) || texel(&img) == 0 || at + bytes > room || img.format == vk::Format::D16_UNORM {
             continue;
         }
         if !only().is_empty() && !only().contains(&img.key.address) {
@@ -173,7 +174,7 @@ pub(super) unsafe fn record(d: &victory_vk::ash::Device, cmd: vk::CommandBuffer,
         let region = vk::BufferImageCopy::default()
             .buffer_offset(*at)
             .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 })
-            .image_extent(vk::Extent3D { width: img.extent.width, height: img.extent.height, depth: 1 });
+            .image_extent(vk::Extent3D { width: img.extent.width, height: img.extent.height, depth: img.extent.depth.max(1) });
         // SAFETY: as the caller says.
         unsafe { d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, p.buffer, &[region]) };
     }
@@ -211,7 +212,27 @@ pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
         }
         tracing::info!(frame, at = format_args!("{:#x}", img.key.address), width = img.extent.width, height = img.extent.height, min = lo, max = hi, not_zero = some, "Vulkan: a depth image's values at the dump");
     }
-    for (n, (img, at)) in p.items.iter().enumerate().filter(|(_, (i, _))| i.format == vk::Format::R16G16B16A16_SFLOAT && i.extent.width >= 480) {
+    for (n, (img, at)) in p.items.iter().enumerate() {
+        let count = img.extent.width as usize * img.extent.height as usize * img.extent.depth.max(1) as usize;
+        let t = texel(img) as usize;
+        // SAFETY: as above.
+        let src = unsafe { std::slice::from_raw_parts((p.mapped as *const u8).add(*at as usize), count * t) };
+        let odd = not_finite(img.format, src, t);
+        if odd.iter().any(|&c| c != 0) {
+            tracing::info!(
+                frame,
+                label = %p.label,
+                n,
+                at = format_args!("{:#x}", img.key.address),
+                format = ?img.format,
+                size = format_args!("{}x{}x{}", img.extent.width, img.extent.height, img.extent.depth),
+                not_finite = ?odd,
+                texels = count,
+                "Vulkan: an image holding values that are not finite, at the dump"
+            );
+        }
+    }
+    for (n, (img, at)) in p.items.iter().enumerate().filter(|(_, (i, _))| i.format == vk::Format::R16G16B16A16_SFLOAT && i.extent.width >= 480 && i.extent.depth <= 1) {
         let count = img.extent.width as usize * img.extent.height as usize;
         // SAFETY: as above.
         let src = unsafe { std::slice::from_raw_parts((p.mapped as *const u8).add(*at as usize), count * 8) };
@@ -270,6 +291,40 @@ fn tell_depth_uses() {
     for (state, draws) in uses.into_iter().take(32) {
         tracing::info!(state, draws, "Vulkan: draws by depth target and depth state");
     }
+}
+
+/// Texels per channel whose value is an infinity or a NaN (float formats;
+/// zeros for the others).
+fn not_finite(format: vk::Format, src: &[u8], t: usize) -> [u64; 4] {
+    use vk::Format as F;
+    let mut odd = [0u64; 4];
+    let halves = match format {
+        F::R16G16B16A16_SFLOAT => 4,
+        F::R16G16_SFLOAT => 2,
+        F::R16_SFLOAT => 1,
+        _ => 0,
+    };
+    let floats = match format {
+        F::R32G32B32A32_SFLOAT => 4,
+        F::R32G32_SFLOAT => 2,
+        F::R32_SFLOAT => 1,
+        _ => 0,
+    };
+    for px in src.chunks_exact(t.max(1)) {
+        for c in 0..halves {
+            odd[c] += u64::from(u16::from_le_bytes([px[2 * c], px[2 * c + 1]]) & 0x7c00 == 0x7c00);
+        }
+        for c in 0..floats {
+            odd[c] += u64::from(u32::from_le_bytes([px[4 * c], px[4 * c + 1], px[4 * c + 2], px[4 * c + 3]]) & 0x7f80_0000 == 0x7f80_0000);
+        }
+        if format == F::B10G11R11_UFLOAT_PACK32 {
+            let x = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            odd[0] += u64::from(x >> 6 & 0x1f == 0x1f);
+            odd[1] += u64::from(x >> 17 & 0x1f == 0x1f);
+            odd[2] += u64::from(x >> 27 == 0x1f);
+        }
+    }
+    odd
 }
 
 fn half(x: u16) -> f32 {
