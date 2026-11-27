@@ -150,6 +150,97 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (the character): **why no character was drawn: the memory
+  map held 64 KiB of the 50 MB buffer of skinned vertices** (branch
+  `worktree-agent-a376a5a004106857f`, host only, shown on the card: runs
+  ch1 to ch8 on the cache of `batch-2026-11-27d`).
+  - **Where it was lost** (run ch1, exe int57): the albedo G-buffer
+    (0xb0a5a0000) has the room, the window frame, the yard and the posters
+    and no character and nobody in the yard, before and after every ped
+    draw; so nothing downstream (classes, lighting, SSS) is at fault. The
+    peds are skinned by compute (CS_PedStandardSkinning_0/1/9 ...) into two
+    buffers, 0xad5540000 (50 MB) and 0xad8740000 (25 MB), that the mesh
+    programs (MS_VS_PedTransformPreSkinD*) read. Replayed from its capture,
+    CS_PedStandardSkinning_0 stores 4,703 dwords at 0xad5c409d0; the
+    capture's memory map has `ad5540000 +10000` and nothing else there:
+    every store went to the sink and the mesh programs read zeros.
+  - **Why**: those buffers lie in memory the title maps page by page
+    (views of physical pages: each 64 KiB page is an allocation of its
+    own). A buffer view named the buffer's first address only (`touch`),
+    and "loose" memory was imported as the run of pages of that one
+    allocation: one page. Buffers in `XMemVirtualAlloc` regions were never
+    affected (the region is imported whole), which is why the world drew.
+  - **Fix** (ae2725f, b6efb7b): a view imports its buffer whole
+    (`Memory::want_range`: loose memory to the end of the range named, over
+    the allocations that follow, as far as they are committed read-write
+    memory and no region, pool or view of their own); the title's buffer
+    resources are known by address (`buffer_resource`), so an address named
+    inside one (a root view, an index buffer, a copy) imports all of it;
+    a range over several regions wants each. In ch3 the map has
+    `ad5540000 +4f60000` and about fifty buffers of 0.1 to 8 MB at
+    0xaf... come in whole that had one page each before.
+  - **Also fixed there**: a loose union with pages freed since (a block of
+    the process heap: no call says so) was refused whole and stayed
+    refused: in vk105 143 MB of loose memory read zeros from the world's
+    load on (`a region was not imported`, also runs gi4 and gi9). Each run
+    of pages still there is a region now.
+  - **After it, under the ceiling as it is** (ch2, ch3, ch7): the
+    character's back and shoulders in the jumpsuit are in the albedo and
+    in the final frame, the people in the yard are in the albedo, and the
+    window's mesh shows in ch2 and ch7 (it is drawn from such a buffer
+    too). No head yet (in ch6 and ch7 its eyes and an ear float where it
+    belongs), the hair a tuft at the neck: the next point.
+  - **What changes from run to run, and why: the pool's GPU view is three
+    quarters unbound.** The title shows 1,770 MB of pool pages in its GPU
+    view; under the ceiling the view keeps 372 MB on the card (images take
+    3,072 MB, 2,241 MB of them render targets and other card-written
+    images, among them 3840x2160 ones), and an unbound page reads zeros.
+    Only a recording that names a page brings it back, and what programs
+    read through views made once (meshlets, vertices, tables) is never
+    named again. Runs on one build differ in buildings, window frame,
+    mesh, bunk and hair by what was evicted. With
+    `VICTORY_VK_CEILING_MB=5376` (ch5: view 1,144 MB, card 6.55 GB at
+    peak, no image refused) the buildings, the watchtower and the bunk
+    take the reference's shapes.
+  - **The head and the hair were lost there too.** Run ch8 (the rule
+    below, `VICTORY_VK_CEILING_MB=5312`: view 1,038 MB on the card, card
+    6.49 GB at peak): the albedo at frame 1680 has the whole character
+    from behind, head, brown hair, the ponytail down the back, the orange
+    jumpsuit, and through the window the building, the watchtower and
+    the people in orange at the tables; the final frame 1950 has the
+    head, neck and shoulders as a dark silhouette against the yard (no
+    indirect light on it: the dark-walls matter), the lit window frame,
+    the building at the left, the watchtower, the bunk and posters at the
+    right. No window mesh in that frame, no lettering, the left wall's
+    albedo black (48 textures of 256 to 1024 texels were not made: the
+    images wanted a thirteenth block while the view held the room).
+  - **Pool pages by what reads them** (9640112): pages wholly under a
+    filled texture are cold (programs read the image, never the page) and
+    lose their card page first; a buffer view warms its range; a page
+    programs read that lost its card page takes a cold page's. Measured
+    (ch7): 737 MB of the 1,779 MB shown are texture pages, none of them
+    on the card any more, and the other 1,040 MB still compete for 384 MB
+    (124,303 evictions of pages programs read). So the rule is right and
+    not enough: **the view needs about 1.05 GB on the card and the images
+    3.3 GB**, 0.9 GB more than the ceiling leaves together. To decide
+    (card memory): raise `CEILING` from 4,608 to about 5,500 MiB (card at
+    about 6.7 GB at peak; the watchdog stands at 7.7), or find the room
+    in the 2.2 GB of card-written images.
+  - **Tools**: `replay` marks stores outside the capture's memory map
+    (`stores.txt`: "OUTSIDE THE MEMORY MAP"); `VICTORY_VK_TRACE_DRAWS=Ped`
+    lists every draw of the named programs in the first dumped frame with
+    the title's indirect records; the first images not made are named;
+    `VICTORY_VK_CEILING_MB` / `VICTORY_VK_ROOM_MB` (diagnostics);
+    `examples/ops` lists a program's console instructions.
+  - **Open**: the card memory of the pool's view and the images (the
+    decision above; until then the head, the mesh and the buildings come
+    and go with what is evicted); the character black in the final frame
+    though whole in the albedo (indirect light); the window's mesh not in
+    every run; the lettering; captures lack the descriptors programs take
+    from the resource heap by index (replays of the skinning and culling
+    programs read zeros for them) and the indirect records of mesh draws;
+    a title crash 44 s into one run's loading (ch8's first try, another
+    build running beside it; not seen again).
 - 2026-11-27 (code tables): a program's constant tables are memory it
   reads by address, not variables of its module (branch
   `worktree-agent-a237c60fd3ce29af8`; offline only, awaiting a bake).
