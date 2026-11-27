@@ -797,12 +797,6 @@ pub(crate) fn write_descriptor(handle: u64, view: &crate::descriptor::View) {
     descriptors::write(handle, view);
 }
 
-/// Saves the pipeline cache (at the end of a run).
-pub(crate) fn save_cache() {
-    if let Some(b) = backend() {
-        stages::save_cache(b);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Presentation
@@ -826,7 +820,6 @@ fn start_reports() {
                 std::thread::sleep(Duration::from_millis(250));
                 budget::steps(b);
                 engine::report_stalls(b);
-                stages::save_cache_now_and_then(b);
                 if last.elapsed() >= Duration::from_secs(10) {
                     last = Instant::now();
                     report(b, FRAME.load(Ordering::Relaxed));

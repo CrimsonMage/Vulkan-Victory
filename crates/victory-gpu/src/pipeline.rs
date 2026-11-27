@@ -389,11 +389,6 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     let _ = CACHE_DIR.set(dir);
 }
 
-/// Saves the pipeline cache now if anything was added (at the end of a run).
-#[cfg(windows)]
-pub fn save_pipeline_cache() {
-    crate::vulkan::save_cache();
-}
 
 /// The folder of the pipeline caches, if one is set.
 #[cfg_attr(not(windows), allow(dead_code))]

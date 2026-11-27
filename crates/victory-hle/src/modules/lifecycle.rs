@@ -315,8 +315,6 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
-    // Compiled host pipelines kept for the next run.
-    victory_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

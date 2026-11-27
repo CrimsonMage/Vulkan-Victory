@@ -344,67 +344,14 @@ pub(crate) fn lookup(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
     }
 }
 
-/// The one `VkPipelineCache` of the run, loaded from the cache folder
-/// (one file per `pipelineCacheUUID`), saved at the end ([`save_cache`]).
-pub(crate) fn cache(b: &Backend) -> vk::PipelineCache {
-    static CACHE: OnceLock<vk::PipelineCache> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let data = cache_file(b).and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
-        // SAFETY: valid create info; a blob of another driver is ignored by
-        // the driver (its header names the device).
-        let made = unsafe {
-            b.host.device.create_pipeline_cache(
-                &vk::PipelineCacheCreateInfo::default().initial_data(&data),
-                None,
-            )
-        };
-        match made {
-            Ok(c) => {
-                tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache");
-                c
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Vulkan: no pipeline cache");
-                vk::PipelineCache::null()
-            }
-        }
-    })
-}
-
-fn cache_file(b: &Backend) -> Option<std::path::PathBuf> {
-    let uuid: String = b.host.caps.pipeline_cache_uuid.iter().map(|x| format!("{x:02x}")).collect();
-    Some(crate::pipeline::cache_dir()?.join(format!("vulkan-{uuid}.bin")))
-}
-
-/// Saves the pipeline cache (at the end of a run).
-pub(crate) fn save_cache(b: &Backend) {
-    let c = cache(b);
-    if c == vk::PipelineCache::null() {
-        return;
-    }
-    // SAFETY: a live cache.
-    if let (Ok(data), Some(f)) = (unsafe { b.host.device.get_pipeline_cache_data(c) }, cache_file(b)) {
-        let tmp = f.with_extension("tmp");
-        if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &f).is_ok() {
-            tracing::info!(kb = data.len() >> 10, "Vulkan: the pipeline cache saved");
-        }
-    }
-}
-
-/// Every 60 s, when parts were compiled since the last save: the pipeline
-/// cache is saved (runs end by being killed, so the save at the end is
-/// rarely reached).
-pub(crate) fn save_cache_now_and_then(b: &Backend) {
-    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
-    let parts = STATS[4].load(Ordering::Relaxed);
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let (when, saved) = *last.get_or_insert((Instant::now(), parts));
-    if when.elapsed() < std::time::Duration::from_secs(60) || parts == saved {
-        return;
-    }
-    *last = Some((Instant::now(), parts));
-    drop(last);
-    save_cache(b);
+/// No `VkPipelineCache` of ours: the driver keeps its own compiled
+/// pipelines on disk (NVIDIA's shader disk cache, Mesa's), and a cache
+/// object kept and saved by us on top of it only cost memory. Measured
+/// (vk71 against vk72): our file had grown to 2.3 GiB, read whole at start;
+/// without it parts still arrive in ~6 ms each and the process peaks 4 GiB
+/// lower.
+pub(crate) fn cache(_b: &Backend) -> vk::PipelineCache {
+    vk::PipelineCache::null()
 }
 
 struct Queue {

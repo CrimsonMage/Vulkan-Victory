@@ -254,7 +254,6 @@ pub(super) fn run(jobs: Option<usize>, index: Option<PathBuf>) -> anyhow::Result
     if let Some(dir) = crate::pipeline::cache_dir() {
         println!("bake: slow stages' SPIR-V (diagnostics builds) in {}", dir.with_file_name("slow-stages").display());
     }
-    stages::save_cache(b);
     let rows = all_rows(&shared, &before);
     std::fs::write(&path, index_text(&rows))?;
     println!("bake: done in {:.0} s; pipeline index {}", started.elapsed().as_secs_f64(), path.display());
@@ -314,7 +313,6 @@ fn watch(b: &'static Backend, s: &Arc<Shared>, before: &[Row], path: &Path, star
         }
         last = n;
         if saved.elapsed() >= Duration::from_secs(60) {
-            stages::save_cache(b);
             let _ = std::fs::write(path, index_text(&all_rows(s, before)));
             saved = Instant::now();
         }
