@@ -98,7 +98,7 @@ impl Lift<'_> {
                 R::M(b, half)
             }
             Reg::S(c) => R::D(self.user_data(u32::from(c))),
-            _ => R::D(self.f.global(Op::Undef, Ty::U32)),
+            _ => R::D(self.f.konst(Ty::U32, 0)),
         }
     }
 

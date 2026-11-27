@@ -52,7 +52,7 @@ impl Lift<'_> {
                         _ => self.u32v(d),
                     }
                 }
-                Err(_) => self.f.global(Op::Undef, ty),
+                Err(_) => self.f.konst(ty, 0),
             };
             let phi = self.f.push(Node { op: Op::Phi, ty, args: vec![inner, outer], imm: Vec::new() });
             self.born.insert(phi, self.cur_block);
@@ -287,7 +287,7 @@ impl Lift<'_> {
             for j in 0..self.all_phis[b].len() {
                 let node = self.all_phis[b][j];
                 let ty = self.f.ty(node);
-                let undef = self.f.global(Op::Undef, ty);
+                let undef = self.f.konst(ty, 0);
                 for a in &mut self.f.nodes[node as usize].args {
                     if *a == u32::MAX {
                         *a = undef;
@@ -353,7 +353,7 @@ impl Lift<'_> {
                         self.u32v(d)
                     }
                 },
-                Err(_) => self.f.global(Op::Undef, ty),
+                Err(_) => self.f.konst(ty, 0),
             };
             self.f.nodes[node as usize].args[k] = x;
         }

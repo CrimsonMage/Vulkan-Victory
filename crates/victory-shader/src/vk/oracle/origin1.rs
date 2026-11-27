@@ -357,3 +357,34 @@ fn a_pixel_that_ends_outside_exec_without_an_export_is_killed() {
 fn push_window_ps() -> usize {
     crate::vk::lift::push_window(HwStage::Ps) as usize
 }
+
+/// A register nothing wrote reads 0 (origin/main: an unwritten VGPR reads
+/// 0, and upstream f4438b3 "reads of uninitialized SGPRs read as zero, as
+/// VGPRs do"), also as what a lane outside EXEC keeps when the register is
+/// first written under EXEC. The interpreter reads `undef` (a poison here)
+/// for an undefined value.
+#[test]
+fn a_register_nothing_wrote_reads_zero() {
+    // v0 = v9 + s0 where nothing wrote v9; then v10, written only by the
+    // lanes with s1 > v0, is added in
+    let shader = build_valu_cs(&[
+        vop2(0x25, 0, sgpr(0), 9),  // v_add_nc_u32 v0, s0, v9
+        0xBE8C_037E,                // s_mov_b32 s12, exec_lo
+        0x7DA8_0001,                // v_cmpx_gt_u32 exec, s1, v0
+        vop1(0x001, 10, 0xFF),      // v_mov_b32 v10, 0x1234
+        0x1234,
+        0xBEFE_030C,                // s_mov_b32 exec_lo, s12
+        vop2(0x25, 0, vgpr(10), 0), // v_add_nc_u32 v0, v10, v0
+    ]);
+    let (f, _) = crate::vk::thread_ir_native(&shader.native).expect("translation");
+    for (s0, s1, want) in [(7u32, 0u32, 7u32), (7, 100, 7 + 0x1234)] {
+        let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+        mem.put(0x1000, &[0x2000, 0, 0x1_0000, 0x3000_0FAC]);
+        let mut m = Machine::new(&f, 32, mem);
+        m.undef = 0x5555_5555;
+        m.push[4..6].copy_from_slice(&[s0, s1]);
+        m.push[8] = 0x1000;
+        assert_eq!(m.run(), Stop::Returned);
+        assert_eq!(out(&m.mem, 0), want, "s0 {s0}, s1 {s1}");
+    }
+}
