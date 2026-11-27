@@ -444,3 +444,25 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         assert_eq!(got, want[i], "{backend}: case {i}");
     });
 }
+
+/// A gather at a named level reads that level: four texel loads at it
+/// (origin/main `emit/lower.rs`, "A gather at a named level, done as four
+/// texel reads"; its README: "Gathers at a named mip level (with and
+/// without an offset) read level 0; fixed"). `image_gather4_lz` stays a
+/// gather. (The interpreter's images hold one texel: the form is checked.)
+#[test]
+fn a_gather_at_a_named_level_reads_four_texels_of_that_level() {
+    use crate::vk::tir::{ImageKind, Op};
+    let count = |opcode: u32, what: fn(&ImageKind) -> bool| {
+        let (f, _) = crate::vk::thread_ir_native(&sampling(opcode).native).expect("translation");
+        f.nodes.iter().filter(|n| matches!(&n.op, Op::Image { kind, .. } if what(kind))).count()
+    };
+    let gathers = |k: &ImageKind| matches!(k, ImageKind::Gather { .. });
+    let loads = |k: &ImageKind| matches!(k, ImageKind::Load { mip: true });
+    // image_gather4_l (0x44): s, t, level; image_gather4_l_o (0x54): offset first
+    for opcode in [0x44, 0x54] {
+        assert_eq!((count(opcode, gathers), count(opcode, loads)), (0, 4), "opcode {opcode:#x}");
+    }
+    // image_gather4_lz (0x47)
+    assert_eq!((count(0x47, gathers), count(0x47, loads)), (1, 0));
+}

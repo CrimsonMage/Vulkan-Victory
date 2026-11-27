@@ -25,7 +25,7 @@ draws, (b) the fog apply pass's huge R/A on sky pixels, (c) glyph boxes.
 | 6 NaN tests | as before (same intent, unproven on the driver); their test not ported |
 | 7 legacy mad | fixed: fused, sources flushed |
 | 8 `image_sample_b` outside pixel | open |
-| 9 gathers at a named mip | open |
+| 9 gathers at a named mip | fixed (2D): four texel loads at the level |
 | found by the audit, not in the table below | **pixel kill never emitted** (fixed), **position w was 1/w** (fixed), **immediate comparison samplers never compared** (fixed), **float-to-integer conversions undefined out of range** (fixed), V#s with NUM_RECORDS -1 (side branch): `docs/opcode-audit.md` |
 
 ## Rows that could explain (a), (b), (c)

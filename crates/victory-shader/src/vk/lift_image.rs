@@ -205,6 +205,9 @@ impl Lift<'_> {
             (false, true) => Some(self.next_f(m)?),
             _ => None,
         };
+        if let (true, false, Some(lod), None) = (gather && m.class.dim == 1 && !m.class.arrayed, md.lz, lod_v, dref_v) {
+            return self.gather_at_level(m, coord, lod, off_v);
+        }
         let min_v = if md.min_lod { Some(self.next_f(m)?) } else { None };
         Self::push_opt(m, img::DREF, dref_v);
         Self::push_opt(m, img::BIAS, bias_v);
@@ -228,6 +231,54 @@ impl Lift<'_> {
         let args = std::mem::take(&mut m.args);
         let r = self.emit(Op::Image { kind, class: m.class, sampler: s, flags: m.flags }, Ty::vec(S::F32, 4), args);
         self.sample_result(m, r, gather, dref)
+    }
+
+    /// A gather at a named level (`image_gather4_l`, `_l_o`) of a 2D image:
+    /// the host's gather has no level, so the four texels are read at the
+    /// level (rounded to a whole one), in the gather's order (u0,v1)
+    /// (u1,v1) (u1,v0) (u0,v0), the offset in texels of that level,
+    /// coordinates past the edge clamped (origin/main `emit/lower.rs`,
+    /// "A gather at a named level, done as four texel reads": the title's
+    /// meshlet culling reads a 4x4 block of the depth pyramid this way, and
+    /// a gather of level 0 tested it against the wrong depths).
+    fn gather_at_level(&mut self, m: &mut Mimg, coord: V, lod: V, off: Option<V>) -> Res<()> {
+        let (zero, half, one) = (self.kf(0.0), self.kf(0.5), self.kf(1.0));
+        let l = self.gl(glsl::N_MAX, Ty::F32, &[lod, zero]);
+        let l = self.gl(glsl::ROUND_EVEN, Ty::F32, &[l]);
+        let mip = self.f_to_int(l, false);
+        let class = ImageClass { dynamic: true, ..m.class };
+        let z = self.k32(0);
+        let size = self.emit(Op::Image { kind: ImageKind::Size, class, sampler: Sampler::None, flags: img::LOD }, Ty::vec(S::U32, 2), vec![m.tw, z, mip]);
+        let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        for k in 0..2u32 {
+            let n = self.extract(size, k);
+            let n = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[n]);
+            let last = self.spv(op::F_SUB, Ty::F32, &[n, one]);
+            let c = self.extract(coord, k);
+            let t = self.spv(op::F_MUL, Ty::F32, &[c, n]);
+            let t = self.spv(op::F_SUB, Ty::F32, &[t, half]);
+            let mut first = self.gl(glsl::FLOOR, Ty::F32, &[t]);
+            if let Some(o) = off {
+                let (sh, w) = (self.k32(8 * k), self.k32(6));
+                let by = self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w]);
+                let by = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[by]);
+                first = self.spv(op::F_ADD, Ty::F32, &[first, by]);
+            }
+            let next = self.spv(op::F_ADD, Ty::F32, &[first, one]);
+            for (to, x) in [(&mut lo, first), (&mut hi, next)] {
+                let x = self.gl(glsl::N_CLAMP, Ty::F32, &[x, zero, last]);
+                to.push(self.f_to_int(x, false));
+            }
+        }
+        let comp = m.dmask.trailing_zeros();
+        let mut vals = Vec::new();
+        for (x, y) in [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])] {
+            let at = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 2), &[x, y]);
+            let r = self.emit(Op::Image { kind: ImageKind::Load { mip: true }, class, sampler: Sampler::None, flags: img::LOD }, Ty::vec(S::U32, 4), vec![m.tw, at, mip]);
+            let v = self.extract(r, comp);
+            vals.push(if m.d16 { self.f32v(v) } else { v });
+        }
+        self.write_result(m.inst, m.dreg, &vals, m.d16)
     }
 
     /// A sample's channels by dmask (a gather's four; a comparison's one).
