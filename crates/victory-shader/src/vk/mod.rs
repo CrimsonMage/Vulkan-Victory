@@ -12,6 +12,8 @@ pub mod emit;
 pub mod graph;
 pub mod ifconv;
 pub mod interp;
+#[cfg(test)]
+mod oracle;
 pub mod lift;
 pub mod pack16;
 pub mod report;
@@ -251,7 +253,19 @@ pub fn thread_ir_plain(container: &[u8]) -> Result<(tir::Func, lift::Interface, 
     Ok((f, iface, native))
 }
 
+/// The thread program of a bare compute program (no container: no
+/// signatures), for offline tests.
+pub fn thread_ir_native(native: &NativeProgram) -> Result<(tir::Func, lift::Interface), ShaderError> {
+    thread_ir_parts(native, &[], &[], 0, true)
+}
+
 fn thread_ir_of(c: &Container<'_>, native: &NativeProgram, uniform: bool) -> Result<(tir::Func, lift::Interface), ShaderError> {
+    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
+    thread_ir_parts(native, &osg, &isg, mesh_stride(c, native), uniform)
+}
+
+fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], stride: u32, uniform: bool) -> Result<(tir::Func, lift::Interface), ShaderError> {
     let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // The branches that only skip code when no lane is left for it go: the
     // skipped vector code is guarded by EXEC anyway, and without them the
@@ -261,12 +275,10 @@ fn thread_ir_of(c: &Container<'_>, native: &NativeProgram, uniform: bool) -> Res
     // the skips' renaming goes by register and would undo it)
     crate::spill::user_data(&mut p, native);
     let io = io::raise(&p, native)?;
-    let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
-    let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
-    let rows = if native.stage == HwStage::Ps { &isg } else { &osg };
+    let rows = if native.stage == HwStage::Ps { isg } else { osg };
     let iface_elems = elements(rows);
     let mut lift = lift::Lift::new(&p, native, &io);
-    lift.mesh_stride = mesh_stride(c, native);
+    lift.mesh_stride = stride;
     lift.halves = pack16::halves(&native.io, &iface_elems);
     lift.unnamed_row = pack16::unnamed_row(&native.io, &iface_elems);
     if native.stage == HwStage::Vs {

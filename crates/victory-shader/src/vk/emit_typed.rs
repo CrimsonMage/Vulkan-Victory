@@ -220,25 +220,51 @@ impl Emit<'_> {
         let k32 = self.c32(32);
         let full = self.m.op(op::I_EQUAL, self.t.bool_, &[w, k32]);
         let fl = self.m.op(op::SELECT, u, &[full, raw, h]);
-        // unorm: raw / (2^w - 1); snorm: max(signed / (2^(w-1) - 1), -1)
-        let k31 = self.c32(31);
-        let wc = self.m.ext(glsl::U_MIN, u, &[w, k31]);
-        let one = self.c32(1);
-        let top = self.m.op(op::SHIFT_LEFT_LOGICAL, u, &[one, wc]);
-        let umax = self.m.op(op::I_SUB, u, &[top, one]);
-        let umax = self.m.op(op::CONVERT_U_TO_F, f, &[umax]);
-        let rf = self.m.op(op::CONVERT_U_TO_F, f, &[raw]);
-        let un = self.m.op(op::F_DIV, f, &[rf, umax]);
-        let un = self.m.op(op::BITCAST, u, &[un]);
-        let wm1 = self.m.op(op::I_SUB, u, &[wc, one]);
-        let stop = self.m.op(op::SHIFT_LEFT_LOGICAL, u, &[one, wm1]);
-        let smax = self.m.op(op::I_SUB, u, &[stop, one]);
-        let smax = self.m.op(op::CONVERT_U_TO_F, f, &[smax]);
-        let sf = self.m.op(op::CONVERT_S_TO_F, f, &[signed]);
-        let sn = self.m.op(op::F_DIV, f, &[sf, smax]);
-        let m1 = self.m.c_f32((-1.0f32).to_bits());
-        let sn = self.m.ext(glsl::N_MAX, f, &[sn, m1]);
-        let sn = self.m.op(op::BITCAST, u, &[sn]);
+        // unorm: raw / (2^w - 1); snorm: max(signed / (2^(w-1) - 1), -1),
+        // each the float nearest the exact quotient (`Lift::norm`; the
+        // table's widths: unorm 8, 16, 10 and 2, snorm 8 and 16)
+        let bool_ = self.t.bool_;
+        let w16 = {
+            let k = self.c32(16);
+            self.m.op(op::I_EQUAL, bool_, &[w, k])
+        };
+        let w8 = {
+            let k = self.c32(8);
+            self.m.op(op::I_EQUAL, bool_, &[w, k])
+        };
+        let w10 = {
+            let k = self.c32(10);
+            self.m.op(op::I_EQUAL, bool_, &[w, k])
+        };
+        let un = {
+            let pick = |s: &mut Self, c: Id, a: u64, b: Id| {
+                let a = s.m.c_u64(a);
+                s.m.op(op::SELECT, s.t.u64_, &[c, a, b])
+            };
+            let k = self.m.c_u64(norm_k(2, 40));
+            let k = pick(self, w10, norm_k(10, 40), k);
+            let k = pick(self, w8, norm_k(8, 40), k);
+            let k = pick(self, w16, norm_k(16, 48), k);
+            let (s40, s48) = (self.c32(scale(40)), self.c32(scale(48)));
+            let sc = self.m.op(op::SELECT, u, &[w16, s48, s40]);
+            self.norm_quotient(raw, k, sc)
+        };
+        let sn = {
+            let mag = self.m.ext(glsl::S_ABS, u, &[signed]);
+            let (d8, d16) = (self.c32(127), self.c32(32767));
+            let d = self.m.op(op::SELECT, u, &[w16, d16, d8]);
+            let mag = self.m.ext(glsl::U_MIN, u, &[mag, d]);
+            let (k8, k16) = (self.m.c_u64(norm_k(7, 42)), self.m.c_u64(norm_k(15, 45)));
+            let k = self.m.op(op::SELECT, self.t.u64_, &[w16, k16, k8]);
+            let (s42, s45) = (self.c32(scale(42)), self.c32(scale(45)));
+            let sc = self.m.op(op::SELECT, u, &[w16, s45, s42]);
+            let x = self.norm_quotient(mag, k, sc);
+            let xf = self.m.op(op::BITCAST, f, &[x]);
+            let nx = self.m.op(op::F_NEGATE, f, &[xf]);
+            let nx = self.m.op(op::BITCAST, u, &[nx]);
+            let neg = self.m.op(op::S_LESS_THAN, bool_, &[signed, z]);
+            self.m.op(op::SELECT, u, &[neg, nx, x])
+        };
         let x = self.m.op(op::SELECT, u, &[sint, signed, raw]);
         let x = self.m.op(op::SELECT, u, &[snorm, sn, x]);
         let x = self.m.op(op::SELECT, u, &[unorm, un, x]);
@@ -246,7 +272,35 @@ impl Emit<'_> {
     }
 }
 
+/// `(2^sh - 1) / (2^v - 1)` (`sh` a multiple of `v`).
+fn norm_k(v: u32, sh: u32) -> u64 {
+    ((1u64 << sh) - 1) / ((1u64 << v) - 1)
+}
+
+/// The bits of 2^-sh.
+fn scale(sh: u32) -> u32 {
+    (127 - sh) << 23
+}
+
 impl Emit<'_> {
+    /// The float nearest `a / d` for a code `0 <= a <= d` (bits), `k` =
+    /// [`norm_k`] of `d` and `sc` the matching [`scale`]: `(a k | 1)`
+    /// converted once, scaled; 0 for 0.
+    fn norm_quotient(&mut self, a: Id, k: Id, sc: Id) -> Id {
+        let (u, q, f, b) = (self.t.u32_, self.t.u64_, self.t.f32_, self.t.bool_);
+        let a64 = self.m.op(op::U_CONVERT, q, &[a]);
+        let p = self.m.op(op::I_MUL, q, &[a64, k]);
+        let one = self.m.c_u64(1);
+        let p = self.m.op(op::BITWISE_OR, q, &[p, one]);
+        let x = self.m.op(op::CONVERT_U_TO_F, f, &[p]);
+        let scf = self.m.op(op::BITCAST, f, &[sc]);
+        let x = self.m.op(op::F_MUL, f, &[x, scf]);
+        let x = self.m.op(op::BITCAST, u, &[x]);
+        let z = self.c32(0);
+        let zero = self.m.op(op::I_EQUAL, b, &[a, z]);
+        self.m.op(op::SELECT, u, &[zero, z, x])
+    }
+
     /// `TypedPack`: the encoder, the decoder's inverse. (shape, the four
     /// channel registers, d16: 1 when they are 16-bit values) -> the
     /// element's dwords (bits past it 0). Floats round to nearest even,
@@ -394,5 +448,19 @@ mod tests {
         // unknown codes: one 32-bit channel
         assert_eq!(t[0], entry(1, 32, FLOAT));
         assert_eq!(t[127], entry(1, 32, FLOAT));
+    }
+
+    /// `(a k | 1)` converted once and scaled is the float nearest `a / d`
+    /// for every code of the widths the decoders use.
+    #[test]
+    fn norm_quotients_round_to_nearest() {
+        for (v, sh) in [(8, 40), (16, 48), (10, 40), (2, 40), (7, 42), (15, 45), (9, 45)] {
+            let d = (1u64 << v) - 1;
+            let k = norm_k(v, sh);
+            for a in 1..=d {
+                let x = ((a * k) | 1) as f32 * f32::from_bits(scale(sh));
+                assert_eq!(x, a as f32 / d as f32, "{a} / {d}");
+            }
+        }
     }
 }

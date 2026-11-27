@@ -32,6 +32,58 @@ impl Lift<'_> {
         }
     }
 
+    /// `f` as f16 bits (low 16 of a u32) rounded toward zero, as
+    /// `v_cvt_pkrtz_f16_f32` rounds whatever the host's conversion does:
+    /// the host's half, one step back toward zero where it lies farther
+    /// out than `f` (an overflow to infinity becomes ±65504, not ±inf).
+    pub(super) fn f16_toward_zero(&mut self, f: V) -> V {
+        let h = self.spv(op::F_CONVERT, Ty::F16, &[f]);
+        let back = self.spv(op::F_CONVERT, Ty::F32, &[h]);
+        let fa = self.gl(glsl::F_ABS, Ty::F32, &[f]);
+        let ba = self.gl(glsl::F_ABS, Ty::F32, &[back]);
+        // ordered: never for NaN
+        let away = self.spv(op::F_ORD_GREATER_THAN, Ty::BOOL, &[ba, fa]);
+        let hb = self.spv(op::BITCAST, Ty::U16, &[h]);
+        let hb = self.spv(op::U_CONVERT, Ty::U32, &[hb]);
+        let one = self.k32(1);
+        let stepped = self.spv(op::I_SUB, Ty::U32, &[hb, one]);
+        self.spv(op::SELECT, Ty::U32, &[away, stepped, hb])
+    }
+
+    /// `v_fract`: below 1.0 always (a tiny negative's x - floor(x) rounds
+    /// to 1.0; RDNA gives the largest float below it); NaN stays.
+    pub(super) fn below_one(&mut self, x: V, ty: Ty) -> V {
+        let (one, top) = if ty == Ty::F16 { (0x3C00, 0x3BFF) } else { (0x3F80_0000, 0x3F7F_FFFF) };
+        let (one, top) = (self.f.konst(ty, one), self.f.konst(ty, top));
+        let ge = self.spv(op::F_ORD_GREATER_THAN_EQUAL, Ty::BOOL, &[x, one]);
+        self.spv(op::SELECT, ty, &[ge, top, x])
+    }
+
+    /// `v_sin`/`v_cos` of `a` turns: the turn's fraction first (RDNA reduces
+    /// large arguments so; a host sine of thousands of radians drifts),
+    /// sin(-0) -0, and exact zeros at half turns (sin) and quarter turns
+    /// (cos).
+    pub(super) fn turns(&mut self, sin: bool, a: V) -> V {
+        let fr = self.gl(glsl::FRACT, Ty::F32, &[a]);
+        let k = self.kf(std::f32::consts::TAU);
+        let r = self.spv(op::F_MUL, Ty::F32, &[fr, k]);
+        let x = self.gl(if sin { glsl::SIN } else { glsl::COS }, Ty::F32, &[r]);
+        // the zeros: sin at fractions 0 and 0.5, cos at 0.25 and 0.75
+        let (z0, z1) = if sin { (self.kf(0.0), self.kf(0.5)) } else { (self.kf(0.25), self.kf(0.75)) };
+        let e0 = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[fr, z0]);
+        let e1 = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[fr, z1]);
+        let zero = self.spv(op::LOGICAL_OR, Ty::BOOL, &[e0, e1]);
+        let pz = self.kf(0.0);
+        let x = self.spv(op::SELECT, Ty::F32, &[zero, pz, x]);
+        if sin {
+            // sin(±0) is the zero itself
+            let az = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[a, pz]);
+            self.spv(op::SELECT, Ty::F32, &[az, a, x])
+        } else {
+            x
+        }
+    }
+
     pub(super) fn fbin(&mut self, inst: &Inst, v: &Valu, o: u16, swap: bool) -> Res<V> {
         let a = self.fsrc(inst, v, 0)?;
         let b = self.fsrc(inst, v, 1)?;
@@ -113,6 +165,17 @@ impl Lift<'_> {
         };
         let mut x = x;
         if self.f.ty(x) == Ty::F16 {
+            // the output modifier, then clamp
+            let k = match v.omod {
+                1 => Some(0x4000),
+                2 => Some(0x4400),
+                3 => Some(0x3800),
+                _ => None,
+            };
+            if let Some(k) = k {
+                let k = self.f.konst(Ty::F16, k);
+                x = self.spv(op::F_MUL, Ty::F16, &[x, k]);
+            }
             if v.clamp {
                 let (z, o) = (self.f.konst(Ty::F16, 0), self.f.konst(Ty::F16, 0x3C00));
                 x = self.gl(glsl::N_CLAMP, Ty::F16, &[x, z, o]);
@@ -335,13 +398,12 @@ impl Lift<'_> {
                 };
                 let a = self.fsrc(inst, v, 0)?;
                 let x = self.gl(g, Ty::F32, &[a]);
+                let x = if name == "v_fract_f32" { self.below_one(x, Ty::F32) } else { x };
                 f(self, x)
             }
             "v_sin_f32" | "v_cos_f32" => {
                 let a = self.fsrc(inst, v, 0)?;
-                let k = self.kf(std::f32::consts::TAU);
-                let r = self.spv(op::F_MUL, Ty::F32, &[a, k]);
-                let x = self.gl(if name == "v_sin_f32" { glsl::SIN } else { glsl::COS }, Ty::F32, &[r]);
+                let x = self.turns(name == "v_sin_f32", a);
                 f(self, x)
             }
             "v_ldexp_f32" => {
@@ -401,10 +463,12 @@ impl Lift<'_> {
                     }
                     "v_sin_f16" | "v_cos_f16" => {
                         let a32 = self.spv(op::F_CONVERT, Ty::F32, &[a]);
-                        let k = self.kf(std::f32::consts::TAU);
-                        let r = self.spv(op::F_MUL, Ty::F32, &[a32, k]);
-                        let s = self.gl(if name == "v_sin_f16" { glsl::SIN } else { glsl::COS }, Ty::F32, &[r]);
+                        let s = self.turns(name == "v_sin_f16", a32);
                         self.spv(op::F_CONVERT, Ty::F16, &[s])
+                    }
+                    "v_fract_f16" => {
+                        let x = self.gl(glsl::FRACT, Ty::F16, &[a]);
+                        self.below_one(x, Ty::F16)
                     }
                     _ => {
                         let g = match name {
@@ -489,8 +553,11 @@ impl Lift<'_> {
                 if name != "v_cvt_pkrtz_f16_f32" {
                     return Err(unsupported(off, name));
                 }
-                let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, 2), &[a, b]);
-                let x = self.gl(glsl::PACK_HALF_2X16, Ty::U32, &[v2]);
+                let lo = self.f16_toward_zero(a);
+                let hi = self.f16_toward_zero(b);
+                let k16 = self.k32(16);
+                let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[hi, k16]);
+                let x = self.spv(op::BITWISE_OR, Ty::U32, &[lo, hi]);
                 f(self, x)
             }
             _ => Err(unsupported(off, name)),
