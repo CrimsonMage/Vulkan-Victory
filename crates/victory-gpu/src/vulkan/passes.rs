@@ -179,6 +179,11 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
         return;
     }
     let mut meta: Vec<String> = programs.iter().map(|(n, hash, stage)| format!("program {n} {hash} {stage}")).collect();
+    // the memory map the card translates title addresses through (what
+    // lies outside every range reads the zero block there)
+    for r in super::memory(b).map.ranges() {
+        meta.push(format!("maprange {:x} {:x} {:x}", r.title_start, r.title_size, r.device_base));
+    }
     let mut walk = Walk { b, dir: &dir, have: BTreeMap::new(), total: 0, slots: BTreeSet::new(), todo: VecDeque::new(), meta: Vec::new() };
     for (param, r) in roots.iter().enumerate() {
         meta.push(format!("root {param} {}", r.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
