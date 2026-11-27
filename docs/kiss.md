@@ -150,6 +150,48 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (indirect light): why everything the sun does not hit was
+  black, found by walking back from the tiled lighting with pass captures
+  (runs gi5 to gi9, branch `worktree-agent-a8a715585abfc9ff1`).
+  - **The buffers**: the tiled lighting samples indirect diffuse and
+    specular from two 1280x720 shared-exponent textures (0x9bb910000,
+    0x9be0e0000); both were all zeros, and so was every stage back to the
+    screen probes' ray radiance (2048x120, 0x9bb700000 / 0xafa840000) and
+    the sky cube (0x9d4eb0000). The miss path itself works: with every ray
+    a miss, CS_ScreenProbe_RayMiss writes sky radiance into its ray buffer.
+  - **Host, fixed (899741d, shown in run gi9)**: the title stores packed
+    R9G9B9E5 words through 32_UINT unordered views of textures whose
+    resources do not say they take unordered access. Our image then had no
+    storage usage, the view's storage binding stayed null and the stores
+    went nowhere (CS_ScreenProbes_Inject, the final gather, the sky cube).
+    Every colour image now takes storage where the driver gives it; a
+    shared-exponent texture that is no render target is a 32_UINT image;
+    an unordered view without a storage view is a warning. After it the
+    ray radiance, the final gather's output and both lighting inputs hold
+    light (diffuse mean 0.06 / 0.03 / 0.03, specular 0.6 / 0.7 / 1.2), the
+    sky cube has its blue (the sky in the lighting buffer is pink-white,
+    not brown) and the bunk shows; walls and the character are still far
+    too dark.
+  - **Translator, awaiting a bake (7756993)**: a gather of an integer
+    view went through the float image and read nothing on the card.
+    CS_Tiling_Generate_Opaque gathers the stencil of the material classes:
+    no tile got a class, its lists stayed empty (0xaf3630000) and every
+    tiled pass after it (reflection rays, their filters and resolves) ran
+    on no tile. A gather is by the T#'s integer bit now, as a load; the
+    host's stencil views hold the stencil in every channel (the programs
+    load it from the first and gather it from the second). Replayed: the
+    program fills its six lists (681 / 24 / 24 / 657 / 657 / 681 tiles).
+  - **Captures**: an indirect dispatch left its capture open (the next
+    program's push and dispatch lines went into it) and its own arguments
+    were not in it: closed and named now (`dispatch-indirect`). Captured
+    memory is what the CPU sees when the pass is recorded: lists and
+    counts the card writes in the same frame are a frame old or just
+    cleared (open: read them from the card, as the images). Replay writes
+    `reads.txt`, `stores.txt`, `images.txt` (`SHOW`, `UNDECODED`, `SPV`).
+  - Open: walls still dark with sky light and no occlusion (expected:
+    too bright), the builder (docs/fork-ray-tracing.md, record.rs
+    `bvh_builder`), the dither pattern.
+
 - 2026-11-26: wave-uniform values before emission (`vk/uniform.rs`). The
   card spent ~85% of a world frame in mesh draws whose modules exchanged
   between wave64 halves at every `v_readfirstlane` and counted every
