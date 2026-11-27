@@ -411,6 +411,19 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (rule, the user's): **no bake per translator change.** A
+  translator change ends with offline evidence: the instruction oracle
+  (vk/oracle), the golden behaviour of every used program under the
+  interpreter (which programs changed, and why), spirv-val, and replays of
+  captured passes. A bake is made for a verified batch only; host-only
+  changes never need one (they leave crates/victory-shader alone).
+  - **Pass captures** (vulkan/passes.rs, diagnostics): with
+    `VICTORY_VK_DUMP_AT=<program,…>` one run writes, for each program's
+    first execution, `pass-<frame>-<program>/` in the capture folder:
+    meta.txt (programs, root parameters, push constants, the draw or
+    dispatch, state), mem/ (the tables and the memory they point at) and
+    img/ (level 0 of every image its T#s name, as the card held it). The
+    interpreter replays it: a pass is examined without title or card.
 - 2026-11-26 (midnight): the fog pass, tables, float controls.
   - **CS_ApplyCombinedDeferred** (fog apply) has finite inputs (census of
     every float image, volumes whole, just before it: none holds an
