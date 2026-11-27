@@ -610,17 +610,7 @@ impl Rec {
         }
         super::passes::note(|| format!("push {}", words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
         if cfg!(feature = "diagnostics") {
-            for st in stages {
-                for ud in st.user_data.iter().filter(|u| matches!(u.root, RootType::Descriptor) && u.dword == 0) {
-                    let at = u64::from(root.word(ud.slot, 0)) | u64::from(root.word(ud.slot, 1)) << 32;
-                    if at != 0 && super::root_view_short(b, at) {
-                        let mut names = lock(&SHORT_ROOTS);
-                        if names.len() < 4096 {
-                            *names.entry(format!("{:?} {:#x}", st.stage, st.guard_id)).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
+            count_root_views(b, stages, root);
         }
         if self.pushed && words == self.last_push {
             return;
@@ -1069,6 +1059,22 @@ static PLANE_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Diagnostics: programs (stage, guard id) pushed a root view whose range
 /// is short -> times.
 static SHORT_ROOTS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Diagnostics: the root views a push carries, by how much of their
+/// memory-map range is left.
+fn count_root_views(b: &Backend, stages: &[&Stage], root: &Root) {
+    for st in stages {
+        for ud in st.user_data.iter().filter(|u| matches!(u.root, RootType::Descriptor) && u.dword == 0) {
+            let at = u64::from(root.word(ud.slot, 0)) | u64::from(root.word(ud.slot, 1)) << 32;
+            if at != 0 && super::root_view_short(b, at) {
+                let mut names = lock(&SHORT_ROOTS);
+                if names.len() < 4096 {
+                    *names.entry(format!("{:?} {:#x}", st.stage, st.guard_id)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+}
 
 /// The ten programs most often pushed a short root view.
 pub(crate) fn short_root_programs() -> String {
