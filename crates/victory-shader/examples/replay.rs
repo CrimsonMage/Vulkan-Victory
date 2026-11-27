@@ -11,7 +11,8 @@
 //! channel), `missing.txt` (memory read that the capture lacks, as
 //! ranges), `notes.txt` (what replay assumed) and `reads.txt` (each image
 //! slot the program read: how often, and the range of what came back);
-//! `images.txt` is what every image of the capture holds, read or not.
+//! `images.txt` is what every image of the capture holds, read or not
+//! (`SHOW=<slot>,...` writes some of them as tone-mapped pictures).
 //!
 //! Assumed: every sampler filters linearly and clamps to the edge (no
 //! sampler state is captured); level 0 only (an explicit level, bias or
@@ -613,6 +614,28 @@ fn image_census(slots: &HashMap<u32, Slot>) -> String {
     out
 }
 
+/// `SHOW=<slot>[,<slot>...]` (hex): those slots' level 0, first slice, as
+/// `slot-<id>.png`, tone mapped (x / (1 + x), then gamma 2.2).
+fn show(slots: &HashMap<u32, Slot>, out: &Path) {
+    for id in std::env::var("SHOW").unwrap_or_default().split(',').filter(|x| !x.is_empty()).map(|x| hex(x) as u32) {
+        let Some(s) = slots.get(&id) else { continue };
+        let (bytes, known) = texel_bytes(&s.view_format);
+        if !known {
+            continue;
+        }
+        let uint = !s.view_format.starts_with('D') && (s.view_format.contains("UINT") || s.view_format.contains("SINT"));
+        let rgba: Vec<u8> = (0..(s.w * s.h) as usize)
+            .flat_map(|i| {
+                let v = s.data.get(i * bytes..(i + 1) * bytes).map_or([0; 4], |t| decode(&s.view_format, t, uint));
+                let f = v.map(|x| if uint { x as u32 as f32 } else { f32::from_bits(x as u32) });
+                let tone = |x: f32| ((x.max(0.0) / (1.0 + x.max(0.0))).powf(1.0 / 2.2) * 255.0) as u8;
+                [tone(f[0]), tone(f[1]), tone(f[2]), 255]
+            })
+            .collect();
+        png(&out.join(format!("slot-{id:x}.png")), s.w, s.h, &rgba);
+    }
+}
+
 // ---- output ----
 
 fn crc32(data: &[u8]) -> u32 {
@@ -797,6 +820,7 @@ fn main() {
     let mut cap = read_capture(&dir);
     view_as(&mut cap);
     let _ = std::fs::write(out.join("images.txt"), image_census(&cap.slots));
+    show(&cap.slots, &out);
     let (f, _, native) = thread_ir(&container).expect("translation");
     let state = State { slots: std::mem::take(&mut cap.slots), written: BTreeMap::new(), notes: BTreeSet::new(), reads: BTreeMap::new() };
     let images = Replay(Rc::new(RefCell::new(state)));
