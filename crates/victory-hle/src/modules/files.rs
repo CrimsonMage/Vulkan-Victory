@@ -519,7 +519,10 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // faulting into its handler; the title's synchronous reads (title+0x313fc0)
 // read straight into 4 KiB-aligned destinations and retry a failed
 // `ReadFile` forever. `fread` has no such retry and reads beside instead
-// (see there). The bytes read are announced to the GPU side.
+// (see there). The bytes read are announced to the GPU side. A page the
+// GPU side keeps write-protected (it has a copy of it) would fail the
+// kernel's write the same way: such pages are opened for the call
+// (`victory_gpu::track::writing`).
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -528,9 +531,18 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    );
+    let (ok, error) = {
+        let _writing = victory_gpu::track::writing(buffer as usize, len as usize);
+        let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+            file, buffer, len, read, overlapped,
+        );
+        // SAFETY: plain call.
+        (ok, unsafe { windows_sys::Win32::Foundation::GetLastError() })
+    };
+    static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if ok == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+        tracing::warn!(buffer = format_args!("{buffer:p}"), len, "ReadFile: the host could not write the buffer (a protected title page, or a view away for a moment)");
+    }
     // The bytes are there (a synchronous read): host textures over them
     // detile again (unified memory).
     if ok != 0 && overlapped.is_null() && !read.is_null() {
@@ -538,6 +550,8 @@ pub extern "system" fn ReadFile(
         let n = unsafe { *read } as usize;
         victory_gpu::title_memory_written(buffer as usize, n);
     }
+    // SAFETY: plain call; the title sees the host's error.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
     ok
 }
 
@@ -556,6 +570,8 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         return read(buffer, size, count, stream);
     }
     const CHUNK: usize = 1 << 20;
+    // Write-protected pages of the buffer open at once, not fault by fault.
+    let _writing = victory_gpu::track::writing(buffer as usize, total);
     let mut beside = vec![0u8; total.min(CHUNK)];
     let mut done = 0;
     while done < total {

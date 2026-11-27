@@ -10,8 +10,9 @@
 //!   noted as `xmem` announces them. The pool's GPU view (the reservation
 //!   `CopyPageMappingsBatchX` maps into) is a sparse buffer of card pages
 //!   ([`victory_vk::pool`]): bound at each mapping call, filled from the
-//!   section's import when a page is first shown and at every announced
-//!   write. Sections are imported by host pointer (their whole views) when
+//!   section's import when a page is first shown, at every announced
+//!   write and after every CPU store into it (`crate::track`). Sections
+//!   are imported by host pointer (their whole views) when
 //!   a page of theirs is first shown. The memory map (ABI v1) is built from
 //!   what is imported.
 //! - **Presentation.** A swapchain on the title's window (or one of ours);
@@ -35,7 +36,6 @@ use victory_vk::timeline::Timeline;
 mod bound;
 mod baking;
 mod slow;
-mod stale;
 mod passes;
 mod targets;
 mod budget;
@@ -224,6 +224,9 @@ impl Memory {
             if r.import.is_some() || r.refused || !r.wanted {
                 continue;
             }
+            // Pages write tracking protects are opened for the driver's
+            // pinning, and stay open until the import is made.
+            let _writing = crate::track::writing(at, r.len);
             // SAFETY: the region as `xmem` reserved it; committed whole here.
             let ready = unsafe { ready_region(at, r.len) };
             let made = ready.map_err(|e| anyhow::anyhow!(e)).and_then(|()| {
@@ -975,7 +978,7 @@ fn report(b: &Backend, frame: u64) {
     gpu_stats::collect(b);
     record::report();
     images::report();
-    stale::report(b);
+    paging::report_written(frames);
     card_memory(b);
 }
 

@@ -163,6 +163,20 @@ pub(super) fn unfill_for_dstorage(physical: &mut Physical, keys: Vec<(usize, usi
     }
 }
 
+/// A store faulted at `at`: if that is a stand-in for a filler page, its
+/// page is made writable and the write counted (true).
+pub(super) fn stand_in_written(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    let in_fill = FILL_RANGES.read().is_ok_and(|f| f.range(..=at).next_back().is_some_and(|(&base, &len)| at < base + len));
+    let mut old = 0;
+    // SAFETY: a page of a stand-in of ours.
+    if in_fill && unsafe { VirtualProtect((at & !(PAGE - 1)) as *const c_void, PAGE, PAGE_READWRITE, &mut old) } != 0 {
+        victory_gpu::mapstat::filler_written();
+        return true;
+    }
+    false
+}
+
 /// Stand-ins by address, and their bytes, for the fault handler (which
 /// must not wait for the page table).
 pub(super) fn fill_ranges() -> std::sync::RwLockWriteGuard<'static, BTreeMap<usize, usize>> {

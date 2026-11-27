@@ -1,6 +1,7 @@
 //! Filling images from title memory: queued images set up and detiled
 //! into one staging buffer per flush, refilled at announced writes and
-//! when their memory's fingerprint changes; images freed with their memory.
+//! when the CPU stores into their memory (write tracking; a fingerprint
+//! where that cannot be had); images freed with their memory.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -12,21 +13,25 @@ use super::super::{Backend, lock};
 use super::{Image, Key, PLACES, STATS, USERS, full_barrier, once_warn, registry, release, to_general};
 
 
-/// Announced write over `[at, at + len)`: images there are filled again.
-pub(crate) fn written(at: u64, len: u64) {
+/// A write over `[at, at + len)` (announced, or found by write tracking):
+/// images there are filled again. Whether any image filled from title
+/// memory lies there.
+pub(crate) fn written(at: u64, len: u64) -> bool {
     let mut guard = registry();
-    let Some(r) = guard.as_mut() else { return };
-    let from = r.first_over(at);
-    let mut hit = Vec::new();
-    for (k, img) in r.images.range(from..) {
-        if k.address >= at + len {
-            break;
+    let Some(r) = guard.as_mut() else { return false };
+    let (mut hit, mut any) = (Vec::new(), false);
+    for img in (at >> 16..=(at + len.max(1) - 1) >> 16).filter_map(|page| r.over.get(&page)).flatten() {
+        let k = &img.key;
+        if img.card_written() || k.address >= at + len || k.address + img.bytes.max(1) <= at {
+            continue;
         }
-        if !img.card_written() && k.address + img.bytes.max(1) > at && !img.pending.swap(true, Ordering::Relaxed) {
+        any = true;
+        if !img.pending.swap(true, Ordering::Relaxed) {
             hit.push(img.clone());
         }
     }
     r.pending.extend(hit);
+    any
 }
 
 /// The title freed, unmapped or remapped `[at, at + len)`: images over
@@ -45,7 +50,7 @@ pub(crate) fn released(b: &Backend, at: u64, len: u64, why: super::Dropped) {
         .collect();
     let value = b.timeline.last();
     for k in gone {
-        if let Some(img) = r.images.remove(&k) {
+        if let Some(img) = r.take(&k) {
             super::super::descriptors::image_gone(img.id);
             r.dropped.push((value, img));
             super::DROPPED[why as usize].fetch_add(1, Ordering::Relaxed);
@@ -324,10 +329,17 @@ fn plan(img: &Image) -> anyhow::Result<Vec<Sub>> {
 fn detile(b: &Backend, img: &Image, subs: &[Sub], linear: &mut [u8], base: u64) -> anyhow::Result<Vec<vk::BufferImageCopy>> {
     let texture = crate::resource::texture_layout(&img.desc).ok_or_else(|| anyhow::anyhow!("no layout"))?;
     let layout = &texture.planes[0].layout;
+    // Protect, then copy: a store into its memory from here on faults and
+    // has it filled again (`crate::track`). Memory that cannot be tracked
+    // is checked by fingerprint ([`refresh`]).
+    let tracked = crate::track::protect(img.key.address, img.bytes.max(layout.size), true);
+    img.tracked.store(tracked, Ordering::Relaxed);
     let tiled = super::super::read_title(b, img.key.address, layout.size)?;
-    // The baseline the fingerprint check compares with (a first check
-    // would only store it, missing a change made before it).
-    img.hash.store(fingerprint(b, img.key.address, img.bytes).unwrap_or(0), Ordering::Relaxed);
+    if !tracked {
+        // The baseline the fingerprint check compares with (a first check
+        // would only store it, missing a change made before it).
+        img.hash.store(fingerprint(b, img.key.address, img.bytes).unwrap_or(0), Ordering::Relaxed);
+    }
     let mut regions = Vec::new();
     let mut at = 0usize;
     for s in subs {
@@ -415,8 +427,10 @@ pub(crate) fn format_bytes(f: vk::Format) -> u32 {
     }
 }
 
-/// Textures the title fills that changed without an API call saying so
-/// (movie frames, glyph atlases: the CPU writes them in place). At each
+/// Textures whose memory write tracking does not cover (`crate::track`:
+/// memory `xmem` does not map, pages left open as hot, and textures the
+/// card writes too, whose title memory is not their content until the CPU
+/// stores into it) that changed without an API call saying so. At each
 /// present the images that are due have their memory's [`fingerprint`]
 /// compared with the one of their last fill; a changed one is filled again
 /// at the next flush. An image is due one present after its fill or a
@@ -441,7 +455,7 @@ pub(crate) fn refresh(b: &Backend, frame: u64) {
     let mut due: Vec<Arc<Image>> = {
         let guard = registry();
         let Some(r) = guard.as_ref() else { return };
-        r.images.values().filter(|i| !i.attachment() && i.next_check.load(Ordering::Relaxed) <= frame).cloned().collect()
+        r.images.values().filter(|i| !i.attachment() && !i.tracked.load(Ordering::Relaxed) && i.next_check.load(Ordering::Relaxed) <= frame).cloned().collect()
     };
     // the longest overdue first: what the budget leaves waits a present
     due.sort_by_key(|i| i.next_check.load(Ordering::Relaxed));
@@ -514,6 +528,25 @@ fn fingerprint(b: &Backend, at: u64, len: u64) -> Option<u64> {
     let mut first = [0u8; 8];
     first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
     Some(u64::from_le_bytes(first).max(1))
+}
+
+/// Diagnostics: live images filled from title memory that write tracking
+/// covers and that are checked by fingerprint, and the six filled most
+/// often.
+pub(super) fn tracking() -> String {
+    let guard = registry();
+    let Some(r) = guard.as_ref() else { return String::new() };
+    let filled: Vec<&Arc<Image>> = r.images.values().filter(|i| i.written[3].load(Ordering::Relaxed) > 0).collect();
+    let tracked = filled.iter().filter(|i| i.tracked.load(Ordering::Relaxed)).count();
+    let polled = r.images.values().filter(|i| !i.attachment() && !i.tracked.load(Ordering::Relaxed)).count();
+    let mut most = filled;
+    most.sort_by_key(|i| std::cmp::Reverse(i.written[3].load(Ordering::Relaxed)));
+    let most: Vec<String> = most
+        .iter()
+        .take(6)
+        .map(|i| format!("{}x at {:#x} {:?} {}x{} {}K", i.written[3].load(Ordering::Relaxed), i.key.address, i.format, i.extent.width, i.extent.height, i.bytes >> 10))
+        .collect();
+    format!("tracked {tracked}, checked by fingerprint {polled}; most filled: {}", most.join("; "))
 }
 
 /// Diagnostics: the first images the CPU changed, once each.

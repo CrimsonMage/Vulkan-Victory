@@ -25,7 +25,7 @@ const TABLE: u64 = 4096;
 const VIEW: u64 = 64 << 10;
 const RANGE: u64 = 4 << 20;
 /// The most a capture holds: memory blocks, memory bytes, image bytes.
-const BLOCKS: usize = 4096;
+const BLOCKS: usize = 16384;
 const MEMORY: u64 = 768 << 20;
 const IMAGES: u64 = 1024 << 20;
 
@@ -110,13 +110,15 @@ impl Walk<'_> {
             // a V#: base, stride, records
             let base = u64::from(w[k]) | u64::from(w[k + 1] & 0xffff) << 32;
             let (stride, records) = (u64::from((w[k + 1] >> 16) & 0x3fff).max(1), u64::from(w[k + 2]));
-            if base >> 32 != 0 && records != 0 {
+            // (title memory starts low: constant buffers sit at 32-bit
+            // addresses; `take` drops what is not title memory)
+            if base >= 0x1_0000 && records != 0 {
                 self.todo.push_back((base, (stride * records).min(RANGE), depth + 1));
             }
             // plain pointers (a table named by a constant)
             for p in [k, k + 2] {
                 let at = u64::from(w[p]) | u64::from(w[p + 1]) << 32;
-                if (1..0x40).contains(&w[p + 1]) && at % 4 == 0 {
+                if w[p + 1] < 0x40 && at >= 0x1_0000 && at % 4 == 0 {
                     self.todo.push_back((at, TABLE, depth + 1));
                 }
             }
@@ -124,13 +126,28 @@ impl Walk<'_> {
         }
     }
 
+    fn one(&mut self, at: u64, want: u64, depth: u32) {
+        let Some(bytes) = self.take(at, want) else { return };
+        self.meta.push(format!("mem {at:x} {:x}", bytes.len()));
+        if depth < 3 {
+            self.scan(&bytes, depth);
+        }
+    }
+
+    /// Small blocks first (tables, constant buffers), so the large ranges
+    /// cannot use the capture's room up before them.
     fn run(&mut self) {
-        while let Some((at, want, depth)) = self.todo.pop_front() {
-            let Some(bytes) = self.take(at, want) else { continue };
-            self.meta.push(format!("mem {at:x} {:x}", bytes.len()));
-            if depth < 3 {
-                self.scan(&bytes, depth);
+        let mut large = VecDeque::new();
+        loop {
+            while let Some((at, want, depth)) = self.todo.pop_front() {
+                if want > VIEW {
+                    large.push_back((at, want, depth));
+                } else {
+                    self.one(at, want, depth);
+                }
             }
+            let Some((at, want, depth)) = large.pop_front() else { break };
+            self.one(at, want, depth);
         }
     }
 }

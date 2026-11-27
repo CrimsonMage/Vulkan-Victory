@@ -17,7 +17,7 @@ the twin; it implements only what is truly console-only.
 
 | Xbox side (what the title uses) | PC side (what victory turns it into) | Module | Status |
 |---|---|---|---|
-| Unified memory: the CPU writes, the GPU reads the same pages | Title memory imported by host pointer into Vulkan (buffer device addresses = title addresses, through the memory map); the pool's GPU view a sparse buffer of card pages bound at each page-mapping call, filled at announced writes | `victory-gpu/vulkan*`, `victory-vk`, `victory-hle/xmem.rs` | works (`docs/vulkan-host.md`) |
+| Unified memory: the CPU writes, the GPU reads the same pages | Title memory imported by host pointer into Vulkan (buffer device addresses = title addresses, through the memory map); the pool's GPU view a sparse buffer of card pages bound at each page-mapping call, filled at announced writes and after CPU stores (write tracking: pages the card has a copy of are write-protected, no mirror) | `victory-gpu/vulkan*`, `victory-vk`, `victory-hle/xmem.rs` | works (`docs/vulkan-host.md`) |
 | D3D12.X device and command lists (`d3d12_xs`) | Vulkan, recorded from the calls the title's threads write down | `victory-gpu` (`device`, `list`, `vulkan/`) | works; the only GPU back end since 2026-11-26 |
 | Console GPU code (RDNA2 machine code, no HLSL or DXIL shipped) | Decoder → IR → **SPIR-V** (`docs/vulkan-abi.md`), translated once per stage and kept on disk | `victory-shader` (`vk/`) | works |
 | Console tiled texture layouts | Detiled into card images when the data arrives | `victory-gpu/vulkan/images*` | works |
@@ -71,6 +71,14 @@ exactly one home, the one a PC game would give it:
 
 No class is mirrored in both places and kept in sync by watching or
 comparing. If something seems to need that, it is in the wrong class.
+
+The card forces two exceptions, both copies of memory the CPU may still
+write: the pool's GPU view (imported memory cannot back a sparse buffer on
+NVIDIA) and textures (the console's tiled layouts are not the card's).
+They are kept exact by write tracking, not by comparing: such a page is
+write-protected, the first store into it faults once, and its copies are
+made again before the next submission (`victory-gpu/src/track.rs`,
+`docs/vulkan-host.md` "Write tracking").
 
 ## Rules
 
@@ -505,6 +513,21 @@ driver errors and no new crash, and the captures look no worse.
     glyph boxes; ~700 pool pages a frame the CPU changes after the card
     copied them (write tracking planned, no extra RAM); 670 ms of card
     time a frame.
+- 2026-11-27: write tracking for the card's copies of title memory
+  (`track.rs`; `docs/vulkan-host.md` "Write tracking"). Pages under a
+  pool page on the card or an image filled from title memory are
+  write-protected in every title view; a store faults once into `xmem`'s
+  handler, the next flush (before every submission and present) protects
+  again and has the copies made again. One byte of state per tracked
+  64 KiB page; no mirror. Kernel writes (file reads, the driver's pinning)
+  open their range first. Deleted: the stale-page census (`stale.rs`), the
+  fingerprint of every tracked image at every fill; fingerprint polling
+  stays only for textures the card writes too (2,050 of 19,972 images).
+  World, a frame: 130 to 160 faults (2 to 6 us each), 25 to 105 pool
+  pages copied again, ~19 flushes costing ~3.5 ms, ~3 ms more of image
+  fills; RAM and card memory as before (15.2 to 16.2 GB, 6.4 to 6.6 GB).
+  Open: the ~3 ms target (one submission a flush, small images filled
+  only if changed).
 - 2026-11-26 (night): the shader piece, towards "complete".
   - **Indexes**: `docs/translation-index.md` (xtask, every container of a
     pack: coverage, refusals, approximations) and

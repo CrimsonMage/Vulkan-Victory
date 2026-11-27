@@ -38,6 +38,7 @@ mod fillers;
 mod hooks;
 mod places;
 mod ring;
+mod tracked;
 use places::placeholder;
 use fillers::*;
 pub use hooks::{XMemAlloc, XMemFree, XMemSetAllocationHooks};
@@ -133,6 +134,9 @@ pub extern "system" fn XMemVirtualAlloc(
     let constrained = base.is_null();
     let region = constrained && kind & MEM_RESERVE_PLACEHOLDER == 0;
     let (kind, bytes) = reservation(kind, size, constrained, region);
+    if kind & MEM_COMMIT != 0 {
+        tracked::title_protects(base, bytes);
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -1065,6 +1069,7 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
                     physical.shown.remove(&key);
                 }
             }
+            tracked::unmapped(at + k * PAGE, physical.shown.get(&key));
         }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1138,7 +1143,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Sit
         victory_gpu::mapstat::aliased();
     }
     for k in 0..len.div_ceil(PAGE) {
-        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        let places = physical.shown.entry(slice.key(k)).or_default();
+        tracked::mapped(base + k * PAGE, places.as_slice());
+        places.push(base + k * PAGE);
     }
     let (section, page) = slice.key(0);
     ring::note(if matches!(site, Site::Remnant) { "remnant shown again" } else { "view mapped" }, base, len, section, page);
@@ -1153,6 +1160,7 @@ fn install_fault_handler() {
     ONCE.call_once(|| {
         victory_gpu::mapstat::on_tick(check_fillers);
         victory_loader::describe_title_memory_with(describe);
+        tracked::start();
         // SAFETY: the handler touches only its own state and protections.
         unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
     });
@@ -1168,11 +1176,13 @@ fn install_fault_handler() {
 ///   bookkeeping decides, not a flag), and found there, the thread goes on;
 /// - the title wrote into a stand-in for a filler page: the page is made
 ///   writable and the write counted (it does not reach the filler page's
-///   other places).
+///   other places);
+/// - a store into a page write tracking protects (the card has a copy of
+///   it, `victory_gpu::track`): noted and let through.
 unsafe extern "system" fn on_fault(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH};
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, VirtualProtect, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: the system passes the exception being dispatched.
     let r = unsafe { &*(*info).ExceptionRecord };
     if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
@@ -1184,21 +1194,16 @@ unsafe extern "system" fn on_fault(info: *mut windows_sys::Win32::System::Diagno
     if kind != READ && kind != WRITE {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    if kind == WRITE && victory_gpu::track::write_fault(at) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // A change under way ends first (stand-ins change only during one).
     let holder = victory_gpu::mapping_lock_held();
     if !holder && !victory_gpu::remapping_over(2000) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if kind == WRITE {
-        let in_fill = FILL_RANGES
-            .read()
-            .is_ok_and(|f| f.range(..=at).next_back().is_some_and(|(&base, &len)| at < base + len));
-        let mut old = 0;
-        // SAFETY: a page of a stand-in of ours.
-        if in_fill && unsafe { VirtualProtect((at & !(PAGE - 1)) as *const c_void, PAGE, PAGE_READWRITE, &mut old) } != 0 {
-            victory_gpu::mapstat::filler_written();
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+    if kind == WRITE && stand_in_written(at) {
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
     if holder {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1433,6 +1438,9 @@ pub mod memory {
     #[allow(non_snake_case)]
     pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
         let span = freed(address as usize, size, kind);
+        if let Some((at, len)) = span {
+            super::tracked::title_protects(at as *const c_void, len);
+        }
         // SAFETY: the title's own arguments.
         let ok = unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) };
         if ok != 0 && size == 0 && kind & MEM_RELEASE != 0 {
@@ -1461,12 +1469,25 @@ pub mod memory {
     #[allow(non_snake_case)]
     pub extern "system" fn VirtualAlloc(at: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
         if kind & CONSOLE_KINDS == 0 && protect & GRAPHICS_PROTECTION == 0 {
+            if kind & super::MEM_COMMIT != 0 {
+                super::tracked::title_protects(at, size);
+            }
             // SAFETY: the title's own arguments.
             return unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(at, size, kind, protect) };
         }
         static NOTED: std::sync::Once = std::sync::Once::new();
         NOTED.call_once(|| tracing::info!(kind, protect, "VirtualAlloc with console flags: the XMem way"));
         super::XMemVirtualAlloc(at, size, kind & !CONSOLE_KINDS, 0, protect)
+    }
+
+    /// The title's `VirtualProtect`: the host's, on pages write tracking
+    /// has let go of first (the title is told its own protection, and
+    /// ours does not outlive the one it sets).
+    #[allow(non_snake_case)]
+    pub extern "system" fn VirtualProtect(at: *mut c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+        super::tracked::title_protects(at, size);
+        // SAFETY: the title's own arguments.
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at, size, protect, old) }
     }
 
     /// Victory's frees of title memory (`XMemFreeDefault`) go the same way.
@@ -1505,7 +1526,7 @@ pub mod memory {
         HleModule {
             name: "memory",
             dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-            exports: vec![hle_export!(VirtualAlloc), hle_export!(VirtualFree)],
+            exports: vec![hle_export!(VirtualAlloc), hle_export!(VirtualFree), hle_export!(VirtualProtect)],
         }
     }
 }

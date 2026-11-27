@@ -39,6 +39,7 @@ fn compose_test() -> bool {
 pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::Shown]) {
     let Some(b) = backend() else { return };
     let t = Instant::now();
+    super::paging::flush_written(b, true);
     images::flush(b);
     split(Split::Flush, t);
     let t = Instant::now();

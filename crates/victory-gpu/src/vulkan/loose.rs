@@ -104,6 +104,9 @@ fn page_info(p: usize) -> Option<PageInfo> {
     ok.then_some(info)
 }
 
+/// Committed read-write memory; a page write tracking keeps read-only is
+/// that too (it is opened for the import, `crate::track::writing`).
 fn usable(i: &PageInfo) -> bool {
-    i.State == windows_sys::Win32::System::Memory::MEM_COMMIT && matches!(i.Protect & 0x1ff, 0x04 | 0x40)
+    let writable = matches!(i.Protect & 0x1ff, 0x04 | 0x40) || (i.Protect & 0x1ff == 0x02 && crate::track::protected(i.BaseAddress as usize));
+    i.State == windows_sys::Win32::System::Memory::MEM_COMMIT && writable
 }
