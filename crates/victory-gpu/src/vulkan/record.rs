@@ -864,9 +864,12 @@ impl Rec {
 
     pub(crate) fn dispatch(&mut self, b: &'static Backend, x: u32, y: u32, z: u32) {
         if let Some(cmd) = self.prepare_dispatch(b) {
+            let mut lap = super::Lap::start(57);
             self.watch_cull(b, Some([x, y, z]), None);
+            lap.next();
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
+            lap.next();
             STATS[1].fetch_add(1, Ordering::Relaxed);
             let ud = [self.last_push[9], self.last_push[10], self.last_push[11], self.last_push[12]];
             self.note_as(|| format!("dispatch {x}x{y}x{z} ud5-8={:08x} {:08x} {:08x} {:08x}", ud[0], ud[1], ud[2], ud[3]), true);
@@ -878,6 +881,7 @@ impl Rec {
     /// Everything a dispatch needs bound; `None` (counted) if it is
     /// skipped. What it writes may be indirect records: no window holds.
     fn prepare_dispatch(&mut self, b: &'static Backend) -> Option<vk::CommandBuffer> {
+        let mut lap = super::Lap::start(48);
         let Some((shaders, _)) = crate::pipeline::parts(self.pipeline) else {
             skipped(false);
             return None;
@@ -891,6 +895,7 @@ impl Rec {
             BUILDER_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        lap.next();
         let stage = match stage_of(b, shaders, "compute") {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -907,8 +912,10 @@ impl Rec {
             return None;
         };
         self.guard_id = stage.guard_id;
+        lap.next();
         self.end_pass(b);
         let cmd = self.cmd(b)?;
+        lap.next();
         for s in shaders {
             if super::targets::wants(&s.name) {
                 // SAFETY: outside rendering, in our command buffer.
@@ -919,11 +926,14 @@ impl Rec {
                 unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.compute.slots) };
             }
         }
+        lap.next();
         self.indirect.clear();
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }
+        lap.next();
         self.refresh_map(b, cmd);
+        lap.next();
         // SAFETY: outside rendering, in our command buffer.
         unsafe {
             if self.bound_compute != pipeline {
@@ -931,7 +941,9 @@ impl Rec {
                 self.bound_compute = pipeline;
                 super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             }
+            lap.next();
             self.push(b, cmd, &[&stage], true);
+            lap.next();
         }
         Some(cmd)
     }

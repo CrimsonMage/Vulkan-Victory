@@ -593,11 +593,38 @@ pub(crate) fn op_time(op: u64, since: Instant) {
     o[1].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Diagnostics: the steps of one recording path, timed into [`OPS`] from
+/// a first index on (48.. a dispatch's preparing: parts, stage, pass and
+/// command buffer, dump hooks, windows and immediates, map, bind, push;
+/// 57.. the dispatch: watch, the call, the note).
+pub(crate) struct Lap(u64, Instant);
+
+impl Lap {
+    pub(crate) fn start(first: u64) -> Lap {
+        Lap(first, Instant::now())
+    }
+
+    /// The step ends; the next begins.
+    pub(crate) fn next(&mut self) {
+        if cfg!(feature = "diagnostics") {
+            op_time(self.0, self.1);
+            self.0 += 1;
+            self.1 = Instant::now();
+        }
+    }
+}
+
+impl Drop for Lap {
+    fn drop(&mut self) {
+        self.next();
+    }
+}
+
 fn ops_text(frames: u64) -> String {
     let mut all: Vec<(usize, u64, u64)> = OPS.iter().enumerate().map(|(k, o)| (k, o[0].swap(0, Ordering::Relaxed), o[1].swap(0, Ordering::Relaxed))).filter(|o| o.2 != 0).collect();
     all.sort_by_key(|o| std::cmp::Reverse(o.1));
     let f = frames as f64;
-    all.iter().take(10).map(|&(k, ns, n)| format!("op{k}: {:.1} ms {:.0} calls {:.1} us each", ns as f64 / 1e6 / f, n as f64 / f, ns as f64 / 1e3 / n as f64)).collect::<Vec<_>>().join(" | ")
+    all.iter().take(16).map(|&(k, ns, n)| format!("op{k}: {:.1} ms {:.0} calls {:.1} us each", ns as f64 / 1e6 / f, n as f64 / f, ns as f64 / 1e3 / n as f64)).collect::<Vec<_>>().join(" | ")
 }
 
 // ---------------------------------------------------------------------------
