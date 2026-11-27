@@ -411,6 +411,33 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (night, later): measured.
+  - **Wave-uniform values need no exchange** (vk/uniform.rs): mesh
+    exchange calls 7,607 -> 1,094 over the used set, no counted barriers
+    left, 157 of 240 mesh programs exchange nothing. In game (vk80): the
+    card's time 670 -> 100 ms a frame, no fault, frame 2,160 reached. The
+    frame is now the CPU's: recording takes ~1.4 s of thread time a frame
+    in a diagnostics build (join 547 ms): next to measure in a release
+    build.
+  - **The oracle** (vk/oracle, the other fork's valu tests through our
+    interpreter): 6 of 30 passed at first, 21 pass now, 11 ignored with
+    reasons. Fixes: a read hoisted above a store in one EXEC guard,
+    normalized buffer codes an ulp off, v_med3 with NaN, v_fract returning
+    1.0, v_sin/v_cos of large turns, v_bfe_i32 computed fields,
+    v_cmp_class, f16 omod, d16 integer loads, v_cvt_pkrtz rounding (inf
+    past 65504). Host: A8 views read their channel as alpha (glyph boxes?).
+  - **Lighting**: the first non-finite HDR texels are written by
+    CS_ApplyCombinedDeferred (fog apply: inscatter + hdr * transmittance);
+    the program is exact in the interpreter, so a fog input's R holds the
+    NaN: the volumetric-fog writers are next. The glass passes spread it.
+  - **Known gaps found**: constant tables read through s_getpc_b64 read
+    zeros (being fixed); unbound pages of the pool's sparse view fault the
+    card when a shader reaches them (why the range's-end V# rule faulted);
+    a mesh program's user-data entries 28-31 overlap the pixel window.
+  - **Title crash** (null-based reads, ~1 run in 5): xmem cleared (no
+    remap, stand-in or failed map in the failing runs; the null comes from
+    title heap memory). The crash report now carries the last mapping
+    operations per page.
 - 2026-11-26 (late): the world, after the shader piece.
   - **Read another fork** (Belobug/VIctory-Belobug-AMD, same upstream and
     licence; D3D12, a right picture at ~22 fps on an RX 7900 XTX, ~30 GB of
