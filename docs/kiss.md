@@ -499,6 +499,22 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (07:30): **the test scene is on screen** (run vk102, tag
+  `batch-2026-11-27b`, exe int55; frame
+  /mnt/data/victory/capture/vk102/frame-1380.png): window, yard, building,
+  watchtower, the character's hair, low sun. Against the user's reference
+  (/mnt/data/victory/reference/opening-shot-target.jpg) still wrong: black
+  and amber only (blue is near zero in the HDR buffer already), the
+  interior and the character's body black (no indirect light), no window
+  mesh, dark blocks in the sky, dither.
+  - The bake after the tone-map table fix took 403 s (75 stages compiled,
+    the rest from the fresh driver cache).
+  - **Card memory**: both runs on this build were ended by the watchdog at
+    world load (7.4 and 7.7 GB on the card). Our Vulkan heap use is 4.7 GB
+    (images 2.56, buffers 0.4, pool 0.26, driver 1.4) and the budget the
+    driver reports has shrunk to 4.7 GB: about 3 GB on the card is the
+    process's but not in that heap's count. Not understood; next to trace
+    (it also decides whether a run survives the load).
 - 2026-11-27 (morning): **the world is lit in the lighting buffer** (run
   vk98, batch `batch-2026-11-27` baked into a fresh driver cache, exe
   int54): class depth written (458k texels with classes), the HDR target
