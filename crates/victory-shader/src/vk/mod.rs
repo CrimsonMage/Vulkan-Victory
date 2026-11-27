@@ -12,6 +12,7 @@ pub mod emit;
 pub mod graph;
 pub mod ifconv;
 pub mod interp;
+pub mod interp_group;
 #[cfg(test)]
 mod oracle;
 pub mod lift;

@@ -138,6 +138,11 @@ pub struct Machine<'a> {
     f: &'a Func,
     lanes: usize,
     vals: Vec<Vec<W>>,
+    /// Where the run is: block, the block it was entered from, the next
+    /// item of its body (none before the start).
+    at: Option<(usize, usize, usize)>,
+    /// Blocks entered.
+    total: u64,
     pub mem: Memory,
     /// Push-constant dwords (user data k at 4 + k).
     pub push: Vec<u32>,
@@ -319,6 +324,8 @@ impl<'a> Machine<'a> {
             f,
             lanes,
             vals: vec![Vec::new(); f.nodes.len()],
+            at: None,
+            total: 0,
             mem,
             push: vec![0; 64],
             group: [0; 3],
@@ -361,30 +368,92 @@ impl<'a> Machine<'a> {
 
     /// Runs the wave from the entry block.
     pub fn run(&mut self) -> Stop {
+        self.step(false, false).1
+    }
+
+    /// Runs on from where the machine is (the entry block at first) to the
+    /// next exchange (`xchg`) or console barrier (`barrier`) at the top
+    /// level of a block, which it leaves unevaluated (the node, with
+    /// `Stop::Returned`), or to the program's end (no node). For
+    /// [`super::interp_group`], which runs the units of a group in turn
+    /// and settles those nodes between them ([`Machine::settle`]).
+    pub fn step(&mut self, xchg: bool, barrier: bool) -> (Option<V>, Stop) {
+        let f = self.f;
         let all = self.live.clone();
-        for &v in &self.f.prelude.clone() {
-            if let Err(e) = self.eval(v, &all, &all) {
-                return Stop::Error(e);
+        if self.at.is_none() {
+            for &v in &f.prelude {
+                if let Err(e) = self.eval(v, &all, &all) {
+                    return (None, Stop::Error(e));
+                }
+            }
+            if let Some(stop) = self.begin(0, usize::MAX) {
+                return (None, stop);
             }
         }
-        let (mut b, mut prev) = (0usize, usize::MAX);
-        let mut total = 0u64;
         loop {
-            self.visits[b] += 1;
-            total += 1;
-            self.trail.push_back(b);
-            if self.trail.len() > self.trail_len {
-                self.trail.pop_front();
-            }
-            if total > self.limit {
-                return Stop::Limit;
-            }
-            match self.enter(b, prev).and_then(|()| self.block(b, &all)) {
-                Ok(Some(t)) => (prev, b) = (b, t),
-                Ok(None) => return Stop::Returned,
-                Err(e) => return Stop::Error(format!("block {b}: {e}")),
+            let (b, prev, i) = self.at.unwrap_or((0, usize::MAX, 0));
+            let step = match f.blocks[b].body.get(i) {
+                Some(Item::N(v)) if (xchg && f.node(*v).op == Op::Xchg) || (barrier && f.node(*v).op == Op::Barrier) => {
+                    return (Some(*v), Stop::Returned);
+                }
+                Some(it) => self.items(std::slice::from_ref(it), &all, &all).map(|()| Some((b, prev, i + 1))),
+                None => self.leave(b, &all).map(|t| t.map(|t| (t, b, 0))),
+            };
+            match step {
+                Ok(Some(next)) if next.2 > 0 => self.at = Some(next),
+                Ok(Some((t, from, _))) => {
+                    if let Some(stop) = self.begin(t, from) {
+                        return (None, stop);
+                    }
+                }
+                Ok(None) => return (None, Stop::Returned),
+                Err(e) => return (None, Stop::Error(format!("block {b}: {e}"))),
             }
         }
+    }
+
+    /// Enters block `b` from `prev`: counted, its phis taken. The stop when
+    /// the run is over its limit or the entry is none of the block's.
+    fn begin(&mut self, b: usize, prev: usize) -> Option<Stop> {
+        self.at = Some((b, prev, 0));
+        self.visits[b] += 1;
+        self.total += 1;
+        self.trail.push_back(b);
+        if self.trail.len() > self.trail_len {
+            self.trail.pop_front();
+        }
+        if self.total > self.limit {
+            return Some(Stop::Limit);
+        }
+        self.enter(b, prev).err().map(|e| Stop::Error(format!("block {b}: {e}")))
+    }
+
+    /// The node [`Machine::step`] stopped at is done: an exchange with the
+    /// pair every invocation gets, a barrier with none.
+    pub fn settle(&mut self, v: V, pair: [u64; 2]) {
+        self.vals[v as usize] = vec![[pair[0], pair[1], 0, 0]; self.lanes];
+        self.watched(v);
+        if let Some(at) = &mut self.at {
+            at.2 += 1;
+        }
+    }
+
+    /// The word this unit gives at exchange `v`: the same in every
+    /// invocation that is there, as the card's exchange takes it (any of
+    /// them stores it), or the error.
+    pub fn own_word(&self, v: V) -> Result<u64, String> {
+        let a = self.f.node(v).args[0];
+        let mut words = (0..self.lanes).filter(|&l| self.live[l]).map(|l| self.value(a, l)[0]);
+        let first = words.next().unwrap_or(0);
+        if words.any(|w| w != first) {
+            return Err(format!("the word %{a} of exchange %{v} differs within a half"));
+        }
+        Ok(first)
+    }
+
+    /// Invocations a unit of this machine has (32 or 64).
+    pub fn lanes(&self) -> usize {
+        self.lanes
     }
 
     /// The phis of block `b` entered from `prev` (all at once).
@@ -409,11 +478,10 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    /// Runs block `b`'s body; the block it goes to (none: it returned).
-    fn block(&mut self, b: usize, all: &[bool]) -> Result<Option<usize>, String> {
-        let blk = &self.f.blocks[b];
-        self.items(&blk.body, all, all)?;
-        match blk.term {
+    /// Leaves block `b` by its terminator: the block it goes to (none: it
+    /// returned).
+    fn leave(&mut self, b: usize, all: &[bool]) -> Result<Option<usize>, String> {
+        match self.f.blocks[b].term {
             Term::Return => Ok(None),
             Term::Jump(t) => Ok(Some(t)),
             Term::Branch(c, t, e) => {
