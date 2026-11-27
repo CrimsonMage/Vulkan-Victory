@@ -36,6 +36,20 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A stop's text without the value numbers an error names (`%716`): they
+/// shift with any change of the lowering, the behaviour does not.
+fn unnumbered(stop: &str) -> String {
+    let mut out = String::with_capacity(stop.len());
+    let mut after_percent = false;
+    for c in stop.chars() {
+        if !(after_percent && c.is_ascii_digit()) {
+            out.push(c);
+            after_percent = c == '%';
+        }
+    }
+    out
+}
+
 /// The behaviour hash of a container (or why it has none).
 pub fn behaviour(container: &[u8]) -> String {
     let (f, _, native) = match thread_ir(container) {
@@ -56,7 +70,7 @@ pub fn behaviour(container: &[u8]) -> String {
         m.image_texel = [0, 1, 2, 3].map(|c| u64::from(((mix(seed * 4 + c) >> 40) as f32 / (1u64 << 24) as f32).to_bits()));
         m.image_vary = true;
         let stop = m.run();
-        let mut s = format!("{stop:?}\n");
+        let mut s = format!("{}\n", unnumbered(&format!("{stop:?}")));
         for (k, v) in &m.outputs {
             let _ = writeln!(s, "o {k:?} {v:x}");
         }
