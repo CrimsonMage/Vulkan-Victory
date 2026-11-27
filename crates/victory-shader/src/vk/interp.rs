@@ -835,6 +835,9 @@ fn compare(o: u16, at: Ty, x: &[u64]) -> Option<u64> {
     Some(u64::from(r))
 }
 
+/// What a float-to-integer conversion SPIR-V leaves undefined reads here.
+pub const CONVERT_POISON: u64 = 0xDEAD_BEEF;
+
 /// Conversions and arithmetic of one component (division aside).
 fn arith(o: u16, ty: Ty, at: Ty, x: &[u64]) -> Option<u64> {
     let m = mask(ty.s);
@@ -846,10 +849,12 @@ fn arith(o: u16, ty: Ty, at: Ty, x: &[u64]) -> Option<u64> {
         op::U_CONVERT => x[0] & m,
         op::S_CONVERT => (s(0) as u64) & m,
         op::F_CONVERT => rf(f(0)),
-        op::CONVERT_F_TO_U if f(0).is_nan() => 0,
-        op::CONVERT_F_TO_U => f(0).clamp(0.0, m as f64) as u64 & m,
-        op::CONVERT_F_TO_S if f(0).is_nan() => 0,
-        op::CONVERT_F_TO_S => (f(0).clamp(-half, half - 1.0) as i64 as u64) & m,
+        // SPIR-V leaves a conversion of a NaN or of a value the type does
+        // not hold undefined: the poison shows a lift that did not clamp
+        op::CONVERT_F_TO_U if !(f(0).trunc() >= 0.0 && f(0).trunc() <= m as f64) => CONVERT_POISON & m,
+        op::CONVERT_F_TO_U => f(0) as u64 & m,
+        op::CONVERT_F_TO_S if !(f(0).trunc() >= -half && f(0).trunc() <= half - 1.0) => CONVERT_POISON & m,
+        op::CONVERT_F_TO_S => (f(0) as i64 as u64) & m,
         op::CONVERT_S_TO_F => rf(s(0) as f64),
         op::CONVERT_U_TO_F => rf(x[0] as f64),
         op::S_NEGATE => (s(0).wrapping_neg() as u64) & m,
