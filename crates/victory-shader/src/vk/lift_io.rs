@@ -35,6 +35,13 @@ impl Lift<'_> {
             Input::PrimitiveId => u(self, Builtin::PrimitiveId),
             Input::ThreadIdInGroup(c) => self.thread_id(c),
             Input::GroupId(c) => u(self, Builtin::WorkgroupId(c)),
+            // The console's position w is w itself (D3D's SV_Position.w,
+            // the hardware's POS_W); Vulkan's FragCoord.w is 1/w.
+            Input::Position(3) => {
+                let rhw = self.f.global(Op::Builtin(Builtin::FragCoord(3)), Ty::F32);
+                let one = self.kf(1.0);
+                self.global_node(Op::Spv(op::F_DIV), Ty::F32, vec![one, rhw])
+            }
             Input::Position(c) => self.f.global(Op::Builtin(Builtin::FragCoord(c)), Ty::F32),
             Input::FrontFace => {
                 let b = self.f.global(Op::Builtin(Builtin::FrontFacing), Ty::BOOL);

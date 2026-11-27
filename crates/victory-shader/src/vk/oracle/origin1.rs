@@ -243,3 +243,26 @@ fn a_pixel_outside_exec_at_the_last_export_is_killed() {
         assert_eq!(wrote, inside, "lane {l} writes mrt0");
     }
 }
+
+/// The console's pixel position w is w (D3D's `SV_Position.w`; the
+/// hardware's POS_W register, of which Mesa takes the reciprocal to make
+/// GL's `gl_FragCoord.w`); origin/main `emit/lower.rs` `input` loads
+/// `SV_Position` column 3 as it is. Vulkan's `FragCoord.w` is 1/w: the
+/// program must be given its reciprocal. (The interpreter's FragCoord.w is
+/// 1.0, so the form is checked.)
+#[test]
+fn a_pixels_position_w_is_w_not_its_reciprocal() {
+    use crate::vk::tir::{Builtin, Op};
+    let mut native = pixel(&[
+        0xF800_180F,
+        0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+    ]);
+    // SPI_PS_INPUT_ADDR: POS_W_FLOAT_ENA alone: w arrives in v0
+    native.io = StageIo::Ps { inputs: Vec::new(), input_addr: 1 << 11, db_shader_control: 0, patches: Vec::new() };
+    let (f, _) = crate::vk::thread_ir_native(&native).expect("translation");
+    let out = f.nodes.iter().find(|n| matches!(n.op, Op::Output { slot: 0, comp: 0 })).expect("mrt0.x");
+    let v = f.node(out.args[0]);
+    assert_eq!(v.op, Op::Spv(crate::vk::spirv::op::F_DIV), "1 / FragCoord.w: {v:?}");
+    assert_eq!(f.as_const(v.args[0]), Some(u64::from(1.0f32.to_bits())));
+    assert_eq!(f.node(v.args[1]).op, Op::Builtin(Builtin::FragCoord(3)));
+}
