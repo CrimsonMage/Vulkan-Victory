@@ -45,6 +45,8 @@ pub mod root;
 mod sampler;
 mod signature;
 #[cfg(windows)]
+pub mod track;
+#[cfg(windows)]
 pub mod upscale;
 #[cfg(windows)]
 mod vulkan;
@@ -68,7 +70,8 @@ pub use watch::{
 /// The bytes of a write the title's own memory views do not show the card
 /// are there: title memory `[at, at + len)` (DirectStorage and file reads
 /// into title memory, page writes through the runtime's views). The
-/// Vulkan backend fills the card pages that show them again.
+/// Vulkan backend fills the card pages that show them again. The title's
+/// own stores need no such call: [`track`] sees them.
 #[cfg(windows)]
 pub fn title_memory_written(at: usize, len: usize) {
     if len > 0 {

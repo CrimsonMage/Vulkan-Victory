@@ -7,8 +7,10 @@
 //! one card page per physical page however many title pages show it,
 //! bound in queue order at each mapping call and filled from the physical
 //! page's home (the section's import) by a card copy when the page is
-//! first shown and whenever the title announces it written (DirectStorage
-//! completion, title copies). Only pages actually shown get card memory.
+//! first shown, whenever the title announces it written (DirectStorage
+//! completion, title copies) and after CPU stores into it, which the
+//! caller's write tracking finds ([`PoolView::stored`]). Only pages
+//! actually shown get card memory.
 //!
 //! Room: card pages come in 64 MiB blocks while everything of ours on the
 //! card stays under the view's [`PoolView::ceiling`] (the one card-memory
@@ -111,6 +113,22 @@ pub struct PoolView {
     pub stats: Stats,
     /// Blocks given back, freed once the timeline passes the ticket.
     retired: Vec<(u64, usize)>,
+    /// Title addresses of evicted pages [`PoolView::written`] and
+    /// [`PoolView::ensure`] brought back: copies made with their CPU views
+    /// not yet write-protected, for the caller to take and have tracked.
+    pub back: Vec<u64>,
+}
+
+/// What a refresh of pages is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// A recording names them: touched; evicted ones come back.
+    Named,
+    /// An announced write: as named, and those on the card filled again.
+    Written,
+    /// The CPU stored into them (write tracking): those on the card are
+    /// filled again; evicted ones stay so (filled when they come back).
+    Stored,
 }
 
 impl PoolView {
@@ -168,6 +186,7 @@ impl PoolView {
             ceiling,
             stats: Stats::default(),
             retired: Vec::new(),
+            back: Vec::new(),
         };
         let _ = timeline;
         view.grow(host)?;
@@ -563,7 +582,8 @@ impl PoolView {
         tick: u64,
         source: impl Fn(PageKey) -> Option<Source>,
     ) -> Result<()> {
-        self.refresh(host, timeline, range, (tick, true), source)
+        let keys = self.keys_in(range);
+        self.refresh(host, timeline, keys, (tick, Why::Written), source).map(drop)
     }
 
     /// A recording names `[at, at + len)` (a root view, an index or
@@ -578,24 +598,37 @@ impl PoolView {
         tick: u64,
         source: impl Fn(PageKey) -> Option<Source>,
     ) -> Result<()> {
-        self.refresh(host, timeline, range, (tick, false), source)
+        let keys = self.keys_in(range);
+        self.refresh(host, timeline, keys, (tick, Why::Named), source).map(drop)
     }
 
-    /// The physical pages shown in `[at, at + len)`: touched at `tick`;
-    /// evicted ones filled and bound again; resident ones filled again if
-    /// `refill`.
-    fn refresh(
+    /// The CPU stored into the pages shown at the title addresses `at`
+    /// (those of this view): the ones on the card are filled again from
+    /// `source`, in one submission. How many were.
+    pub fn stored(
         &mut self,
         host: &Host,
         timeline: &Timeline,
-        (at, len): (u64, u64),
-        (tick, refill): (u64, bool),
+        at: &[u64],
         source: impl Fn(PageKey) -> Option<Source>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut keys: Vec<PageKey> = at.iter().filter_map(|&t| self.page_at(t)).map(|(key, _)| key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        self.refresh(host, timeline, keys, (0, Why::Stored), source)
+    }
+
+    /// Whether the page shown at title address `title` is on the card now.
+    pub fn resident(&self, title: u64) -> bool {
+        self.page_at(title).is_some_and(|(key, _)| self.pages[&key].slot.is_some())
+    }
+
+    /// The physical pages shown in `[at, at + len)`, once each.
+    fn keys_in(&self, (at, len): (u64, u64)) -> Vec<PageKey> {
         let lo = at.max(self.title_start);
         let hi = at.saturating_add(len).min(self.title_start + self.len);
         if lo >= hi {
-            return Ok(());
+            return Vec::new();
         }
         let mut keys: Vec<PageKey> = ((lo - self.title_start) / PAGE
             ..(hi - self.title_start).div_ceil(PAGE))
@@ -603,12 +636,33 @@ impl PoolView {
             .collect();
         keys.sort_unstable();
         keys.dedup();
+        keys
+    }
+
+    /// The physical pages `keys`, by [`Why`]: touched at `tick`; evicted
+    /// ones filled and bound again; those on the card filled again. How
+    /// many were filled.
+    fn refresh(
+        &mut self,
+        host: &Host,
+        timeline: &Timeline,
+        keys: Vec<PageKey>,
+        (tick, why): (u64, Why),
+        source: impl Fn(PageKey) -> Option<Source>,
+    ) -> Result<u64> {
         let mut binds = Vec::new();
         let mut fills = Vec::new();
         for key in keys {
-            self.touch(key, tick);
+            if why != Why::Stored {
+                self.touch(key, tick);
+            }
             let resident = self.pages[&key].slot;
-            if resident.is_some() && !refill {
+            let as_it_is = match why {
+                Why::Named => resident.is_some(),
+                Why::Written => false,
+                Why::Stored => resident.is_none(),
+            };
+            if as_it_is {
                 continue;
             }
             let Some(src) = source(key) else { continue };
@@ -618,15 +672,18 @@ impl PoolView {
                     let Some(s) = self.slot(host, timeline, &mut binds) else { continue };
                     self.place(key, s, &mut binds);
                     self.stats.refilled += 1;
+                    self.back.extend(self.pages[&key].shown.first().map(|t| self.title_start + t * PAGE));
                     s
                 }
             };
             fills.push((src, slot));
         }
+        let filled = fills.len() as u64;
         if fills.is_empty() && binds.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        self.flush(host, timeline, fills, binds)
+        self.flush(host, timeline, fills, binds)?;
+        Ok(filled)
     }
 
     /// Diagnostics: the pages shown, and the runs they make (title pages

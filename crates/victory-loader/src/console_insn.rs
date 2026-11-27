@@ -59,7 +59,7 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// on view memory opens as it does any write, and which is a crash otherwise (as the
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, VirtualQuery};
     let (regions, answers) = WRITABLE.with(Cell::get);
     if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
         let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
@@ -70,7 +70,10 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
+    // Read-only counts: title memory the card has a copy of is kept so by
+    // write tracking, and the write then faults inside this handler into
+    // the one that opens it (as the shortcut above says).
+    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_READONLY) == 0 {
         return None;
     }
     let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);

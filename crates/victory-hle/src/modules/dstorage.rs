@@ -984,7 +984,12 @@ fn read_at(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+            Err(error) => {
+                if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NOACCESS as i32) {
+                    tracing::warn!(at = format_args!("{:p}", out.as_ptr()), len = out.len(), "DirectStorage: the host could not write the destination (a protected title page?)");
+                }
+                break Err(from_win32(&error));
+            }
         }
     };
     STATS.read_ns.fetch_add(nanos_since(start), Ordering::Relaxed);
@@ -1009,6 +1014,9 @@ fn into_destination(
         // that was stops being one first (its stand-ins elsewhere would
         // never show them).
         let _target = super::xmem::target_memory(at, len);
+        // A read straight into it is the kernel's write, which a page the
+        // GPU side write-protects would fail: opened for the request.
+        let _writing = victory_gpu::track::writing(at, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
