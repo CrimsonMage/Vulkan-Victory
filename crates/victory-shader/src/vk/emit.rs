@@ -604,6 +604,18 @@ impl<'a> Emit<'a> {
             }
             _ => {}
         }
+        // Signed zeros, infinities and NaNs as written, for every float
+        // width the module uses: the console's rules we spell out (legacy
+        // multiplies, med3 and class tests on NaN, min/max of zeros) are
+        // not the compiler's to fold. A device without them for a width
+        // takes the module with that mode left out (victory-vk
+        // `limits::fit_float_controls`).
+        self.m.capability(en::CAP_SIGNED_ZERO_INF_NAN_PRESERVE);
+        for (w, cap) in [(16, Some(en::CAP_FLOAT16)), (32, None), (64, Some(en::CAP_FLOAT64))] {
+            if cap.is_none_or(|c| self.m.has_capability(c)) {
+                self.m.execution_mode(fid, en::EM_SIGNED_ZERO_INF_NAN_PRESERVE, &[w]);
+            }
+        }
         let (words, at) = self.m.finish();
         let input_locations = self.input_locations.iter().map(|&(l, w)| (l, at + w)).collect();
         let vertex_inputs = if self.st.stage == HwStage::Vs { self.inputs.keys().copied().collect() } else { Vec::new() };
