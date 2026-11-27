@@ -589,23 +589,29 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
     }
 }
 
+/// The format of the colour image of a resource.
+fn made_format(desc: &ResourceDesc, card_written: bool) -> Option<vk::Format> {
+    // DXGI_FORMAT_R9G9B9E5_SHAREDEXP that is no render target: the card
+    // can neither store to nor render to that format, and the title writes
+    // such textures as packed words through 32_UINT views (the screen
+    // probes' ray radiance, the final gather's output), whether or not the
+    // resource says it takes unordered access. A 32_UINT image takes the
+    // stores; its sampled views read the words as what they are
+    // (`views::view_format`).
+    if crate::resource::pc_format(desc.format) == 67 && desc.flags & RENDER_TARGET == 0 {
+        return Some(vk::Format::R32_UINT);
+    }
+    color_format(desc.format, card_written)
+}
+
 fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Option<&Arc<Image>>) -> Option<Image> {
     let depth = key.depth;
     let card_written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0
         || alias.is_some_and(|a| a.card_written());
     let format = if depth {
         depth_format(desc.format)?
-    } else if crate::resource::pc_format(desc.format) == 67 && desc.flags & RENDER_TARGET == 0 {
-        // DXGI_FORMAT_R9G9B9E5_SHAREDEXP that is no render target: the
-        // card can neither store to nor render to that format, and the
-        // title writes such textures as packed words through 32_UINT
-        // views (the screen probes' ray radiance, the final gather's
-        // output), whether or not the resource says it takes unordered
-        // access. A 32_UINT image takes the stores; its sampled views read
-        // the words as what they are (`views::view_format`).
-        vk::Format::R32_UINT
     } else {
-        color_format(desc.format, card_written)?
+        made_format(desc, card_written)?
     };
     let (kind, extent, layers) = match desc.dimension {
         TEXTURE_1D => (vk::ImageType::TYPE_1D, vk::Extent3D { width: key.width, height: 1, depth: 1 }, u32::from(key.depth_or_array)),
