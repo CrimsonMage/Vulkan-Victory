@@ -532,23 +532,25 @@ impl Rec {
         self.end_pass(b);
         // What compute stored into the depth buffer's memory goes into its
         // depth plane first.
-        if let Some(depth) = self.attached.iter().find(|i| i.depth())
-            && let Some(plane) = depth.plane()
+        if let Some(depth) = self.attached.iter().find(|i| i.depth()).cloned()
             && b.host.caps.maintenance8
         {
-            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
-            let region = vk::ImageCopy::default()
-                .src_subresource(layers(vk::ImageAspectFlags::COLOR))
-                .dst_subresource(layers(vk::ImageAspectFlags::DEPTH))
-                .extent(vk::Extent3D { width: depth.extent.width.min(plane.extent.width), height: depth.extent.height.min(plane.extent.height), depth: 1 });
-            // SAFETY: outside rendering in our command buffer; live images in GENERAL.
-            unsafe {
-                images::full_barrier(&b.host.device, cmd);
-                b.host.device.cmd_copy_image(cmd, plane.image, vk::ImageLayout::GENERAL, depth.image, vk::ImageLayout::GENERAL, &[region]);
-                images::full_barrier(&b.host.device, cmd);
+            for (plane, aspect) in depth.planes().into_iter().zip([vk::ImageAspectFlags::DEPTH, vk::ImageAspectFlags::STENCIL]) {
+                let Some(plane) = plane.filter(|_| depth.aspect().contains(aspect)) else { continue };
+                let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+                let region = vk::ImageCopy::default()
+                    .src_subresource(layers(vk::ImageAspectFlags::COLOR))
+                    .dst_subresource(layers(aspect))
+                    .extent(vk::Extent3D { width: depth.extent.width.min(plane.extent.width), height: depth.extent.height.min(plane.extent.height), depth: 1 });
+                // SAFETY: outside rendering in our command buffer; live images in GENERAL.
+                unsafe {
+                    images::full_barrier(&b.host.device, cmd);
+                    b.host.device.cmd_copy_image(cmd, plane.image, vk::ImageLayout::GENERAL, depth.image, vk::ImageLayout::GENERAL, &[region]);
+                    images::full_barrier(&b.host.device, cmd);
+                }
+                PLANE_COPIES.fetch_add(1, Ordering::Relaxed);
+                self.keep.push(plane.clone());
             }
-            PLANE_COPIES.fetch_add(1, Ordering::Relaxed);
-            self.keep.push(plane.clone());
         }
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()

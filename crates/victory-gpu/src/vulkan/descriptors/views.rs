@@ -334,8 +334,14 @@ fn texture_words(
     // A storage view of a depth buffer: the stores go to the colour image
     // over its memory (`images::written_plane`).
     let (image, title_format) = if unordered && image.depth() && image.samples == 1 {
-        match images::written_plane(b, &image, address, rdesc) {
-            Some(p) => (p, 41),
+        let stencil = images::reads_stencil(title_format);
+        images::once_warn(format!(
+            "Vulkan: a storage view of a depth buffer (its stores go to a colour image, copied in before the buffer is attached): at {address:#x}, resource format {}, view format {title_format}, {} plane",
+            rdesc.format,
+            if stencil { "stencil" } else { "depth" }
+        ));
+        match images::written_plane(b, &image, address, rdesc, stencil) {
+            Some(p) => (p, if stencil { 62 } else { 41 }),
             None => (image, title_format),
         }
     } else {

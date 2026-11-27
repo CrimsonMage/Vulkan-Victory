@@ -111,6 +111,8 @@ pub(crate) struct Image {
     /// those stores ([`written_plane`]), copied into the depth plane
     /// before the depth image is next attached.
     plane: OnceLock<Arc<Image>>,
+    /// The same for its stencil plane (an 8-bit integer image).
+    plane_stencil: OnceLock<Arc<Image>>,
     /// A fill is queued.
     pending: AtomicBool,
     /// The ticket of the last submission of ours that names it (its
@@ -152,9 +154,10 @@ impl Image {
 }
 
 impl Image {
-    /// The colour image that takes the stores into this depth image.
-    pub(crate) fn plane(&self) -> Option<&Arc<Image>> {
-        self.plane.get()
+    /// The colour images that take the stores into this depth image's
+    /// depth plane and its stencil plane.
+    pub(crate) fn planes(&self) -> [Option<&Arc<Image>>; 2] {
+        [self.plane.get(), self.plane_stencil.get()]
     }
 
     pub(crate) fn card_written(&self) -> bool {
@@ -224,7 +227,7 @@ impl Image {
     }
 }
 
-fn once_warn(text: String) {
+pub(crate) fn once_warn(text: String) {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
         tracing::warn!("{text}");
@@ -504,17 +507,22 @@ pub(crate) fn of_resource(b: &Backend, resource: This) -> Option<Arc<Image>> {
     at(b, data as u64, &desc, false)
 }
 
-/// The colour image that takes storage writes into depth image `depth`
-/// (over `address`, the resource `desc`): a 32-bit float image of its
-/// shape, made the first time. A depth image has no storage views.
-pub(crate) fn written_plane(b: &Backend, depth: &Arc<Image>, address: u64, desc: &ResourceDesc) -> Option<Arc<Image>> {
-    if let Some(p) = depth.plane() {
+/// The colour image that takes storage writes into a plane of depth image
+/// `depth` (over `address`, the resource `desc`), made the first time: a
+/// 32-bit float image of its shape for the depth plane, an 8-bit integer
+/// one for the stencil plane. A depth image has no storage views.
+pub(crate) fn written_plane(b: &Backend, depth: &Arc<Image>, address: u64, desc: &ResourceDesc, stencil: bool) -> Option<Arc<Image>> {
+    let cell = if stencil { &depth.plane_stencil } else { &depth.plane };
+    if let Some(p) = cell.get() {
         return Some(p.clone());
     }
-    // DXGI_FORMAT_R32_FLOAT
-    let plain = ResourceDesc { format: 41, flags: (desc.flags & !DEPTH_STENCIL) | UNORDERED, sample_count: 1, mip_levels: 1, ..*desc };
-    let p = at(b, address, &plain, true)?;
-    Some(depth.plane.get_or_init(|| p).clone())
+    // DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32_FLOAT
+    let format = if stencil { 62 } else { 41 };
+    let plain = ResourceDesc { format, flags: (desc.flags & !DEPTH_STENCIL) | UNORDERED, sample_count: 1, mip_levels: 1, ..*desc };
+    // The stencil plane's image is keyed one byte on: images over one
+    // address share card memory, and the two planes are two memories.
+    let p = at(b, address + u64::from(stencil), &plain, true)?;
+    Some(cell.get_or_init(|| p).clone())
 }
 
 /// The image over `address` of `desc`'s shape, made the first time
@@ -706,6 +714,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         bytes,
         views: Mutex::new(Vec::new()),
         plane: OnceLock::new(),
+        plane_stencil: OnceLock::new(),
         pending: AtomicBool::new(false),
         last_use: AtomicU64::new(0),
         fresh: AtomicBool::new(true),
