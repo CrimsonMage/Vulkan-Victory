@@ -626,11 +626,14 @@ impl Rec {
             return None;
         };
         let cmd = self.cmd(b)?;
+        let mut told = None;
         for s in shaders {
             if super::targets::wants(&s.name) {
                 self.end_pass(b);
                 // SAFETY: outside rendering, in our command buffer.
                 unsafe { super::targets::before(b, cmd, &s.name) };
+                super::targets::tables(b, &s.name, &self.graphics.slots);
+                told = Some(s.name.as_str());
             }
         }
         if let Some(h) = super::descriptors::heaps(b) {
@@ -639,6 +642,9 @@ impl Rec {
         self.refresh_map(b, cmd);
         self.last_inputs = (0, 0);
         let (formats, count, depth) = self.begin_pass(b, cmd)?;
+        if let Some(name) = told {
+            self.tell_draw(name, gs);
+        }
         let key = DrawKey { pipeline: self.pipeline as usize, formats, count, depth, rect: self.topology == RECTANGLES, mesh };
         let made = match self.links.get(&key) {
             Some(l) => l.clone(),

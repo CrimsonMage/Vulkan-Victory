@@ -233,6 +233,35 @@ impl Rec {
         }
     }
 
+    /// Diagnostics: the state of the first draw of a program dumped before
+    /// (targets, depth and stencil tests, the first target's blend).
+    pub(super) fn tell_draw(&self, program: &str, gs: &GraphicsState) {
+        let (z, t) = (&gs.depth, &gs.blend.RenderTarget[0]);
+        let targets: Vec<String> = self.attached.iter().map(|i| format!("{:#x} {:?} {}x{}", i.key.address, i.format, i.extent.width, i.extent.height)).collect();
+        tracing::info!(
+            program,
+            targets = %targets.join(", "),
+            depth = format_args!("test={} write={} func={} bounds={} {:?}", z.DepthEnable.as_bool(), z.DepthWriteMask.0, z.DepthFunc.0, gs.depth_bounds, self.depth_bounds),
+            stencil = format_args!(
+                "on={} read={:#x} write={:#x} ref={:#x} front(func={} pass={} fail={} zfail={}) back(func={})",
+                z.StencilEnable.as_bool(),
+                z.StencilReadMask,
+                z.StencilWriteMask,
+                self.stencil_ref,
+                z.FrontFace.StencilFunc.0,
+                z.FrontFace.StencilPassOp.0,
+                z.FrontFace.StencilFailOp.0,
+                z.FrontFace.StencilDepthFailOp.0,
+                z.BackFace.StencilFunc.0
+            ),
+            blend = format_args!("on={} src={} dst={} op={} mask={:#x}", t.BlendEnable.as_bool(), t.SrcBlend.0, t.DestBlend.0, t.BlendOp.0, t.RenderTargetWriteMask),
+            viewports = ?self.viewports.first().map(|v| (v.x, v.y, v.width, v.height, v.min_depth, v.max_depth)),
+            scissor = ?self.scissors.first().map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height)),
+            cull = gs.rasterizer.CullMode.0,
+            "Vulkan: the state of the first draw of a program dumped before"
+        );
+    }
+
     /// Draw test state: nothing hidden, every channel written.
     ///
     /// # Safety
