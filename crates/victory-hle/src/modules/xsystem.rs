@@ -247,7 +247,7 @@ mod device_type {
             data.cast::<u32>()
                 .write_unaligned(console_mode(console::current()));
         }
-        tracing::debug!(console = console::current().name(), "device type read");
+        tracing::info!(console = console::current().name(), "device type read");
         SUCCESS
     }
 

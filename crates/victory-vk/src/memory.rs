@@ -136,7 +136,7 @@ impl Imported {
             .memory_type_index(memory_type)
             .push_next(&mut import)
             .push_next(&mut flags);
-        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        let memory = match crate::account::traced(host, "import", || unsafe { device.allocate_memory(&alloc, None) }) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { device.destroy_buffer(buffer, None) };
@@ -187,6 +187,8 @@ impl Imported {
 pub enum Place {
     /// Card memory, not mapped (streamed-once copies, render scratch).
     Card,
+    /// Card memory of the recordings' scratch (booked apart).
+    Scratch,
     /// PC memory the CPU writes and the card reads (descriptors, constants).
     Upload,
     /// PC memory the card writes and the CPU reads.
@@ -225,7 +227,7 @@ impl Buffer {
         let needs = unsafe { device.get_buffer_memory_requirements(buffer) };
         use vk::MemoryPropertyFlags as M;
         let (want, avoid) = match place {
-            Place::Card => (M::DEVICE_LOCAL, M::HOST_VISIBLE),
+            Place::Card | Place::Scratch => (M::DEVICE_LOCAL, M::HOST_VISIBLE),
             Place::Upload => (M::HOST_VISIBLE | M::HOST_COHERENT, M::DEVICE_LOCAL),
             Place::Readback => (
                 M::HOST_VISIBLE | M::HOST_COHERENT | M::HOST_CACHED,
@@ -235,7 +237,7 @@ impl Buffer {
         let memory_type = host
             .memory_type(needs.memory_type_bits, want, avoid)
             .or_else(|| match place {
-                Place::Card => host.memory_type(needs.memory_type_bits, M::empty(), M::empty()),
+                Place::Card | Place::Scratch => host.memory_type(needs.memory_type_bits, M::empty(), M::empty()),
                 _ => host.memory_type(
                     needs.memory_type_bits,
                     M::HOST_VISIBLE | M::HOST_COHERENT,
@@ -249,10 +251,19 @@ impl Buffer {
             .allocation_size(needs.size)
             .memory_type_index(memory_type)
             .push_next(&mut flags);
-        let memory = unsafe { device.allocate_memory(&alloc, None) }.context("vkAllocateMemory")?;
-        crate::account::allocated(host, memory, memory_type, needs.size, crate::account::Kind::Buffers);
+        let (what, kind) = match place {
+            Place::Card => ("card buffer", crate::account::Kind::Buffers),
+            Place::Scratch => ("scratch buffer", crate::account::Kind::Scratch),
+            _ => ("host buffer", crate::account::Kind::Buffers),
+        };
+        let memory = crate::account::traced(host, what, || {
+            let m = unsafe { device.allocate_memory(&alloc, None) }?;
+            crate::account::allocated(host, m, memory_type, needs.size, kind);
+            Ok::<_, vk::Result>(m)
+        })
+        .context("vkAllocateMemory")?;
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
-        let mapped = if place == Place::Card {
+        let mapped = if matches!(place, Place::Card | Place::Scratch) {
             std::ptr::null_mut()
         } else {
             unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?

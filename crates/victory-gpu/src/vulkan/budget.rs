@@ -36,14 +36,7 @@ const ROOM: u64 = 1 << 30;
 /// A move of this much prints the card-memory line.
 const STEP: u64 = 256 << 20;
 
-/// The card heap's budget and use, if the driver tells them.
-fn heap(host: &Host) -> Option<(u64, u64)> {
-    host.heaps()
-        .iter()
-        .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .filter_map(|(_, bu)| *bu)
-        .max_by_key(|(budget, _)| *budget)
-}
+use account::card_heap as heap;
 
 /// Bytes of card memory ours may take now: the ceiling, less what the
 /// budget leaves past the others' use and the room.
@@ -119,11 +112,28 @@ pub(super) fn card_memory(b: &Backend) {
     let (card, host) = account::totals_mb();
     let (heap_budget, heap_used) = heap(&b.host).map_or((0, 0), |(t, u)| (t >> 20, u >> 20));
     let ours: u64 = card.iter().sum();
+    // The whole process on the card, as nvidia-smi counts it, and the part
+    // no Vulkan heap's use shows: the driver's own objects.
+    let (process, outside) = account::process(&b.host).map_or((0, 0), |(p, o)| (p >> 20, o >> 20));
+    // Every heap: size, use and budget in MiB ("d" marks card heaps).
+    let heaps: Vec<String> = b
+        .host
+        .heaps()
+        .iter()
+        .map(|(h, bu)| {
+            let (budget, used) = bu.unwrap_or((0, 0));
+            let d = if h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) { "d" } else { "" };
+            format!("{}{d}/{}/{}", h.size >> 20, used >> 20, budget >> 20)
+        })
+        .collect();
     tracing::info!(
+        process_mb = process,
+        outside_mb = outside,
         images_mb = card[0],
         images_bound_mb = images::used_mb(),
         pool_mb = card[1],
         buffers_mb = card[3],
+        scratch_mb = card[5],
         other_mb = card[4],
         ours_mb = ours,
         limit_mb = limit(&b.host) >> 20,
@@ -132,6 +142,8 @@ pub(super) fn card_memory(b: &Backend) {
         driver_mb = heap_used.saturating_sub(ours),
         host_buffers_mb = host[3],
         imports_mb = host[2],
+        heaps = %heaps.join(" "),
+        traced = %account::traced_line(),
         "Vulkan: card memory"
     );
 }
@@ -177,4 +189,78 @@ pub(super) fn steps(b: &Backend) {
         }
         card_memory(b);
     }
+}
+
+/// `victory vkprobe` with `VICTORY_VK_PROBE_SPV=<folder>`: every module of
+/// the folder (by name: `*.spv`, a compute module; `*.vks`, a translation
+/// of the stage cache) is compiled as the game compiles its stages, and
+/// what the card lost over each compile is printed (when it is 1 MiB or
+/// more): MiB outside every heap's use and MiB of heap use that is no
+/// allocation of ours; then the sums by kind of stage. How the shape of a
+/// module is tested against the driver (`docs/vulkan-host.md`, "Card
+/// memory the driver takes").
+pub(super) fn probe_spv(b: &Backend, dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| Some(e.ok()?.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "spv" || e == "vks"))
+        .collect();
+    files.sort();
+    let d = &b.host.device;
+    let now = || heap(&b.host).unwrap_or((0, 0));
+    let start = now();
+    let mut made = Vec::new();
+    // By kind of stage: modules, SPIR-V words, bytes outside, bytes of heap use.
+    let mut sums: std::collections::BTreeMap<String, [i64; 4]> = std::collections::BTreeMap::new();
+    for file in &files {
+        let (stage, words, samplers, tables) = if file.extension().is_some_and(|e| e == "vks") {
+            let vs = super::stage_cache::read_file(file).ok_or_else(|| anyhow::anyhow!("{}: not a translation", file.display()))?;
+            (vs.stage, vs.spirv, vs.samplers, vs.tables)
+        } else {
+            let bytes = std::fs::read(file)?;
+            let words = bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+            (victory_shader::HwStage::Cs, words, Vec::new(), Vec::new())
+        };
+        let before = now();
+        let t = std::time::Instant::now();
+        let fitted = victory_vk::limits::fit_float_controls(&words, b.host.caps.signed_zero_inf_nan);
+        let code = fitted.as_deref().unwrap_or(&words);
+        // SAFETY: a SPIR-V module from a file the user names.
+        let module = unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None) }?;
+        let p = super::stages::compile(b, stage, module, &samplers, &tables, None);
+        let after = now();
+        let (outside, heap) = (before.0 as i64 - after.0 as i64, after.1 as i64 - before.1 as i64);
+        let s = sums.entry(format!("{stage:?}")).or_default();
+        *s = [s[0] + 1, s[1] + words.len() as i64, s[2] + outside, s[3] + heap];
+        if outside.abs().max(heap.abs()) >= 1 << 20 || p.is_err() {
+            println!(
+                "{}: {stage:?} words {} ms {} outside {} MiB heap {} MiB{}",
+                file.file_name().unwrap_or_default().to_string_lossy(),
+                words.len(),
+                t.elapsed().as_millis(),
+                outside >> 20,
+                heap >> 20,
+                p.as_ref().err().map(|e| format!(" FAILED {e:#}")).unwrap_or_default(),
+            );
+        }
+        made.push((module, p.ok()));
+    }
+    for (kind, s) in &sums {
+        println!("{kind}: modules {} kwords {} outside {} MiB heap {} MiB", s[0], s[1] / 1000, s[2] >> 20, s[3] >> 20);
+    }
+    for (module, p) in made {
+        // SAFETY: ours, never used.
+        unsafe {
+            if let Some(p) = p {
+                d.destroy_pipeline(p, None);
+            }
+            d.destroy_shader_module(module, None);
+        }
+    }
+    let end = now();
+    println!(
+        "after destroying them: outside {} MiB heap {} MiB since the start",
+        (start.0 as i64 - end.0 as i64) >> 20,
+        (end.1 as i64 - start.1 as i64) >> 20
+    );
+    Ok(())
 }

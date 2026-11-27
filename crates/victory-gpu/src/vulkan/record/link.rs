@@ -176,7 +176,10 @@ pub(super) fn part(b: &Backend, inputs: &[(u32, u32, vk::Format, u32)], colors: 
         info = info.vertex_input_state(&vertex_input).input_assembly_state(&assembly);
     }
     // SAFETY: valid create infos.
-    let p = unsafe { b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None) }.ok()?[0];
+    let p = victory_vk::account::traced(&b.host, "small part", || unsafe {
+        b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None)
+    })
+    .ok()?[0];
     map.insert(key, p);
     Some(p)
 }
@@ -239,7 +242,10 @@ pub(super) fn link(b: &Backend, key: LinkKey, vertex_input: Option<vk::Pipeline>
         .layout(layout.pipeline)
         .push_next(&mut libraries);
     // SAFETY: valid create infos over live parts.
-    let p = unsafe { b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None) }.ok()?[0];
+    let p = victory_vk::account::traced(&b.host, "link", || unsafe {
+        b.host.device.create_graphics_pipelines(stages::cache(b), &[info], None)
+    })
+    .ok()?[0];
     STATS[6].fetch_add(1, Ordering::Relaxed);
     map.insert(key, p);
     Some(p)

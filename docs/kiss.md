@@ -192,11 +192,56 @@ driver errors and no new crash, and the captures look no worse.
     20 MiB a stage kind on the card), all but a few bytes of it the
     128-entry table of buffer formats (`Helper::TypedShape`, in 1,429
     modules) and a split mesh program's table of parts.
+    Over the whole pack (25,694 modules) the most is 664. The host's
+    refusal of a module over 16 KiB a thread (the entry below) stays as
+    a guard and refuses nothing now: the ray-trace program compiles again.
   - Open: the format table could lie in the tables buffer too (one fixed
     place for every program, no constant), for a compile of those 1,429
     modules; the tables buffer is PC memory the card reads (as title
     memory is): on the card if a program's table reads show up in frame
     times.
+
+- 2026-11-27 (later): **card memory accounted for** (runs vm1–vm7,
+  `docs/vulkan-host.md` "Card memory the driver takes"). vk103's 6.9 GB
+  for the process were 3.3 GB of ours (images 2.56, scratch 0.48, pool
+  0.26), 1.4 GB of the driver's inside the heap's count and 2.1 GB
+  outside any heap's count. Both driver parts come from pipelines:
+  - **Outside the heaps** is the driver's per-thread local memory: a
+    program's own variables (SPIR-V `Private` and `Function`) are kept
+    on the card for 32,768 threads, as big as the worst pipeline of each
+    kind of stage, and never given back. The constant tables of a
+    program's code (the tone-map fix of tag `batch-2026-11-27b`) are
+    `Private` arrays: the nine tables of one ray-trace program (47.7 KiB)
+    held 1.7 GiB. That is the ~1.2 GB by which runs on tag b sit above
+    runs on the tag before. No shape of variable avoids it (probed);
+    **tables must become memory read by address: a translator change,
+    open.** Until then a module over 16 KiB a thread is refused before
+    it compiles (today that program alone; its dispatches are skipped,
+    and with the structure builder off its rays find nothing anyway).
+    Next: the BC1/3/7 compressors (357 MiB for 44 scratch arrays).
+  - **Inside the heap** are the pipelines themselves, in arenas that
+    double and are never given back (~1.06 GiB for 3,624 stages). The
+    game's background bake compiled the 266 slow stages a second time
+    in every run (368 MiB): it leaves them alone now.
+  - Ours: every command buffer kept the most scratch it ever used
+    (478 MiB, growing); scratch is lent by the timeline now (39 MiB).
+    The images are the title's own targets (2.2 GB over 2.0 GB of title
+    memory) and textures (0.5 GB), not copies kept past use. The seven
+    3840x2160 targets (233 MiB) are the title's interface plane and its
+    depth and colour targets: it reads Series S, renders the world at
+    1280x720 into a 1920x1080 plane and still draws its interface at
+    3840x2160, whatever display mode is listed.
+  - The card-memory line adds up now: `process_mb` (what `nvidia-smi`
+    shows for the process) `= ours_mb + driver_mb + outside_mb`.
+  - With the driver's share smaller the images get room. On tag
+    `batch-2026-11-27c`: int56 (run vmi56) was killed by the watchdog at
+    frame ~1,830 with 7.7 GB on the card (the process 6.9 GB, 45,901
+    images refused at its limit); with these changes (run vm7s) the card
+    peaks at 6.2 GB (the process 5.4 GB), no kill, frame 2,310 in the
+    same 420 s, 1,461 images refused: the ground is lit, with shadows.
+    RAM peaks 0.45 GB higher (17.07 against 16.61 GB): not traced, open.
+  - Storage usage on every colour image (899741d) costs no card memory
+    (168,918 images: the same size and alignment with and without it).
 
 - 2026-11-27 (indirect light): why everything the sun does not hit was
   black, found by walking back from the tiled lighting with pass captures
@@ -589,6 +634,22 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (10:00): run vk104 (tag `batch-2026-11-27c`, exe int56;
+  frame /mnt/data/victory/capture/vk104/frame-2400.png): the sky is pale
+  and warm as in the reference, the watchtower and buildings stand
+  against it, the bunk at the right shows. Still wrong: interior walls
+  and the character's body dark, the yard's ground dark, no window mesh,
+  dither. What changed: colour images take storage views (stores of
+  packed colour into textures made without storage use went nowhere: ray
+  radiance, final gather, the sky cube), and gathers of integer views
+  read integers (the tile lists).
+  - **Card memory**: the driver keeps a module's `Private`/`Function`
+    variables for 32,768 threads on the card, outside every heap's count:
+    the code tables as private arrays cost 1.7 GB for one program (nine
+    tables, 48 KiB). Tables are to become memory read by address (being
+    built); host stopgaps on the card-memory agent's branch (process on
+    the card 6.9 -> 5.4 GB).
+  - The bake after the gather fix: 3163 s (799 stages compiled).
 - 2026-11-27 (07:30): **the test scene is on screen** (run vk102, tag
   `batch-2026-11-27b`, exe int55; frame
   /mnt/data/victory/capture/vk102/frame-1380.png): window, yard, building,

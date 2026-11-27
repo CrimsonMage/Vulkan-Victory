@@ -352,7 +352,7 @@ impl Rec {
         let at = self
             .cmd
             .as_mut()?
-            .scratch(&b.host, HEAD + u64::from(records * 4 * spec.words))?;
+            .scratch(&b.host, &b.timeline, HEAD + u64::from(records * 4 * spec.words))?;
         let mut push = Vec::with_capacity(bound::PUSH_BYTES);
         for v in [src, at.address, count] {
             push.extend(v.to_le_bytes());

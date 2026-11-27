@@ -50,16 +50,22 @@ pub enum Kind {
 
 /// Timestamp pairs for the busy figure (two queries each).
 const PAIRS: u32 = 8192;
-/// A recording's first scratch buffer (it doubles as it grows).
-const SCRATCH: u64 = 64 << 10;
+/// A scratch buffer's least size.
+const SCRATCH: u64 = 256 << 10;
+/// Scratch buffers kept for the next recordings at most; what comes back
+/// past it is freed.
+const SPARE: u64 = 32 << 20;
 
 /// A command buffer's scratch: card memory its commands write and read
-/// (bounded indirect records), reused once the command buffer has run.
+/// (bounded indirect records). The buffers are the timeline's, lent to
+/// one recording at a time and handed back once its command buffer has
+/// run: the card holds what the recordings in flight use, not the most
+/// each command buffer ever used (vk103: 478 MiB and growing).
 #[derive(Default)]
 struct Scratch {
+    /// The last one is being filled.
     buffers: Vec<Buffer>,
-    /// The buffer being filled, and bytes used in it.
-    at: usize,
+    /// Bytes used in it.
     used: u64,
 }
 
@@ -73,37 +79,25 @@ pub struct ScratchRange {
 }
 
 impl Scratch {
-    fn take(&mut self, host: &Host, bytes: u64) -> Option<ScratchRange> {
-        loop {
-            if let Some(b) = self.buffers.get(self.at) {
-                let offset = self.used.next_multiple_of(16);
-                if offset + bytes <= b.size {
-                    self.used = offset + bytes;
-                    return Some(ScratchRange {
-                        buffer: b.buffer,
-                        offset,
-                        address: b.address + offset,
-                    });
-                }
-                self.at += 1;
-                self.used = 0;
-                continue;
-            }
-            let last = self.buffers.last().map_or(SCRATCH / 2, |b| b.size);
-            let size = (last * 2).max(bytes.next_power_of_two());
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::INDIRECT_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST;
-            self.buffers
-                .push(Buffer::new(host, size, usage, Place::Card).ok()?);
-            self.at = self.buffers.len() - 1;
-            self.used = 0;
+    fn take(&mut self, host: &Host, timeline: &Timeline, bytes: u64) -> Option<ScratchRange> {
+        let offset = self.used.next_multiple_of(16);
+        if let Some(b) = self.buffers.last().filter(|b| offset + bytes <= b.size) {
+            self.used = offset + bytes;
+            return Some(ScratchRange {
+                buffer: b.buffer,
+                offset,
+                address: b.address + offset,
+            });
         }
-    }
-
-    fn reset(&mut self) {
-        self.at = 0;
-        self.used = 0;
+        let b = timeline.lend(host, bytes)?;
+        let range = ScratchRange {
+            buffer: b.buffer,
+            offset: 0,
+            address: b.address,
+        };
+        self.buffers.push(b);
+        self.used = bytes;
+        Some(range)
     }
 }
 
@@ -144,6 +138,8 @@ struct State {
     ticket: u64,
     lines: Vec<LineState>,
     recorders: Vec<Recorder>,
+    /// Scratch buffers no recording holds.
+    spare: Vec<Buffer>,
     next_pair: u32,
     /// The serial the next recording begins with ([`Mark`]).
     next_serial: u64,
@@ -202,8 +198,8 @@ impl Trail {
 
 impl Recording {
     /// `bytes` of the command buffer's scratch, 16-byte aligned.
-    pub fn scratch(&mut self, host: &Host, bytes: u64) -> Option<ScratchRange> {
-        self.scratch.take(host, bytes)
+    pub fn scratch(&mut self, host: &Host, timeline: &Timeline, bytes: u64) -> Option<ScratchRange> {
+        self.scratch.take(host, timeline, bytes)
     }
 }
 
@@ -282,6 +278,7 @@ impl Timeline {
                 ticket: 0,
                 lines: vec![host_line],
                 recorders: Vec::new(),
+                spare: Vec::new(),
                 next_pair: 0,
                 next_serial: 0,
             }),
@@ -518,9 +515,20 @@ impl Timeline {
     /// record parts in parallel), begun, with its start timestamp. Hand it
     /// back with [`Timeline::submit_on`] or [`Timeline::abandon`].
     pub fn begin(&self, host: &Host) -> Result<Recording> {
-        let (index, pool, cmd, mut scratch, pair) = {
+        let mut freed = Vec::new();
+        let (index, pool, cmd, pair) = {
             let mut s = self.state();
             let i = self.take_recorder(host, &mut s)?;
+            // Its last recording has run: its scratch is lent again.
+            let mut kept: u64 = s.spare.iter().map(|b| b.size).sum();
+            for b in std::mem::take(&mut s.recorders[i].scratch).buffers {
+                if kept + b.size <= SPARE {
+                    kept += b.size;
+                    s.spare.push(b);
+                } else {
+                    freed.push(b);
+                }
+            }
             let pair = self.timing.map(|_| {
                 let p = 2 * (s.next_pair % PAIRS);
                 s.next_pair = s.next_pair.wrapping_add(1);
@@ -530,9 +538,12 @@ impl Timeline {
             s.next_serial += 1;
             let r = &mut s.recorders[i];
             r.serial = serial;
-            (i, r.pool, r.cmd, std::mem::take(&mut r.scratch), pair)
+            (i, r.pool, r.cmd, pair)
         };
-        scratch.reset();
+        for b in freed {
+            // SAFETY: the command buffer that used it has run.
+            unsafe { b.destroy(host) };
+        }
         let device = &host.device;
         // SAFETY: the recorder's last submission has run and it is ours.
         unsafe {
@@ -551,7 +562,7 @@ impl Timeline {
             index,
             cmd,
             pair,
-            scratch,
+            scratch: Scratch::default(),
             trail: Trail::default(),
         })
     }
@@ -653,10 +664,10 @@ impl Timeline {
             .command_buffer_infos(&infos)
             .signal_semaphore_infos(&signals);
         // SAFETY: queues are used under the state's lock only.
-        self.check(unsafe {
+        self.check(crate::account::traced(host, "submit", || unsafe {
             host.device
                 .queue_submit2(l.queue, &[submit], vk::Fence::null())
-        })
+        }))
         .context("vkQueueSubmit2")?;
         commit(s, line, value, timing);
         Ok(value)
@@ -670,6 +681,22 @@ impl Timeline {
         let r = &mut s.recorders[recording.index];
         r.done_at = 0;
         r.scratch = recording.scratch;
+    }
+
+    /// A scratch buffer of at least `bytes` for a recording: the smallest
+    /// spare one that holds them, else a new one.
+    fn lend(&self, host: &Host, bytes: u64) -> Option<Buffer> {
+        {
+            let mut s = self.state();
+            let fit = s.spare.iter().enumerate().filter(|(_, b)| b.size >= bytes).min_by_key(|(_, b)| b.size).map(|(i, _)| i);
+            if let Some(i) = fit {
+                return Some(s.spare.swap_remove(i));
+            }
+        }
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::INDIRECT_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        Buffer::new(host, bytes.next_power_of_two().max(SCRATCH), usage, Place::Scratch).ok()
     }
 
     /// Binds sparse memory on the host line, behind everything given
@@ -699,10 +726,10 @@ impl Timeline {
             .push_next(&mut values);
         // SAFETY: queues are used under the state's lock only; the binds
         // name live buffers and memory.
-        self.check(unsafe {
+        self.check(crate::account::traced(host, "sparse bind", || unsafe {
             host.device
                 .queue_bind_sparse(self.queues[0], &[info], vk::Fence::null())
-        })
+        }))
         .context("vkQueueBindSparse")?;
         commit(&mut s, HOST, value, None);
         Ok(s.ticket)
@@ -732,6 +759,9 @@ impl Timeline {
                 for b in &r.scratch.buffers {
                     b.destroy(host);
                 }
+            }
+            for b in &s.spare {
+                b.destroy(host);
             }
             for l in &s.lines {
                 host.device.destroy_semaphore(l.semaphore, None);

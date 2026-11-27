@@ -170,6 +170,14 @@ fn main() -> Result<()> {
         Command::Config => show_config(),
         Command::Bake { jobs, index } => bake(jobs, index),
         Command::Vkprobe => {
+            #[cfg(windows)]
+            if let Some(dir) = std::env::var_os("VICTORY_VK_PROBE_SPV") {
+                // The game's cache folder: translations compile with the
+                // immediate sampler slots of earlier runs, as in the game.
+                let cfg = victory_core::Config::load()?;
+                victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+                return victory_gpu::probe_spv(std::path::Path::new(&dir));
+            }
             if !victory_vk::vkprobe()? {
                 std::process::exit(1);
             }

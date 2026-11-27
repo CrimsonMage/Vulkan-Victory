@@ -1392,6 +1392,144 @@ began: the process went 3,105 → 6,442 MiB in ~3 s.
   GPU view were not mapped". Idle images are not evicted: dropping one
   would leave the descriptors that name it empty.
 
+### Card memory the driver takes (vm1–vm7, 2026-11-27, branch `worktree-agent-ac0ae83396b163713`)
+
+vk103 ended with 6,869 MiB on the card for the process (`nvidia-smi`),
+of which only 3,294 MiB were allocations of ours. The rest is the
+driver's, in two places, and both come from pipelines.
+
+**How it is counted.** On NVIDIA the card heap's budget
+(`VK_EXT_memory_budget`) is the heap's use plus what is free on the card
+(checked against `nvidia-smi`'s `memory.free` to 1 MiB). So:
+
+- the process on the card = free when the device was made − free now
+  (`account::start`, `account::process`; other programs' moves are in it);
+- **outside** = that − the heap's use: card memory no Vulkan heap counts;
+- **driver** = the heap's use − our allocations.
+
+The 10 s line `Vulkan: card memory` adds up from these:
+`process_mb = ours_mb + driver_mb + outside_mb`, and
+`ours_mb = images_mb + pool_mb + buffers_mb + scratch_mb + other_mb`.
+`heaps=` lists every heap as size/use/budget (`d`: the card's; the other
+one is system memory: imports and mapped buffers, `imports_mb`,
+`host_buffers_mb`).
+
+**What tells which call takes it.** `VICTORY_CARD_TRACE=1`
+(`account::traced`): every driver call that can take card memory (stage
+compiles by kind, links, shader modules, images, views, imports, buffers,
+sparse buffer and binds, submissions) runs alone and the budget is read
+before and after; the sums by kind are the line's `traced=` field, and a
+stage compile that moves 2 MiB or more is logged. The run is slow (calls
+wait for each other); 100 s are enough, the driver's share is taken while
+the title makes its pipelines.
+
+`victory vkprobe` with `VICTORY_VK_PROBE_SPV=<folder>` compiles every
+`*.spv` (a compute module) and `*.vks` (a translation of the stage cache)
+of the folder as the game does and prints what each compile took. One
+process per variant: the driver sizes by the worst pipeline so far and
+does not shrink.
+
+**Measured** (vm1 traced; vk103, and vm7s on tag `batch-2026-11-27c` with these changes, at the end of the run, MiB):
+
+| What | vk103 | vm7s | How it is known |
+|---|---|---|---|
+| images (256 MiB blocks) | 2,560 | 3,072 | ours; vk103 refused 46,218 images at its limit, vm7s 1,461 |
+| pool's GPU view | 256 | 384 | ours |
+| recordings' scratch | 478 | 46 | ours (vk103: `buffers_mb`) |
+| driver, in the heap's use | 1,426 | 1,058 | heap use − ours; grows only in stage compiles, in doubling steps (5, 11, 22, … 348 MiB for compute; 1, 3, 6, … 96 for mesh) |
+| outside every heap | 2,149 | 844 | process − heap use; traced at start: compute compiles 1,761, one first-frame step 174, the pool's sparse buffer 32, mesh compiles 16, imports 11; then ~+100 over a run |
+| **the process** | **6,869** | **5,405** | `nvidia-smi --query-compute-apps` (6,869 / 5,405) |
+
+Not card memory, measured at zero or near it: imports (9.3 GiB of title
+memory imported by host pointer cost 11 MiB), descriptor buffers and the
+memory maps (host heap), image and view objects (2 MiB for 573 views),
+submissions, sparse binds, links, shader modules. There are two heaps
+only: the card's and system memory.
+
+**Outside the heaps: per-thread local memory.**
+
+- The driver keeps each program's own variables (SPIR-V `Private` and
+  `Function` storage) on the card for 32,768 threads: bytes × 32,768,
+  one buffer per kind of stage, as big as the pipeline that asks most.
+  It is never given back, not when the pipeline is destroyed either.
+- Whether a variable is ever written does not matter. One compute
+  program, CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar
+  (6d7fe7745ab9c6d8), has nine constant tables of its code (47.7 KiB,
+  `Private` arrays with initialisers, read through `min(index, last)`):
+  1,712 MiB. With the tables gone the same module takes 1 MiB.
+- No shape of variable helps (probed, one process each): `NonWritable`
+  1,751 MiB, a `Function` variable with the initialiser in the function
+  that reads it 1,750, the same stored once at the function's head
+  1,739. Tables must be memory the program reads by address, not
+  variables: **a translator change** (ABI: a place for a program's
+  tables), not made here. (Made 2026-11-27, awaiting a bake: the host's
+  tables buffer, `vulkan/tables.rs`, `docs/vulkan-abi.md` section 3.1.)
+- Next in line: the BC1/BC3/BC7 compressors (CS_CompressBC7Mip0: 44
+  `Function` arrays, 11.4 KiB, 357 MiB), then every program's 512-byte
+  table (16 MiB). (The arrays were the picks of `v_movrels_b32`:
+  selections on the index's bits since 2026-11-27, no variable. The most
+  a used module has is then 652 bytes, the 512-byte table of buffer
+  formats and a split mesh program's parts.)
+- **The limit** (`victory_vk::limits::thread_bytes`, `THREAD_BYTES`
+  16 KiB = 512 MiB on the card): a module over it is refused before it
+  compiles, like one over a device limit ("N bytes of variables for each
+  thread over 16384"); its draws and dispatches are skipped
+  (`skipped_no_pipeline`). Today that is the ray-trace program alone
+  (its rays find nothing while the structure builder is off). It comes
+  back by itself once its tables are not variables.
+
+**In the heap's use: the pipelines themselves.**
+
+- Each kind of stage has an arena that doubles when it is full and is
+  never given back (destroying all pipelines of a probe returned 0 of
+  191 MiB). After the title's 3,624 stages it holds ~1.06 GiB: the
+  translated programs are large (228 M SPIR-V words).
+- The game's background bake compiled the 266 stages earlier bakes
+  found slow again in every run, beside the title's own pipelines of
+  them, and destroyed them: that only pushed the compute arena one
+  doubling further (368 MiB). The background bake now leaves stages
+  with an outcome alone (`baking::prepare`); `victory bake` still
+  retries them.
+- Smaller only with smaller translations or fewer pipelines; the title
+  binds 2,371 of the 3,624 stages in the test run, so making pipelines
+  at first use would save little.
+
+**Ours.**
+
+- **Scratch** (`timeline.rs`): every command buffer kept the most
+  scratch it ever used, doubled (478 MiB with ~230 command buffers in
+  flight, and growing). Scratch buffers are now the timeline's, lent to
+  a recording and handed back when its command buffer has run; 32 MiB
+  are kept spare. 46 MiB.
+- **Images**: 1,478 images the card writes hold 2,236 MiB over
+  2,016 MiB of title memory, 18,802 filled textures 497 MiB over
+  3,409 MiB (texture quality low); ~340 MiB of the blocks is free
+  space between images. They are the title's own targets, not copies
+  kept past use (the line `where image memory goes`, `sums=`).
+- **The seven 3840x2160 targets** (233 MiB) are the title's choice. It
+  reads the device type (Series S, logged `device type read`), scales
+  the world from 1280x720 to a 1920x1080 plane, and draws its interface
+  on a second plane of 3840x2160 with two depth-stencil and three colour
+  targets of that size, whatever display mode is listed (1280x720 and
+  1920x1080 tried). The host cannot make them smaller without scaling
+  every viewport, scissor, copy and texel fetch that names them.
+- `ours` over `limit` in vk103 was the same thing seen from the other
+  side: the limit is what the card's free memory leaves, and the driver
+  took 3.5 GiB after the images were made.
+- **Storage usage for every colour image** (integrate 899741d) costs no
+  card memory: of 168,918 images given the usage by that rule in run
+  vm7s, none asked for more memory or another alignment than its twin
+  without it (6,731,188 KiB both ways), and `outside_mb` did not move.
+
+**Before and after on tag `batch-2026-11-27c`** (same translator and
+driver cache, 420 s runs): int56 (run vmi56) was killed by the watchdog
+at frame ~1,830 with 7,707 MiB on the card (the process 6,885; 45,901
+images refused). With these changes (run vm7s) the card peaks at 6,238 MiB
+(the process 5,405: 5,391 while loading, 5,405 in the world), nothing is
+killed and the run reaches frame 2,310 with 1,461 images refused. The
+process's resident memory peaks 0.45 GB higher (17.07 against 16.61 GB at
+equal times; imports are equal): not traced.
+
 ### vk28: the hang at world load, the pool and images (2026-11-26, branch `worktree-agent-a3b7585e2bcbe1a37`)
 
 vk28 (b4465d1): FSR4 ran, the world began loading, then `NVRM: Xid 109
