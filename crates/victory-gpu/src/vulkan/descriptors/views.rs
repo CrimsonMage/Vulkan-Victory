@@ -335,11 +335,19 @@ fn texture_words(
     // over its memory (`images::written_plane`).
     let (image, title_format) = if unordered && image.depth() && image.samples == 1 {
         let stencil = images::reads_stencil(title_format);
-        images::once_warn(format!(
-            "Vulkan: a storage view of a depth buffer (its stores go to a colour image, copied in before the buffer is attached): at {address:#x}, resource format {}, view format {title_format}, {} plane",
-            rdesc.format,
-            if stencil { "stencil" } else { "depth" }
-        ));
+        static TOLD: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
+        let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if told.len() < 16 && !told.contains(&(address, title_format)) {
+            told.push((address, title_format));
+            tracing::warn!(
+                at = format_args!("{address:#x}"),
+                resource_format = rdesc.format,
+                view_format = title_format,
+                plane = if stencil { "stencil" } else { "depth" },
+                "Vulkan: a storage view of a depth buffer: its stores go to a colour image, copied in before the buffer is attached"
+            );
+        }
+        drop(told);
         match images::written_plane(b, &image, address, rdesc, stencil) {
             Some(p) => (p, if stencil { 62 } else { 41 }),
             None => (image, title_format),
