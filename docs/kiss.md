@@ -634,6 +634,17 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (10:25): run vk105 (tag `batch-2026-11-27d`, exe int57;
+  frame /mnt/data/victory/capture/vk105/frame-2430.png): code tables are
+  memory read by address (one 2 MiB host buffer, a place per table set
+  kept in `code-tables.txt`), picks are selections; with the card-memory
+  cuts the process holds 4.95 GB on the card (outside the heaps 392 MiB,
+  was 2.1 GB), card total at peak 5.79 GB (was 7.7), no watchdog, RAM
+  16.5 GB, card 324 ms a frame. The bake took 545 s (178 stages
+  compiled). Picture: lit window frame, pale sky, golden yard with long
+  shadows, a tree, buildings, the bunk. Against the reference still: the
+  character is not there (hair only in some frames), interior walls
+  dark, no window mesh, the image smeared, the bunk too white.
 - 2026-11-27 (10:00): run vk104 (tag `batch-2026-11-27c`, exe int56;
   frame /mnt/data/victory/capture/vk104/frame-2400.png): the sky is pale
   and warm as in the reference, the watchtower and buildings stand
