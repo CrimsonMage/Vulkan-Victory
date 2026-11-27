@@ -209,6 +209,8 @@ struct Open {
     cse: HashMap<Node, V>,
     /// Thread-IR values made inside.
     inner: HashSet<V>,
+    /// A store (or other effect) is inside: memory reads stay after it.
+    effects: bool,
 }
 
 pub struct Lift<'a> {
@@ -403,27 +405,14 @@ impl<'a> Lift<'a> {
         } else {
             None
         };
-        if let Some(k) = &key {
-            if self.guarded
-                && let Some(o) = &self.open
-                && let Some(&v) = o.cse.get(k)
-            {
-                return v;
-            }
-            if !self.no_cse
-                && let Some(&v) = self.cse.get(k)
-            {
-                return v;
-            }
+        if let Some(v) = key.as_ref().and_then(|k| self.shared(k)) {
+            return v;
         }
         if !node.op.removable() {
             self.epoch += 1;
         }
-        // Pure values and loads of values from outside the guard go outside
-        // it, where the other guards of the block share them.
-        let hoist = self.guarded
-            && key.is_some()
-            && node.args.iter().all(|a| !self.open.as_ref().unwrap().inner.contains(a));
+        let hoist = self.hoisted(&node, key.is_some(), load);
+        let effect = !node.op.removable();
         let v = self.f.push(node);
         // (inside a guard: not visible after it)
         self.born.insert(v, if self.guarded && !hoist { usize::MAX } else { self.cur_block });
@@ -431,6 +420,7 @@ impl<'a> Lift<'a> {
             let o = self.open.as_mut().expect("an open guard");
             o.items.push(Item::N(v));
             o.inner.insert(v);
+            o.effects |= effect;
             if let Some(k) = key {
                 o.cse.insert(k, v);
             }
@@ -444,6 +434,34 @@ impl<'a> Lift<'a> {
             }
         }
         v
+    }
+
+    /// A value equal to `k` made before: in the open guard, or shared in
+    /// the block.
+    fn shared(&self, k: &Node) -> Option<V> {
+        if self.guarded
+            && let Some(o) = &self.open
+            && let Some(&v) = o.cse.get(k)
+        {
+            return Some(v);
+        }
+        if self.no_cse { None } else { self.cse.get(k).copied() }
+    }
+
+    /// Whether `node` (made inside a guard) goes outside it: pure values
+    /// and loads of values from outside it, where the other guards of the
+    /// block share them; loads only while no store is inside. Memory reads
+    /// and effects keep their order with the open guard's effects: an
+    /// unguarded one closes it first.
+    fn hoisted(&mut self, node: &Node, keyed: bool, load: bool) -> bool {
+        let memory = !node.op.removable() || matches!(node.op, Op::Load { .. } | Op::LdsLoad | Op::Image { .. });
+        if memory && !self.guarded && self.open.as_ref().is_some_and(|o| o.effects) {
+            self.close();
+        }
+        self.guarded && keyed && {
+            let o = self.open.as_ref().unwrap();
+            !(load && o.effects) && node.args.iter().all(|a| !o.inner.contains(a))
+        }
     }
 
     fn rollback(&mut self, mark: usize) {
@@ -723,7 +741,9 @@ impl<'a> Lift<'a> {
                     }
                 }
             }
-            Operand::Literal(l) => self.k32(if k > 0 { 0 } else { l }),
+            // 64-bit: a signed operand's literal sign-extends, others zero-extend
+            Operand::Literal(l) if k > 0 => self.k32(if inst.name().ends_with("_i64") && (l as i32) < 0 { u32::MAX } else { 0 }),
+            Operand::Literal(l) => self.k32(l),
             Operand::Attr { .. } => return Err(unsupported(off, "an attribute operand")),
         })
     }

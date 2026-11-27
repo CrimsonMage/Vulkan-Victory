@@ -93,6 +93,7 @@ impl Lift<'_> {
                 defined: HashSet::new(),
                 cse: HashMap::new(),
                 inner: HashSet::new(),
+                effects: false,
             });
         }
         Ok(true)
