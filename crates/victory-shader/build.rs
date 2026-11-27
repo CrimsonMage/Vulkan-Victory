@@ -3,8 +3,41 @@
 //! not change keeps its cached translations. Also lists every `VICTORY_*`
 //! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
+//!
+//! Only what can change an emitted module or its interface counts: the
+//! files of `fingerprint.rs` (the interpreter, the oracle tests) and every
+//! `#[cfg(test)]` item are left out, so test and offline-tool edits keep
+//! the cache. (Examples and xtask are outside `src` anyway.)
 
 use std::path::{Path, PathBuf};
+
+include!("fingerprint.rs");
+
+/// `text` without its `#[cfg(test)]` items (the item after each such
+/// attribute line, to its `;` (a `mod x;`) or its matching closing brace)
+/// and without blank lines.
+fn without_tests(text: &str) -> String {
+    let mut out = String::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.trim() != "#[cfg(test)]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mut depth = 0i64;
+        for item in lines.by_ref() {
+            depth += item.matches('{').count() as i64 - item.matches('}').count() as i64;
+            if depth <= 0 && (item.contains('}') || item.trim_end().ends_with(';')) {
+                break;
+            }
+        }
+    }
+    out
+}
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -40,9 +73,13 @@ fn main() {
     list.sort();
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
+    println!("cargo:rerun-if-changed=fingerprint.rs");
     for p in &list {
         let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
-        let text = std::fs::read(p).unwrap_or_default();
+        if FINGERPRINT_EXCLUDE.iter().any(|x| rel == *x || rel.starts_with(&format!("{x}/"))) {
+            continue;
+        }
+        let text = without_tests(&String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default())).into_bytes();
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
         fnv(&mut state, &text);

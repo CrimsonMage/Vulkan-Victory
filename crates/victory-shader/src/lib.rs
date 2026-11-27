@@ -60,3 +60,18 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+#[cfg(test)]
+mod fingerprint_tests {
+    include!("../fingerprint.rs");
+
+    /// Every file or folder the fingerprint leaves out exists (a rename
+    /// would silently put it back in).
+    #[test]
+    fn fingerprint_exclusions_exist() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for x in FINGERPRINT_EXCLUDE {
+            assert!(src.join(x).exists(), "{x} is in fingerprint.rs but not in src");
+        }
+    }
+}
