@@ -24,7 +24,8 @@
 //! or block (pixel), `LIMIT=n` block visits a wave, `DISPATCH="x y z"` the
 //! groups of an indirect dispatch (the capture has no size for it),
 //! `GROUP="x y z"` that group only, `WATCH=n,m|all` (with `LANES=n`) the
-//! values computed into `trace.txt`, `DUMP=1` the thread IR, `CARD=1` the
+//! values computed into `trace.txt`, `REGION="x0 y0 x1 y1"` (pixel) the
+//! blocks that touch that rectangle only, `DUMP=1` the thread IR, `CARD=1` the
 //! card's floats (`vk::interp::card_floats`: denormals are zeros),
 //! `INPUTS="loc.comp=a[,b,c];..."` a pixel program's inputs as a + b x +
 //! c y at each pixel's centre (what its vertex program gives it: without
@@ -979,7 +980,10 @@ fn pixels(run: &mut Run<'_>, stride: usize, out: &Path, census: &mut String) {
     let (w, h) = (vw as u32, vh as u32);
     let mut targets: BTreeMap<u16, Vec<[f32; 4]>> = BTreeMap::new();
     let blocks: Vec<[u32; 2]> = (0..h.div_ceil(4)).flat_map(|by| (0..w.div_ceil(8)).map(move |bx| [bx * 8, by * 4])).collect();
-    for b in blocks.iter().step_by(stride) {
+    // REGION="x0 y0 x1 y1": only the blocks that touch that rectangle of pixels
+    let region: Option<Vec<u32>> = std::env::var("REGION").ok().map(|v| v.split_whitespace().filter_map(|x| x.parse().ok()).collect());
+    let inside = |b: &[u32; 2]| region.as_ref().is_none_or(|r| r.len() < 4 || (b[0] + 8 > r[0] && b[0] < r[2] && b[1] + 4 > r[1] && b[1] < r[3]));
+    for b in blocks.iter().filter(|b| inside(b)).step_by(stride) {
         let m = run.wave(|m| m.frag_block = Some([vx as u32 + b[0], vy as u32 + b[1]]));
         for (&(slot, comp, _, lane), &v) in &m.outputs {
             let q = lane as u32 / 4;

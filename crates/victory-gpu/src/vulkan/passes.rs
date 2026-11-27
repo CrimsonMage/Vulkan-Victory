@@ -6,7 +6,10 @@
 //! tables and views, the tables and V# ranges they point at) and
 //! `img/<image id>.bin` (level 0 of each image a T# of those tables names,
 //! as the card holds it just before the program runs: rows tightly packed,
-//! slices then layers one after another).
+//! slices then layers one after another). A draw's colour targets are
+//! taken twice, `before/<address>.bin` and `after/<address>.bin` (level 0,
+//! raw; a `target` line each): the texels that differ are the ones the
+//! draw wrote, to hold against a replay of it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -66,6 +69,52 @@ pub(super) fn note(line: impl FnOnce() -> String) {
 /// The program's draw or dispatch is recorded: its capture takes no more.
 pub(super) fn close() {
     OPEN.with(|o| *o.borrow_mut() = None);
+}
+
+/// Whether this thread records a program that is being captured.
+pub(super) fn open() -> bool {
+    OPEN.with(|o| o.borrow().is_some())
+}
+
+/// The colour targets of the draw being captured, as the card holds them
+/// at this point of the list: level 0 of each as `<tag>/<address>.bin`.
+///
+/// # Safety
+/// Recording into `cmd`, outside rendering.
+pub(super) unsafe fn targets(b: &Backend, cmd: vk::CommandBuffer, attached: &[Arc<Image>], tag: &str) {
+    let Some(dir) = OPEN.with(|o| o.borrow().clone()) else { return };
+    if std::fs::create_dir_all(dir.join(tag)).is_err() {
+        return;
+    }
+    let born = super::present::FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    let (mut items, mut at, mut meta) = (Vec::new(), 0u64, Vec::new());
+    for img in attached.iter().filter(|i| !i.depth() && i.samples == 1) {
+        let bytes = level0(img, vk::ImageAspectFlags::COLOR);
+        if bytes == 0 || at + bytes > IMAGES {
+            continue;
+        }
+        meta.push(format!("target {tag} {:x} {:?} {}x{}", img.key.address, img.format, img.extent.width, img.extent.height));
+        items.push((img.clone(), vk::ImageAspectFlags::COLOR, at, bytes, format!("{tag}/{:x}.bin", img.key.address)));
+        at += bytes.next_multiple_of(16);
+    }
+    if items.is_empty() {
+        return;
+    }
+    append(&dir, &meta);
+    let Ok(buf) = Buffer::new(&b.host, at, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback) else { return };
+    // SAFETY: as the caller says.
+    unsafe {
+        images::full_barrier(&b.host.device, cmd);
+        for (img, aspect, at, _, _) in &items {
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(*at)
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: *aspect, mip_level: 0, base_array_layer: 0, layer_count: img.layers.max(1) })
+                .image_extent(vk::Extent3D { width: img.extent.width, height: img.extent.height, depth: img.extent.depth.max(1) });
+            b.host.device.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, buf.buffer, &[region]);
+        }
+        images::full_barrier(&b.host.device, cmd);
+    }
+    lock(&PENDING).push(Shot { dir, mapped: buf.mapped as usize, held: buf, items, born });
 }
 
 /// Title memory reached from the roots.
