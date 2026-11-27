@@ -224,6 +224,11 @@ impl Lift<'_> {
         Self::push_opt(m, img::MIN_LOD, min_v);
         let (lod, dref, offset) = (md.lod, md.dref, md.offset);
         let kind = if gather {
+            // A gather of an integer view gives its integers (the title's
+            // tile classification gathers the stencil of the material
+            // classes and tests the bits): which the view is, its T# says
+            // at run time, as for a load. A comparison is of floats.
+            m.class.dynamic = !dref;
             ImageKind::Gather { comp: m.dmask.trailing_zeros() as u8, lod, dref, offset }
         } else {
             ImageKind::Sample { lod, bias: md.bias, grad: md.grad, dref, offset, min_lod: md.min_lod }
