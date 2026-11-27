@@ -243,6 +243,8 @@ pub struct Lift<'a> {
     /// Each V#'s derived values (by its four words), made once in the
     /// deepest block defining a word, for every access below it.
     vsharps: HashMap<Vec<V>, mem::VSharp>,
+    /// `s_getpc_b64` results: the node and the code offset it holds.
+    pcs: HashMap<V, u32>,
     guarded: bool,
     /// Unguarded VALU writes meet the old values by this EXEC.
     sel: Option<V>,
@@ -338,6 +340,7 @@ impl<'a> Lift<'a> {
             born: HashMap::new(),
             depth: vec![0; p.blocks.len()],
             vsharps: HashMap::new(),
+            pcs: HashMap::new(),
             guarded: false,
             sel: None,
             undo: Vec::new(),

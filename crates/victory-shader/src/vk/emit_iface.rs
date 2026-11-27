@@ -437,6 +437,10 @@ impl Emit<'_> {
             let (_, fid) = helpers.remove(k);
             self.write_bvh(fid);
         }
+        while let Some(k) = helpers.iter().position(|h| matches!(h.0, Helper::CodeTable(_))) {
+            let (Helper::CodeTable(t), fid) = helpers.remove(k) else { unreachable!() };
+            self.write_code_table(fid, usize::from(t));
+        }
         if helpers.is_empty() {
             return;
         }

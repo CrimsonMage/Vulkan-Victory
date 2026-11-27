@@ -27,7 +27,11 @@ impl Lift<'_> {
             | "cmpk_ge" | "cmpk_lt" | "cmpk_le" | "bitcmp0" | "bitcmp1" => self.sop_cmp(&s),
             "bitset0" | "bitset1" => self.sop_bitset(&s),
             "getpc" => {
-                let x = self.k32((off + 4) as u32);
+                // the code offset, as a value of its own: loads from it are
+                // the code's own bytes (lift_mem.rs `code_table`)
+                let k = self.k32((off + 4) as u32);
+                let x = self.spv(op::COPY_OBJECT, Ty::U32, &[k]);
+                self.pcs.insert(x, (off + 4) as u32);
                 self.sdst(inst, dst, 0, R::D(x));
                 let z = self.k32(0);
                 self.sdst(inst, dst, 1, R::D(z));

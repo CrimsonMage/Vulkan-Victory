@@ -50,6 +50,7 @@ pub mod op {
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
     pub const COMPOSITE_INSERT: u16 = 82;
+    pub const COPY_OBJECT: u16 = 83;
     pub const SAMPLED_IMAGE: u16 = 86;
     pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
