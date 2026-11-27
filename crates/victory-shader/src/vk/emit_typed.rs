@@ -76,6 +76,37 @@ pub(crate) fn format_table() -> [u32; 128] {
 }
 
 impl Emit<'_> {
+    /// `CodeTable(t)`: the program's code from the table's start, a private
+    /// array with its constant, at the dword index (0 past the end).
+    pub(super) fn write_code_table(&mut self, fid: Id, t: usize) {
+        let (u, b) = (self.t.u32_, self.t.bool_);
+        let table = self.f.tables[t].clone();
+        let len = table.len().max(1) as u32;
+        let arr = self.m.t_array_plain(u, len);
+        let words: Vec<Id> = if table.is_empty() { vec![self.c32(0)] } else { table.iter().map(|&w| self.c32(w)).collect() };
+        let init = self.m.c_composite(arr, &words);
+        let pa = self.m.t_ptr(en::SC_PRIVATE, arr);
+        let var = self.m.variable_init(pa, en::SC_PRIVATE, init);
+        self.interface.push(var);
+        let fty = self.m.global_fn_type(u, &[u]);
+        self.m.op_to(op::FUNCTION, u, fid, &[0, fty]);
+        let i = self.m.id();
+        self.m.op_to(55, u, i, &[]);
+        let entry = self.m.id();
+        self.m.label(entry);
+        let last = self.c32(len - 1);
+        let at = self.m.ext(glsl::U_MIN, u, &[i, last]);
+        let pu = self.m.t_ptr(en::SC_PRIVATE, u);
+        let ep = self.m.op(op::ACCESS_CHAIN, pu, &[var, at]);
+        let e = self.m.op(op::LOAD, u, &[ep]);
+        let past = self.m.op(op::U_GREATER_THAN, b, &[i, last]);
+        let past = if table.is_empty() { self.m.c_bool(true) } else { past };
+        let z = self.c32(0);
+        let r = self.m.op(op::SELECT, u, &[past, z, e]);
+        self.m.op_void(254, &[r]); // OpReturnValue
+        self.m.op_void(op::FUNCTION_END, &[]);
+    }
+
     /// `TypedShape`: the table, a private array with its constant, at the
     /// FORMAT code.
     pub(super) fn write_typed_shape(&mut self, fid: Id) {

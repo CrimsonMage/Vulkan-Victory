@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// The most dwords of code a constant table read through `s_getpc_b64`
+/// takes (from its start on).
+const CODE_TABLE_DWORDS: usize = 4096;
+
 impl Lift<'_> {
     pub(super) fn translate(&mut self, addr: V) -> V {
         self.emit(Op::Call(Helper::Translate), Ty::U64, vec![addr])
@@ -35,6 +39,8 @@ impl Lift<'_> {
                 let oo = l.spv(op::I_ADD, Ty::U32, &[o, ka]);
                 l.buffer_load_raw(&vs, oo, m, fl)
             })?
+        } else if let Some(start) = self.code_base(inst, &base)? {
+            self.code_words(inst, &base, o, start, d, n)?
         } else {
             let a = self.opnd_u64(inst, &base)?;
             let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
@@ -51,6 +57,73 @@ impl Lift<'_> {
             self.def(inst, Reg::S(d + i as u8), R::D(w));
         }
         Ok(())
+    }
+
+    /// Where the table starts (a code offset) when a scalar load's base is
+    /// `s_getpc_b64` plus a constant (plus anything): the address is then
+    /// the program's own code, at a code offset known now.
+    fn code_base(&mut self, inst: &Inst, base: &Operand) -> Res<Option<u32>> {
+        if self.pcs.is_empty() {
+            return Ok(None);
+        }
+        let lo = self.opnd_dw(inst, base, 0, false)?;
+        let mut stack = vec![self.u32v(lo)];
+        let mut seen = HashSet::new();
+        while let Some(v) = stack.pop() {
+            // (args may name values not made yet: a loop's phis)
+            if !seen.insert(v) || seen.len() > 256 || v as usize >= self.f.nodes.len() {
+                continue;
+            }
+            let n = self.f.node(v);
+            if let (Op::Spv(op::I_ADD), [a, b]) = (&n.op, n.args.as_slice()) {
+                for (p, c) in [(a, b), (b, a)] {
+                    if let (Some(&pc), Some(c)) = (self.pcs.get(p), self.f.as_const(*c)) {
+                        return Ok(Some(pc.wrapping_add(c as u32)));
+                    }
+                }
+            }
+            if let Some(&pc) = self.pcs.get(&v) {
+                return Ok(Some(pc));
+            }
+            stack.extend(n.args.iter().copied());
+        }
+        Ok(None)
+    }
+
+    /// The dwords of a scalar load from the program's code (`code_base`):
+    /// a table of the code from `start` on, read at the load's offset into
+    /// it (0 past the code's end).
+    fn code_words(&mut self, inst: &Inst, base: &Operand, o: V, start: u32, d: u8, n: u8) -> Res<Vec<V>> {
+        let k = match self.f.tables_at.iter().position(|&s| s == start) {
+            Some(k) => k,
+            None => {
+                let code = &self.native.code;
+                let from = (start as usize).min(code.len());
+                let to = code.len().min(from + 4 * CODE_TABLE_DWORDS);
+                let words = code[from..to].chunks(4).map(|c| c.iter().rev().fold(0u32, |w, &b| w << 8 | u32::from(b))).collect();
+                self.f.tables.push(words);
+                self.f.tables_at.push(start);
+                self.f.tables.len() - 1
+            }
+        };
+        let lo = self.opnd_dw(inst, base, 0, false)?;
+        let lo = self.u32v(lo);
+        let byte = self.spv(op::I_ADD, Ty::U32, &[lo, o]);
+        let ks = self.k32(start);
+        let rel = self.spv(op::I_SUB, Ty::U32, &[byte, ks]);
+        let two = self.k32(2);
+        let first = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[rel, two]);
+        self.smem_words(inst, d, n, |l, at, m, fl| {
+            let ws: Vec<V> = (at..at + m)
+                .map(|i| {
+                    let ki = l.k32(i);
+                    let idx = l.spv(op::I_ADD, Ty::U32, &[first, ki]);
+                    l.emit(Op::Call(Helper::CodeTable(k as u16)), Ty::U32, vec![idx])
+                })
+                .collect();
+            let v = if m == 1 { ws[0] } else { l.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, m as u8), &ws) };
+            Ok(if fl { l.spv(op::BITCAST, Ty::vec(S::F32, m as u8), &[v]) } else { v })
+        })
     }
 
     /// `n` dwords for s[d..] in loads of up to four (`load(at, count,

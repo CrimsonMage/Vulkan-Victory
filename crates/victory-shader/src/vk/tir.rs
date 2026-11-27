@@ -108,6 +108,10 @@ pub enum Helper {
     /// direction xyz, inverse direction xyz) -> uvec4: the ray/node test
     /// of `image_bvh*_intersect_ray` (emit_bvh.rs).
     BvhRay,
+    /// (dword index u32) -> u32: dword `index` of `Func::tables[k]`, 0
+    /// past its end: a constant table in the program's own code, read
+    /// through `s_getpc_b64` (lift_mem.rs `code_table`).
+    CodeTable(u16),
 }
 
 /// Image access kinds.
@@ -288,6 +292,10 @@ pub struct Func {
     /// emitted at the function's start.
     pub prelude: Vec<V>,
     pub blocks: Vec<Block>,
+    /// Constant tables of the program's code (`Helper::CodeTable`).
+    pub tables: Vec<Vec<u32>>,
+    /// Each table's code offset.
+    pub tables_at: Vec<u32>,
     global: HashMap<Node, V>,
 }
 

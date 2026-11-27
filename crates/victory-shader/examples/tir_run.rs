@@ -12,7 +12,8 @@
 //! `UNDEF=bits` what undefined values read (default 0), `FILL=dword` what
 //! memory the file leaves out reads (default 0), `OUT=1` prints the values
 //! a pixel or vertex program outputs and what image stores write
-//! (watched), `VARY=1` image texels that differ by lane.
+//! (watched), `VARY=1` image texels that differ by lane, `LANES=n` how many
+//! lanes a watched value prints (4).
 use victory_shader::vk::{interp, thread_ir, tir};
 
 fn hex(s: &str) -> u64 {
@@ -59,6 +60,9 @@ fn configure(m: &mut interp::Machine, f: &tir::Func) {
         m.image_texel = if v.len() >= 6 { [v[2], v[3], v[4], v[5]] } else { [v[2]; 4] };
     }
     m.image_vary = var("VARY").is_some();
+    if let Some(n) = var("LANES") {
+        m.watch_lanes = n.parse().unwrap();
+    }
     if let Some(x) = var("FILL") {
         m.mem.fill = hex(&x) as u32;
     }

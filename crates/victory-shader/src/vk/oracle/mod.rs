@@ -176,6 +176,43 @@ fn run_cases_on(shader: &HostShader, cases: &[[u32; 4]], _devices: &[(&str, bool
     assert!(failed.is_empty(), "{} of {} cases failed:\n{}", failed.len(), cases.len(), failed.join("\n"));
 }
 
+/// Ours (not theirs): a constant table after `s_endpgm`, read through
+/// `s_getpc_b64` + its distance + an index from s0, as
+/// CS_ApplyCombinedDeferred reads its tap offsets: the table's own words
+/// (the reference: the code's bytes at their code offset in memory).
+#[test]
+fn constant_tables_in_the_code_read_through_getpc() {
+    const TABLE: [u32; 6] = [0x3F80_0000, 0xBF00_0000, 7, 0xDEAD_BEEF, 0, 0x4120_0000];
+    // the prologue is 7 dwords: s_getpc_b64 at byte 28 gives 32
+    let body = |dist: u32| {
+        vec![
+            0xBE86_1F00,             // s_getpc_b64 s[6:7]
+            sop2(0x00, 6, 6, 255),   // s_add_u32 s6, s6, dist
+            dist,
+            sop2(0x04, 7, 7, 0x80),  // s_addc_u32 s7, s7, 0
+            sop2(0x1E, 12, 0, 0x82), // s_lshl_b32 s12, s0, 2 (s[8:11]: the V#)
+            sop2(0x00, 6, 6, 12),    // s_add_u32 s6, s6, s12
+            sop2(0x04, 7, 7, 0x80),  // s_addc_u32 s7, s7, 0
+            0x3D << 26 | 13 << 6 | 3, // s_load_dword s13, s[6:7], 0
+            125 << 25,
+            vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+        ]
+    };
+    let start = build_cs(&body(0), 1, 0).native.code.len() as u32;
+    let mut shader = build_cs(&body(start - 32), 1, 0);
+    shader.native.code.extend(TABLE.iter().flat_map(|w| w.to_le_bytes()));
+    // the reference: the code's bytes at their code offsets, as memory
+    let words: Vec<u32> = shader.native.code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+    mem.put(0, &words);
+    let cases: Vec<[u32; 4]> = (0..TABLE.len() as u32).map(|i| [i, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let reference = mem.dwords.get(&u64::from(start + 4 * i as u32)).copied();
+        assert_eq!(Some(got), reference, "{backend}: table dword {i}");
+        assert_eq!(got, TABLE[i], "{backend}: table dword {i}");
+    });
+}
+
 /// Ours (not theirs): `v_cvt_pkrtz_f16_f32 v0, v1, v2` rounds toward zero,
 /// past the largest half too (±65504, not infinity), whatever the host's
 /// own conversion rounds by.

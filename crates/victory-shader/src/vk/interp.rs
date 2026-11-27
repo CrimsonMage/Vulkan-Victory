@@ -149,6 +149,8 @@ pub struct Machine<'a> {
     /// Images read texels that differ by lane: each float channel scaled
     /// by 1, 1.5, 2, 2.5 or 3 (lane mod 5), so branches on them diverge.
     pub image_vary: bool,
+    /// How many lanes a watched value prints (4).
+    pub watch_lanes: usize,
 }
 
 fn width(s: S) -> u32 {
@@ -279,6 +281,7 @@ impl<'a> Machine<'a> {
             undef: 0,
             outputs: BTreeMap::new(),
             image_vary: false,
+            watch_lanes: 4,
         }
     }
 
@@ -364,7 +367,7 @@ impl<'a> Machine<'a> {
 
     fn watched(&mut self, v: V) {
         if self.watch.contains(&v) {
-            let x: Vec<String> = (0..self.lanes.min(4)).map(|l| format!("{:x?}", &self.value(v, l)[..usize::from(self.f.ty(v).n)])).collect();
+            let x: Vec<String> = (0..self.lanes.min(self.watch_lanes)).map(|l| format!("{:x?}", &self.value(v, l)[..usize::from(self.f.ty(v).n)])).collect();
             self.log.push(format!("%{v} = {}", x.join(" ")));
         }
     }
@@ -519,6 +522,7 @@ impl<'a> Machine<'a> {
                 let x = self.arg(n, 1, l);
                 typed_pack(a as u32, [x[0] as u32, x[1] as u32, x[2] as u32, x[3] as u32], self.arg(n, 2, l)[0] != 0)
             }
+            Helper::CodeTable(k) => [u64::from(self.f.tables[usize::from(k)].get(a as usize).copied().unwrap_or(0)), 0, 0, 0],
             Helper::BvhRay => return Err(format!("helper {h:?}")),
         })
     }
@@ -646,6 +650,7 @@ impl Pure<'_> {
                     *d = both[k as usize];
                 }
             }
+            op::COPY_OBJECT => r = a[0],
             op::BITCAST => r = repack(&a[0], width(a0t.s), a0t.n, width(ty.s), ty.n),
             op::SELECT => {
                 let vector = self.f.ty(n.args[0]).n > 1;
