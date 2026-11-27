@@ -16,6 +16,7 @@ pub mod interp;
 mod oracle;
 pub mod lift;
 pub mod pack16;
+pub mod phivars;
 pub mod report;
 pub mod semantics;
 pub mod spirv;
