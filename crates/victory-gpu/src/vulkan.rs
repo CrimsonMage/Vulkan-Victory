@@ -473,6 +473,34 @@ pub fn title_page_reservation(at: usize, len: usize) {
     }
 }
 
+/// The title's buffer resources: first address -> (bytes, resources there).
+static BUFFERS: Mutex<BTreeMap<u64, (u64, u32)>> = Mutex::new(BTreeMap::new());
+
+/// The title made (or, `gone`, released) a buffer resource over `[at, at +
+/// len)`: an address named inside it later (a root view, an index buffer,
+/// a copy) names the buffer, and loose memory is imported for all of it.
+pub(crate) fn buffer_resource(at: u64, len: u64, gone: bool) {
+    let mut all = lock(&BUFFERS);
+    if !gone {
+        let e = all.entry(at).or_insert((0, 0));
+        *e = (e.0.max(len), e.1 + 1);
+    } else if let Some(e) = all.get_mut(&at) {
+        e.1 = e.1.saturating_sub(1);
+        if e.1 == 0 {
+            all.remove(&at);
+        }
+    }
+}
+
+/// `[at, at + len)` and the buffer resource holding `at`, as one range.
+fn with_buffer(at: u64, len: u64) -> (u64, u64) {
+    let end = at.saturating_add(len.max(1));
+    match lock(&BUFFERS).range(..=at).next_back() {
+        Some((&b, &(l, _))) if at < b + l => (b, end.max(b + l) - b),
+        _ => (at, end - at),
+    }
+}
+
 /// The title released a texture resource (its last reference).
 pub(crate) fn resource_released(address: u64, desc: &crate::resource::ResourceDesc) {
     if let Some(b) = backend() {
@@ -799,6 +827,29 @@ impl Memory {
     /// first page in the memory map and nothing else: the stores went to
     /// the sink, the mesh programs read zeros and no character was drawn.
     fn want_range(&mut self, at: u64, len: u64) -> bool {
+        // What the call names first, whatever the buffer around it is made
+        // of; then the buffer resource holding it, whole.
+        let named = at;
+        let (at, len) = with_buffer(at, len);
+        let mut any = at != named && self.want_piece(named, 1);
+        let end = at.saturating_add(len.max(1));
+        let mut p = at;
+        // A range over several regions (a buffer the title placed across
+        // allocations of its own): each of them.
+        for _ in 0..32 {
+            any |= self.want_piece(p, end - p);
+            let over = self.regions.range(..=p as usize).next_back().map(|(&a, r)| (a + r.len) as u64);
+            match over {
+                Some(o) if o > p && o < end => p = o,
+                _ => break,
+            }
+        }
+        any
+    }
+
+    /// [`Memory::want_range`] for the region, or the loose memory, that
+    /// holds `at`.
+    fn want_piece(&mut self, at: u64, len: u64) -> bool {
         let end = (at.saturating_add(len.max(1)) as usize).next_multiple_of(PAGE as usize);
         // A loose region that ends inside the range grows below, if pages
         // that may join it follow.
@@ -863,7 +914,7 @@ impl Memory {
         // the old imports go once the card is done with them.
         let (base, len) = self.join_neighbours(base, len);
         let (base, len) = self.merge_loose(base, len);
-        tracing::info!(at = format_args!("{at:#x}"), base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
+        tracing::info!(at = format_args!("{at:#x}"), named_kb = (end.saturating_sub(at as usize)) >> 10, base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
         // Pages of a region joined here may have been freed since it was
         // imported (a block of the process heap: no call of the title's
         // says so). Imported whole, the union was refused for the free

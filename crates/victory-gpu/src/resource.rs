@@ -760,15 +760,24 @@ fn hand_out_resource(
         heap_flags,
         backing,
     });
+    // The Vulkan backend imports the memory of a buffer whole, whichever
+    // address in it a call names.
+    #[cfg(windows)]
+    if resource.desc.dimension == BUFFER {
+        crate::vulkan::buffer_resource(resource.data() as u64, resource.desc.width, false);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
-/// A texture goes: the Vulkan backend lets its card images go.
+/// A texture goes: the Vulkan backend lets its card images go. A buffer
+/// goes: it is no range of memory to import any more.
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
         if self.desc.dimension != BUFFER {
             crate::vulkan::resource_released(self.data() as u64, &self.desc);
+        } else {
+            crate::vulkan::buffer_resource(self.data() as u64, self.desc.width, true);
         }
     }
 }
