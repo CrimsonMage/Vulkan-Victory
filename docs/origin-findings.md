@@ -12,6 +12,22 @@ verified here).
 The order is by how likely a row explains (a) the lighting buffer black after the tiled-lighting
 draws, (b) the fog apply pass's huge R/A on sky pixels, (c) glyph boxes.
 
+## Status after the fixes of 2026-11-27 (offline evidence only; no bake, no run)
+
+| Row | Now |
+|---|---|
+| 0 multi-dword bounds | fixed: per dword (`lift_mem.rs` `dword_addrs`) |
+| 1 whole-wave sections | fixed for every program but a wave64 whose halves exchange (`lift_wave.rs` `section_values`) |
+| 2 node tests with the builder off | fixed: no hit, nothing read (`VICTORY_BVH_BUILDER`, part of the stage cache key). An all-zero node was already a miss in both forms |
+| 3 pixel quad reads, `s_wqm` | open |
+| 4 first-lane reads | fixed: empty EXEC reads the first lane there; a pixel helper lane its own value |
+| 5 unwritten registers | fixed: 0 |
+| 6 NaN tests | as before (same intent, unproven on the driver); their test not ported |
+| 7 legacy mad | fixed: fused, sources flushed |
+| 8 `image_sample_b` outside pixel | open |
+| 9 gathers at a named mip | open |
+| found by the audit, not in the table below | **pixel kill never emitted** (fixed), **position w was 1/w** (fixed), **immediate comparison samplers never compared** (fixed), **float-to-integer conversions undefined out of range** (fixed), V#s with NUM_RECORDS -1 (side branch): `docs/opcode-audit.md` |
+
 ## Rows that could explain (a), (b), (c)
 
 | # | What the console does (their finding) | origin implements it | ours | Verdict | Affects |
