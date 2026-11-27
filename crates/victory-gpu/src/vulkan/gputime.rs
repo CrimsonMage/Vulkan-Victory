@@ -97,6 +97,20 @@ pub(super) fn tell(b: &Backend, frame: u64) {
     let total = at.first().zip(at.last()).map_or(0.0, |(a, z)| ns(z.0 - a.0));
     let mut top: Vec<(&str, (f64, u32))> = by.into_iter().collect();
     top.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    // The order the card ran them in (runs of one program joined), with the
+    // time since the first mark: where a dump taken in this frame
+    // (`targets.rs` marks it "DUMP <program>") falls among the programs.
+    let mut order: Vec<String> = Vec::new();
+    let mut last = "";
+    for &(t, name) in &at {
+        if name != last {
+            order.push(format!("{:.1}:{name}", ns(t - at[0].0) / 1e6));
+            last = name;
+        }
+    }
+    for (n, part) in order.chunks(30).enumerate() {
+        tracing::info!(part = n, order = %part.join(" | "), "Vulkan: the frame's programs in the order the card ran them (ms: program)");
+    }
     tracing::info!(marks = at.len(), total_ms = format_args!("{:.1}", total / 1e6), "Vulkan: the card's time by program for one frame follows");
     for (name, (t, binds)) in top.into_iter().take(40) {
         tracing::info!(ms = format_args!("{:.2}", t / 1e6), share = format_args!("{:.1}%", 100.0 * t / total.max(1.0)), binds, program = name, "Vulkan: card time");

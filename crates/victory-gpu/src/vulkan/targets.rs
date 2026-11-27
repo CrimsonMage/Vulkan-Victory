@@ -74,6 +74,8 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, name: &str) {
     let Some(mut p) = make(b) else { return };
     p.label = format!("before-{name}-");
     // SAFETY: as the caller says.
+    unsafe { super::gputime::mark(b, cmd, || format!("DUMP {name}")) };
+    // SAFETY: as the caller says.
     unsafe {
         images::full_barrier(&b.host.device, cmd);
         record(&b.host.device, cmd, &p);
