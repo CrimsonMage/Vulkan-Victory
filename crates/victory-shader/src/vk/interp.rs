@@ -151,6 +151,11 @@ pub struct Machine<'a> {
     pub image_vary: bool,
     /// How many lanes a watched value prints (4).
     pub watch_lanes: usize,
+    /// The invocations the host subgroup has (all, by default). A pixel
+    /// subgroup may be partly filled: an invocation that is not there
+    /// computes nothing, is in no ballot or reduction, and a shuffle from
+    /// it is noted and reads 0.
+    pub live: Vec<bool>,
 }
 
 fn width(s: S) -> u32 {
@@ -282,6 +287,7 @@ impl<'a> Machine<'a> {
             outputs: BTreeMap::new(),
             image_vary: false,
             watch_lanes: 4,
+            live: vec![true; lanes],
         }
     }
 
@@ -300,7 +306,7 @@ impl<'a> Machine<'a> {
 
     /// Runs the wave from the entry block.
     pub fn run(&mut self) -> Stop {
-        let all = vec![true; self.lanes];
+        let all = self.live.clone();
         for &v in &self.f.prelude.clone() {
             if let Err(e) = self.eval(v, &all, &all) {
                 return Stop::Error(e);
@@ -356,8 +362,8 @@ impl<'a> Machine<'a> {
             Term::Return => Ok(None),
             Term::Jump(t) => Ok(Some(t)),
             Term::Branch(c, t, e) => {
-                let x0 = self.value(c, 0)[0];
-                if (1..self.lanes).any(|l| self.value(c, l)[0] != x0) {
+                let x0 = self.value(c, all.iter().position(|&a| a).unwrap_or(0))[0];
+                if (0..self.lanes).any(|l| all[l] && self.value(c, l)[0] != x0) {
                     return Err(format!("the branch on %{c} differs between invocations"));
                 }
                 Ok(Some(if x0 != 0 { t } else { e }))
@@ -596,9 +602,30 @@ impl<'a> Machine<'a> {
                 if !spv[src] {
                     self.note(n.args[0], || "a shuffle reads an inactive invocation".into());
                 }
+                if !self.live[src] {
+                    // an invocation that is not there: undefined
+                    return Ok([0xDEAD_1A4E, 0, 0, 0]);
+                }
                 self.arg(n, 0, src)
             }
-            _ => return Err(format!("subgroup op {o}")),
+            _ => {
+                // arithmetic: a reduction, or a scan over the invocations
+                // below this one (group operation 0, 1 inclusive, 2 exclusive)
+                let g = match n.op {
+                    Op::Wave(_, g) => g,
+                    _ => 0,
+                };
+                let lanes = r.clone().filter(|&i| {
+                    spv[i]
+                        && match g {
+                            1 => i <= l,
+                            2 => i < l,
+                            _ => true,
+                        }
+                });
+                let xs: Vec<u32> = lanes.map(|i| self.arg(n, 0, i)[0] as u32).collect();
+                [u64::from(reduce(o, &xs).ok_or_else(|| format!("subgroup op {o}"))?), 0, 0, 0]
+            }
         })
     }
 
@@ -833,6 +860,27 @@ fn compare(o: u16, at: Ty, x: &[u64]) -> Option<u64> {
         _ => return None,
     };
     Some(u64::from(r))
+}
+
+/// A subgroup arithmetic operation (SPIR-V opcode) over 32-bit values: the
+/// operation's identity for none.
+fn reduce(o: u16, xs: &[u32]) -> Option<u32> {
+    let f = |x: u32| f32::from_bits(x);
+    let fold = |id: u32, step: &dyn Fn(u32, u32) -> u32| xs.iter().fold(id, |a, &x| step(a, x));
+    Some(match o {
+        349 => fold(0, &|a, x| a.wrapping_add(x)),
+        350 => fold(0, &|a, x| (f(a) + f(x)).to_bits()),
+        353 => fold(i32::MAX as u32, &|a, x| (a as i32).min(x as i32) as u32),
+        354 => fold(u32::MAX, &|a, x| a.min(x)),
+        355 => fold(f32::INFINITY.to_bits(), &|a, x| f(a).min(f(x)).to_bits()),
+        356 => fold(i32::MIN as u32, &|a, x| (a as i32).max(x as i32) as u32),
+        357 => fold(0, &|a, x| a.max(x)),
+        358 => fold(f32::NEG_INFINITY.to_bits(), &|a, x| f(a).max(f(x)).to_bits()),
+        359 => fold(u32::MAX, &|a, x| a & x),
+        360 => fold(0, &|a, x| a | x),
+        361 => fold(0, &|a, x| a ^ x),
+        _ => return None,
+    })
 }
 
 /// What a float-to-integer conversion SPIR-V leaves undefined reads here.
