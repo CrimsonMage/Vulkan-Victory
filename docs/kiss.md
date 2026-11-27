@@ -150,6 +150,82 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (colour): **where the world's colour goes: stage by stage**
+  (runs col1 to col3 on tag `batch-2026-11-27d`, branch
+  `worktree-agent-aea8d1272ae4e7c80`; host only, no translator change).
+  The opening shot was amber or black. Mean R / G / B of the same places
+  at each stage (run col1, exe int57, frame 1600):
+
+  | Stage | window frame, face to the room | wall | yard | sky | bunk |
+  |---|---|---|---|---|---|
+  | albedo (0xb0a5a0000, linear) | 0.155 / 0.208 / 0.284 (blue) | 0.38 / 0.40 / 0.40 | 0.12 / 0.10 / 0.05 | - | 0.56 / 0.53 / 0.45 |
+  | indirect diffuse in (0x9bb910000) | 0 | 0 | 0 | - | 0.71 / 0.34 / 0.30 (leftover) |
+  | lighting buffer after the tiled lighting (0x99a1d0000) | 0.91 / 0.24 / 0.020 | 0.000 | 0.83 / 0.17 / 0.010 | 3.5 / 3.4 / 4.9 (before fog) | 0.32 / 0.15 / 0.11 |
+  | after fog, = upscaled HDR (0x99e980000) | 0.91 / 0.24 / 0.020 | 0.0020 / 0.0006 / 0.0003 | 0.84 / 0.20 / 0.031 | 4.8 / 2.4 / 1.75 | 0.32 / 0.15 / 0.11 |
+  | 10-bit target after the composite (0xb3a8f0000) | 0.66 / 0.42 / 0.14 | 0.055 / 0.016 / 0.002 | 0.70 / 0.45 / 0.20 | 0.93 / 0.86 / 0.82 | 0.47 / 0.35 / 0.28 |
+  | final frame (bytes) | 168 / 105 / 35 | 14 / 4 / 0 | 181 / 115 / 50 | 235 / 219 / 209 | 120 / 89 / 71 |
+  | reference (bytes) | blue-grey | 95 / 92 / 81 | 132 / 90 / 52 | 206 / 177 / 160 | pale |
+
+  - **Albedo: right.** The G-buffer has the hues (blue frame, grey-beige
+    walls, posters, green-brown ground). Texture decode, sRGB and channel
+    order are not the fault. (The bunk's and some props' albedo differ
+    from run to run, beige, pink, olive: not traced.)
+  - **Lighting: the shaders are right, the light is missing.** Captures
+    now take a draw's colour targets before and after it; the card's
+    result equals the interpreter's texel by texel for the programs
+    replayed (TL_PS_PBR_MATERIAL_TRANSLUCENCY 0.5327 / 0.3169 / 0.2705
+    against 0.5332 / 0.3175 / 0.2702; NoDir standard 0.7495 against
+    0.7512; the standard program over a band of 26,739 texels it wrote:
+    26,648 within 2%, means 0.7008 / 0.3487 / 0.2200 against 0.7012 /
+    0.3489 / 0.2199). What a surface gets:
+    - *the sun only.* Its colour is the title's own: a 16x1 table
+      (0x9d2f40000) that CS_DirectionalLightTransmittanceLUT makes from
+      the atmosphere's transmittance (replayed: the same), 0.284 / 0.061 /
+      0.0039 at the ground, red to blue 73 to 1 at this low sun. Blue paint
+      under it is orange: 0.155 x 0.28 against 0.284 x 0.004.
+    - *no indirect light.* The diffuse light image is 0 on walls, frame
+      and yard (every probe ray misses without structures) and holds
+      leftovers on the bunk, the one thing indoors that showed.
+    - *no ray-traced sun shadow.* The window frame is of the translucent
+      class (albedo alpha 5; 234,227 texels with part of the yard's
+      ground), which lets the sun through from behind where the shadow
+      mask (0xae6260000) says lit. The mask is 0 on the interior walls
+      (the cascades see the building) but 0.80 on the frame, in a
+      checkerboard: the frame's face to the room is 0.9 red. Standard
+      surfaces facing away from the sun stay dark by their normal. Read
+      as: the cascades cannot tell a frame's face from its sunlit back a
+      few centimetres behind, and the shadow rays that could find nothing
+      (not proven: the rays' part of the mask was not traced).
+    - With the interior black the title's exposure sits at its upper
+      clamp: the sky and yard are over-exposed (sky 235 against 206).
+  - **Post: right.** PS_CompositeNMB replayed from its captured inputs is
+    the card's 10-bit target within a step (21,408 texels, worst 2.3 of
+    1023); fed neutral greys from 0.01 to 100 with the captured tables it
+    returns greys (R and B 9% under G in the shadows, within 2% from 1 up: the
+    title's grade, the green-grey shadows of the reference). The back
+    buffer is the 10-bit target.
+  - **Done (host)**: `VICTORY_AMBIENT=constant:<level>[,<r>,<g>,<b>]`
+    (`vulkan/ambient.rs`, off by default) clears the diffuse light image
+    to a constant right after CS_ScreenProbes_TemporalResolve_* (the idea
+    of VIctory-Belobug-AMD and VIctory-NVIDIA, which is how those D3D12
+    forks get their interiors while ray tracing is off). Run col3 (0.5):
+    walls 77 / 78 / 66, the frame's edges blue, posters, the window's
+    mesh, the bunk, a golden yard; exposure comes down by itself (sky HDR
+    4.8 -> 3.7). Still wrong there: the frame's face is orange (the
+    shadow rays), the sky too white, no character.
+    BCPack: BC7 rotation only in modes 4 and 5 (fxceless's fix; no
+    control word of the shipped tables is affected, so no texture of this
+    title changes).
+  - **Open**, most important first: (1) the stand-in as an estimate from
+    the frame before (VIctory-NVIDIA `ambient.rs`: the radiance
+    CS_CacheScreenSpaceRadiance keeps, 64x36 cells, gathered at 160x90
+    points; a host compute pass), so that level and tint follow the hour
+    and nothing glows at night, then on by default while the builder is
+    off; (2) sun shadows without rays for the translucent class (the
+    builder, or the mask from the cascades); (3) the same for reflections
+    (CS_RayMiss gives the sky's light indoors); (4) the albedo that
+    differs between runs.
+
 - 2026-11-27 (code tables): a program's constant tables are memory it
   reads by address, not variables of its module (branch
   `worktree-agent-a237c60fd3ce29af8`; offline only, awaiting a bake).
