@@ -1112,54 +1112,9 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
-/// The bytes of a texture's console layout from its start through level
-/// `level` (the levels after it are smaller and come before it; the
-/// smallest share the first block): all of it for level 0, for a texture
-/// of several slices or planes, or without a layout.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn bytes_through(desc: &ResourceDesc, bytes: u64, level: u32) -> u64 {
-    if level == 0 {
-        return bytes;
-    }
-    let Some(texture) = texture_layout(desc) else { return bytes };
-    let [plane] = texture.planes.as_slice() else { return bytes };
-    let l = &plane.layout;
-    if l.slices != 1 || l.first_tail_mip == 0 || l.mips.is_empty() {
-        return bytes;
-    }
-    // level `level` ends where the next more detailed one starts
-    let next = (level.min(l.mips.len() as u32) - 1).min(l.first_tail_mip - 1);
-    match l.mips[next as usize].offset {
-        0 => bytes,
-        end => end.min(bytes),
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_streamed_texture_owns_its_small_levels_first() {
-        // 1024x1024 BC1 with its full chain: the small levels come first,
-        // level 0 last
-        let desc = ResourceDesc { dimension: 3, alignment: 0, width: 1024, height: 1024, depth_or_array_size: 1, mip_levels: 11, format: 71, sample_count: 1, sample_quality: 0, layout: 0, flags: 0 };
-        let all = texture_layout(&desc).expect("a layout").size;
-        assert_eq!(bytes_through(&desc, all, 0), all);
-        let through: Vec<u64> = (0..11).map(|l| bytes_through(&desc, all, l)).collect();
-        assert!(through.windows(2).all(|w| w[0] >= w[1]), "{through:x?}");
-        // level 1 and on: without level 0's 512 KiB; level 2 and on: without level 1's 128 KiB too
-        assert_eq!(all - through[1], 512 << 10, "{through:x?}");
-        assert_eq!(through[1] - through[2], 128 << 10, "{through:x?}");
-        // the smallest levels share one block
-        assert_eq!(bytes_through(&desc, all, u32::MAX), through[10]);
-        assert!(through[10] > 0 && through[10] <= 64 << 10, "{through:x?}");
-        // several slices: all of it
-        let array = ResourceDesc { depth_or_array_size: 2, ..desc };
-        let all = texture_layout(&array).expect("a layout").size;
-        assert_eq!(bytes_through(&array, all, 3), all);
-    }
     use crate::object::slot;
 
     type Release = extern "system" fn(This) -> u32;

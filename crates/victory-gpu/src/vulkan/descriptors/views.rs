@@ -215,32 +215,6 @@ fn null_texture(dimension: u32, unordered: bool) -> Vec<u32> {
     .to_vec()
 }
 
-/// The level a two-dimensional shader resource view's
-/// `ResourceMinLODClamp` keeps sampling from (word 7): a title that
-/// streams levels in may show a texture whole and clamp it to the levels
-/// that are there. Diagnostics tell the first ones.
-fn min_level(image: &Image, address: u64, dimension: u32, desc: Option<&[u32; 10]>, unordered: bool) -> u32 {
-    let Some(d) = desc.filter(|_| dimension == 4 && !unordered) else { return 0 };
-    let clamp = f32::from_bits(d[7]);
-    if !(clamp >= 1.0 && clamp < 16.0) {
-        return 0;
-    }
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEEN.fetch_add(1, Ordering::Relaxed);
-    if cfg!(feature = "diagnostics") && (n < 8 || n.is_power_of_two()) {
-        tracing::info!(
-            n,
-            at = format_args!("{address:#x}"),
-            size = format_args!("{}x{}", image.desc.width, image.desc.height),
-            levels = image.mips + image.dropped,
-            most_detailed = d[4],
-            clamp,
-            "Vulkan: a texture view with a minimum level of detail (the levels before it need not be in memory)"
-        );
-    }
-    clamp as u32
-}
-
 /// What a texture view shows: its kind and ranges.
 struct Shape {
     kind: vk::ImageViewType,
@@ -408,7 +382,6 @@ fn texture_words(
     };
     let mapping = if unordered { 0 } else { desc.map_or(0, |d| d[2]) };
     let shape = shape(&image, dimension, desc, unordered);
-    images::names_level(b, &image, shape.base_mip.max(min_level(&image, address, dimension, desc, unordered)));
     let (format, aspect, stencil) = view_format(&image, title_format, unordered);
     if unordered {
         note_wide_uav(&image, rdesc.format, title_format, format);

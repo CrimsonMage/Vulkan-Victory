@@ -45,7 +45,7 @@ pub(crate) fn released(b: &Backend, at: u64, len: u64, why: super::Dropped) {
         .images
         .range(from..)
         .take_while(|(k, _)| k.address < at + len)
-        .filter(|(k, i)| k.address + i.own.load(Ordering::Relaxed).max(1) > at)
+        .filter(|(k, i)| k.address + i.bytes.max(1) > at)
         .map(|(k, _)| *k)
         .collect();
     let value = b.timeline.last();

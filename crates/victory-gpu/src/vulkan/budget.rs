@@ -73,37 +73,25 @@ fn rule() -> (u64, u64) {
 }
 
 /// Whether `bytes` more of ours (an image block) may be allocated: never
-/// past the limit by more than the pool's views can give back. Images come
-/// first: the views give blocks back for them now (down to [`LEAST`]) if
-/// the memory lock is free, and at the next frame otherwise
-/// ([`follow_budget`]); what they hold past the least counts as room
-/// either way. (Until 2026-11-27 an image block asked for while the lock
-/// was held, or while the view's blocks were still in use, was refused:
-/// its texture then read the null image for the rest of the run, since
-/// nothing names a view again that a program picks by index. Run sh5: 19
-/// blocks refused with 1,344 MiB in the view, 41,873 views without an
-/// image.)
+/// past the limit. Images come first: the pool's views give blocks back
+/// for them now (down to [`LEAST`]) if the memory lock is free; otherwise
+/// at the next frame, and the image waits for its next naming.
 pub(super) fn fits(b: &Backend, bytes: u64) -> bool {
     let host = &b.host;
     let over = || (account::card_total() + bytes).saturating_sub(limit(host));
-    let mut later = 0;
-    if over() > 0 {
-        match b.memory.try_lock() {
-            Ok(mut m) => {
-                let mut need = over();
-                for p in &mut m.pools {
-                    let has = p.card_bytes();
-                    let target = has.saturating_sub(need).max(LEAST);
-                    if target < has && p.shrink(host, &b.timeline, target).is_ok() {
-                        need = need.saturating_sub(has - p.card_bytes());
-                    }
-                    later += p.card_bytes().saturating_sub(LEAST);
-                }
+    if over() > 0
+        && let Ok(mut m) = b.memory.try_lock()
+    {
+        let mut need = over();
+        for p in &mut m.pools {
+            let has = p.card_bytes();
+            let target = has.saturating_sub(need).max(LEAST);
+            if target < has && p.shrink(host, &b.timeline, target).is_ok() {
+                need = need.saturating_sub(has - p.card_bytes());
             }
-            Err(_) => later = (account::totals_mb().0[Kind::Pool as usize] << 20).saturating_sub(LEAST),
         }
     }
-    let fits = over() <= later;
+    let fits = over() == 0;
     if !fits {
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
