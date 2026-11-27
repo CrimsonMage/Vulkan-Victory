@@ -1590,6 +1590,71 @@ of each stays. What went, and what was kept for the Vulkan path:
 - Still on the host's `d3d12.dll`: the title's root signature
   serialization (`root.rs`), which the title calls itself.
 
+### Handoff: write tracking for card copies of title memory (2026-11-27, not built)
+
+Goal (coordinator): the card never reads a stale copy of title memory;
+write tracking instead of polling; no extra RAM or VRAM. This section is
+the evaluation and plan; the agent that wrote it ran out of room before
+building it.
+
+**Where the card holds copies.** (1) The pool's GPU view: one card page per
+physical 64 KiB page (`victory-vk/src/pool.rs`, `vulkan/paging.rs`), filled
+at mapping and at announced writes. (2) Images filled from title memory
+(`images/fill.rs`), refreshed by fingerprint polling (`refresh`). Imports
+(regions, sections, loose) are zero-copy and need nothing. vk-world census
+(`stale.rs`, one page in 8): sampled 3,786, stale 1,997.
+
+**Announced writes today** (the only places the card copy is refreshed):
+- `files.rs` `ReadFile` (host kernel32 `ReadFile` writes the title buffer,
+  then `title_memory_written`), `fread` (a Rust copy, then announced);
+- `dstorage.rs`: positioned host `ReadFile` straight into title memory for
+  uncompressed requests, `xmem::write_physical` for decompressed ones, then
+  `pages_written` / `title_memory_written`;
+- `xmem.rs:757` (`pages_written`), `engine.rs:452` (CPU-landed bottom-of-pipe
+  writes).
+
+**Plan.**
+1. A bit per physical page (`PageKey`): `protected`, `dirty`, `hot` (frames
+   dirty in a row). Kept in xmem (it knows every view of a physical page:
+   `Physical::shown`).
+2. Protect after the copy is *queued*, before it is *taken*: the order must be
+   protect (all views of the page, `VirtualProtect` PAGE_READONLY) -> fill
+   (`PoolView::written` / image refill reading the home) so that a write
+   between faults and re-marks the page. Protect only pages that have a card
+   page now (pool: resident, not evicted; images: the pages under images the
+   title fills, not card-written ones).
+3. Fault path: xmem's vectored handler `on_fault` already sees writes. A write
+   into a protected page: set `dirty`, make every view of that page
+   PAGE_READWRITE again, `EXCEPTION_CONTINUE_EXECUTION`. It must take no lock
+   our own writers may hold: use a lock-free page set (the bits in an atomic
+   array by page index, or a separate small mutex never held across a
+   title-memory write), not `PHYSICAL` and not `memory(b)`.
+4. Flush at present (and in `buffer_over`/`ensure` for pages a recording names):
+   dirty pages -> `title_memory_written` (pool refill; images over them get
+   `cpu_changed` and refill), clear `dirty`, protect again. A page dirty 8
+   frames running becomes `hot`: left writable and re-copied every frame (no
+   fault storm); a hot page clean for 8 frames is protected again.
+5. Host writes that do not fault in user mode: Wine's `NtReadFile` checks the
+   buffer with `virtual_check_buffer_for_write`, which touches each page under
+   its own `__TRY`; whether our VEH sees that fault first under Wine 11 must be
+   checked in a run. Safe either way: before every host call that writes title
+   memory (`ReadFile` in files.rs and dstorage.rs), unprotect the range and mark
+   it dirty; log any `ERROR_NOACCESS` / `STATUS_ACCESS_VIOLATION` from such
+   calls ("a host call failed on a protected title page") so a missed site
+   shows itself.
+6. Our own Rust writers (bottom-of-pipe CPU writes, decompression into title
+   memory, CPU copies) fault into the same handler; it is lock-free per (3).
+7. Then delete `stale.rs` (keep one counter line: faults, pages re-copied,
+   pages kept writable) and image fingerprint polling for images whose pages
+   are tracked.
+
+**Cost estimate to verify.** ~700 pool pages went stale a frame in an
+every-page experiment. A fault under Wine is a signal plus VEH dispatch
+(tens of µs) plus two `VirtualProtect` per view; 700 a frame is several ms.
+The hot-page rule bounds it; measure faults/frame, pages/frame and ms/frame
+in the 10 s line. If it stays over ~3 ms: track pool pages only and keep the
+fingerprint polling for images, or copy hot pages unconditionally.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
