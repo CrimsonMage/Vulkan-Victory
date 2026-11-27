@@ -18,7 +18,8 @@
 //! or block (pixel), `LIMIT=n` block visits a wave, `DISPATCH="x y z"` the
 //! groups of an indirect dispatch (the capture has no size for it),
 //! `GROUP="x y z"` that group only, `WATCH=n,m|all` (with `LANES=n`) the
-//! values computed into `trace.txt`, `DUMP=1` the thread IR.
+//! values computed into `trace.txt`, `DUMP=1` the thread IR, `CARD=1` the
+//! card's floats (`vk::interp::card_floats`: denormals are zeros).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -692,6 +693,10 @@ fn main() {
     let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new() };
     if std::env::var_os("DUMP").is_some() {
         victory_shader::vk::tir::dump(&f);
+    }
+    if std::env::var_os("CARD").is_some() {
+        victory_shader::vk::interp::card_floats(true);
+        images.0.borrow_mut().notes.insert("the card's floats: denormal operands and results are zeros".into());
     }
     let stride = env("STRIDE", 1).max(1) as usize;
     let mut census = String::new();

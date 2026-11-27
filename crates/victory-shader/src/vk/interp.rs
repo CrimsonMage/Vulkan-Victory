@@ -260,10 +260,31 @@ pub fn f32_to_f16(f: f32) -> u16 {
     s | r as u16
 }
 
+thread_local! {
+    static CARD_FLOATS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's runs compute 32-bit floats as the card does
+/// instead of as IEEE 754 (and the console) do: a denormal operand of a
+/// comparison or of arithmetic is zero and a denormal result is flushed
+/// to zero, both with the sign kept; negation, the absolute value and
+/// selects move the bits. Measured on an NVIDIA RTX 5060 Ti, which has
+/// no `shaderDenormPreserveFloat32` to ask for the other. For replays and
+/// tests that ask what the card computes from a translation.
+pub fn card_floats(on: bool) {
+    CARD_FLOATS.with(|c| c.set(on));
+}
+
+/// A denormal's bits as the card takes them: its zero.
+fn card_f32(bits: u32) -> u32 {
+    let denormal = bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0;
+    if denormal && CARD_FLOATS.with(std::cell::Cell::get) { bits & 0x8000_0000 } else { bits }
+}
+
 fn to_f(s: S, x: u64) -> f64 {
     match s {
         S::F16 => f64::from(f16_to_f32(x as u16)),
-        S::F32 => f64::from(f32::from_bits(x as u32)),
+        S::F32 => f64::from(f32::from_bits(card_f32(x as u32))),
         S::F64 => f64::from_bits(x),
         _ => x as f64,
     }
@@ -273,7 +294,7 @@ fn from_f(s: S, x: f64) -> u64 {
     match s {
         S::F16 => u64::from(f32_to_f16(x as f32)),
         S::F64 => x.to_bits(),
-        _ => u64::from((x as f32).to_bits()),
+        _ => u64::from(card_f32((x as f32).to_bits())),
     }
 }
 
@@ -859,6 +880,8 @@ fn glsl_one(g: u32, ty: Ty, at: Ty, x: &[u64]) -> Option<u64> {
     Some(match g {
         glsl::ROUND_EVEN => rf(f(0).round_ties_even()),
         glsl::TRUNC => rf(f(0).trunc()),
+        // the card moves the bits (a denormal stays one)
+        glsl::F_ABS if at.s == S::F32 && CARD_FLOATS.with(std::cell::Cell::get) => x[0] & 0x7FFF_FFFF,
         glsl::F_ABS => rf(f(0).abs()),
         glsl::S_ABS => s(0).unsigned_abs() & m,
         glsl::FLOOR => rf(f(0).floor()),
