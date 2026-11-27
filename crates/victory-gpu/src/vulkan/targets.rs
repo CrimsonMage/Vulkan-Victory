@@ -129,14 +129,29 @@ pub(super) fn plan(b: &Backend, frame: u64) -> Option<Plan> {
     make(b)
 }
 
+/// `VICTORY_VK_DUMP_ONLY=<address>[,<address>...]` (hex): only the images
+/// over these title addresses are dumped (many dumps of one target stay
+/// small).
+fn only() -> &'static [u64] {
+    static ONLY: OnceLock<Vec<u64>> = OnceLock::new();
+    ONLY.get_or_init(|| {
+        let v = std::env::var("VICTORY_VK_DUMP_ONLY").unwrap_or_default();
+        v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect()
+    })
+}
+
 fn make(b: &Backend) -> Option<Plan> {
-    let buf = Buffer::new(&b.host, ROOM, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback).ok()?;
+    let room = if only().is_empty() { ROOM } else { 128 << 20 };
+    let buf = Buffer::new(&b.host, room, vk::BufferUsageFlags::TRANSFER_DST, Place::Readback).ok()?;
     let (mut items, mut at) = (Vec::new(), 0u64);
     for img in images::card_written_images() {
         let bytes = u64::from(img.extent.width) * u64::from(img.extent.height) * texel(&img);
         // shadow maps (D16) are left out: there are dozens, and compute
         // outputs (no draws: last in the order) must fit
-        if img.samples > 1 || img.extent.width < 128 || texel(&img) == 0 || at + bytes > ROOM || img.format == vk::Format::D16_UNORM {
+        if img.samples > 1 || img.extent.width < 128 || texel(&img) == 0 || at + bytes > room || img.format == vk::Format::D16_UNORM {
+            continue;
+        }
+        if !only().is_empty() && !only().contains(&img.key.address) {
             continue;
         }
         items.push((img, at));
