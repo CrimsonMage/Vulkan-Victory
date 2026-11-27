@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::spirv::{glsl, op};
-use super::tir::{Builtin, Func, Helper, ImageKind, Item, Node, Op, S, Term, Ty, V};
+use super::tir::{Builtin, Func, Helper, ImageClass, ImageKind, Item, Node, Op, S, Sampler, Term, Ty, V};
 
 /// A value of one invocation: up to four components, as bits.
 type W = [u64; 4];
@@ -112,6 +112,15 @@ pub enum Stop {
     Error(String),
 }
 
+/// What image instructions read and write, in place of the machine's one
+/// texel (a capture's images: `examples/replay`).
+pub trait Images {
+    /// An image instruction of invocation `lane` with its operand values
+    /// (word 7 of the T# first, then as `tir::img` orders them); a store's
+    /// result is ignored.
+    fn image(&mut self, kind: ImageKind, class: ImageClass, sampler: Sampler, flags: u16, args: &[W], lane: usize) -> W;
+}
+
 /// One console wave of a thread program.
 pub struct Machine<'a> {
     f: &'a Func,
@@ -146,6 +155,15 @@ pub struct Machine<'a> {
     /// Outputs written: (slot, component, index or invocation, invocation)
     /// -> bits (the last write).
     pub outputs: BTreeMap<(u16, u8, u64, usize), u64>,
+    /// Image stores in order: (invocation, the store's operands).
+    pub image_stores: Vec<(usize, Vec<W>)>,
+    /// The images, where they are given (else `image_texel`).
+    pub images: Option<Box<dyn Images + 'a>>,
+    /// A pixel program's invocations as 2 x 2 quads of an 8 x 4 block at
+    /// this pixel (else lane % 8, lane / 8 from the origin).
+    pub frag_block: Option<[u32; 2]>,
+    /// The work group's size, for local invocation ids (zero: x only).
+    pub local_size: [u32; 3],
     /// Images read texels that differ by lane: each float channel scaled
     /// by 1, 1.5, 2, 2.5 or 3 (lane mod 5), so branches on them diverge.
     pub image_vary: bool,
@@ -280,6 +298,10 @@ impl<'a> Machine<'a> {
             image_texel: [0; 4],
             undef: 0,
             outputs: BTreeMap::new(),
+            image_stores: Vec::new(),
+            images: None,
+            frag_block: None,
+            local_size: [0; 3],
             image_vary: false,
             watch_lanes: 4,
         }
@@ -463,10 +485,27 @@ impl<'a> Machine<'a> {
                 self.arg(n, 1 + k, l)
             }
             Op::Phi => return Err("a phi outside its block".into()),
+            Op::Image { kind, class, sampler, flags } if self.images.is_some() => {
+                let args: Vec<W> = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
+                if pred[l] && matches!(kind, ImageKind::Store { .. }) {
+                    self.image_stores.push((l, args.clone()));
+                }
+                if matches!(kind, ImageKind::Store { .. }) && !pred[l] {
+                    [0; 4]
+                } else {
+                    self.images.as_mut().map_or([0; 4], |im| im.image(*kind, *class, *sampler, *flags, &args, l))
+                }
+            }
             Op::Image { kind, .. } => match kind {
                 ImageKind::Size => self.image_size,
                 ImageKind::Levels => s(u64::from(self.image_levels)),
-                ImageKind::Store { .. } => [0; 4],
+                ImageKind::Store { .. } => {
+                    if pred[l] {
+                        let args = (0..n.args.len()).map(|k| self.arg(n, k, l)).collect();
+                        self.image_stores.push((l, args));
+                    }
+                    [0; 4]
+                }
                 _ => self.texel(l),
             },
             Op::Input { loc, comp, .. } | Op::PerVertex { loc, comp, .. } => s(input(*loc, *comp, l, n.ty)),
@@ -489,8 +528,20 @@ impl<'a> Machine<'a> {
             Builtin::WorkgroupId(c) => self.group[usize::from(c)],
             Builtin::SubgroupId => sg,
             Builtin::SubgroupLocalId => lane,
-            Builtin::LocalInvocationIndex | Builtin::LocalInvocationId(0) => sg * 32 + lane,
+            Builtin::LocalInvocationIndex => sg * 32 + lane,
+            Builtin::LocalInvocationId(c) if self.local_size[0] > 0 => {
+                let [x, y, _] = self.local_size;
+                let i = sg * 32 + lane;
+                [i % x, i / x % y.max(1), i / (x * y.max(1))][usize::from(c).min(2)]
+            }
+            Builtin::LocalInvocationId(0) => sg * 32 + lane,
             Builtin::LocalInvocationId(_) => 0,
+            Builtin::FragCoord(c @ 0..=1) if self.frag_block.is_some() => {
+                let [ox, oy] = self.frag_block.unwrap_or_default();
+                let q = lane / 4;
+                let (x, y) = (ox + q % 4 * 2 + (lane & 1), oy + q / 4 * 2 + (lane >> 1 & 1));
+                (0.5f32 + if c == 0 { x } else { y } as f32).to_bits()
+            }
             // pixels: lane l at (l % 8, l / 8) of an 8x4 tile, no helpers
             Builtin::FragCoord(0) => (0.5f32 + (lane % 8) as f32).to_bits(),
             Builtin::FragCoord(1) => (0.5f32 + (lane / 8) as f32).to_bits(),
