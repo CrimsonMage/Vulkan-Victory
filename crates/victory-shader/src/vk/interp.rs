@@ -36,6 +36,9 @@ pub struct Memory {
     pub missing: BTreeMap<u64, (u32, V)>,
     /// Stores: address -> value (also applied to `dwords`).
     pub stored: BTreeMap<u64, u32>,
+    /// Missing dwords read a hash of their address and this seed instead
+    /// of 0 (random memory, for comparing two translations).
+    pub noise: Option<u64>,
 }
 
 impl Memory {
@@ -53,6 +56,7 @@ impl Memory {
         let d = a & !3;
         match self.dwords.get(&d) {
             Some(&w) => (w >> (8 * (a & 3))) as u8,
+            None if self.noise.is_some() => (noise(d, self.noise.unwrap_or(0)) >> (8 * (a & 3))) as u8,
             None => {
                 if !quiet {
                     self.missing.entry(d).or_insert((0, who)).0 += 1;
@@ -85,6 +89,14 @@ impl Memory {
         let d = a.wrapping_sub(self.range.0);
         if d < self.range.1 && self.range.1 - d >= bytes { a } else { ZERO }
     }
+}
+
+/// A dword of random memory at `d` (splitmix64 of the address and seed).
+fn noise(d: u64, seed: u64) -> u32 {
+    let mut z = d ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) as u32
 }
 
 /// Why a run stopped.
@@ -129,6 +141,9 @@ pub struct Machine<'a> {
     pub image_texel: W,
     /// What an undefined value reads (a poison to find uses of them).
     pub undef: u64,
+    /// Outputs written: (slot, component, index or invocation, invocation)
+    /// -> bits (the last write).
+    pub outputs: BTreeMap<(u16, u8, u64, usize), u64>,
 }
 
 fn width(s: S) -> u32 {
@@ -257,6 +272,7 @@ impl<'a> Machine<'a> {
             image_levels: 1,
             image_texel: [0; 4],
             undef: 0,
+            outputs: BTreeMap::new(),
         }
     }
 
@@ -424,7 +440,15 @@ impl<'a> Machine<'a> {
                 [first(0), first(1), 0, 0]
             }
             Op::Xchg => return Err("an exchange in a wave32 run".into()),
-            Op::Barrier | Op::Output { .. } | Op::Demote => [0; 4],
+            Op::Output { slot, comp } => {
+                if pred[l] {
+                    let at = if n.args.len() > 1 { self.arg(n, 1, l)[0] } else { l as u64 };
+                    let x = self.arg(n, 0, l)[0];
+                    self.outputs.insert((*slot, *comp, at, l), x);
+                }
+                [0; 4]
+            }
+            Op::Barrier | Op::Demote => [0; 4],
             Op::Pick => {
                 let k = (self.arg(n, 0, l)[0] as usize).min(n.args.len() - 2);
                 self.arg(n, 1 + k, l)

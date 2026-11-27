@@ -486,6 +486,30 @@ Known gaps (the program translates; the result differs from the console):
   group barrier orders buffer and image memory as well as workgroup
   memory; buffer writes one half reads back from the other without such a
   barrier are not ordered (nor are they in the HLSL the program came from).
+  **Most of this goes before emission (`vk/uniform.rs`).** A value is
+  wave-uniform when every invocation of the console wave computes the same
+  bits: constants, user data, the map, the group id (the mesh group input);
+  pure operations, helpers and typed decodes of uniform values; loads from
+  uniform addresses in a program that writes no memory; block phis of
+  uniform values (block branches are the console's scalar branches);
+  guard phis whose condition (EXEC all or none) and values are uniform; an
+  exchange's pair; ballots, any, all, broadcasts and shuffles of uniform
+  values (found optimistically, so loop counters the wave advances
+  together stay uniform). Then a `v_readfirstlane` or `v_readlane` of a
+  uniform value, or of a value written under EXEC `e` read at `e`'s first
+  lane (the written value when that is uniform), is that value; an
+  exchange of a uniform word is that word twice; an exchange of a word
+  made only of uniform values and the invocation's place (subgroup id,
+  lane: the console thread index, `v_mbcnt` of -1, compares of it, such as
+  `v_cmpx_eq_u32 exec, 0, v0` and `v_cmpx_gt_u32 exec, count, v0`), or of
+  the ballot of such a boolean, is computed by each half for the other
+  (its subgroup id's lowest bit flipped), in wave64 groups of whole waves;
+  an exchange nothing reads goes; and in a program with no shared state
+  (no LDS access, no memory or image write) the halves' meetings and the
+  console's barriers go (they order nothing). What still exchanges is a
+  lane's data read across lanes (`v_readlane` of a loop value, masks of
+  loaded data). `v_readlane` of a uniform value in a wave64 vertex or pixel
+  program is no longer listed as an approximation.
 - Cube samples with derivatives or offsets read the faces as a 2D array:
   no filtering across face edges.
 

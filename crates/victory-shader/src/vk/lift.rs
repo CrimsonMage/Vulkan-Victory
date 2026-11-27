@@ -61,6 +61,9 @@ pub struct Interface {
     /// Workgroup memory in dwords.
     pub lds_dwords: u32,
     pub approximate: Vec<Approx>,
+    /// Approximations that hold unless the value is wave-uniform (then the
+    /// translation is exact: [`super::uniform`] decides).
+    pub unless_uniform: Vec<(V, Approx)>,
     /// Pixel: depth / stencil / sample mask exported.
     pub depth: bool,
     pub demotes: bool,
@@ -553,12 +556,22 @@ impl<'a> Lift<'a> {
     }
 
     fn approx(&mut self, note: &'static str) {
-        let (b, i) = self.site;
-        let opcode = self.p.blocks.get(b).and_then(|b| b.insts.get(i)).map_or("", |i| i.name());
-        let a = Approx { note, opcode };
+        let a = self.approx_here(note);
         if !self.iface.approximate.contains(&a) {
             self.iface.approximate.push(a);
         }
+    }
+
+    fn approx_here(&self, note: &'static str) -> Approx {
+        let (b, i) = self.site;
+        let opcode = self.p.blocks.get(b).and_then(|b| b.insts.get(i)).map_or("", |i| i.name());
+        Approx { note, opcode }
+    }
+
+    /// An approximation taken unless `v` turns out wave-uniform.
+    fn approx_unless_uniform(&mut self, note: &'static str, v: V) {
+        let a = self.approx_here(note);
+        self.iface.unless_uniform.push((v, a));
     }
 
     /// A data dword as a lane mask half.

@@ -33,9 +33,7 @@ impl Lift<'_> {
         if !self.xwave || !self.lds_dirty {
             return;
         }
-        self.close();
-        let z = self.k32(0);
-        self.exchange(z);
+        self.meet();
     }
 
     /// At the console's memory barrier (`s_waitcnt_vscnt`): the halves meet
@@ -44,9 +42,16 @@ impl Lift<'_> {
         if !self.xwave {
             return;
         }
+        self.meet();
+    }
+
+    /// The halves meet, nothing exchanged (`uniform::MEET`: it goes in a
+    /// program with nothing shared to order).
+    fn meet(&mut self) {
         self.close();
         let z = self.k32(0);
-        self.exchange(z);
+        self.emit_imm(Op::Xchg, Ty::vec(S::U32, 2), vec![z], vec![crate::vk::uniform::MEET]);
+        self.lds_dirty = false;
     }
 
     /// The two dwords of a wave64 mask: exchanged once per block (masks

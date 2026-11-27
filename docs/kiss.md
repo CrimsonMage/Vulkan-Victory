@@ -142,6 +142,21 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-26: wave-uniform values before emission (`vk/uniform.rs`). The
+  card spent ~85% of a world frame in mesh draws whose modules exchanged
+  between wave64 halves at every `v_readfirstlane` and counted every
+  barrier, though the programs (MS_VS_Transform and kin) have no real
+  cross-lane flow: their readfirstlanes read the group id, loads from
+  scalar addresses and masks of scalar compares. The thread IR now knows
+  which values every invocation of a console wave computes alike; reads
+  of one lane of them are the value, exchanges of them and exchanges of
+  words made of the invocation's place (thread index compares) are
+  computed locally, and programs with no shared state lose their
+  meetings and barriers. On the used set: mesh exchange calls 7,607 ->
+  1,094 (programs exchanging 240 -> 83), counted barriers 480 -> 0;
+  compute exchange calls 6,175 -> 1,732. Interpreter runs of the old and
+  new thread IR agree on random memory for all 1,592 programs.
+
 - 2026-11-26: 64-bit image atomics (ABI v5). The 679 alpha prepass
   pixel programs do one `image_atomic_umax` on a two-dword texel (depth
   high, payload low); it ran on the low dword only. Now a u64 atomic on an
