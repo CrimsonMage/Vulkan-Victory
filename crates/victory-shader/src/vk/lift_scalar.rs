@@ -628,18 +628,20 @@ impl Lift<'_> {
         let k32 = self.k32(32);
         let wc = self.gl(glsl::U_MIN, Ty::U32, &[w, k32]);
         if signed {
-            // (a << (32 - o - w)) >> (32 - w)
+            // (a << l) >> (l + o), l = 32 - min(o + w, 32): a field past bit
+            // 31 extends from bit 31; width 0 gives 0.
             let ow = self.spv(op::I_ADD, Ty::U32, &[o, wc]);
             let ow = self.gl(glsl::U_MIN, Ty::U32, &[ow, k32]);
             let l = self.spv(op::I_SUB, Ty::U32, &[k32, ow]);
             let k31 = self.k32(31);
             let l = self.gl(glsl::U_MIN, Ty::U32, &[l, k31]);
             let sh = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[a, l]);
-            let r = self.spv(op::I_SUB, Ty::U32, &[k32, wc]);
+            let r = self.spv(op::I_ADD, Ty::U32, &[l, o]);
             let r = self.gl(glsl::U_MIN, Ty::U32, &[r, k31]);
-            let r2 = self.spv(op::I_ADD, Ty::U32, &[r, k32]);
-            let _ = r2;
-            self.spv(op::SHIFT_RIGHT_ARITHMETIC, Ty::U32, &[sh, r])
+            let x = self.spv(op::SHIFT_RIGHT_ARITHMETIC, Ty::U32, &[sh, r]);
+            let zero = self.k32(0);
+            let none = self.spv(op::I_EQUAL, Ty::BOOL, &[wc, zero]);
+            self.spv(op::SELECT, Ty::U32, &[none, zero, x])
         } else {
             let s = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[a, o]);
             let m = self.mask_bits(wc);

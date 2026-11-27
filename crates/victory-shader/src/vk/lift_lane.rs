@@ -23,11 +23,8 @@ impl Lift<'_> {
 
     /// `v_cmp_class`: whether `x` is in one of the classes of `mask`.
     pub(super) fn class(&mut self, x: V, mask: V, t: Ty) -> V {
-        let Some(m) = self.f.as_const(mask) else {
-            // dynamic class masks: rare; treat as "not in class"
-            self.approx("v_cmp_class with a computed class mask");
-            return self.kb(false);
-        };
+        // a computed mask tests every class against its bit
+        let m = self.f.as_const(mask).map_or(0x3FF, |m| m as u32);
         let z = if t == Ty::F16 { self.f.konst(t, 0) } else { self.kf(0.0) };
         let nan = self.spv(op::IS_NAN, Ty::BOOL, &[x]);
         let inf = self.spv(op::IS_INF, Ty::BOOL, &[x]);
@@ -58,13 +55,22 @@ impl Lift<'_> {
             self.spv(op::LOGICAL_AND, Ty::BOOL, &[finite, nd])
         };
         let pos = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[signed]);
+        // the quiet bit splits NaNs: signalling (class 0) and quiet (1)
+        let qb = self.k32(if t == Ty::F16 { 0x200 } else { 0x40_0000 });
+        let q = self.spv(op::BITWISE_AND, Ty::U32, &[bits, qb]);
+        let quiet = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[q, zz]);
+        let dynamic = self.f.as_const(mask).is_none();
         let mut acc = self.kb(false);
         for bit in 0..10 {
             if m >> bit & 1 == 0 {
                 continue;
             }
             let t = match bit {
-                0 | 1 => nan,
+                0 => {
+                    let sig = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[quiet]);
+                    self.spv(op::LOGICAL_AND, Ty::BOOL, &[nan, sig])
+                }
+                1 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[nan, quiet]),
                 2 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, neg]),
                 3 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[normal, neg]),
                 4 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[denorm, signed]),
@@ -80,6 +86,14 @@ impl Lift<'_> {
                     let p = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[neg]);
                     self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, p])
                 }
+            };
+            let t = if dynamic {
+                let kb = self.k32(1 << bit);
+                let mb = self.spv(op::BITWISE_AND, Ty::U32, &[mask, kb]);
+                let on = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[mb, zz]);
+                self.spv(op::LOGICAL_AND, Ty::BOOL, &[t, on])
+            } else {
+                t
             };
             acc = self.spv(op::LOGICAL_OR, Ty::BOOL, &[acc, t]);
         }

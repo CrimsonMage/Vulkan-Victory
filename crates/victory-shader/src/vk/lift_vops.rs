@@ -49,15 +49,24 @@ impl Lift<'_> {
         let b = self.fsrc(inst, v, 1)?;
         let c = self.fsrc(inst, v, 2)?;
         // clamp idiom: med3(x, 0, 1)
-        let x = if self.f.as_const(b).is_some() && self.f.as_const(c).is_some() {
-            self.gl(glsl::N_CLAMP, Ty::F32, &[a, b, c])
-        } else {
-            let lo = self.gl(glsl::N_MIN, Ty::F32, &[a, b]);
-            let hi = self.gl(glsl::N_MAX, Ty::F32, &[a, b]);
-            let m = self.gl(glsl::N_MIN, Ty::F32, &[hi, c]);
-            self.gl(glsl::N_MAX, Ty::F32, &[lo, m])
-        };
+        let x = self.med3(a, b, c, Ty::F32);
         f(self, x)
+    }
+
+    /// RDNA2's `v_med3_f32`/`_f16`: the median; with a NaN operand, the
+    /// smallest of the others (all NaN: NaN).
+    pub(super) fn med3(&mut self, a: V, b: V, c: V, ty: Ty) -> V {
+        let lo = self.gl(glsl::N_MIN, ty, &[a, b]);
+        let hi = self.gl(glsl::N_MAX, ty, &[a, b]);
+        let m = self.gl(glsl::N_MIN, ty, &[hi, c]);
+        let median = self.gl(glsl::N_MAX, ty, &[lo, m]);
+        let min3 = self.gl(glsl::N_MIN, ty, &[lo, c]);
+        let na = self.spv(op::IS_NAN, Ty::BOOL, &[a]);
+        let nb = self.spv(op::IS_NAN, Ty::BOOL, &[b]);
+        let nc = self.spv(op::IS_NAN, Ty::BOOL, &[c]);
+        let nab = self.spv(op::LOGICAL_OR, Ty::BOOL, &[na, nb]);
+        let any = self.spv(op::LOGICAL_OR, Ty::BOOL, &[nab, nc]);
+        self.spv(op::SELECT, ty, &[any, min3, median])
     }
 
     pub(super) fn op_fma_mix_f32(&mut self, inst: &Inst, name: &'static str, v: &Valu, _a_exec: V) -> Res<()> {
@@ -119,10 +128,7 @@ impl Lift<'_> {
             self.f16src(inst, v, 2)?
         };
         let x = if name == "v_med3_f16" {
-            let lo = self.gl(glsl::N_MIN, Ty::F16, &[a, b]);
-            let hi = self.gl(glsl::N_MAX, Ty::F16, &[a, b]);
-            let m = self.gl(glsl::N_MIN, Ty::F16, &[hi, c]);
-            self.gl(glsl::N_MAX, Ty::F16, &[lo, m])
+            self.med3(a, b, c, Ty::F16)
         } else if name == "v_min3_f16" || name == "v_max3_f16" {
             let g = if name == "v_min3_f16" { glsl::N_MIN } else { glsl::N_MAX };
             let t = self.gl(g, Ty::F16, &[a, b]);
