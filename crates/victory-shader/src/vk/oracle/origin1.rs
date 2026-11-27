@@ -134,3 +134,57 @@ fn a_vector_store_past_a_views_end_writes_the_dwords_inside() {
         assert_eq!(got, want, "a view of {limit} bytes");
     }
 }
+
+/// `s_mov_b32 s<n>, literal`.
+fn s_mov_lit(n: u8, x: u32) -> [u32; 2] {
+    [s_mov_b32(n, 255), x]
+}
+
+/// The "compare" sampler of `sampler.rs`'s console-compiled set: less or
+/// equal, linear, opaque black border.
+const COMPARE_WORDS: [u32; 4] = [0x3006, 0x00FF_F000, 0x1450_0000, 0x4000_0000];
+
+/// A program that samples one 2D image (a T# of zeros in s[24:31]) with the
+/// immediate sampler `COMPARE_WORDS` in s[16:19], by MIMG opcode `opcode`
+/// (address v2.. as the opcode takes it), result to v0.
+fn sampling(opcode: u32) -> HostShader {
+    let mut body = Vec::new();
+    for (k, w) in COMPARE_WORDS.into_iter().enumerate() {
+        body.extend(s_mov_lit(16 + k as u8, w));
+    }
+    for k in 0..8u8 {
+        body.push(s_mov_b32(24 + k, 128));
+    }
+    // v2 = s0 (the reference or s), v3 = s1, v4 = s2
+    body.extend([vop1(0x001, 2, sgpr(0)), vop1(0x001, 3, sgpr(1)), vop1(0x001, 4, sgpr(2))]);
+    // image_<op> v0, v[2:..], s[24:31], s[16:19] dmask:0x1 dim:2D
+    body.extend([0xF000_0108 | opcode << 18, 0x0086_0002]);
+    build_valu_cs(&body)
+}
+
+/// On the console the comparison is the instruction's: `image_sample_c_lz`
+/// compares with the S#'s function whatever else uses that S#
+/// (origin/main `emit/lower.rs` `cmp_samplers`: an immediate sampler a `_c`
+/// sample uses becomes a comparison static sampler, `emit/mod.rs`
+/// `filter |= 0x80`). The host makes immediate samplers from the words the
+/// translator lists: listed as the console wrote them, the sampler does
+/// not compare and the sample returns the stored depth, not the test's
+/// result. The words of a comparison's sampler carry `sampler::COMPARES`.
+#[test]
+fn an_immediate_sampler_of_a_comparison_sample_compares() {
+    use crate::sampler::{COMPARES, StaticSampler};
+    use crate::vk::tir::{ImageKind, Op, Sampler};
+    // image_sample_c_lz (0x2f): the reference, then s, t
+    let (f, iface) = crate::vk::thread_ir_native(&sampling(0x2f).native).expect("translation");
+    let marked = [COMPARE_WORDS[0] | COMPARES, COMPARE_WORDS[1], COMPARE_WORDS[2], COMPARE_WORDS[3]];
+    assert_eq!(iface.samplers, vec![marked]);
+    let s = StaticSampler::from_words(marked);
+    // D3D12_FILTER: comparison reduction, min and mag linear; LESS_EQUAL
+    assert_eq!((s.filter, s.comparison, s.address, s.border), (0x94, 4, [4, 1, 1], 1));
+    let sample = f.nodes.iter().find(|n| matches!(n.op, Op::Image { .. })).expect("a sample");
+    assert!(matches!(sample.op, Op::Image { kind: ImageKind::Sample { dref: true, lod: true, .. }, sampler: Sampler::Static(0), .. }));
+    // image_sample_lz (0x27) with the same words: no comparison
+    let (_, iface) = crate::vk::thread_ir_native(&sampling(0x27).native).expect("translation");
+    assert_eq!(iface.samplers, vec![COMPARE_WORDS]);
+    assert_eq!(StaticSampler::from_words(COMPARE_WORDS).filter, 0x14);
+}

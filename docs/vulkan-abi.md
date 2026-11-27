@@ -293,6 +293,20 @@ console code builds from constants): the translator lists their words
 the sampler heap it reserves for them, and sets the constants per stage
 at pipeline creation.
 
+**Comparison.** On the console the comparison is the instruction's
+(`image_sample_c*`), with the function every S# holds in word 0 bits
+12-14; a Vulkan sampler compares or it does not. Heap samplers compare by
+the title's own description (its comparison filter). An immediate sampler
+that a comparison instruction uses is listed with **word 0 bits 29-30 both
+set** (`victory_shader::sampler::COMPARES`; reduction 3, which the console
+never writes): `StaticSampler::from_words` then gives the comparison
+filter (`filter & 0x180 == 0x80`) and the host's sampler has
+`compareEnable` with that function. The same console words used by a plain
+sample are listed unmarked, as another immediate sampler. (Since
+2026-11-27; before it immediate samplers never compared and a comparison
+sample read the stored depth. No layout change: the host code is as it
+was.)
+
 ## 6. Stage interface
 
 - **Locations come from the title's semantic registry.** Every

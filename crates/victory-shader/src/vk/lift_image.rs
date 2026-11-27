@@ -146,7 +146,16 @@ impl Lift<'_> {
 
     /// The sampler: an immediate S# (constant words) is a static sampler
     /// of the interface; else the S#'s word 3 (its slot) is an argument.
-    fn image_sampler(&mut self, m: &mut Mimg) -> Res<Sampler> {
+    ///
+    /// `compare`: the instruction is a comparison (`_c`). On the console the
+    /// comparison is the instruction's: every S# holds a function, used or
+    /// not. The host's sampler must compare for these and must not for the
+    /// others, so an immediate sampler a comparison uses is listed with
+    /// [`crate::sampler::COMPARES`] set in word 0 (origin/main
+    /// `emit/lower.rs` `cmp_samplers`, `emit/mod.rs`: its static sampler
+    /// gets the comparison filter). Heap samplers compare by the title's
+    /// own description.
+    fn image_sampler(&mut self, m: &mut Mimg, compare: bool) -> Res<Sampler> {
         let s = m.sampler.ok_or(unsupported(m.inst.machine.offset, "a sample without a sampler"))?;
         let mut w = Vec::new();
         for i in 0..4 {
@@ -155,7 +164,8 @@ impl Lift<'_> {
         }
         let c: Option<Vec<u32>> = w.iter().map(|&x| self.f.as_const(x).map(|k| k as u32)).collect();
         if let Some(words) = c {
-            let words = [words[0], words[1], words[2], words[3]];
+            let mark = if compare { crate::sampler::COMPARES } else { 0 };
+            let words = [words[0] | mark, words[1], words[2], words[3]];
             let n = self.iface.samplers.iter().position(|s| *s == words).unwrap_or_else(|| {
                 self.iface.samplers.push(words);
                 self.iface.samplers.len() - 1
@@ -177,7 +187,7 @@ impl Lift<'_> {
         }
         // a cube with derivatives or offsets: its faces as a 2D array
         let layers = m.class.dim == 3 && (md.grad || md.offset);
-        let s = self.image_sampler(m)?;
+        let s = self.image_sampler(m, md.dref)?;
         let off_v = if md.offset { Some(self.next_u(m)?) } else { None };
         let bias_v = if md.bias { Some(self.next_f(m)?) } else { None };
         let dref_v = if md.dref { Some(self.next_f(m)?) } else { None };
@@ -377,7 +387,7 @@ impl Lift<'_> {
     }
 
     fn image_lod(&mut self, m: &mut Mimg) -> Res<()> {
-        let s = self.image_sampler(m)?;
+        let s = self.image_sampler(m, false)?;
         let coord = self.next_vec(m, m.coords.min(3), true)?;
         m.args.push(coord);
         let args = std::mem::take(&mut m.args);

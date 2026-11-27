@@ -159,3 +159,11 @@ fn with_the_builder_on_the_node_is_tested() {
         assert_eq!(f.nodes.iter().filter(|n| n.op == Op::Call(Helper::BvhRay)).count(), 1);
     }
 }
+
+/// The builder's switch is one of the names whose values join the stage
+/// cache key (`translation_fingerprint`, from `build.rs`'s list): a stage
+/// translated with the builder off is not served to a run with it on.
+#[test]
+fn the_builders_switch_is_part_of_the_translation_fingerprint() {
+    assert!(env!("VICTORY_SHADER_SWITCHES").split(',').any(|n| n == "VICTORY_BVH_BUILDER"));
+}
