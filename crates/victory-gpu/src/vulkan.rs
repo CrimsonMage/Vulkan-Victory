@@ -582,6 +582,24 @@ pub(crate) fn split(what: Split, since: Instant) {
     SPLIT[what as usize].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Diagnostics: recording time and calls by the stream's op (the 10 s
+/// line tells the costliest).
+static OPS: [[AtomicU64; 2]; 64] = [const { [const { AtomicU64::new(0) }; 2] }; 64];
+
+/// A recorded call of op `op` took the time since `since`.
+pub(crate) fn op_time(op: u64, since: Instant) {
+    let o = &OPS[(op as usize).min(63)];
+    o[0].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    o[1].fetch_add(1, Ordering::Relaxed);
+}
+
+fn ops_text(frames: u64) -> String {
+    let mut all: Vec<(usize, u64, u64)> = OPS.iter().enumerate().map(|(k, o)| (k, o[0].swap(0, Ordering::Relaxed), o[1].swap(0, Ordering::Relaxed))).filter(|o| o.2 != 0).collect();
+    all.sort_by_key(|o| std::cmp::Reverse(o.1));
+    let f = frames as f64;
+    all.iter().take(10).map(|&(k, ns, n)| format!("op{k}: {:.1} ms {:.0} calls {:.1} us each", ns as f64 / 1e6 / f, n as f64 / f, ns as f64 / 1e3 / n as f64)).collect::<Vec<_>>().join(" | ")
+}
+
 // ---------------------------------------------------------------------------
 // For the recording (M2b)
 
@@ -848,6 +866,9 @@ fn report(b: &Backend, frame: u64) {
         views_ms = format_args!("{:.1}", ms[5]),
         "Vulkan: frame time split (ms a frame; record and views summed over threads)"
     );
+    if cfg!(feature = "diagnostics") {
+        tracing::info!(ops = %ops_text(frames), "Vulkan: recording by call (a frame; the stream's op numbers)");
+    }
     let (flights, held, lines) = engine::report_text(b, frames);
     let m = memory(b);
     let imported: u64 = m

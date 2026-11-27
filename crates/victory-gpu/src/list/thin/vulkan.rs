@@ -53,7 +53,11 @@ pub(super) fn translate(list: This, stream: &[u64]) -> (u64, bool) {
         let call = Call { op, w: &stream[i + 1..i + 1 + len] };
         i += 1 + len;
         calls += 1;
+        let t = std::time::Instant::now();
         reset |= one(&mut rec, b, list, &call);
+        if cfg!(feature = "diagnostics") {
+            crate::vulkan::op_time(op, t);
+        }
     }
     record::put(list, rec);
     crate::vulkan::split(crate::vulkan::Split::Record, started);
