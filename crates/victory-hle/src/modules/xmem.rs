@@ -37,6 +37,8 @@ use crate::{HleModule, hle_export};
 mod fillers;
 mod hooks;
 mod places;
+mod ring;
+use places::placeholder;
 use fillers::*;
 pub use hooks::{XMemAlloc, XMemFree, XMemSetAllocationHooks};
 #[cfg(feature = "diagnostics")]
@@ -1045,6 +1047,8 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
         return;
     };
     let size = m.len;
+    let (section, page) = m.slice.key(0);
+    ring::note(if m.fill { "stand-in taken away" } else { "view taken away" }, at, size, section, page);
     // Out of the GPU side's map; what stays is shown again below.
     victory_gpu::title_memory_unmapped(at, size);
     if m.fill {
@@ -1088,55 +1092,6 @@ fn unmap_view(physical: &mut Physical, at: usize, base: usize, end: usize, site:
     // page may be shown elsewhere by it.
     let pages = if m.fill { 1 } else { size.div_ceil(PAGE) };
     physical.unshown.extend((0..pages).map(|k| m.slice.key(k)));
-}
-
-/// The host's flag that joins adjacent placeholders (not in windows-sys).
-const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
-
-/// Makes `[base, base + len)` exactly one placeholder: the placeholders it
-/// lies in are joined if it spans more than one (views unmapped one by one
-/// leave one each), and what lies outside it is split off. Placeholders
-/// change in the process alone (no wineserver request under Proton).
-fn placeholder(base: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_PRIVATE, VirtualQuery};
-    let query = |at: usize| {
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: a query into our structure.
-        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-        // A free placeholder: reserved and private (a view is mapped memory).
-        (n != 0 && info.State == MEM_RESERVE && info.Type == MEM_PRIVATE).then_some(info)
-    };
-    let end = base + len;
-    let Some(info) = query(base) else {
-        return false;
-    };
-    let start = info.AllocationBase as usize;
-    let mut stop = info.BaseAddress as usize + info.RegionSize;
-    let mut pieces = 1;
-    while stop < end {
-        match query(stop) {
-            Some(next) if next.AllocationBase as usize == stop => {
-                stop = next.BaseAddress as usize + next.RegionSize;
-                pieces += 1;
-            }
-            _ => return false,
-        }
-    }
-    if pieces > 1 {
-        // SAFETY: adjacent free placeholders, joined into one.
-        if unsafe { VirtualFree(start as *mut c_void, stop - start, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } == 0 {
-            return false;
-        }
-        victory_gpu::mapstat::merged();
-    }
-    if start != base || stop != end {
-        // SAFETY: splits the placeholder around the range.
-        if unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
-            return false;
-        }
-        victory_gpu::mapstat::split();
-    }
-    true
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1185,6 +1140,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, site: Sit
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
+    let (section, page) = slice.key(0);
+    ring::note(if matches!(site, Site::Remnant) { "remnant shown again" } else { "view mapped" }, base, len, section, page);
     physical.views.insert(base, Mapped { len, slice, fill: false });
     true
 }

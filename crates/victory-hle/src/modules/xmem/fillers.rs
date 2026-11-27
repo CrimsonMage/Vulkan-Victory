@@ -81,6 +81,8 @@ pub(super) fn fill(physical: &mut Physical, base: usize, len: usize, slice: Slic
         return false;
     }
     victory_gpu::mapstat::filled(site, len);
+    let (section, page) = slice.key(0);
+    super::ring::note("filler stand-in shown", base, len, section, page);
     fill_ranges().insert(base, len);
     physical.views.insert(base, Mapped { len, slice, fill: true });
     true
