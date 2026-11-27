@@ -935,10 +935,11 @@ fn effects(
             "s_cbranch_vccz" | "s_cbranch_vccnz" => r.extend(mask(VCC)),
             "s_cbranch_execz" | "s_cbranch_execnz" => r.extend(mask(EXEC)),
             "s_sendmsg" | "s_sendmsghalt" => r.push(Reg::S(M0)),
-            "s_endpgm"
-            | "s_endpgm_saved"
-            | "s_endpgm_ordered_ps_done"
-            | "s_code_end"
+            // The end reads EXEC: a pixel lane that gets there outside it,
+            // on a path with no last export, is killed (vk/lift_flow.rs
+            // `terminator`); other stages read nothing of it.
+            "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => r.extend(mask(EXEC)),
+            "s_code_end"
             | "s_branch"
             | "s_barrier"
             | "s_icache_inv"
@@ -1389,7 +1390,8 @@ mod tests {
             ],
             true,
         );
-        assert!(p.inputs.is_empty(), "{:?}", p.inputs);
+        // (the end reads EXEC)
+        assert!(p.inputs.iter().all(|i| matches!(i.0, Reg::S(c) if c == EXEC || c == EXEC + 1)), "{:?}", p.inputs);
         let [b0, b1, b2] = &p.blocks[..] else {
             panic!()
         };

@@ -306,3 +306,54 @@ fn float_to_integer_conversions_saturate_and_take_nan_to_zero() {
         });
     }
 }
+
+/// A pixel lane that reaches the program's end outside EXEC on a path
+/// with no last export left without exporting: killed (origin/main
+/// `emit/lower.rs`, `LaneExit::End`: "A lane leaving without its final
+/// export was killed"). Here the wave skips the export when s0 is 0 (a
+/// scalar branch), after the lanes at x < 4 left EXEC: on that path they
+/// are killed at the end; on the other at the export.
+#[test]
+fn a_pixel_that_ends_outside_exec_without_an_export_is_killed() {
+    use crate::vk::tir::{Item, Op};
+    let mut native = pixel(&[
+        vop1(0x001, 1, 242), // v_mov_b32 v1, 1.0
+        0x7C22_00F6,         // v_cmpx_lt_f32 exec, 4.0, v0
+        0xBF06_8000,         // s_cmp_eq_u32 s0, 0
+        0xBF85_0002,         // s_cbranch_scc1 -> the end
+        0xF800_180F,
+        0x0101_0101,         // exp mrt0, v1, v1, v1, v1 done vm
+    ]);
+    native.layout = vec![RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 0, slot: 0 }];
+    let (f, _) = crate::vk::thread_ir_native(&native).expect("translation");
+    let demotes = |f: &crate::vk::tir::Func, b: usize| -> Vec<u32> {
+        f.blocks[b]
+            .body
+            .iter()
+            .filter_map(|it| match it {
+                Item::Guard { cond, body, .. } if body.iter().any(|x| matches!(x, Item::N(v) if f.node(*v).op == Op::Demote)) => Some(*cond),
+                _ => None,
+            })
+            .collect()
+    };
+    let per_block: Vec<Vec<u32>> = (0..f.blocks.len()).map(|b| demotes(&f, b)).collect();
+    let n: usize = per_block.iter().map(Vec::len).sum();
+    assert_eq!(n, 2, "a kill at the export and one at the end: {per_block:?}");
+    for s0 in [0u32, 1] {
+        let mut m = Machine::new(&f, 32, Memory::default());
+        m.push[push_window_ps()] = s0;
+        assert_eq!(m.run(), Stop::Returned);
+        // the kills of the blocks this run entered
+        let run: Vec<u32> = (0..f.blocks.len()).filter(|&b| m.visits[b] > 0).flat_map(|b| per_block[b].clone()).collect();
+        for l in 0..32usize {
+            let inside = l % 8 >= 4;
+            let killed = run.iter().any(|&c| m.value(c, l)[0] != 0);
+            assert_eq!(killed, !inside, "s0 {s0}, lane {l}");
+        }
+    }
+}
+
+/// The push dword of a pixel program's user-data entry 0.
+fn push_window_ps() -> usize {
+    crate::vk::lift::push_window(HwStage::Ps) as usize
+}

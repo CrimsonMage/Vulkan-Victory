@@ -256,9 +256,15 @@ impl Lift<'_> {
                 Term::Branch(c, taken, not_taken)
             }
             Exit::End => {
-                // pixels: lanes not in EXEC at the end are killed
+                // pixels: a lane outside EXEC at the end, in a block
+                // without the last export (which kills its own, `inst`),
+                // left without exporting: killed (origin/main
+                // `emit/lower.rs`, `LaneExit::End`: "A lane leaving without
+                // its final export was killed")
                 let last = p.blocks[b].insts.last();
+                let exported = p.blocks[b].insts.iter().any(|i| matches!(i.fields, Fields::Exp { done: true, .. }));
                 if self.native.stage == HwStage::Ps
+                    && !exported
                     && let Some(inst) = last.filter(|i| i.read(Reg::S(ir::EXEC)).is_some())
                 {
                     let a = self.active(inst)?;
