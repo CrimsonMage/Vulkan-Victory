@@ -63,6 +63,18 @@ pub(super) fn wants(name: &str) -> bool {
     frame >= f && lock(at_names()).iter().any(|n| n == name)
 }
 
+/// `VICTORY_VK_TRACE_DRAWS=<part of a name>[,...]`: whether a draw of the
+/// programs `names` gives is traced (in the first dumped frame only).
+pub(super) fn traced(names: impl FnOnce() -> Vec<String>) -> bool {
+    static PARTS: OnceLock<Vec<String>> = OnceLock::new();
+    let parts = PARTS.get_or_init(|| std::env::var("VICTORY_VK_TRACE_DRAWS").map(|v| v.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect()).unwrap_or_default());
+    if parts.is_empty() || from() != Some(super::present::FRAME.load(Ordering::Relaxed)) {
+        return false;
+    }
+    let names = names();
+    parts.iter().any(|p| names.iter().any(|n| n.contains(p.as_str())))
+}
+
 /// The programs of the first dumped frame in the order they were first
 /// used (told with the dump: which names `VICTORY_VK_DUMP_AT` can take).
 static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());

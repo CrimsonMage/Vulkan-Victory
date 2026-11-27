@@ -609,7 +609,21 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
             Some(img)
         }
         None => {
-            STATS[3].fetch_add(1, Ordering::Relaxed);
+            // Which images a run goes without (the first ones; the 10 s
+            // line counts them all): a draw into one is left out, a
+            // program that reads one reads zeros.
+            if cfg!(feature = "diagnostics") && STATS[3].fetch_add(1, Ordering::Relaxed) < 48 {
+                tracing::warn!(
+                    at = format_args!("{address:#x}"),
+                    format = desc.format,
+                    size = format_args!("{}x{}x{}", desc.width, desc.height, desc.depth_or_array_size),
+                    mips = desc.mip_levels,
+                    flags = format_args!("{:#x}", desc.flags),
+                    "Vulkan: no image was made (no card memory under the ceiling, or no format for it)"
+                );
+            } else if !cfg!(feature = "diagnostics") {
+                STATS[3].fetch_add(1, Ordering::Relaxed);
+            }
             None
         }
     }

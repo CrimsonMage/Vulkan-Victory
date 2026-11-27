@@ -166,6 +166,9 @@ pub(crate) struct Rec {
     last_inputs: (usize, usize),
     last_user: String,
     last_layout: String,
+    /// Diagnostics: the title's records of the indirect execution being
+    /// recorded (their address, the count's).
+    last_indirect: Option<(u64, Option<u64>)>,
     /// What the console's own methods keep (`console.rs`, `query.rs`).
     console: console::State,
     /// Diagnostics: the pipeline the trail last named (`trail.rs`), and
@@ -219,6 +222,7 @@ impl Default for Rec {
             last_inputs: (0, 0),
             last_user: String::new(),
             last_layout: String::new(),
+            last_indirect: None,
             noted: std::ptr::null(),
             guard_id: 0,
             last_tables: Vec::new(),
@@ -786,12 +790,52 @@ impl Rec {
         }
     }
 
+    /// Diagnostics (`VICTORY_VK_TRACE_DRAWS=<part of a program's name>,...`):
+    /// every draw of such a program in the first dumped frame, as a line:
+    /// its programs, what was drawn, the title's indirect records as the
+    /// CPU reads them, scissor, depth and blend state, targets and roots.
+    fn trace_draw(&mut self, what: &str) {
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        let indirect = self.last_indirect.take();
+        let Some((shaders, state)) = crate::pipeline::parts(self.pipeline) else { return };
+        if !super::targets::traced(|| shaders.iter().map(|s| s.name.clone()).collect()) {
+            return;
+        }
+        let Some(b) = super::backend() else { return };
+        let words = |at: u64, n: u64| {
+            super::read_title(b, at, 4 * n).map_or_else(
+                |_| "unreadable".into(),
+                |bytes| format!("{:?}", bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>()),
+            )
+        };
+        let records = indirect.map_or_else(String::new, |(src, count)| {
+            format!("records at {src:#x} = {} count {}", words(src, 6), count.map_or_else(|| "none".into(), |c| format!("at {c:#x} = {}", words(c, 1))))
+        });
+        let depth = state.map_or_else(String::new, |gs| {
+            let z = &gs.depth;
+            format!("test {} write {} func {} stencil {} blend {}", z.DepthEnable.as_bool(), z.DepthWriteMask.0, z.DepthFunc.0, z.StencilEnable.as_bool(), gs.blend.RenderTarget[0].BlendEnable.as_bool())
+        });
+        tracing::info!(
+            programs = %shaders.iter().map(|s| format!("{} {}", s.name, s.hash)).collect::<Vec<_>>().join(" + "),
+            what,
+            records,
+            scissor = ?self.scissors.first().map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height)),
+            state = depth,
+            targets = %self.attached.iter().map(|i| format!("{:#x}", i.key.address)).collect::<Vec<_>>().join(" "),
+            roots = %self.graphics.slots.iter().take(6).map(|r| r.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(":")).collect::<Vec<_>>().join(" "),
+            "Vulkan: a traced draw"
+        );
+    }
+
     /// Counts a recorded draw, on the attachments too; diagnostics builds
     /// describe the first ones.
     fn drawn(&mut self, what: &str) {
         super::passes::note(|| format!("did {what} index {:x?} viewport {:?} scissor {:?}", self.index.map(|i| (i.address, i.size, i.format)), self.viewports.first().map(|v| (v.x, v.y, v.width, v.height, v.min_depth, v.max_depth)), self.scissors.first().map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))));
         super::passes::close();
         self.note(|| what.to_owned());
+        self.trace_draw(what);
         let n = STATS[0].fetch_add(1, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
             && self.last_push[12] != 0

@@ -310,7 +310,10 @@ impl Rec {
                 super::super::passes::note(|| format!("dispatch-indirect src {:x}", spec.src));
                 super::super::passes::close();
             }
-            MESH => self.mesh_indirect(b, buffer, at, counted, spec.max),
+            MESH => {
+                self.last_indirect = Some((spec.src, spec.count));
+                self.mesh_indirect(b, buffer, at, counted, spec.max);
+            }
             _ => self.draw_indirect(
                 b,
                 spec.kind == DRAW_INDEXED,

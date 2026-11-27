@@ -41,14 +41,31 @@ use account::card_heap as heap;
 /// Bytes of card memory ours may take now: the ceiling, less what the
 /// budget leaves past the others' use and the room.
 pub(super) fn limit(host: &Host) -> u64 {
+    let ceiling = ceiling();
     let Some((budget, usage)) = heap(host) else {
-        return CEILING;
+        return ceiling;
     };
     // The driver's own use for us (spills, internal heaps) counts against
     // the ceiling too: the process's whole use stays under it (vk40: ours
     // 5,318 MiB, the process 5,609).
     let others = usage.saturating_sub(account::card_total());
-    CEILING.saturating_sub(others).min(budget.saturating_sub(others).saturating_sub(ROOM))
+    ceiling.saturating_sub(others).min(budget.saturating_sub(others).saturating_sub(ROOM))
+}
+
+/// [`CEILING`]; diagnostics builds take `VICTORY_VK_CEILING_MB` instead
+/// (to see what a run shows when no image is refused).
+fn ceiling() -> u64 {
+    static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics").then(|| std::env::var("VICTORY_VK_CEILING_MB").ok()?.trim().parse::<u64>().ok()).flatten();
+        match asked {
+            Some(mb) => {
+                tracing::warn!(mb, "Vulkan: the card-memory ceiling is VICTORY_VK_CEILING_MB (diagnostics)");
+                mb << 20
+            }
+            None => CEILING,
+        }
+    })
 }
 
 /// Whether `bytes` more of ours (an image block) may be allocated: never
