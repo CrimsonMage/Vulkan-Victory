@@ -227,6 +227,81 @@ fn constant_tables_in_the_code_read_through_getpc() {
     });
 }
 
+/// Ours (not theirs): a constant table after `s_endpgm` read by a vector
+/// load, `s_getpc_b64` + its distance in s[6:7] added to an index each lane
+/// holds (`v_lshlrev_b64`, `v_add_co_u32`, `v_add_co_ci_u32`,
+/// `global_load_dword*`), as CS_BakeACESWithGamutCompressLUT_QuasiLogShaper
+/// reads its spline coefficients: the table's own words (the reference: the
+/// code's bytes at their code offset in memory). They were read as title
+/// memory at the code offset (the zero block): the tone-map table came out
+/// one value and the final frame a flat grey.
+#[test]
+fn constant_tables_in_the_code_read_by_vector_loads() {
+    const TABLE: [u32; 8] = [0xC080_0000, 0xC04A_1274, 0xBEF8_72B0, 0x3FEC_827F, 7, 0xDEAD_BEEF, 0, 0x4120_0000];
+    // `load`: the two words of the global load into v[d..]; `last`: the
+    // register whose dword is the result
+    let body = |dist: u32, load: [u32; 2], last: u8| {
+        vec![
+            0xBE86_1F00,                      // s_getpc_b64 s[6:7]
+            sop2(0x00, 6, 6, 255),            // s_add_u32 s6, s6, dist
+            dist,
+            sop2(0x04, 7, 7, 0x80),           // s_addc_u32 s7, s7, 0
+            0x18 << 25 | 2 << 17 | 1 << 9 | 0x9F, // v_ashrrev_i32 v2, 31, v1 (v1 = s0: the index)
+            vop3(0x2FF, 1, 0x82, vgpr(1), 0)[0], // v_lshlrev_b64 v[1:2], 2, v[1:2]
+            vop3(0x2FF, 1, 0x82, vgpr(1), 0)[1],
+            0xD70F_6A01,                      // v_add_co_u32 v1, vcc, s6, v1
+            vgpr(1) as u32 | 6 << 9,
+            0x28 << 25 | 2 << 17 | 2 << 9 | 7, // v_add_co_ci_u32 v2, vcc, s7, v2, vcc
+            load[0],
+            load[1],
+            vop1(0x001, 0, vgpr(last)),       // v_mov_b32 v0, v<last>
+        ]
+    };
+    // global_load_dword v10, v[1:2]; global_load_dwordx3 v[10:12], v[1:2]
+    for (load, last, at) in [([0xDC30_8000, 0x0A7D_0001], 10u8, 0usize), ([0xDC3C_8000, 0x0A7D_0001], 12, 2)] {
+        let start = build_cs(&body(0, load, last), 1, 0).native.code.len() as u32;
+        let mut shader = build_cs(&body(start - 32, load, last), 1, 0);
+        shader.native.code.extend(TABLE.iter().flat_map(|w| w.to_le_bytes()));
+        let words: Vec<u32> = shader.native.code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+        mem.put(0, &words);
+        let cases: Vec<[u32; 4]> = (0..(TABLE.len() - at) as u32).map(|i| [i, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let reference = mem.dwords.get(&u64::from(start + 4 * (i + at) as u32)).copied();
+            assert_eq!(Some(got), reference, "{backend}: table dword {}", i + at);
+            assert_eq!(got, TABLE[i + at], "{backend}: table dword {}", i + at);
+        });
+    }
+}
+
+/// Ours: in a program that reads its code through `s_getpc_b64`, a vector
+/// load at an address that is not made of it stays a read of title memory
+/// (here the table at s[4:5] + 0: the V#'s first dword, 0x2000).
+#[test]
+fn vector_loads_elsewhere_stay_memory_beside_a_code_table() {
+    let body = [
+        0xBE86_1F00,                  // s_getpc_b64 s[6:7]
+        sop2(0x00, 6, 6, 255),        // s_add_u32 s6, s6, 64
+        64,
+        sop2(0x04, 7, 7, 0x80),       // s_addc_u32 s7, s7, 0
+        0x3D << 26 | 13 << 6 | 3,     // s_load_dword s13, s[6:7], 0
+        125 << 25,
+        vop1(0x001, 1, sgpr(4)),      // v_mov_b32 v1, s4
+        vop1(0x001, 2, sgpr(5)),      // v_mov_b32 v2, s5
+        0xDC30_8000,                  // global_load_dword v0, v[1:2]
+        0x007D_0001,
+        0xD70F_6A00,                  // v_add_co_u32 v0, vcc, s13, v0
+        vgpr(0) as u32 | 13 << 9,
+    ];
+    let mut shader = build_cs(&body, 1, 0);
+    let at = shader.native.code.len();
+    shader.native.code.resize(at.max(32 + 64) + 4, 0);
+    shader.native.code[32 + 64..32 + 68].copy_from_slice(&5u32.to_le_bytes());
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0x2000 + 5, "{backend}: the table's first dword plus the code's 5");
+    });
+}
+
 /// Ours (not theirs): `v_cvt_pkrtz_f16_f32 v0, v1, v2` rounds toward zero,
 /// past the largest half too (±65504, not infinity), whatever the host's
 /// own conversion rounds by.

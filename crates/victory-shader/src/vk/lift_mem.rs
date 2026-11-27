@@ -63,7 +63,16 @@ impl Lift<'_> {
             return Ok(None);
         }
         let lo = self.opnd_dw(inst, base, 0, false)?;
-        let mut stack = vec![self.u32v(lo)];
+        let lo = self.u32v(lo);
+        Ok(self.code_start(lo, false))
+    }
+
+    /// The code offset `s_getpc_b64` plus a constant gives, when `lo` (an
+    /// address's low dword) is made of that. `sums`: looked for through
+    /// additions, copies, selections and phis only (an index added per
+    /// lane, a register kept where EXEC is off); else through anything.
+    fn code_start(&self, lo: V, sums: bool) -> Option<u32> {
+        let mut stack = vec![lo];
         let mut seen = HashSet::new();
         while let Some(v) = stack.pop() {
             // (args may name values not made yet: a loop's phis)
@@ -74,22 +83,25 @@ impl Lift<'_> {
             if let (Op::Spv(op::I_ADD), [a, b]) = (&n.op, n.args.as_slice()) {
                 for (p, c) in [(a, b), (b, a)] {
                     if let (Some(&pc), Some(c)) = (self.pcs.get(p), self.f.as_const(*c)) {
-                        return Ok(Some(pc.wrapping_add(c as u32)));
+                        return Some(pc.wrapping_add(c as u32));
                     }
                 }
             }
             if let Some(&pc) = self.pcs.get(&v) {
-                return Ok(Some(pc));
+                return Some(pc);
             }
-            stack.extend(n.args.iter().copied());
+            match (&n.op, sums) {
+                (_, false) | (Op::Spv(op::I_ADD | op::COPY_OBJECT) | Op::Phi, true) => stack.extend(n.args.iter().copied()),
+                (Op::Spv(op::SELECT), true) => stack.extend(n.args.iter().skip(1).copied()),
+                _ => {}
+            }
         }
-        Ok(None)
+        None
     }
 
-    /// The dwords of a scalar load from the program's code (`code_base`):
-    /// a table of the code from `start` on, read at the load's offset into
-    /// it (0 past the code's end).
-    fn code_words(&mut self, inst: &Inst, base: &Operand, o: V, start: u32, d: u8, n: u8) -> Res<Vec<V>> {
+    /// The table of the program's code from byte `start` on (made once a
+    /// start).
+    fn code_table(&mut self, start: u32) -> u16 {
         let k = match self.f.tables_at.iter().position(|&s| s == start) {
             Some(k) => k,
             None => {
@@ -102,6 +114,57 @@ impl Lift<'_> {
                 self.f.tables.len() - 1
             }
         };
+        k as u16
+    }
+
+    /// Dword `first + i` of code table `k`.
+    fn code_dword(&mut self, k: u16, first: V, i: u32) -> V {
+        let ki = self.k32(i);
+        let idx = self.spv(op::I_ADD, Ty::U32, &[first, ki]);
+        self.emit(Op::Call(Helper::CodeTable(k)), Ty::U32, vec![idx])
+    }
+
+    /// A vector load (`global_load_dword*`) from the program's own code:
+    /// its address is `s_getpc_b64` plus a constant plus what each lane
+    /// adds (the tone-map bake reads its spline coefficients by a segment
+    /// index a lane; read as title memory at the code offset they were
+    /// the zero block and the whole table one value: the final frame a
+    /// flat grey). False: not such a load (nothing emitted for it).
+    fn flat_code_load(&mut self, inst: &Inst, name: &str, saddr: &Option<Operand>, addr: &Option<Operand>, dst: &Option<Operand>, offset: i32) -> Res<bool> {
+        let (Some(addr), Some(Operand::Vector { reg, .. }), Some(n)) = (addr, dst, name.strip_prefix("global_load_dword")) else { return Ok(false) };
+        if self.pcs.is_empty() {
+            return Ok(false);
+        }
+        let n: u32 = if n.is_empty() { 1 } else { n[1..].parse().unwrap_or(1) };
+        let lo = self.opnd_dw(inst, addr, 0, false)?;
+        let mut byte = self.u32v(lo);
+        let mut start = self.code_start(byte, true);
+        if let Some(s @ Operand::Scalar { code, .. }) = saddr
+            && *code != crate::gfx10::NULL
+        {
+            let b = self.opnd_dw(inst, s, 0, false)?;
+            let b = self.u32v(b);
+            start = start.or(self.code_start(b, true));
+            byte = self.spv(op::I_ADD, Ty::U32, &[b, byte]);
+        }
+        let Some(start) = start else { return Ok(false) };
+        let k = self.code_table(start);
+        let ko = self.k32((offset as u32).wrapping_sub(start));
+        let rel = self.spv(op::I_ADD, Ty::U32, &[byte, ko]);
+        let two = self.k32(2);
+        let first = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[rel, two]);
+        for i in 0..n {
+            let w = self.code_dword(k, first, i);
+            self.def(inst, Reg::V(reg + i as u8), R::D(w));
+        }
+        Ok(true)
+    }
+
+    /// The dwords of a scalar load from the program's code (`code_base`):
+    /// a table of the code from `start` on, read at the load's offset into
+    /// it (0 past the code's end).
+    fn code_words(&mut self, inst: &Inst, base: &Operand, o: V, start: u32, d: u8, n: u8) -> Res<Vec<V>> {
+        let k = self.code_table(start);
         let lo = self.opnd_dw(inst, base, 0, false)?;
         let lo = self.u32v(lo);
         let byte = self.spv(op::I_ADD, Ty::U32, &[lo, o]);
@@ -110,13 +173,7 @@ impl Lift<'_> {
         let two = self.k32(2);
         let first = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[rel, two]);
         self.smem_words(inst, d, n, |l, at, m, fl| {
-            let ws: Vec<V> = (at..at + m)
-                .map(|i| {
-                    let ki = l.k32(i);
-                    let idx = l.spv(op::I_ADD, Ty::U32, &[first, ki]);
-                    l.emit(Op::Call(Helper::CodeTable(k as u16)), Ty::U32, vec![idx])
-                })
-                .collect();
+            let ws: Vec<V> = (at..at + m).map(|i| l.code_dword(k, first, i)).collect();
             let v = if m == 1 { ws[0] } else { l.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, m as u8), &ws) };
             Ok(if fl { l.spv(op::BITCAST, Ty::vec(S::F32, m as u8), &[v]) } else { v })
         })
@@ -1019,6 +1076,9 @@ impl Lift<'_> {
         let Fields::Flat { dst, addr, data, saddr, offset, lds, .. } = inst.fields.clone() else { unreachable!() };
         if lds || name.starts_with("scratch_") {
             return Err(unsupported(off, name));
+        }
+        if self.flat_code_load(inst, name, &saddr, &addr, &dst, i32::from(offset))? {
+            return Ok(());
         }
         let mut a = match (saddr, addr) {
             (Some(s @ Operand::Scalar { code, .. }), Some(v)) if code != crate::gfx10::NULL => {
