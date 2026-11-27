@@ -138,6 +138,8 @@ fn run_way(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32, wa
     let mut g = Group::new(&f, native.wave64, threads, way.0, mem, setup);
     g.upper_first = way.1;
     match g.run() {
+        // (the halves' LDS accesses are ordered by their meetings)
+        Stop::Returned if g.lds_races > 0 => Err(format!("{} LDS dwords the halves accessed with no meeting between", g.lds_races)),
         Stop::Returned => Ok((0..u64::from(dwords)).map(|i| g.mem.dwords.get(&(0x2000 + 4 * i)).copied().unwrap_or(0)).collect()),
         s => Err(format!("{s:?}")),
     }

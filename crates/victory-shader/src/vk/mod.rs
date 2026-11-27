@@ -302,6 +302,12 @@ fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], strid
     Ok((f, iface))
 }
 
+/// Invocations of the host's group for a compute or mesh program (a
+/// compute group is whole console waves; 0 for other stages).
+pub fn host_threads(native: &NativeProgram) -> u32 {
+    lift::Lift::host_threads(native)
+}
+
 /// Loop iterations (all loops of an invocation together) after which the
 /// invocation gives up: low enough that the programs that give up cannot
 /// make a GPU timeout by themselves (a culling dispatch of thousands of

@@ -44,7 +44,18 @@ pub struct Memory {
     /// Read-only blocks of bytes by start address, sorted (a capture's
     /// memory: a dword stored or put shadows them).
     pub blocks: Vec<(u64, std::sync::Arc<Vec<u8>>)>,
+    /// Where it is kept: every access of title memory and of workgroup
+    /// memory ([`LDS_LOG`] + the dword's index), as (dword address, kind:
+    /// [`READ`], [`WRITE`], [`ATOMIC`]), for [`super::interp_group`].
+    pub log: Option<Vec<(u64, u8)>>,
 }
+
+/// Kinds of access in [`Memory::log`].
+pub const READ: u8 = 0;
+pub const WRITE: u8 = 1;
+pub const ATOMIC: u8 = 2;
+/// Workgroup memory's dwords in [`Memory::log`].
+pub const LDS_LOG: u64 = 1 << 63;
 
 impl Memory {
     /// Puts `words` at `addr`.
@@ -80,7 +91,16 @@ impl Memory {
         }
     }
 
+    fn logged(&mut self, a: u64, kind: u8) {
+        if let Some(log) = &mut self.log {
+            log.push((a & !3, kind));
+        }
+    }
+
     fn read(&mut self, a: u64, bytes: u32, quiet: bool, who: V) -> u64 {
+        if !quiet {
+            self.logged(a, READ);
+        }
         (0..u64::from(bytes)).fold(0, |acc, i| acc | u64::from(self.byte(a + i, quiet, who)) << (8 * i))
     }
 
@@ -88,6 +108,7 @@ impl Memory {
         if a >= SINK {
             return;
         }
+        self.logged(a, WRITE);
         for i in 0..u64::from(bytes) {
             let b = a + i;
             let d = b & !3;
@@ -708,8 +729,11 @@ impl<'a> Machine<'a> {
                 Ok([0; 4])
             }
             Op::Atomic(o) => {
+                let log = self.mem.log.take();
                 let old = self.mem.read(a, 4, !on, v) as u32;
+                self.mem.log = log;
                 if on {
+                    self.mem.logged(a, ATOMIC);
                     let new = atomic(o, old, self.arg(n, 1, l)[0] as u32, n.args.get(2).map(|_| self.arg(n, 2, l)[0] as u32))?;
                     self.mem.write(a, 4, u64::from(new));
                 }
@@ -722,6 +746,14 @@ impl<'a> Machine<'a> {
     fn lds_op(&mut self, n: &Node, l: usize, on: bool) -> Result<W, String> {
         let i = (self.arg(n, 0, l)[0] as usize).min(self.lds.len() - 1);
         let old = self.lds[i];
+        if on {
+            let kind = match n.op {
+                Op::LdsLoad => READ,
+                Op::LdsStore => WRITE,
+                _ => ATOMIC,
+            };
+            self.mem.logged(LDS_LOG + 4 * i as u64, kind);
+        }
         match n.op {
             Op::LdsStore if on => self.lds[i] = self.arg(n, 1, l)[0] as u32,
             Op::LdsAtomic(o) if on => {

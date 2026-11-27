@@ -86,6 +86,11 @@ enum Cmd {
         /// Write the golden file from this run.
         #[arg(long)]
         bless: bool,
+        /// Instead of the golden comparison: each wave64 compute or mesh
+        /// program's group run as console waves and as the host subgroups
+        /// the card runs (its halves exchanging), and those that differ.
+        #[arg(long)]
+        halves: bool,
         /// Worker threads.
         #[arg(long, default_value_t = 3)]
         jobs: usize,
@@ -125,9 +130,9 @@ fn main() -> Result<()> {
             let out = out.unwrap_or_else(|| root.join("docs/translation-index.md"));
             translation_index(&root, &pack, &out, jobs)
         }
-        Cmd::ShaderGolden { pack, golden, list, bless, jobs } => {
+        Cmd::ShaderGolden { pack, golden, list, bless, halves, jobs } => {
             let golden = golden.unwrap_or_else(|| root.join("docs/shader-golden.txt"));
-            shader_golden(&pack, &golden, list.as_deref(), bless, jobs)
+            shader_golden(&pack, &golden, list.as_deref(), bless, halves, jobs)
         }
         Cmd::ShaderExtract { pack, hash, out } => shader_extract(&pack, &hash, &out),
         Cmd::InstallHooks => {
@@ -154,8 +159,8 @@ fn translation_index(root: &Path, pack: &Path, out: &Path, jobs: usize) -> Resul
 }
 
 #[cfg(feature = "index")]
-fn shader_golden(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, jobs: usize) -> Result<()> {
-    golden::run(pack, golden, list, bless, jobs)
+fn shader_golden(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, halves: bool, jobs: usize) -> Result<()> {
+    golden::run(pack, golden, list, bless, halves, jobs)
 }
 
 #[cfg(feature = "index")]
@@ -169,7 +174,7 @@ fn shader_extract(_pack: &Path, _hash: &str, _out: &Path) -> Result<()> {
 }
 
 #[cfg(not(feature = "index"))]
-fn shader_golden(_pack: &Path, _golden: &Path, _list: Option<&Path>, _bless: bool, _jobs: usize) -> Result<()> {
+fn shader_golden(_pack: &Path, _golden: &Path, _list: Option<&Path>, _bless: bool, _halves: bool, _jobs: usize) -> Result<()> {
     with_translator()
 }
 

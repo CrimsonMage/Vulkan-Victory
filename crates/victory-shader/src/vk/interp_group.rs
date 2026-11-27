@@ -23,11 +23,19 @@
 //! upper half of every wave before the lower, so a result that depends on
 //! that order shows as a difference between the two schedules.
 //!
+//! What the halves of a wave do to memory between two meetings is logged,
+//! and an access of one half that the other half's store (or atomic, unless
+//! both are atomics) to the same dword is not ordered with is counted
+//! ([`Group::races`]): the console's wave makes them in instruction order,
+//! lane by lane; the card in any order.
+//!
 //! In both modes a console barrier (`s_barrier`) is passed when every unit
 //! that still runs is at one (the console drops waves that ended), and all
 //! units share title memory and workgroup memory.
 
-use super::interp::{Machine, Memory, Stop};
+use std::collections::HashMap;
+
+use super::interp::{ATOMIC, LDS_LOG, Machine, Memory, Stop, WRITE};
 use super::tir::{Func, Op, V};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +67,16 @@ pub struct Group<'a> {
     pub lds: Vec<u32>,
     /// Exchanges the halves made (pairs).
     pub exchanges: u64,
+    /// Per unit: the dwords it accessed since it last met its partner,
+    /// with the strongest kind of access.
+    seen: Vec<HashMap<u64, u8>>,
+    /// Dwords the two halves of a wave accessed between two meetings, one
+    /// of them storing: how many, and the first.
+    pub races: u64,
+    pub race_at: Option<u64>,
+    /// Those of them in workgroup memory (the lift's meetings before LDS
+    /// accesses leave none).
+    pub lds_races: u64,
 }
 
 impl<'a> Group<'a> {
@@ -81,7 +99,7 @@ impl<'a> Group<'a> {
             })
             .collect();
         let lds = vec![0; units[0].lds.len()];
-        Group { f, at: vec![At::Ready; units.len()], units, halves, upper_first: false, mem, lds, exchanges: 0 }
+        Group { f, at: vec![At::Ready; units.len()], seen: vec![HashMap::new(); units.len()], units, halves, upper_first: false, mem, lds, exchanges: 0, races: 0, race_at: None, lds_races: 0 }
     }
 
     /// Runs the group to its end.
@@ -95,6 +113,7 @@ impl<'a> Group<'a> {
                 }
             }
             if self.at.iter().all(|a| *a == At::Done) {
+                (0..self.units.len()).step_by(2).for_each(|w| self.met(w));
                 return Stop::Returned;
             }
             match self.meet() {
@@ -120,11 +139,16 @@ impl<'a> Group<'a> {
     /// memory.
     fn advance(&mut self, u: usize) -> Result<(), Stop> {
         let m = &mut self.units[u];
+        self.mem.log = self.halves.then(Vec::new);
         std::mem::swap(&mut m.mem, &mut self.mem);
         std::mem::swap(&mut m.lds, &mut self.lds);
         let (node, stop) = m.step(self.halves, true);
         std::mem::swap(&mut m.mem, &mut self.mem);
         std::mem::swap(&mut m.lds, &mut self.lds);
+        for (a, kind) in self.mem.log.take().unwrap_or_default() {
+            let k = self.seen[u].entry(a).or_insert(kind);
+            *k = if *k == kind { kind } else { WRITE };
+        }
         self.at[u] = match (node, stop) {
             (Some(v), _) if self.f.node(v).op == Op::Xchg => At::Xchg(v, m.own_word(v).map_err(|e| Stop::Error(format!("unit {u}: {e}")))?),
             (Some(v), _) => At::Barrier(v),
@@ -135,12 +159,31 @@ impl<'a> Group<'a> {
         Ok(())
     }
 
+    /// The halves of the wave whose lower half is unit `w` meet (or end):
+    /// what they did to the same dwords since they last met is counted
+    /// where the card does not order it, and forgotten.
+    fn met(&mut self, w: usize) {
+        if !self.halves || w + 1 >= self.units.len() {
+            return;
+        }
+        let (lo, hi) = (std::mem::take(&mut self.seen[w]), std::mem::take(&mut self.seen[w + 1]));
+        for (a, k) in &lo {
+            let racing = hi.get(a).is_some_and(|h| (*k == WRITE || *h == WRITE) || (*k == ATOMIC) != (*h == ATOMIC));
+            if racing {
+                self.lds_races += u64::from(a & LDS_LOG != 0);
+                self.races += 1;
+                self.race_at.get_or_insert(*a);
+            }
+        }
+    }
+
     /// What the waiting units can do together: the pairs at an exchange
     /// exchange, and when every unit still running is at a barrier they
     /// pass it. Whether anything went on.
     fn meet(&mut self) -> Result<bool, String> {
         let mut progress = false;
-        for w in (0..self.units.len()).step_by(2).filter(|_| self.halves) {
+        let halves = self.halves;
+        for w in (0..self.units.len()).step_by(2).filter(|_| halves) {
             let lo = self.at[w];
             // a half whose partner is not in the group exchanges with nobody
             let Some(&hi) = self.at.get(w + 1) else {
@@ -153,6 +196,7 @@ impl<'a> Group<'a> {
             };
             match (lo, hi) {
                 (At::Xchg(a, x), At::Xchg(b, y)) if a == b => {
+                    self.met(w);
                     self.units[w].settle(a, [x, y]);
                     self.units[w + 1].settle(b, [x, y]);
                     (self.at[w], self.at[w + 1]) = (At::Ready, At::Ready);
@@ -167,6 +211,7 @@ impl<'a> Group<'a> {
         }
         let waiting = |a: &At| matches!(a, At::Barrier(_));
         if self.at.iter().any(waiting) && self.at.iter().all(|a| waiting(a) || *a == At::Done) {
+            (0..self.units.len()).step_by(2).for_each(|w| self.met(w));
             for u in 0..self.units.len() {
                 if let At::Barrier(v) = self.at[u] {
                     self.units[u].settle(v, [0, 0]);

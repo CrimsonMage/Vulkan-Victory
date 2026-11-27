@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
+use victory_shader::vk::interp_group::{Group, Mode};
 use victory_shader::vk::{interp, thread_ir};
 
 use crate::index::{Source, files, sources};
@@ -100,8 +101,8 @@ fn read_golden(path: &Path) -> Found {
         .collect()
 }
 
-/// The behaviour of each wanted program of the pack, and the slowest.
-fn collect(pack: &Path, wanted: &HashSet<String>, jobs: usize) -> Result<(Found, Vec<(u128, String)>)> {
+/// `what` of each wanted program of the pack (its behaviour), and the slowest.
+fn collect(pack: &Path, wanted: &HashSet<String>, jobs: usize, what: impl Fn(&[u8]) -> String + Sync + std::panic::RefUnwindSafe) -> Result<(Found, Vec<(u128, String)>)> {
     let found = Mutex::new(BTreeMap::new());
     let slow = Mutex::new(Vec::new());
     for path in files(pack)? {
@@ -120,7 +121,7 @@ fn collect(pack: &Path, wanted: &HashSet<String>, jobs: usize) -> Result<(Found,
                     continue;
                 }
                 let t = std::time::Instant::now();
-                let b = std::panic::catch_unwind(|| behaviour(&bytes)).unwrap_or_else(|_| "panic".into());
+                let b = std::panic::catch_unwind(|| what(&bytes)).unwrap_or_else(|_| "panic".into());
                 slow.lock().unwrap().push((t.elapsed().as_millis(), hash.clone()));
                 found.lock().unwrap().insert(hash, (b, name));
             }
@@ -157,7 +158,7 @@ fn compare(old: &Found, found: &Found, wanted: &HashSet<String>) {
     println!("{} programs, {changed} changed behaviour, {} absent", found.len(), missing.len());
 }
 
-pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, jobs: usize) -> Result<()> {
+pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, halves: bool, jobs: usize) -> Result<()> {
     let old = read_golden(golden);
     let wanted: HashSet<String> = match list {
         Some(p) => std::fs::read_to_string(p)
@@ -168,7 +169,10 @@ pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, jobs: u
         None => old.keys().cloned().collect(),
     };
     anyhow::ensure!(!wanted.is_empty(), "no programs: give --list for a first --bless");
-    let (found, slow) = collect(pack, &wanted, jobs)?;
+    if halves {
+        return run_halves(pack, &wanted, jobs);
+    }
+    let (found, slow) = collect(pack, &wanted, jobs, behaviour)?;
     eprintln!("slowest (ms): {slow:?}");
     compare(&old, &found, &wanted);
     if bless {
@@ -179,6 +183,101 @@ pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, jobs: u
         std::fs::write(golden, text).with_context(|| format!("writing {}", golden.display()))?;
         println!("blessed {}", golden.display());
     }
+    Ok(())
+}
+
+/// What a whole group of a program does with the inputs of `seed`, run as
+/// console waves or as the host subgroups the card runs (`upper_first`: the
+/// upper half of each wave64 before the lower between their meetings):
+/// how it stopped, and its outputs, image stores and memory stores as text.
+fn group_run(f: &victory_shader::vk::tir::Func, native: &victory_shader::NativeProgram, seed: u64, mode: Mode, upper_first: bool) -> (interp::Stop, String, u64) {
+    let mem = interp::Memory { range: (0, u64::MAX), noise: Some(seed), ..Default::default() };
+    let setup = |m: &mut interp::Machine| {
+        for (k, p) in m.push.iter_mut().enumerate() {
+            *p = mix(seed << 8 | k as u64) as u32;
+        }
+        m.group = [(seed % 3) as u32, (seed % 2) as u32, 0];
+        m.limit = LIMIT;
+        m.image_size = [64, 64, 1, 1];
+        m.image_texel = [0, 1, 2, 3].map(|c| u64::from(((mix(seed * 4 + c) >> 40) as f32 / (1u64 << 24) as f32).to_bits()));
+    };
+    let mut g = Group::new(f, native.wave64, victory_shader::vk::host_threads(native), mode, mem, setup);
+    g.upper_first = upper_first;
+    let stop = g.run();
+    let mut lines = Vec::new();
+    for (u, m) in g.units.iter().enumerate() {
+        // (an invocation by its place in the group, whatever the units are)
+        let base = u * m.lanes();
+        lines.extend(m.outputs.iter().map(|(k, v)| format!("o {} {} {} {} {v:x}", k.0, k.1, k.2, base + k.3)));
+        lines.extend(m.image_stores.iter().map(|(l, args)| format!("i {} {args:x?}", base + l)));
+    }
+    lines.sort();
+    lines.extend(g.mem.stored.iter().map(|(a, v)| format!("m {a:x} {v:x}")));
+    (stop, lines.join("\n"), g.races)
+}
+
+/// How a wave64 compute or mesh program differs when its group runs as the
+/// card's host subgroups, the halves exchanging where the translation says
+/// so, from the same group run as console waves: "same", "limit" (a run
+/// went past the block limit: nothing to compare), "same-but-raced" (in
+/// some run the halves stored to a dword the other half accessed between
+/// two meetings, as random descriptors make them; the other runs agree), or
+/// the first difference.
+/// None for the programs with nothing to tell apart (no wave64 group).
+pub fn halves(container: &[u8]) -> Option<String> {
+    let (f, _, native) = thread_ir(container).ok()?;
+    let grouped = matches!(native.stage, victory_shader::HwStage::Cs | victory_shader::HwStage::Ms);
+    if !(native.wave64 && grouped && victory_shader::vk::host_threads(&native) > 32) {
+        return None;
+    }
+    let (mut limit, mut raced) = (false, false);
+    for seed in 1..=SEEDS {
+        let (stop, wave, _) = group_run(&f, &native, seed, Mode::Waves, false);
+        for upper_first in [false, true] {
+            let (hstop, halves, races) = group_run(&f, &native, seed, Mode::Halves, upper_first);
+            if stop == interp::Stop::Limit || hstop == interp::Stop::Limit {
+                limit = true;
+                continue;
+            }
+            // random memory: the halves stored to one dword between two
+            // meetings (descriptors that collide), in an order the card
+            // does not keep: nothing to compare in this run
+            if races > 0 {
+                raced = true;
+                continue;
+            }
+            if stop != hstop {
+                return Some(format!("seed {seed}, upper first {upper_first}: the wave {}, the halves {}", unnumbered(&format!("{stop:?}")), unnumbered(&format!("{hstop:?}"))));
+            }
+            if let Some((a, b)) = wave.lines().zip(halves.lines()).find(|(a, b)| a != b) {
+                return Some(format!("seed {seed}, upper first {upper_first}: the wave `{a}`, the halves `{b}`"));
+            }
+            if wave.lines().count() != halves.lines().count() {
+                return Some(format!("seed {seed}, upper first {upper_first}: {} effects as a wave, {} as halves", wave.lines().count(), halves.lines().count()));
+            }
+        }
+    }
+    Some(if raced { "same-but-raced" } else if limit { "limit" } else { "same" }.to_owned())
+}
+
+/// Every wanted wave64 compute or mesh program's group as console waves and
+/// as the card's halves ([`halves`]): the programs that differ.
+pub fn run_halves(pack: &Path, wanted: &HashSet<String>, jobs: usize) -> Result<()> {
+    let (found, slow) = collect(pack, wanted, jobs, |b| halves(b).unwrap_or_default())?;
+    eprintln!("slowest (ms): {slow:?}");
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (hash, (b, name)) in &found {
+        let kind = match b.as_str() {
+            "" => "no wave64 group",
+            "same" | "limit" | "panic" | "same-but-raced" => b.as_str(),
+            _ => {
+                println!("differs {hash} {name}: {b}");
+                "differs"
+            }
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    println!("{} programs: {counts:?}", found.len());
     Ok(())
 }
 
