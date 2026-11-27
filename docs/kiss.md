@@ -801,6 +801,21 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (12:30): run vk106 (exe int58 = integrate 7c6e839, host
+  changes only on the `batch-2026-11-27d` cache; switches
+  `VICTORY_AMBIENT=constant:0.5 VICTORY_VK_CEILING_MB=5312`; frame
+  /mnt/data/victory/capture/vk106/frame-2100.png): the reference's shot
+  in layout and most of its content — the character from behind with the
+  ponytail, the window with its chain-link mesh, building, watchtower,
+  people in the yard, grey walls, the bunk, the posters. Still wrong: the
+  jumpsuit is dark red without its lettering, the window frame black
+  (blue-grey in the reference), the light flat (a constant stands in for
+  indirect light), the sky too white. Card 6.49 GB at peak (process
+  5.65), RAM 16.5 GB, card 423 ms a frame, no fault.
+  - Both switches are test settings: the ceiling default (4,608 MiB) is
+    the user's to decide (the pool's GPU view needs ~1.05 GB), and the
+    constant is to become an estimate from the frame before
+    (VIctory-NVIDIA's ambient.rs is the model).
 - 2026-11-27 (10:25): run vk105 (tag `batch-2026-11-27d`, exe int57;
   frame /mnt/data/victory/capture/vk105/frame-2430.png): code tables are
   memory read by address (one 2 MiB host buffer, a place per table set
