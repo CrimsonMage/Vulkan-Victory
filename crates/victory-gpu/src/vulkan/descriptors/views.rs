@@ -27,6 +27,18 @@ fn components(mapping: u32) -> [vk::ComponentSwizzle; 4] {
     })
 }
 
+/// An A8_UNORM view made with R8_UNORM: the title's channels read the one
+/// channel as alpha, and 0 for red, green and blue (D3D's A8), not R8's
+/// (r, 0, 0, 1).
+fn alpha_only(c: [vk::ComponentSwizzle; 4]) -> [vk::ComponentSwizzle; 4] {
+    use vk::ComponentSwizzle as C;
+    c.map(|s| match s {
+        C::A => C::R,
+        C::R | C::G | C::B => C::ZERO,
+        other => other,
+    })
+}
+
 fn swizzle_of(c: [vk::ComponentSwizzle; 4], fmt: gfx10::Swizzle) -> gfx10::Swizzle {
     use vk::ComponentSwizzle as C;
     c.map(|s| match s {
@@ -316,6 +328,12 @@ fn texture_words(
         note_wide_uav(&image, rdesc.format, title_format, format);
     }
     let comps = components(mapping);
+    // DXGI_FORMAT_A8_UNORM
+    let comps = if !unordered && crate::resource::pc_format(title_format) == 65 && format == vk::Format::R8_UNORM {
+        alpha_only(comps)
+    } else {
+        comps
+    };
     let key = ViewKey {
         format,
         kind: shape.kind,
