@@ -182,10 +182,31 @@ impl Lift<'_> {
         self.f.global(Op::MapField(u32::from(store)), Ty::U64)
     }
 
-    /// d16 results: values (f32 bits) as f16, two per dword.
-    pub(super) fn pack_d16(&mut self, vals: &[V]) -> Vec<V> {
+    /// d16 results, two per dword: floats (f32 bits) as f16; integers
+    /// (`ints`, a bool) their low 16 bits.
+    pub(super) fn pack_d16(&mut self, vals: &[V], ints: V) -> Vec<V> {
         vals.chunks(2)
             .map(|pair| {
+                let int = match self.f.as_const(ints) {
+                    Some(0) => None,
+                    _ => {
+                        let m = self.k32(0xFFFF);
+                        let lo = self.u32v(pair[0]);
+                        let lo = self.spv(op::BITWISE_AND, Ty::U32, &[lo, m]);
+                        Some(match pair.get(1) {
+                            Some(&hi) => {
+                                let hi = self.u32v(hi);
+                                let k16 = self.k32(16);
+                                let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[hi, k16]);
+                                self.spv(op::BITWISE_OR, Ty::U32, &[lo, hi])
+                            }
+                            None => lo,
+                        })
+                    }
+                };
+                if self.f.as_const(ints) == Some(1) {
+                    return int.unwrap();
+                }
                 let mut h = Vec::new();
                 for &x in pair {
                     let f = self.f32v(x);
@@ -196,7 +217,11 @@ impl Lift<'_> {
                     h.push(self.f.konst(Ty::F16, 0));
                 }
                 let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F16, 2), &h);
-                self.spv(op::BITCAST, Ty::U32, &[v2])
+                let fl = self.spv(op::BITCAST, Ty::U32, &[v2]);
+                match int {
+                    Some(i) => self.spv(op::SELECT, Ty::U32, &[ints, i, fl]),
+                    None => fl,
+                }
             })
             .collect()
     }
@@ -343,7 +368,16 @@ impl Lift<'_> {
         let a = self.access_addr(vs, o, bytes, false);
         let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, vs.shape]);
         let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();
-        let vals = if d16 { self.pack_d16(&vals) } else { vals };
+        let vals = if d16 {
+            // the shape's number type (bits 16..19): 3 and up integers
+            let (at, w) = (self.k32(16), self.k32(3));
+            let num = self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[vs.shape, at, w]);
+            let k3 = self.k32(3);
+            let ints = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[num, k3]);
+            self.pack_d16(&vals, ints)
+        } else {
+            vals
+        };
         for (i, v) in vals.into_iter().enumerate() {
             self.def(inst, Reg::V(reg + i as u8), R::D(v));
         }
@@ -435,7 +469,12 @@ impl Lift<'_> {
             }
             Kind::T(t, ch, d16) => {
                 let vals = self.typed_load(a, t, ch);
-                if d16 { self.pack_d16(&vals) } else { vals }
+                if d16 {
+                    let ints = self.kb(matches!(t.num, Num::Uint | Num::Sint));
+                    self.pack_d16(&vals, ints)
+                } else {
+                    vals
+                }
             }
             Kind::VFormat(..) | Kind::VStore(..) => return Err(unsupported(0, "a typed buffer access")),
         })
@@ -514,21 +553,58 @@ impl Lift<'_> {
                 let f = self.spv(op::F_CONVERT, Ty::F32, &[hf]);
                 self.u32v(f)
             }
-            Num::Unorm => {
-                let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
-                let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
-                let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                self.u32v(m)
-            }
-            Num::Snorm => {
-                let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
-                let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
-                let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                let lo = self.kf(-1.0);
-                let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
-                self.u32v(c)
-            }
+            Num::Unorm => self.norm(r, bits, false),
+            Num::Snorm => self.norm(r, bits, true),
         }
+    }
+
+    /// A normalized code (`r`, sign-extended when `signed`) as the bits of
+    /// the float nearest its exact quotient by `2^bits - 1` (`2^(bits-1) -
+    /// 1` signed; the lowest signed code -1.0), as the console's buffer
+    /// unit converts it: a host multiply by the reciprocal (or division)
+    /// lands an ulp off for many codes, and titles truncate `x * 255` back
+    /// to the code (a material index in a vertex colour). With `d = 2^v -
+    /// 1` and `S` a multiple of `v`, `2^S = K d + 1`, so `a 2^S / d = a K +
+    /// a / d`: `a K` is its floor, never exact for `0 < a < d`, and `a K |
+    /// 1` rounds as the quotient does (one conversion, correctly rounded).
+    pub(super) fn norm(&mut self, r: V, bits: u32, signed: bool) -> V {
+        let v = if signed { bits - 1 } else { bits };
+        let d = (1u64 << v) - 1;
+        let (mag, neg) = if signed {
+            let a = self.gl(glsl::S_ABS, Ty::U32, &[r]);
+            let kd = self.k32(d as u32);
+            let a = self.gl(glsl::U_MIN, Ty::U32, &[a, kd]);
+            let z = self.k32(0);
+            (a, Some(self.spv(op::S_LESS_THAN, Ty::BOOL, &[r, z])))
+        } else {
+            (r, None)
+        };
+        let f = if d == 1 {
+            self.spv(op::CONVERT_U_TO_F, Ty::F32, &[mag])
+        } else {
+            let sh = 40u32.div_ceil(v) * v;
+            let k = ((1u64 << sh) - 1) / d;
+            let a = self.spv(op::U_CONVERT, Ty::U64, &[mag]);
+            let kk = self.f.konst(Ty::U64, k);
+            let q = self.spv(op::I_MUL, Ty::U64, &[a, kk]);
+            let one = self.f.konst(Ty::U64, 1);
+            let q = self.spv(op::BITWISE_OR, Ty::U64, &[q, one]);
+            let x = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[q]);
+            let scale = self.kf(f32::from_bits((127 - sh) << 23));
+            let x = self.spv(op::F_MUL, Ty::F32, &[x, scale]);
+            let z = self.k32(0);
+            let zero = self.spv(op::I_EQUAL, Ty::BOOL, &[mag, z]);
+            let fz = self.kf(0.0);
+            self.spv(op::SELECT, Ty::F32, &[zero, fz, x])
+        };
+        let f = match neg {
+            Some(n) => {
+                let m = self.spv(op::F_NEGATE, Ty::F32, &[f]);
+                self.spv(op::SELECT, Ty::F32, &[n, m, f])
+            }
+            None => f,
+        };
+        self.u32v(f)
     }
 
     /// A 2_10_10_10 element (x in the low bits): one dword.
@@ -548,20 +624,8 @@ impl Lift<'_> {
             let r = self.spv(opc, Ty::U32, &[w, o, wv]);
             let x = match t.num {
                 Num::Uint | Num::Sint => r,
-                Num::Unorm => {
-                    let f = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[r]);
-                    let k = self.kf(1.0 / ((1u64 << bits) - 1) as f32);
-                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                    self.u32v(m)
-                }
-                _ => {
-                    let f = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[r]);
-                    let k = self.kf(1.0 / ((1u64 << (bits - 1)) - 1) as f32);
-                    let m = self.spv(op::F_MUL, Ty::F32, &[f, k]);
-                    let lo = self.kf(-1.0);
-                    let c = self.gl(glsl::N_MAX, Ty::F32, &[m, lo]);
-                    self.u32v(c)
-                }
+                Num::Unorm => self.norm(r, bits, false),
+                _ => self.norm(r, bits, true),
             };
             out.push(x);
         }
