@@ -105,13 +105,18 @@ const LIVE: [u32; 7] = [u32::MAX, 0x0000_0FFF, 0x0000_00F0, 0x0000_0F0F, 0x0F0F_
 /// lane's number from its pixel (x + 8 y, as the interpreter places the
 /// lanes), then [`program`], s7 exported as mrt0 by the lanes in EXEC.
 fn pixel64(section: &[u32], bits: bool) -> NativeProgram {
+    pixel64_of(program(section, bits))
+}
+
+/// [`pixel64`] with `body` for the program.
+fn pixel64_of(body: Vec<u32>) -> NativeProgram {
     let mut words = vec![
         vop1(7, 2, vgpr(0)),       // v_cvt_u32_f32 v2, v0 (x)
         vop1(7, 3, vgpr(1)),       // v_cvt_u32_f32 v3, v1 (y)
         vop2(0x1A, 3, 128 + 3, 3), // v_lshlrev_b32 v3, 3, v3
         vop2(0x25, 0, vgpr(3), 2), // v_add_nc_u32 v0, v3, v2
     ];
-    words.extend(program(section, bits));
+    words.extend(body);
     words.extend([0xF800_180F, 0, S_ENDPGM]); // exp mrt0, v0, v0, v0, v0 done vm
     NativeProgram {
         stage: HwStage::Ps,
@@ -181,4 +186,29 @@ fn a_wave_reduction_is_over_the_lanes_that_are_there() {
 #[test]
 fn a_wave64_reduction_on_one_subgroup_counts_each_lane_once() {
     check(true);
+}
+
+/// Ours: the section's vector result read after it (v1, which after the
+/// tree's last step holds the whole wave's result in the lanes of the lower
+/// half: the tiled-lighting pixel programs keep it across their light
+/// loop). The steps ran lane by lane before, lane 32 read as lane 0: a sum
+/// counted the subgroup twice.
+#[test]
+fn a_wave64_sections_vector_result_counts_each_lane_once() {
+    let mut failed = Vec::new();
+    for ((name, op, code, identity, fold), bits) in CASES.into_iter().flat_map(|c| [(c, true), (c, false)]) {
+        let mut body = program(&section64(op, code), bits);
+        *body.last_mut().unwrap() = vop1(0x001, 0, vgpr(1)); // v_mov_b32 v0, v1
+        let pixel = pixel64_of(body);
+        for (live, (below, s1)) in LIVE.into_iter().flat_map(|l| [(32u32, 0x15u32), (20, 0x2A), (7, 0)].map(|x| (l, x))) {
+            let value = |l: u32| if bits { 1u32 << l } else { l ^ s1 };
+            let mut lanes = (0..32).filter(|l| live >> l & 1 != 0 && *l < below).peekable();
+            let want = lanes.peek().is_some().then(|| lanes.fold(identity, |a, l| fold(a, value(l))));
+            let got = run_pixel(&pixel, [below, s1], live);
+            if got != Ok(want) {
+                failed.push(format!("{name} (bits {bits}), lanes {live:#010x} below {below}: {got:x?}, want {want:x?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{} failed:\n{}", failed.len(), failed.join("\n"));
 }

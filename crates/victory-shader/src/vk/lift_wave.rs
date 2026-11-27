@@ -350,7 +350,10 @@ impl Lift<'_> {
                     let mut vals = Vec::new();
                     for inst in &p.blocks[b].insts[start + 1..sec.end] {
                         for &(_, w) in &inst.writes {
-                            if let Some(&sh @ (Shape::Active(..) | Shape::Prefix(..))) = sec.shapes.get(&w) {
+                            // (one subgroup for a wave of 64: its lanes are
+                            // the lower half's)
+                            let shape = sec.shapes.get(&w).or_else(|| sec.lower.get(&w).filter(|_| self.wave64));
+                            if let Some(&sh @ (Shape::Active(..) | Shape::Prefix(..))) = shape {
                                 vals.push((w, sh));
                             }
                         }

@@ -143,6 +143,12 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// For a wave of 64: what a vector value holds in every lane of the
+    /// lower half where the halves differ (after the tree's last step the
+    /// lower half's lanes hold the whole wave's result, the upper half's
+    /// their own half's), for a host subgroup that stands for the wave
+    /// and has only those lanes.
+    pub lower: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -180,8 +186,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lower) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, lower });
         i = end + 1;
     }
     out
@@ -268,7 +274,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, HashMap<Value, Shape>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -693,13 +699,14 @@ fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
-) -> HashMap<Value, Shape> {
+) -> (HashMap<Value, Shape>, HashMap<Value, Shape>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
+    let mut lower = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
@@ -727,9 +734,13 @@ fn shapes(
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+        } else if wave == 64
+            && let Some(sh @ (Shape::Active(..) | Shape::Prefix(..))) = per_lane(&lanes[..32], all)
+        {
+            lower.insert(v, sh);
         }
     }
-    out
+    (out, lower)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
