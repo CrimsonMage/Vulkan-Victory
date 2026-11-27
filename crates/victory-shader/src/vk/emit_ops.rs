@@ -157,19 +157,54 @@ impl Emit<'_> {
         0
     }
 
-    /// args[0] picks one of the rest (clamped) through a function array.
-    pub(super) fn pick(&mut self, v: V, args: &[Id]) -> Id {
-        let var = self.picks[&v];
-        let u = self.t.u32_;
-        let p = self.m.t_ptr(en::SC_FUNCTION, u);
-        for (i, &a) in args[1..].iter().enumerate() {
-            let k = self.c32(i as u32);
-            let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, k]);
-            self.m.op_void(op::STORE, &[ptr, a]);
-        }
+    /// args[0] picks one of the rest (clamped): selections on the bits of
+    /// the index ([`pick_tree`]). (Until 2026-11-27 through a function
+    /// array per pick, stored whole and read at the index: NVIDIA keeps a
+    /// module's variables on the card for 32,768 threads, and the 44 picks
+    /// of CS_CompressBC7Mip0, 11.4 KiB of arrays, held 357 MiB.)
+    pub(super) fn pick(&mut self, args: &[Id]) -> Id {
+        let (u, b) = (self.t.u32_, self.t.bool_);
         let max = self.c32((args.len() - 2) as u32);
         let idx = self.m.ext(glsl::U_MIN, u, &[args[0], max]);
-        let ptr = self.m.op(op::ACCESS_CHAIN, p, &[var, idx]);
-        self.m.op(op::LOAD, u, &[ptr])
+        // bit k of the index, made when a selection first asks for it
+        let mut bits: Vec<Id> = Vec::new();
+        pick_tree(&args[1..], |bit, lower, upper| {
+            while bits.len() <= bit as usize {
+                let (k, z) = (self.c32(1 << bits.len()), self.c32(0));
+                let masked = self.m.op(op::BITWISE_AND, u, &[idx, k]);
+                bits.push(self.m.op(op::I_NOT_EQUAL, b, &[masked, z]));
+            }
+            self.m.op(op::SELECT, u, &[bits[bit as usize], upper, lower])
+        })
+    }
+}
+
+/// The one of `items` an index below their count names, as a tree of
+/// two-way choices on the index's bits, lowest first: `choose(bit, lower,
+/// upper)` is `upper` where the index has `bit` set. An item without a
+/// partner passes: no index below the count has its bit set there.
+pub(super) fn pick_tree<T: Copy>(items: &[T], mut choose: impl FnMut(u32, T, T) -> T) -> T {
+    let mut level = items.to_vec();
+    let mut bit = 0;
+    while level.len() > 1 {
+        level = level.chunks(2).map(|c| if let [lower, upper] = *c { choose(bit, lower, upper) } else { c[0] }).collect();
+        bit += 1;
+    }
+    level[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_tree;
+
+    #[test]
+    fn a_pick_tree_gives_the_item_at_every_index() {
+        for n in 1..=140u32 {
+            let items: Vec<u32> = (0..n).map(|i| i * 3 + 7).collect();
+            for i in 0..n {
+                let got = pick_tree(&items, |bit, lower, upper| if i >> bit & 1 == 1 { upper } else { lower });
+                assert_eq!(got, items[i as usize], "{n} items, index {i}");
+            }
+        }
     }
 }

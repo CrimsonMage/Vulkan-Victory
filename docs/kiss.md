@@ -181,6 +181,22 @@ driver errors and no new crash, and the captures look no worse.
     changed, all pass spirv-val; the golden file's behaviours not at all.
     The pack: 662 of 25,889 programs have tables, 300 KiB, 139 KiB as 217
     distinct sets.
+  - **The next worst were the picks** (a commit of its own): `v_movrels_b32`
+    reads the register `m0` names (an array the console program keeps in
+    its registers), which was a function array per pick, stored whole and
+    read at the index: the 44 picks of CS_CompressBC7Mip0 were 11.4 KiB
+    of arrays (357 MiB on the card), BC1's 10.4 KiB, BC3's 7.2 KiB. A pick
+    is selections on the index's bits now, no variable; 22 used modules
+    change, each smaller. The most variable bytes of a used module is
+    then 652 (compute 524, mesh 652, pixel and vertex 516: about 16 to
+    20 MiB a stage kind on the card), all but a few bytes of it the
+    128-entry table of buffer formats (`Helper::TypedShape`, in 1,429
+    modules) and a split mesh program's table of parts.
+  - Open: the format table could lie in the tables buffer too (one fixed
+    place for every program, no constant), for a compile of those 1,429
+    modules; the tables buffer is PC memory the card reads (as title
+    memory is): on the card if a program's table reads show up in frame
+    times.
 
 - 2026-11-27 (indirect light): why everything the sun does not hit was
   black, found by walking back from the tiled lighting with pass captures

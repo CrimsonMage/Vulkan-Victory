@@ -176,7 +176,6 @@ pub struct Emit<'a> {
     /// Specialization constant [`SPEC_CODE_TABLES`] (0: not declared).
     spec_tables: Id,
     helpers: HashMap<Helper, Id>,
-    picks: HashMap<V, Id>,
     /// Merges of the selections `open_if` opened.
     if_merge: Vec<Id>,
     /// The invocation's loop iterations so far (the loop guard; 0: none yet).
@@ -262,7 +261,6 @@ impl<'a> Emit<'a> {
             spec_samplers: HashMap::new(),
             spec_tables: 0,
             helpers: HashMap::new(),
-            picks: HashMap::new(),
             if_merge: Vec::new(),
             spent_var: 0,
             guard_fn: 0,
@@ -388,7 +386,7 @@ impl<'a> Emit<'a> {
                 0
             }
             Op::Phi => unreachable!("guard phis are written by their guard"),
-            Op::Pick => self.pick(v, &args),
+            Op::Pick => self.pick(&args),
         };
         self.set_id(v, id);
     }
@@ -515,29 +513,6 @@ impl<'a> Emit<'a> {
 
         let fid = self.m.id();
         let void = self.t.void;
-        // pick arrays
-        let mut picks = Vec::new();
-        fn find(list: &[Item], f: &Func, out: &mut Vec<V>) {
-            for it in list {
-                match it {
-                    Item::N(v) if f.node(*v).op == Op::Pick => out.push(*v),
-                    Item::Guard { body, .. } => find(body, f, out),
-                    _ => {}
-                }
-            }
-        }
-        for b in &self.f.blocks {
-            find(&b.body, self.f, &mut picks);
-        }
-        for v in picks {
-            let n = (self.f.node(v).args.len() - 1) as u32;
-            let u = self.t.u32_;
-            let arr = self.m.t_array(u, n.max(1));
-            let p = self.m.t_ptr(en::SC_FUNCTION, arr);
-            let id = self.m.id();
-            self.entry_vars.extend_from_slice(&[p, id]);
-            self.picks.insert(v, id);
-        }
         // Body first into a separate buffer: variables go first in the entry.
         let saved = std::mem::take(&mut self.m.body);
         let first = self.m.id();
