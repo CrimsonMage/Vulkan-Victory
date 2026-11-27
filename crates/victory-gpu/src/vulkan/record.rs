@@ -580,6 +580,7 @@ impl Rec {
                 };
             }
         }
+        super::passes::note(|| format!("push {}", words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
         if self.pushed && words == self.last_push {
             return;
         }
@@ -633,6 +634,9 @@ impl Rec {
                 // SAFETY: outside rendering, in our command buffer.
                 unsafe { super::targets::before(b, cmd, &s.name) };
                 super::targets::tables(b, &s.name, &self.graphics.slots);
+                let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
+                // SAFETY: as above.
+                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.graphics.slots) };
                 told = Some(s.name.as_str());
             }
         }
@@ -744,6 +748,8 @@ impl Rec {
     /// Counts a recorded draw, on the attachments too; diagnostics builds
     /// describe the first ones.
     fn drawn(&mut self, what: &str) {
+        super::passes::note(|| format!("did {what} index {:x?} viewport {:?} scissor {:?}", self.index.map(|i| (i.address, i.size, i.format)), self.viewports.first().map(|v| (v.x, v.y, v.width, v.height, v.min_depth, v.max_depth)), self.scissors.first().map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))));
+        super::passes::close();
         self.note(|| what.to_owned());
         let n = STATS[0].fetch_add(1, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
@@ -848,6 +854,8 @@ impl Rec {
             STATS[1].fetch_add(1, Ordering::Relaxed);
             let ud = [self.last_push[9], self.last_push[10], self.last_push[11], self.last_push[12]];
             self.note_as(|| format!("dispatch {x}x{y}x{z} ud5-8={:08x} {:08x} {:08x} {:08x}", ud[0], ud[1], ud[2], ud[3]), true);
+            super::passes::note(|| format!("dispatch {x} {y} {z}"));
+            super::passes::close();
         }
     }
 
@@ -890,6 +898,9 @@ impl Rec {
                 // SAFETY: outside rendering, in our command buffer.
                 unsafe { super::targets::before(b, cmd, &s.name) };
                 super::targets::tables(b, &s.name, &self.compute.slots);
+                let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
+                // SAFETY: as above.
+                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.compute.slots) };
             }
         }
         self.indirect.clear();

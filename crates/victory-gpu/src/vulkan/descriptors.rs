@@ -577,6 +577,14 @@ pub(crate) fn slot_view(slot: u32) -> String {
     found.unwrap_or_else(|| if slot < s.next { "null (freed)".into() } else { "null (never given)".into() })
 }
 
+/// Diagnostics: the image and view the host wrote at image slot `slot`.
+pub(crate) fn slot_image(slot: u32) -> Option<(Arc<Image>, ViewKey)> {
+    let h = heaps(super::backend()?)?;
+    let s = lock(&h.state);
+    let (&(id, key), _) = s.views.iter().find(|(_, v)| **v == slot)?;
+    Some((s.keep.get(&id)?.clone(), key))
+}
+
 /// The image `id` is gone: its slots are reused once the card is done.
 pub(crate) fn image_gone(id: u64) {
     let Some(b) = super::backend() else { return };

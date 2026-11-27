@@ -111,12 +111,13 @@ pub(super) fn tables(b: &Backend, name: &str, roots: &[Vec<u32>]) {
 /// Whether a mid-frame dump of an earlier frame waits to be saved (its
 /// list has been executed by now).
 pub(super) fn pending(frame: u64) -> bool {
-    lock(&PENDING).iter().any(|p| p.born < frame)
+    lock(&PENDING).iter().any(|p| p.born < frame) || super::passes::pending(frame)
 }
 
 /// At a present with the queue idle: the mid-frame dumps of earlier
 /// frames are saved.
 pub(super) fn save_pending(b: &Backend, frame: u64) {
+    super::passes::save_pending(b, frame);
     let (ready, later): (Vec<Plan>, Vec<Plan>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born < frame);
     lock(&PENDING).extend(later);
     for p in ready {

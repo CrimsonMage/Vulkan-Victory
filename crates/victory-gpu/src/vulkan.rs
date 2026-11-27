@@ -36,6 +36,7 @@ mod bound;
 mod baking;
 mod slow;
 mod stale;
+mod passes;
 mod targets;
 mod budget;
 mod compose;

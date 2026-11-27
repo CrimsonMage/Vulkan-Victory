@@ -260,6 +260,28 @@ impl Rec {
             cull = gs.rasterizer.CullMode.0,
             "Vulkan: the state of the first draw of a program dumped before"
         );
+        super::super::passes::note(|| {
+            format!(
+                "targets {} | depth test {} write {} func {} | stencil on {} read {:x} write {:x} ref {:x} func {} | blend on {} src {} dst {} op {} srca {} dsta {} opa {} mask {:x}",
+                targets.join(", "),
+                z.DepthEnable.as_bool(),
+                z.DepthWriteMask.0,
+                z.DepthFunc.0,
+                z.StencilEnable.as_bool(),
+                z.StencilReadMask,
+                z.StencilWriteMask,
+                self.stencil_ref,
+                z.FrontFace.StencilFunc.0,
+                t.BlendEnable.as_bool(),
+                t.SrcBlend.0,
+                t.DestBlend.0,
+                t.BlendOp.0,
+                t.SrcBlendAlpha.0,
+                t.DestBlendAlpha.0,
+                t.BlendOpAlpha.0,
+                t.RenderTargetWriteMask
+            )
+        });
     }
 
     /// Draw test state: nothing hidden, every channel written.

@@ -297,6 +297,7 @@ impl Rec {
             },
             true,
         );
+        super::super::passes::note(|| format!("indirect kind {} max {} count_at {:x?} src {:x}", spec.kind, spec.max, spec.count, spec.src));
         let size = 4 * spec.words;
         match spec.kind {
             DISPATCH => {
