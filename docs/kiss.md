@@ -419,6 +419,31 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-27 (night): the batch bake, and why two of them were lost.
+  - **Every pixel classed as sky**: CS_GenerateMaterialMasks tests the main
+    depth's stencil with a float compare; the stencil integers are
+    denormal bit patterns and the card takes denormals for zero in
+    compares (measured with a native test; the device cannot preserve
+    them). Float compares and class tests are made on the bits now
+    (oracle `vk/oracle/card.rs`; the interpreter has a card-float mode,
+    `CARD=1` in the replay). Arithmetic and min/max still flush denormals.
+  - **Batch** (tag `batch-2026-11-27`): the twelve audit fixes + the
+    compare fix + the fingerprint scope. Phi variables (117f64d) reverted:
+    the "smaller" ActivateRays module (2.3M words) made NVIDIA's compiler
+    use over 12 GB and run past 6.5 minutes (3 minutes at 3.4M words).
+  - **A bake that is killed loses everything**: the driver writes its
+    cache index (`*.toc`) at a clean exit only. Bake 1 was OOM-killed by
+    its own memory cap (the phi module), bake 2 by a timeout set too
+    short; both games after them recompiled every stage in game and
+    showed black. A bake needs a timeout far past its hour and must end
+    by itself. Also: write tracking's fault-cost probe ended a bake (no
+    fault handler there): it runs only once a real store has faulted.
+  - Open: in game, on-demand stage loading stalls behind slow compiles
+    when the driver cache misses (translated stays at a few hundred).
+  - 64-lane approximations in the used set: 76 pixel programs (character
+    shading, particles, mirrors); the wave64 and waterfall tests of
+    origin/main are not ported yet, and the interpreter runs a wave as
+    one, not as the two halves the card runs.
 - 2026-11-27 (early): what kept the world grey, found with origin/main as
   the reference and with pass captures replayed offline.
   - **Reference**: origin/main (the D3D12 path, lit on NVIDIA) checked out
