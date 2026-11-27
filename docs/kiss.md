@@ -541,6 +541,22 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (10:00): run vk104 (tag `batch-2026-11-27c`, exe int56;
+  frame /mnt/data/victory/capture/vk104/frame-2400.png): the sky is pale
+  and warm as in the reference, the watchtower and buildings stand
+  against it, the bunk at the right shows. Still wrong: interior walls
+  and the character's body dark, the yard's ground dark, no window mesh,
+  dither. What changed: colour images take storage views (stores of
+  packed colour into textures made without storage use went nowhere: ray
+  radiance, final gather, the sky cube), and gathers of integer views
+  read integers (the tile lists).
+  - **Card memory**: the driver keeps a module's `Private`/`Function`
+    variables for 32,768 threads on the card, outside every heap's count:
+    the code tables as private arrays cost 1.7 GB for one program (nine
+    tables, 48 KiB). Tables are to become memory read by address (being
+    built); host stopgaps on the card-memory agent's branch (process on
+    the card 6.9 -> 5.4 GB).
+  - The bake after the gather fix: 3163 s (799 stages compiled).
 - 2026-11-27 (07:30): **the test scene is on screen** (run vk102, tag
   `batch-2026-11-27b`, exe int55; frame
   /mnt/data/victory/capture/vk102/frame-1380.png): window, yard, building,
