@@ -13,8 +13,11 @@ use anyhow::{Context, Result, bail};
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
+/// Text we write: code, configuration, documents, scripts and shader
+/// source (HLSL, and GLSL by the stage names `glslangValidator` takes:
+/// the host's own compute programs, `vulkan/ambient.comp`).
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "glsl", "comp", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -196,6 +199,7 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("crates/x/src/vulkan/ambient.comp", b"#version 460\nvoid main() {}\n").is_empty());
     }
 
     #[test]

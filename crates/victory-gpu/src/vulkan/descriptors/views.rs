@@ -78,6 +78,12 @@ pub(crate) fn write(handle: u64, view: &View) {
         }
         _ => {}
     }
+    if images::census_on() {
+        census(b, handle, view);
+    }
+    // The texture the slot names from now on (`images/named.rs`).
+    let mut shown = None;
+    let slot = Slot { handle, heaps: h };
     let words: Vec<u32> = match view {
         View::Sampler(w) => {
             let d = SamplerDesc::from_words(w);
@@ -114,7 +120,7 @@ pub(crate) fn write(handle: u64, view: &View) {
             match crate::resource::buffer_bytes(r) {
                 Some((data, len)) => buffer_words(data as u64, len, desc.as_ref(), unordered),
                 None => match crate::resource::texture_memory(r) {
-                    Some((data, rdesc)) => texture_words(b, h, data as u64, &rdesc, desc.as_ref(), unordered),
+                    Some((data, rdesc)) => texture_words(b, &slot, data as u64, &rdesc, desc.as_ref(), unordered, &mut shown),
                     None => null_texture(desc.as_ref().map_or(4, |d| d[1]), unordered),
                 },
             }
@@ -127,13 +133,35 @@ pub(crate) fn write(handle: u64, view: &View) {
             if rdesc[0] == 1 {
                 buffer_words(address, r.width, Some(&d10), *unordered)
             } else {
-                texture_words(b, h, address, &r, Some(&d10), *unordered)
+                texture_words(b, &slot, address, &r, Some(&d10), *unordered, &mut shown)
             }
         }
     };
+    if shown.is_none() && !matches!(view, View::Sampler(_) | View::ConsoleSampler(_)) {
+        images::slot_shows(handle, None);
+    }
     // SAFETY: the handle is a descriptor slot (views 32 bytes, samplers 16).
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), handle as *mut u32, words.len()) };
     super::super::split(super::super::Split::Views, started);
+}
+
+/// Diagnostics (`images::census`): the texture view the title writes.
+fn census(b: &Backend, handle: u64, view: &View) {
+    match view {
+        View::Shader(r, desc) | View::Unordered(r, _, desc) => {
+            if let Some((data, rdesc)) = crate::resource::texture_memory(*r as crate::object::This) {
+                let words = desc.map_or_else(Vec::new, |d| d.to_vec());
+                images::census_view(b, handle, data as u64, &rdesc, &words, matches!(view, View::Unordered(..)));
+            }
+        }
+        View::Placed(unordered, rdesc, desc) if rdesc[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            // SAFETY: the resource description is these 14 words.
+            let r: crate::resource::ResourceDesc = unsafe { std::ptr::read_unaligned(rdesc.as_ptr().cast()) };
+            images::census_view(b, handle, address, &r, desc, *unordered);
+        }
+        _ => {}
+    }
 }
 
 /// A V# for a buffer view of `len` bytes at `base` (SRV or UAV words).
@@ -213,6 +241,21 @@ fn null_texture(dimension: u32, unordered: bool) -> Vec<u32> {
         storage: unordered,
     })
     .to_vec()
+}
+
+/// The title's slot a view is written into, and the host's heaps.
+struct Slot<'a> {
+    handle: u64,
+    heaps: &'a Heaps,
+}
+
+/// The first level a texture view's description names (`shape`'s
+/// `base_mip`, before there is an image to read it for).
+fn first_level(dimension: u32, desc: Option<&[u32; 10]>, unordered: bool) -> u32 {
+    match (desc, dimension) {
+        (Some(d), 2..=5 | 8..=10) if !unordered => d[4],
+        _ => 0,
+    }
 }
 
 /// What a texture view shows: its kind and ranges.
@@ -362,17 +405,20 @@ fn stored_plane(
 
 fn texture_words(
     b: &Backend,
-    h: &Heaps,
+    slot: &Slot,
     address: u64,
     rdesc: &crate::resource::ResourceDesc,
     desc: Option<&[u32; 10]>,
     unordered: bool,
+    shown: &mut Option<images::Key>,
 ) -> Vec<u32> {
+    let h = slot.heaps;
     let dimension = desc.map_or(0, |d| d[1]);
-    let Some(image) = images::at(b, address, rdesc, true) else {
+    let Some(image) = images::at_view(b, slot.handle, address, rdesc, first_level(dimension, desc, unordered)) else {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         return null_texture(dimension, unordered);
     };
+    *shown = Some(image.key);
     let title_format = desc.map_or(0, |d| d[0]);
     let title_format = if title_format == 0 { rdesc.format } else { title_format };
     let (image, title_format) = if unordered && image.depth() && image.samples == 1 {

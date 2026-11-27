@@ -254,6 +254,11 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        // (heap type 0: shader views)
+        #[cfg(windows)]
+        if kind == 0 {
+            crate::vulkan::descriptors_copied(dst, src, count);
+        }
     }
 }
 

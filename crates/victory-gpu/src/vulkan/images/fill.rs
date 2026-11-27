@@ -34,26 +34,98 @@ pub(crate) fn written(at: u64, len: u64) -> bool {
     any
 }
 
-/// The title freed, unmapped or remapped `[at, at + len)`: images over
-/// any of it go once the card is done (counted by `why`, [`Dropped`]). An
-/// image made there later is filled from what the memory holds then.
+/// The title freed, unmapped or remapped `[at, at + len)`: images whose
+/// bytes lie over any of it go once the card is done (counted by `why`,
+/// [`Dropped`]). An image made there later is filled from what the memory
+/// holds then. Where the title only showed other pages (`Remapped`), a
+/// texture it fills stays: it is filled again from the pages there now
+/// (the caller has [`written`] do that once they are shown), and goes
+/// when no slot of the title names it; an image the card writes goes, as
+/// its content was the old pages'.
 pub(crate) fn released(b: &Backend, at: u64, len: u64, why: super::Dropped) {
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
     let from = r.first_over(at);
+    let remapped = matches!(why, super::Dropped::Remapped);
     let gone: Vec<Key> = r
         .images
         .range(from..)
         .take_while(|(k, _)| k.address < at + len)
-        .filter(|(k, i)| k.address + i.bytes.max(1) > at)
+        .filter(|(k, i)| k.address + i.bytes.max(1) > at && (!remapped || i.card_written()))
         .map(|(k, _)| *k)
         .collect();
-    let value = b.timeline.last();
     for k in gone {
-        if let Some(img) = r.take(&k) {
-            super::super::descriptors::image_gone(img.id);
-            r.dropped.push((value, img));
-            super::DROPPED[why as usize].fetch_add(1, Ordering::Relaxed);
+        r.drop_image(b, &k, why, at);
+    }
+}
+
+impl super::Registry {
+    /// The image of `key` goes once the card is done with it.
+    pub(super) fn drop_image(&mut self, b: &Backend, key: &Key, why: super::Dropped, by: u64) {
+        if let Some(img) = self.take(key) {
+            self.retire(b, img, why, by);
+        }
+    }
+
+    /// `img`, taken out of the registry, goes once the card is done.
+    fn retire(&mut self, b: &Backend, img: Arc<Image>, why: super::Dropped, by: u64) {
+        super::census::dropped(["freed", "unmapped", "remapped", "resource", "unnamed", "renamed"][why as usize], img.key.address, img.bytes, by);
+        super::super::descriptors::image_gone(&img);
+        self.dropped.push((b.timeline.last(), img));
+        super::DROPPED[why as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Textures whose latest view names another first level than their image
+/// has (`levels.rs`: levels the title streamed in, or let go of): an
+/// image with the levels named is made and filled at this flush. The
+/// texture's slots keep showing the old image until the card has filled
+/// the new one ([`settled`]): work in flight reads the slots as it runs.
+/// Without card memory for it the old image stays.
+fn renamed(b: &Backend, r: &mut super::Registry) {
+    for key in std::mem::take(&mut r.renamed) {
+        let Some(old) = r.images.get(&key).cloned() else { continue };
+        let first = old.wanted.load(Ordering::Relaxed);
+        let on_its_way = r.remade.iter().any(|(n, _)| n.key == key && n.named == first);
+        if first == old.named || old.card_written() || on_its_way {
+            continue;
+        }
+        let Some(new) = super::make(b, r, key, &old.desc, None, first) else { continue };
+        let new = Arc::new(new);
+        r.queue(&new);
+        r.remade.push((new, old.written[3].load(Ordering::Relaxed)));
+    }
+}
+
+/// The images made again that the card has set up and filled take their
+/// textures' places: the slots show them, and the old images go once the
+/// card is done. One whose texture went meanwhile, or whose title has
+/// since named yet another level, goes unused.
+fn settled(b: &Backend, r: &mut super::Registry, completed: u64) {
+    let ready = |n: &Arc<Image>| !n.pending.load(Ordering::Relaxed) && (1..=completed).contains(&n.last_use.load(Ordering::Relaxed));
+    let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut r.remade).into_iter().partition(|(n, _)| ready(n));
+    r.remade = waiting;
+    for (new, fills) in ready {
+        let wanted = r.images.get(&new.key).is_some_and(|old| !old.card_written() && old.wanted.load(Ordering::Relaxed) == new.named);
+        let Some(old) = wanted.then(|| r.take(&new.key)).flatten() else {
+            r.dropped.push((b.timeline.last(), new));
+            continue;
+        };
+        r.place(&new);
+        // A write over the texture since reached the old image only.
+        if (old.written[3].load(Ordering::Relaxed) != fills || old.pending.load(Ordering::Relaxed)) && !new.pending.swap(true, Ordering::Relaxed) {
+            r.pending.push(new.clone());
+        }
+        r.retire(b, old, super::Dropped::Renamed, u64::from(new.named));
+    }
+}
+
+/// Textures the title fills that none of its descriptor slots names any
+/// more (`named.rs`) go.
+fn unnamed(b: &Backend, r: &mut super::Registry) {
+    for key in super::named::let_go() {
+        if r.images.get(&key).is_some_and(|i| !i.card_written()) {
+            r.drop_image(b, &key, super::Dropped::Unnamed, 0);
         }
     }
 }
@@ -66,8 +138,14 @@ pub(crate) fn flush(b: &Backend) {
         let Some(r) = guard.as_mut() else { return };
         let completed = b.timeline.completed(&b.host);
         free_staging(b, r, completed);
+        renamed(b, r);
+        settled(b, r, completed);
+        unnamed(b, r);
         let done = finished(b, r, completed);
-        (std::mem::take(&mut r.pending), done)
+        // (an image that went since it was queued is not set up or filled)
+        let live = |i: &Arc<Image>| r.images.get(&i.key).is_some_and(|j| Arc::ptr_eq(i, j)) || r.remade.iter().any(|(n, _)| Arc::ptr_eq(i, n));
+        let pending: Vec<Arc<Image>> = std::mem::take(&mut r.pending).into_iter().filter(live).collect();
+        (pending, done)
     };
     for img in done {
         destroy(b, &img);
@@ -332,9 +410,11 @@ fn detile(b: &Backend, img: &Image, subs: &[Sub], linear: &mut [u8], base: u64) 
     // Protect, then copy: a store into its memory from here on faults and
     // has it filled again (`crate::track`). Memory that cannot be tracked
     // is checked by fingerprint ([`refresh`]).
-    let tracked = crate::track::protect(img.key.address, img.bytes.max(layout.size), true);
+    // (the head of the layout that holds the image's levels: what follows
+    // is other textures' memory, or not mapped)
+    let tracked = crate::track::protect(img.key.address, img.bytes, true);
     img.tracked.store(tracked, Ordering::Relaxed);
-    let tiled = super::super::read_title(b, img.key.address, layout.size)?;
+    let tiled = super::super::read_head(b, img.key.address, img.bytes, layout.size)?;
     if !tracked {
         // The baseline the fingerprint check compares with (a first check
         // would only store it, missing a change made before it).

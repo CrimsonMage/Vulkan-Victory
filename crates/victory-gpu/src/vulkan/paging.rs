@@ -44,9 +44,15 @@ pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
         return;
     };
     let to64 = to as u64;
-    // Images over pages that now show other memory (or none) go (before
-    // the memory lock): the title streams by mapping fresh pages under new
-    // textures and taking old ones away, so images follow its live ones.
+    if images::census_on() {
+        let shown = pages.iter().flatten().count();
+        images::census_mapping(to64, shown, pages.len() - shown);
+    }
+    // Images the card writes over pages that now show other memory (or
+    // none) go (before the memory lock). The textures the title fills
+    // there stay, and are filled again below from the pages shown now: the
+    // title streams by mapping fresh pages under its textures, and says
+    // which textures it has in its descriptor slots (`images/named.rs`).
     images::released(b, to64, pages.len() as u64 * PAGE, images::Dropped::Remapped);
     // Protect, then copy: a store after this is seen at the next flush.
     crate::track::protect(to64, pages.len() as u64 * PAGE, false);
@@ -62,6 +68,8 @@ pub fn title_pages_aliased(to: usize, pages: &[Option<GpuPage>]) {
     {
         tracing::error!(error = %format!("{e:#}"), "Vulkan: pages of the pool's GPU view were not mapped");
     }
+    drop(m_guard);
+    images::written(to64, pages.len() as u64 * PAGE);
 }
 
 /// The pool's GPU view over the page reservation holding `to`, made now.
@@ -151,6 +159,7 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     let Some(b) = backend().filter(|b| !b.timeline.lost()) else {
         return;
     };
+    images::census_written(at as u64, len as u64);
     // Card images over the memory are filled again.
     images::written(at as u64, len as u64);
     let mut guard = memory(b);
@@ -281,23 +290,24 @@ pub(super) fn ensure(b: &super::Backend, m: &mut Memory, at: u64, len: u64) {
     came_back(view);
 }
 
-/// Title memory a filled texture came to lie over (`true`) or left: asked
-/// under the images' lock, done at the next frame under the memory lock
-/// ([`settle`]).
+/// Pages of title memory that textures the title fills came to cover
+/// whole (`true`) or no longer do: asked under the images' lock, done at
+/// the next frame under the memory lock ([`settle`]).
 static TEXTURES: std::sync::Mutex<Vec<(u64, u64, bool)>> = std::sync::Mutex::new(Vec::new());
 
-/// A filled texture lies over `[at, at + len)` now (`over`), or no longer:
-/// programs read a texture's image, never its memory, so the pool pages
-/// wholly under one are the first to lose their card pages
-/// (`PoolView::cool`); the pages of everything else (geometry, tables
-/// programs read by address through views made once) keep theirs while a
-/// cold page has one. Before, the page touched least recently went,
-/// whatever it held, and only a recording that named a page brought it
-/// back: three quarters of the pool's view read zeros in the world (372 of
-/// 1,767 MB on the card, run ch3) and what was drawn changed from run to
-/// run (buildings, the window's mesh, hair).
-pub(super) fn texture_over(at: u64, len: u64, over: bool) {
-    super::lock(&TEXTURES).push((at, len, over));
+/// The textures the title fills cover the page at `at` whole now
+/// (`covered`: their own bytes, as the title's views say), or no longer:
+/// programs read a texture's image, never its memory, so such pool pages
+/// are the first to lose their card pages (`PoolView::cool`); the pages of
+/// everything else (geometry, tables programs read by address through
+/// views made once) keep theirs while a cold page has one. Before, the
+/// page touched least recently went, whatever it held, and only a
+/// recording that named a page brought it back: three quarters of the
+/// pool's view read zeros in the world (372 of 1,767 MB on the card, run
+/// ch3) and what was drawn changed from run to run (buildings, the
+/// window's mesh, hair).
+pub(super) fn texture_page(at: u64, covered: bool) {
+    super::lock(&TEXTURES).push((at, PAGE, covered));
 }
 
 /// A buffer view names `[at, at + len)`: its pool pages are read by

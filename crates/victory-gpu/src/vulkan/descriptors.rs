@@ -9,11 +9,23 @@
 //!
 //! A T#'s slot names a Vulkan image descriptor in the set-0 descriptor
 //! buffer (sampled at binding 0, storage at binding 1); an S#'s names a
-//! sampler in the set-1 descriptor buffer. Slots are given per distinct
-//! (image, view) and sampler, and freed when the image goes (after the
-//! timeline passes what may read them). Slot 0 of both is a null image
+//! sampler in the set-1 descriptor buffer. Slot 0 of both is a null image
 //! (one transparent black texel) and a plain linear sampler. Set 3 holds
 //! the memory map's uniform-buffer descriptor, one per map generation.
+//!
+//! **A slot belongs to a texture and a view of it** (the title address
+//! and shape that name the image, `images::Key`, and the view's ranges),
+//! as the console's descriptor names memory and a shape, **and stays
+//! theirs**: the title keeps its descriptors (programs pick textures by
+//! heap index, and nothing writes those descriptors again), so a slot
+//! given to another texture showed that texture through every descriptor
+//! that still carried it (the character's suit took its colours from
+//! other materials' textures, differently in every run). While the
+//! texture has no image its slots read the null image; when it has one
+//! again (made again for other levels, or after its memory came back)
+//! they show it, and the old descriptors work again. Slots are given in
+//! order; only when all 2^20 are given does a new view take the slots of
+//! the texture that has been without an image longest.
 //!
 //! **Every slot holds a valid descriptor at all times** (vk41: a graphics
 //! shader faulted with "Illegal Instruction Parameter"): every slot of
@@ -22,7 +34,7 @@
 //! before its own are written; and a slot whose image goes is set back to
 //! null at once (title descriptors may still carry it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -30,7 +42,7 @@ use victory_vk::ash::vk;
 use victory_vk::gfx10;
 use victory_vk::memory::{Buffer, Place};
 
-use super::images::{self, Image, ViewKey};
+use super::images::{self, Image, Key, ViewKey};
 use super::stages;
 use super::{Backend, lock};
 
@@ -68,11 +80,16 @@ unsafe impl Sync for Heaps {}
 #[derive(Default)]
 struct State {
     next: u32,
+    /// Slots taken back from textures long without an image.
     free: Vec<u32>,
-    deferred: Vec<(u64, u32)>,
-    views: HashMap<(u64, ViewKey), u32>,
-    by_image: HashMap<u64, Vec<u32>>,
-    keep: HashMap<u64, Arc<Image>>,
+    /// Textures whose image went, the longest ago first, with the
+    /// timeline's value then.
+    gone: VecDeque<(u64, Key)>,
+    /// The slot of each view of each texture.
+    views: HashMap<(Key, ViewKey), u32>,
+    by_texture: HashMap<Key, Vec<(ViewKey, u32)>>,
+    /// The image the slots of a texture show now.
+    shown: HashMap<Key, Arc<Image>>,
     samplers: HashMap<[u32; 8], u32>,
     sampler_objects: Vec<vk::Sampler>,
     /// Map generation and the block it went into.
@@ -320,14 +337,25 @@ impl Heaps {
 
     /// `slot` back to the null image on bindings 0-3.
     fn null_slot(&self, slot: u32) {
+        for binding in [Binding::Sampled, Binding::Storage, Binding::Cube, Binding::Wide] {
+            self.null_at(slot, binding);
+        }
+    }
+
+    /// `slot` back to the null image on one binding.
+    fn null_at(&self, slot: u32, binding: Binding) {
         let Some(n) = self.nulls.get() else { return };
         if slot == 0 {
             return;
         }
-        for (bytes, at) in [(&n[0], self.sampled_at), (&n[1], self.storage_at), (&n[2], self.cube_at), (&n[4], self.wide_at)] {
-            // SAFETY: the slot lies inside the mapped set-0 range.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.resource.mapped.add(at as usize + slot as usize * bytes.len()), bytes.len()) };
-        }
+        let (bytes, at) = match binding {
+            Binding::Sampled => (&n[0], self.sampled_at),
+            Binding::Storage => (&n[1], self.storage_at),
+            Binding::Cube => (&n[2], self.cube_at),
+            Binding::Wide => (&n[4], self.wide_at),
+        };
+        // SAFETY: the slot lies inside the mapped set-0 range.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.resource.mapped.add(at as usize + slot as usize * bytes.len()), bytes.len()) };
     }
 
     /// Slot 0 of `binding`: a null descriptor (`nullDescriptor`).
@@ -397,12 +425,37 @@ impl Heaps {
         }
     }
 
-    /// The slot of `view` of `image` (written the first time).
+    /// The slot of `view` of `image`'s texture (given and written the
+    /// first time).
     fn image_slot(&self, b: &Backend, image: &Arc<Image>, key: ViewKey) -> Option<u32> {
         let mut s = lock(&self.state);
-        if let Some(&slot) = s.views.get(&(image.id, key)) {
+        self.show(b, &mut s, image);
+        if let Some(&slot) = s.views.get(&(image.key, key)) {
             return Some(slot);
         }
+        let image = &s.shown.get(&image.key).cloned().unwrap_or_else(|| image.clone());
+        let slot = match s.free.pop() {
+            Some(slot) => slot,
+            None if s.next < IMAGE_SLOTS => {
+                s.next += 1;
+                s.next - 1
+            }
+            None => self.take_back(b, &mut s)?,
+        };
+        if !self.write_slot(b, slot, image, key) {
+            self.null_slot(slot);
+            s.free.push(slot);
+            return None;
+        }
+        s.views.insert((image.key, key), slot);
+        s.by_texture.entry(image.key).or_default().push((key, slot));
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        Some(slot)
+    }
+
+    /// The descriptors of `key`'s view of `image` into `slot`; whether
+    /// the image has such a view.
+    fn write_slot(&self, b: &Backend, slot: u32, image: &Arc<Image>, key: ViewKey) -> bool {
         let sampled = image.view(b, ViewKey { storage: false, ..key });
         let storage = if key.storage { image.view(b, key) } else { None };
         if key.storage {
@@ -412,44 +465,59 @@ impl Heaps {
                 None => super::images::once_warn(format!("Vulkan: an unordered view without a storage view: {:?} of an image of {:?} at {:#x}, usage {:?}", key.format, image.format, image.key.address, image.usage)),
             }
         }
-        let sampled = sampled.or(storage)?;
+        let Some(sampled) = sampled.or(storage) else { return false };
+        let wide = storage.and_then(|_| wide_view(b, image, key));
+        let cube = matches!(key.kind, vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY)
+            .then(|| image.view(b, ViewKey { kind: vk::ImageViewType::TYPE_2D_ARRAY, storage: false, ..key }))
+            .flatten();
+        // Each binding straight to its new descriptor (work in flight may
+        // read the slot as this runs), or to null: nothing of the slot's
+        // last image is left on any binding.
+        for (view, binding) in [(Some(sampled), Binding::Sampled), (storage, Binding::Storage), (wide, Binding::Wide), (cube, Binding::Cube)] {
+            match view {
+                Some(view) => self.write_image(b, slot, view, binding),
+                None => self.null_at(slot, binding),
+            }
+        }
+        true
+    }
+
+    /// `image` is its texture's image now: the slots the texture has show
+    /// it (after it was made again, or came back).
+    fn show(&self, b: &Backend, s: &mut State, image: &Arc<Image>) {
+        // (ids grow: a caller that still holds the image before the one
+        // shown changes nothing)
+        if s.shown.get(&image.key).is_some_and(|i| i.id >= image.id) {
+            return;
+        }
+        s.shown.insert(image.key, image.clone());
+        for &(view, slot) in s.by_texture.get(&image.key).map_or(&[][..], |v| v) {
+            if !self.write_slot(b, slot, image, view) {
+                self.null_slot(slot);
+            }
+        }
+    }
+
+    /// Every slot is given: the slots of the texture that has been without
+    /// an image longest (and that the card is past) are taken back; one
+    /// of them.
+    fn take_back(&self, b: &Backend, s: &mut State) -> Option<u32> {
         let completed = b.timeline.completed(&b.host);
-        let mut i = 0;
-        while i < s.deferred.len() {
-            if s.deferred[i].0 <= completed {
-                let (_, slot) = s.deferred.swap_remove(i);
+        while s.free.is_empty() {
+            let &(value, key) = s.gone.front()?;
+            if value > completed {
+                return None;
+            }
+            s.gone.pop_front();
+            if s.shown.contains_key(&key) {
+                continue;
+            }
+            for (view, slot) in s.by_texture.remove(&key).unwrap_or_default() {
+                s.views.remove(&(key, view));
                 s.free.push(slot);
-            } else {
-                i += 1;
             }
         }
-        let slot = match s.free.pop() {
-            Some(slot) => slot,
-            None if s.next < IMAGE_SLOTS => {
-                s.next += 1;
-                s.next - 1
-            }
-            None => return None,
-        };
-        // Nothing of the slot's last image is left on any binding.
-        self.null_slot(slot);
-        self.write_image(b, slot, sampled, Binding::Sampled);
-        if let Some(st) = storage {
-            self.write_image(b, slot, st, Binding::Storage);
-            if let Some(wide) = wide_view(b, image, key) {
-                self.write_image(b, slot, wide, Binding::Wide);
-            }
-        }
-        if matches!(key.kind, vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY)
-            && let Some(array) = image.view(b, ViewKey { kind: vk::ImageViewType::TYPE_2D_ARRAY, storage: false, ..key })
-        {
-            self.write_image(b, slot, array, Binding::Cube);
-        }
-        s.views.insert((image.id, key), slot);
-        s.by_image.entry(image.id).or_default().push(slot);
-        s.keep.entry(image.id).or_insert_with(|| image.clone());
-        STATS[0].fetch_add(1, Ordering::Relaxed);
-        Some(slot)
+        s.free.pop()
     }
 
     /// The slot of a sampler (made the first time).
@@ -577,37 +645,119 @@ pub(crate) fn slot_view(slot: u32) -> String {
     let Some(b) = super::backend() else { return "?".into() };
     let Some(h) = heaps(b) else { return "?".into() };
     let s = lock(&h.state);
-    let found = s.views.iter().find(|(_, v)| **v == slot).map(|((id, k), _)| {
-        let image = s.keep.get(id).map(|i| format!(" at {:#x} {:?} {}x{}x{}", i.key.address, i.format, i.extent.width, i.extent.height, i.extent.depth)).unwrap_or_default();
-        format!("image {id}{image} view {:?} {:?} mips {}+{} layers {}+{} storage={}", k.kind, k.format, k.base_mip, k.mips, k.base_layer, k.layers, k.storage)
+    let found = s.views.iter().find(|(_, v)| **v == slot).map(|((key, k), _)| {
+        let image = match s.shown.get(key) {
+            Some(i) => format!("image {} at {:#x} {:?} {}x{}x{}", i.id, i.key.address, i.format, i.extent.width, i.extent.height, i.extent.depth),
+            None => format!("null (its texture at {:#x} has no image)", key.address),
+        };
+        format!("{image} view {:?} {:?} mips {}+{} layers {}+{} storage={}", k.kind, k.format, k.base_mip, k.mips, k.base_layer, k.layers, k.storage)
     });
-    found.unwrap_or_else(|| if slot < s.next { "null (freed)".into() } else { "null (never given)".into() })
+    found.unwrap_or_else(|| if slot < s.next { "null (taken back)".into() } else { "null (never given)".into() })
 }
 
 /// Diagnostics: the image and view the host wrote at image slot `slot`.
 pub(crate) fn slot_image(slot: u32) -> Option<(Arc<Image>, ViewKey)> {
     let h = heaps(super::backend()?)?;
     let s = lock(&h.state);
-    let (&(id, key), _) = s.views.iter().find(|(_, v)| **v == slot)?;
-    Some((s.keep.get(&id)?.clone(), key))
+    let (&(key, view), _) = s.views.iter().find(|(_, v)| **v == slot)?;
+    Some((s.shown.get(&key)?.clone(), view))
 }
 
-/// The image `id` is gone: its slots are reused once the card is done.
-pub(crate) fn image_gone(id: u64) {
+/// `image` is gone: the slots of its texture read the null image until
+/// the texture has an image again (title descriptors may still carry
+/// them: never a view of an image that is gone, never another texture).
+pub(crate) fn image_gone(image: &Image) {
     let Some(b) = super::backend() else { return };
     let Some(h) = heaps(b) else { return };
-    let value = b.timeline.last();
     let mut s = lock(&h.state);
-    if let Some(slots) = s.by_image.remove(&id) {
-        for slot in slots {
-            // Title descriptors may still carry the slot: it reads the null
-            // image from now on, never a view of an image that is gone.
-            h.null_slot(slot);
-            s.deferred.push((value, slot));
+    // (made again since: the slots show the new image already)
+    if s.shown.get(&image.key).is_none_or(|i| i.id != image.id) {
+        return;
+    }
+    s.shown.remove(&image.key);
+    let slots = s.by_texture.get(&image.key).map_or(0, Vec::len);
+    for &(_, slot) in s.by_texture.get(&image.key).map_or(&[][..], |v| v) {
+        h.null_slot(slot);
+    }
+    if slots > 0 {
+        s.gone.push_back((b.timeline.last(), image.key));
+    }
+}
+
+/// `image` was made: the slots its texture has from an earlier image
+/// show it.
+pub(crate) fn image_made(image: &Arc<Image>) {
+    let Some(b) = super::backend() else { return };
+    let Some(h) = heaps(b) else { return };
+    let mut s = lock(&h.state);
+    if s.by_texture.contains_key(&image.key) {
+        h.show(b, &mut s, image);
+    }
+}
+
+/// The title's shader-visible view heaps: first address and bytes.
+static TITLE_HEAPS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// The title made a shader-visible heap of views at `start`.
+pub(crate) fn title_heap(start: u64, size: u64) {
+    lock(&TITLE_HEAPS).push((start, size));
+}
+
+/// Diagnostics: the texture descriptors in the title's view heaps (T#s
+/// with the host's check word and a slot), those of them whose slot
+/// belongs to a texture without an image (they read the null image: a
+/// black or missing surface if a program picks them), and the first of
+/// those (heap index, slot, the texture's address). Descriptors the
+/// title copied itself are among them; so are ones it no longer uses.
+pub(crate) fn reading_null() -> (usize, usize, String) {
+    let Some(h) = super::backend().and_then(heaps) else { return (0, 0, String::new()) };
+    let waiting: HashMap<u32, u64> = {
+        let s = lock(&h.state);
+        s.by_texture.iter().filter(|(k, _)| !s.shown.contains_key(*k)).flat_map(|(k, v)| v.iter().map(|&(_, slot)| (slot, k.address))).collect()
+    };
+    let heaps_now = lock(&TITLE_HEAPS).clone();
+    let (mut all, mut null, mut first) = (0, 0, Vec::new());
+    let mut page = vec![0u8; 64 << 10];
+    for (start, size) in heaps_now {
+        for at in (start..start + size).step_by(page.len()) {
+            let n = page.len().min((start + size - at) as usize);
+            if !read_own(at, &mut page[..n]) {
+                continue;
+            }
+            for (i, d) in page[..n].chunks_exact(32).enumerate() {
+                let word = |w: usize| u32::from_le_bytes([d[4 * w], d[4 * w + 1], d[4 * w + 2], d[4 * w + 3]]);
+                let slot = word(7) & 0xff_ffff;
+                if word(6) ^ word(7) != gfx10::T_CHECK || slot == 0 {
+                    continue;
+                }
+                all += 1;
+                let Some(texture) = waiting.get(&slot) else { continue };
+                null += 1;
+                if first.len() < 6 {
+                    first.push(format!("heap {:#x} slot {slot:#x} texture at {texture:#x}", (at - start) as usize / 32 + i));
+                }
+            }
         }
     }
-    s.views.retain(|(i, _), _| *i != id);
-    s.keep.remove(&id);
+    (all, null, first.join("; "))
+}
+
+/// Reads our own memory at `at` through the kernel (a page of a heap the
+/// title has not committed is no fault).
+fn read_own(at: u64, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut copied = 0;
+    // SAFETY: the destination is `out`; the kernel checks the source.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, out.as_mut_ptr().cast(), out.len(), &mut copied) != 0 }
+}
+
+/// For the 10 s line: slots given, slots of textures without an image.
+pub(crate) fn slots() -> (u32, usize) {
+    let Some(h) = super::backend().and_then(heaps) else { return (0, 0) };
+    let s = lock(&h.state);
+    let waiting = s.by_texture.iter().filter(|(k, _)| !s.shown.contains_key(*k)).map(|(_, v)| v.len()).sum();
+    (s.next - 1, waiting)
 }
 
 // ---- samplers ----

@@ -14,6 +14,13 @@
 //!   reads, page mappings: `vulkan::title_memory_written`). Textures the
 //!   card writes (targets, depth, unordered access) are not filled: the
 //!   card's copy is theirs.
+//! - **Its levels** are the ones the title's latest view of it names
+//!   (`levels.rs`: the title streams levels and says in the view which
+//!   are there); made again when a view names another first level.
+//! - **A texture the title fills lives while one of the title's
+//!   descriptor slots names it** (`named.rs`): the title has no resource
+//!   to release for a texture it places itself, and the slot is how it
+//!   knows the texture; neighbours in its texture pool do not end it.
 //! - **Layouts**: every image lives in `GENERAL` from its creation on
 //!   (attachments, sampling, storage and copies all take it). The title's
 //!   barriers become global memory barriers; there is no per-image state
@@ -32,11 +39,16 @@ use victory_vk::memory::Buffer;
 use super::{Backend, lock};
 
 mod alloc;
+mod census;
 mod fill;
+mod levels;
+mod named;
 
 use alloc::{Block, PLACES, USERS, allocate, memory_type_of, release};
 pub(crate) use alloc::used_mb;
+pub(crate) use census::{mapping as census_mapping, on as census_on, view as census_view, written as census_written};
 pub(crate) use fill::{flush, format_bytes, refresh, released, written};
+pub(crate) use named::{copied as slots_copied, shows as slot_shows};
 use crate::object::This;
 use crate::resource::ResourceDesc;
 
@@ -46,7 +58,6 @@ const DEPTH_STENCIL: u32 = 2;
 const UNORDERED: u32 = 4;
 const BUFFER: u32 = 1;
 const TEXTURE_1D: u32 = 2;
-const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// The shape that, with the address, names an image.
@@ -102,8 +113,21 @@ pub(crate) struct Image {
     /// It shares the memory of an earlier image at its address (one memory,
     /// several shapes, as on the console): made without a clear.
     alias: bool,
-    /// Bytes of its console layout.
+    /// Bytes of its console layout its levels are read from: the head of
+    /// the layout through its largest level (`levels.rs`), all of it for
+    /// an image that leaves none out.
     pub(crate) bytes: u64,
+    /// Bytes of the layout through the level the title's view named: the
+    /// texture's own memory, as the title says (the pool's view takes its
+    /// pages as texture memory, [`Registry::page`]).
+    claim: u64,
+    /// The first console level the title's view named when the image was
+    /// made (0 for an image that keeps every level).
+    named: u32,
+    /// The first level its latest view names: when it is another than
+    /// `named` the image is made again at the next flush
+    /// (`fill::renamed`).
+    wanted: std::sync::atomic::AtomicU32,
     views: Mutex<Vec<(ViewKey, vk::ImageView)>>,
     /// A depth image the title also writes through a storage view (a
     /// compute program storing into a depth buffer's memory, plain memory
@@ -303,20 +327,46 @@ struct Registry {
     /// The images the title fills, by each 64 KiB page of title memory
     /// they lie over: a write names its pages ([`fill::written`]).
     over: std::collections::HashMap<u64, Vec<Arc<Image>>>,
+    /// Textures whose latest view names another first level than their
+    /// image has: made again at the next flush (`fill::renamed`).
+    renamed: Vec<Key>,
+    /// Images made again for other levels, until the card has set them up
+    /// and filled them (`fill::settled`: then each takes its texture's
+    /// place and slots), with the fills its texture's image had when it
+    /// was made.
+    remade: Vec<(Arc<Image>, u64)>,
+}
+
+/// Whether the textures' own bytes (`claim`) cover the whole of `page`.
+fn covered(page: u64, images: &[Arc<Image>]) -> bool {
+    let (from, to) = (page << 16, (page + 1) << 16);
+    let mut spans: Vec<(u64, u64)> = images.iter().map(|i| (i.key.address.max(from), (i.key.address + i.claim).min(to))).collect();
+    spans.sort_unstable();
+    let mut reach = from;
+    for (start, end) in spans {
+        if start > reach {
+            return false;
+        }
+        reach = reach.max(end);
+    }
+    reach >= to
 }
 
 impl Registry {
-    /// Puts `img` into, or takes it out of, the pages it lies over.
+    /// Puts `img` into, or takes it out of, the pages its own bytes lie
+    /// over. A page textures cover whole is texture memory to the pool's
+    /// view: programs read the images, never the page, so it gives its
+    /// card page up before a page programs read by address does
+    /// (`paging::texture_page`).
     fn page(&mut self, img: &Arc<Image>, add: bool) {
-        // (the pool's view keeps card pages for what programs read by
-        // address before it keeps them for a texture's memory)
-        super::paging::texture_over(img.key.address, img.bytes.max(1), add);
-        for page in img.key.address >> 16..=(img.key.address + img.bytes.max(1) - 1) >> 16 {
+        for page in img.key.address >> 16..=(img.key.address + img.claim.max(1) - 1) >> 16 {
             let there = self.over.entry(page).or_default();
             there.retain(|i| !Arc::ptr_eq(i, img));
             if add {
                 there.push(img.clone());
-            } else if there.is_empty() {
+            }
+            super::paging::texture_page(page << 16, covered(page, there));
+            if there.is_empty() {
                 self.over.remove(&page);
             }
         }
@@ -334,38 +384,6 @@ impl Registry {
     /// The key every image that may cover `at` sorts at or after.
     fn first_over(&self, at: u64) -> Key {
         Key { address: at.saturating_sub(self.widest), dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false }
-    }
-
-    /// The title's memory under a new image held other textures: one
-    /// memory holds one texture at a time on the console, so filled images
-    /// that start elsewhere and overlap `[at, at + len)` are textures the
-    /// title has since replaced (it reuses its texture pool without
-    /// unmapping it). They go once the card is done with them; without
-    /// this they piled up to the card-memory ceiling (vk46: 35,467 live).
-    fn drop_overlaid(&mut self, b: &Backend, at: u64, len: u64) {
-        let gone: Vec<Key> = self
-            .images
-            .range(self.first_over(at)..)
-            .take_while(|(k, _)| k.address < at + len)
-            .filter(|(k, i)| k.address != at && !i.card_written() && k.address + i.bytes.max(1) > at)
-            .map(|(k, _)| *k)
-            .collect();
-        let value = b.timeline.last();
-        for k in gone {
-            if let Some(img) = self.take(&k) {
-                if cfg!(feature = "diagnostics") && DROPPED[Dropped::Overlaid as usize].load(Ordering::Relaxed) < 12 {
-                    tracing::info!(
-                        new_at = %format_args!("{at:#x}+{len:#x}"),
-                        old_at = %format_args!("{:#x}+{:#x}", k.address, img.bytes),
-                        old = %format_args!("{:?} {}x{} mips={}", img.format, img.extent.width, img.extent.height, img.mips),
-                        "Vulkan: a texture made over an older one's memory (the older image goes)"
-                    );
-                }
-                super::descriptors::image_gone(img.id);
-                self.dropped.push((value, img));
-                DROPPED[Dropped::Overlaid as usize].fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 }
 
@@ -386,11 +404,13 @@ pub(crate) enum Dropped {
     Unmapped,
     Remapped,
     Resource,
-    /// A newer texture was made over part of its memory.
-    Overlaid,
+    /// No descriptor slot of the title names the texture any more.
+    Unnamed,
+    /// Its view names another first level: the image was made again.
+    Renamed,
 }
 
-pub(crate) static DROPPED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static DROPPED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Images made by what named them first (a view, a resource: target, copy,
 /// plane), and by 256 MiB of title address (diagnostics: where they come from).
@@ -413,7 +433,13 @@ pub(crate) fn report() {
         dropped_unmapped = n(&DROPPED, 1),
         dropped_remapped = n(&DROPPED, 2),
         dropped_resource = n(&DROPPED, 3),
-        dropped_overlaid = n(&DROPPED, 4),
+        dropped_unnamed = n(&DROPPED, 4),
+        made_again_for_levels = n(&DROPPED, 5),
+        named = %named::counts(),
+        slots = %{
+            let (given, waiting) = super::descriptors::slots();
+            format!("{given} given, {waiting} of textures without an image")
+        },
         not_fitting_aliases = UNFIT.load(Ordering::Relaxed),
         fingerprinted_mb = fill::CHECKED.load(Ordering::Relaxed) >> 20,
         cpu_changed_fills = n(&STATS, 4),
@@ -421,6 +447,15 @@ pub(crate) fn report() {
         "Vulkan: images"
     );
     if cfg!(feature = "diagnostics") {
+        let without = registry().as_ref().map_or(0, |r| named::without(|k| r.images.contains_key(k)));
+        let (descriptors, null, first) = super::descriptors::reading_null();
+        tracing::info!(
+            named_without_image = without,
+            title_descriptors = descriptors,
+            reading_null = null,
+            first = %first,
+            "Vulkan: textures the title's slots name that have no image, and the title's texture descriptors whose slot reads the null image"
+        );
         let (biggest, by_kind, sums) = biggest();
         tracing::info!(sums = %sums, biggest = %biggest, by_kind = %by_kind, "Vulkan: where image memory goes");
         tracing::info!(tracked = %fill::tracking(), "Vulkan: images by how a CPU store reaches them, and the ones filled most often");
@@ -509,11 +544,7 @@ pub(crate) fn resource_gone(b: &Backend, address: u64, desc: &ResourceDesc) {
     let Some(key) = key_of(address, desc) else { return };
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
-    if let Some(img) = r.take(&key) {
-        super::descriptors::image_gone(img.id);
-        r.dropped.push((b.timeline.last(), img));
-        DROPPED[Dropped::Resource as usize].fetch_add(1, Ordering::Relaxed);
-    }
+    r.drop_image(b, &key, Dropped::Resource, 0);
 }
 
 // ---- making ----
@@ -568,67 +599,125 @@ pub(crate) fn written_plane(b: &Backend, depth: &Arc<Image>, address: u64, desc:
 /// The image over `address` of `desc`'s shape, made the first time
 /// (`by_view`: a descriptor named it first, else a resource did).
 pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) -> Option<Arc<Image>> {
+    at_level(b, address, desc, None, by_view)
+}
+
+/// The image the view the title writes into its slot `handle` names, the
+/// view's first level `first`: as [`at`], the slot names the texture from
+/// now on (`named.rs`), and the image has the levels from `first` on. An
+/// image there with other levels is made again at the next flush
+/// (`fill::renamed`); until then the view shows the one there.
+pub(crate) fn at_view(b: &Backend, handle: u64, address: u64, desc: &ResourceDesc, first: u32) -> Option<Arc<Image>> {
+    at_level(b, address, desc, Some((handle, first)), true)
+}
+
+/// A key at `address` that sorts before every image there.
+fn first_at(key: Key) -> Key {
+    Key { dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false, ..key }
+}
+
+/// The image of `key` that is there: a view that names another first
+/// level (`first`) than it has has it made again.
+fn known(r: &mut Registry, key: &Key, view: Option<(u64, u32)>) -> Option<Arc<Image>> {
+    let i = r.images.get(key)?.clone();
+    if let Some((_, first)) = view.filter(|_| !i.card_written()) {
+        let first = levels::named(&i.desc, i.mips + i.dropped, first);
+        if i.wanted.swap(first, Ordering::Relaxed) != first && first != i.named {
+            r.renamed.push(*key);
+        }
+    }
+    Some(i)
+}
+
+fn at_level(b: &Backend, address: u64, desc: &ResourceDesc, view: Option<(u64, u32)>, by_view: bool) -> Option<Arc<Image>> {
     let key = key_of(address, desc)?;
     let mut guard = registry();
     let r = guard.get_or_insert_with(Registry::default);
-    if let Some(i) = r.images.get(&key) {
-        return Some(i.clone());
+    // (under the registry's lock: a texture named here is not let go by a
+    // flush that runs beside this)
+    if let Some((handle, _)) = view {
+        named::shows(handle, Some(key));
     }
-    // One memory, several shapes: an image over memory another image has
-    // shares its card memory (the largest one there).
+    if let Some(i) = known(r, &key, view) {
+        return Some(i);
+    }
+    // One memory, several shapes: an image over memory the card writes
+    // shares the card memory of the image there (the largest one). Two
+    // textures the title fills never share: each is filled with its own
+    // shape, and the older is another texture's stale image.
+    let written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0;
     let alias = r
         .images
-        .range(Key { dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false, ..key }..)
+        .range(first_at(key)..)
         .take_while(|(k, _)| k.address == address)
         // a depth image's card memory holds nothing a colour image reads
-        .filter(|(k, _)| k.depth == key.depth)
+        .filter(|(k, i)| k.depth == key.depth && (written || i.card_written()))
         .map(|(_, i)| i.clone())
         .max_by_key(|i| lock(&PLACES).get(&i.id).map_or(0, |p| p.2));
-    let made = make(b, r, key, desc, alias.as_ref());
+    let made = make(b, r, key, desc, alias.as_ref(), view.map_or(0, |v| v.1));
     if let (Some(new), Some(_)) = (&made, &alias)
         && new.card_written()
     {
         // The card writes this memory: no image over it is filled from it.
-        for (_, i) in r.images.range(Key { dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false, ..key }..).take_while(|(k, _)| k.address == address) {
+        for (_, i) in r.images.range(first_at(key)..).take_while(|(k, _)| k.address == address) {
             i.card_written.store(true, Ordering::Relaxed);
         }
     }
     match made {
-        Some(img) => {
-            let img = Arc::new(img);
-            r.widest = r.widest.max(img.bytes);
-            if !img.card_written() {
-                r.drop_overlaid(b, address, img.bytes.max(1));
-                r.page(&img, true);
-            }
-            // Into GENERAL and cleared at the next flush (ahead of anything
-            // that uses it); filled after that unless the card writes it.
-            img.pending.store(true, Ordering::Relaxed);
-            r.pending.push(img.clone());
-            r.images.insert(key, img.clone());
-            STATS[0].fetch_add(1, Ordering::Relaxed);
-            MADE[usize::from(!by_view)].fetch_add(1, Ordering::Relaxed);
-            *lock(&MADE_AT).get_or_insert_with(Default::default).entry(address >> 28).or_insert(0) += 1;
-            Some(img)
-        }
+        Some(img) => Some(r.enter(Arc::new(img), by_view)),
         None => {
-            // Which images a run goes without (the first ones; the 10 s
-            // line counts them all): a draw into one is left out, a
-            // program that reads one reads zeros.
-            if cfg!(feature = "diagnostics") && STATS[3].fetch_add(1, Ordering::Relaxed) < 48 {
-                tracing::warn!(
-                    at = format_args!("{address:#x}"),
-                    format = desc.format,
-                    size = format_args!("{}x{}x{}", desc.width, desc.height, desc.depth_or_array_size),
-                    mips = desc.mip_levels,
-                    flags = format_args!("{:#x}", desc.flags),
-                    "Vulkan: no image was made (no card memory under the ceiling, or no format for it)"
-                );
-            } else if !cfg!(feature = "diagnostics") {
-                STATS[3].fetch_add(1, Ordering::Relaxed);
-            }
+            refused(address, desc);
             None
         }
+    }
+}
+
+impl Registry {
+    /// A new image into the registry: queued to be set up and filled, and
+    /// the slots its texture had before show it again.
+    fn enter(&mut self, img: Arc<Image>, by_view: bool) -> Arc<Image> {
+        self.queue(&img);
+        self.place(&img);
+        MADE[usize::from(!by_view)].fetch_add(1, Ordering::Relaxed);
+        *lock(&MADE_AT).get_or_insert_with(Default::default).entry(img.key.address >> 28).or_insert(0) += 1;
+        img
+    }
+
+    /// `img` is its texture's image from now on: the slots the texture
+    /// has show it.
+    fn place(&mut self, img: &Arc<Image>) {
+        self.widest = self.widest.max(img.claim);
+        if !img.card_written() {
+            self.page(img, true);
+        }
+        self.images.insert(img.key, img.clone());
+        super::descriptors::image_made(img);
+    }
+
+    /// A new image: into GENERAL and cleared at the next flush (ahead of
+    /// anything that uses it); filled after that unless the card writes it.
+    fn queue(&mut self, img: &Arc<Image>) {
+        img.pending.store(true, Ordering::Relaxed);
+        self.pending.push(img.clone());
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Which images a run goes without (the first ones; the 10 s line counts
+/// them all): a draw into one is left out, a program that reads one reads
+/// zeros.
+fn refused(address: u64, desc: &ResourceDesc) {
+    if cfg!(feature = "diagnostics") && STATS[3].fetch_add(1, Ordering::Relaxed) < 48 {
+        tracing::warn!(
+            at = format_args!("{address:#x}"),
+            format = desc.format,
+            size = format_args!("{}x{}x{}", desc.width, desc.height, desc.depth_or_array_size),
+            mips = desc.mip_levels,
+            flags = format_args!("{:#x}", desc.flags),
+            "Vulkan: no image was made (no card memory under the ceiling, or no format for it)"
+        );
+    } else if !cfg!(feature = "diagnostics") {
+        STATS[3].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -647,7 +736,7 @@ fn made_format(desc: &ResourceDesc, card_written: bool) -> Option<vk::Format> {
     color_format(desc.format, card_written)
 }
 
-fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Option<&Arc<Image>>) -> Option<Image> {
+fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Option<&Arc<Image>>, first: u32) -> Option<Image> {
     let depth = key.depth;
     let card_written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0
         || alias.is_some_and(|a| a.card_written());
@@ -670,8 +759,9 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         0 => full,
         n => u32::from(n).min(full),
     };
-    let dropped = dropped_of(desc, card_written || depth || alias.is_some(), mips);
-    let extent = vk::Extent3D { width: extent.width >> dropped, height: extent.height >> dropped, ..extent };
+    let levels = levels::of(desc, card_written || depth || alias.is_some(), mips, first);
+    let dropped = levels.dropped;
+    let extent = vk::Extent3D { width: (extent.width >> dropped).max(1), height: (extent.height >> dropped).max(1), ..extent };
     let mips = mips - dropped;
     let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
     if depth {
@@ -771,7 +861,6 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
     let size = shared.map_or(needs.size, |s| s.2);
     lock(&PLACES).insert(id, (memory, offset, size, ty));
     *lock(&USERS).entry((memory, offset)).or_insert(0) += 1;
-    let bytes = crate::resource::texture_layout(desc).map_or(0, |t| t.size);
     Some(Image {
         id,
         key,
@@ -787,7 +876,10 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         desc: *desc,
         card_written: AtomicBool::new(card_written),
         alias: alias.is_some(),
-        bytes,
+        bytes: levels.bytes,
+        claim: levels.claim,
+        named: levels.named,
+        wanted: std::sync::atomic::AtomicU32::new(levels.named),
         views: Mutex::new(Vec::new()),
         plane: OnceLock::new(),
         plane_stencil: OnceLock::new(),
@@ -802,25 +894,6 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         tracked: AtomicBool::new(false),
         cpu_changed: AtomicBool::new(false),
     })
-}
-
-/// The largest levels texture quality leaves out of the image of a texture
-/// the title fills (`crate::quality`, as the D3D12 path's
-/// `resource::dropped_levels`): two-dimensional, of one sample, in a
-/// console layout the detiling reads. None of a texture the card writes,
-/// a depth texture or an image over another's memory (`kept_whole`).
-fn dropped_of(desc: &ResourceDesc, kept_whole: bool, mips: u32) -> u32 {
-    if kept_whole || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
-        return 0;
-    }
-    let Some((_, block)) = crate::resource::element(crate::resource::pc_format(desc.format)) else {
-        return 0;
-    };
-    let readable = crate::resource::texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
-    if !readable {
-        return 0;
-    }
-    crate::quality::dropped_for(desc.width, u64::from(desc.height), mips, block)
 }
 
 /// The image's level and layer of the console's subresource `index`

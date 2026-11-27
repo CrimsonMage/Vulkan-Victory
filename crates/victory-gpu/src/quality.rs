@@ -6,7 +6,15 @@
 //! largest level, at `low` its two largest: a quarter or a sixteenth of the
 //! card's memory, and of the detiling. The title sees no difference: its
 //! descriptions, sizes and queries are the console's. Only the card image
-//! is smaller (`vulkan/images.rs`, [`dropped_for`]).
+//! is smaller (`vulkan/images/levels.rs`, [`dropped_for`]).
+//!
+//! Only block-compressed textures: those are the colour, normal and
+//! parameter textures a surface is shaded from, where a level less is a
+//! softer picture. An uncompressed texture the title fills is data as
+//! often as colour (a map of material numbers a program reads at an
+//! explicit level, a glyph cache): a smaller image of it blends numbers
+//! (the pale seams on the character's suit, `docs/kiss.md` 2026-11-27),
+//! and there are few of them (9 MB in the test scene).
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -79,18 +87,15 @@ pub(crate) fn levels() -> u32 {
 
 /// The levels to leave out of a two-dimensional texture of `width` by
 /// `height` texels and `mips` levels, in a format of `block`-texel elements
-/// (4: block compressed): at most [`levels`], one level always kept, both
-/// sides at least [`SMALLEST`], and a block-compressed level 0 of whole
-/// blocks (the host requires it).
+/// (4: block compressed; none of a texture of single texels): at most
+/// [`levels`], one level always kept, both sides at least [`SMALLEST`],
+/// and a level 0 of whole blocks.
 pub(crate) fn dropped_for(width: u64, height: u64, mips: u32, block: u64) -> u32 {
-    if width < SMALLEST || height < SMALLEST || mips < 2 {
+    if width < SMALLEST || height < SMALLEST || mips < 2 || block < 2 {
         return 0;
     }
     let mut dropped = levels().min(mips - 1);
-    while dropped > 0
-        && block > 1
-        && (!(width >> dropped).is_multiple_of(block) || !(height >> dropped).is_multiple_of(block))
-    {
+    while dropped > 0 && (!(width >> dropped).is_multiple_of(block) || !(height >> dropped).is_multiple_of(block)) {
         dropped -= 1;
     }
     dropped
@@ -111,15 +116,17 @@ mod tests {
     }
 
     #[test]
-    fn small_one_level_and_unaligned_textures_keep_their_levels() {
+    fn small_one_level_uncompressed_and_unaligned_textures_keep_their_levels() {
         DROPPED.store(3, Relaxed);
         assert_eq!(dropped_for(2048, 2048, 12, 4), 2);
-        assert_eq!(dropped_for(2048, 2048, 2, 1), 1);
-        assert_eq!(dropped_for(255, 2048, 12, 1), 0);
-        assert_eq!(dropped_for(2048, 2048, 1, 1), 0);
+        assert_eq!(dropped_for(2048, 2048, 2, 4), 1);
+        assert_eq!(dropped_for(255, 2048, 12, 4), 0);
+        assert_eq!(dropped_for(2048, 2048, 1, 4), 0);
         // 1000 / 4 = 250 is no whole number of blocks; 1000 / 2 = 500 is.
         assert_eq!(dropped_for(1000, 1000, 10, 4), 1);
-        assert_eq!(dropped_for(1000, 1000, 10, 1), 2);
+        // single texels: data as often as colour
+        assert_eq!(dropped_for(1000, 1000, 10, 1), 0);
+        assert_eq!(dropped_for(256, 256, 7, 1), 0);
         DROPPED.store(0, Relaxed);
     }
 }

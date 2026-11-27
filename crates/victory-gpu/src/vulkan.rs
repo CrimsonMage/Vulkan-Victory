@@ -801,6 +801,9 @@ pub(crate) fn heap_created(start: u64, size: u64, kind: u32, visible: bool, plac
     } else {
         tracing::warn!(start = format_args!("{start:#x}"), kb = size >> 10, kind, placed, "Vulkan: a shader-visible descriptor heap above 4 GiB: tables (32-bit addresses) cannot reach it");
     }
+    if kind == 0 {
+        descriptors::title_heap(start, size);
+    }
     // The whole heap, whatever is committed or mapped where now: every
     // piece of it is imported (it may lie across several views).
     let mut m = match backend() {
@@ -956,18 +959,32 @@ impl Memory {
 /// Reads `len` bytes of title memory at `at` for the CPU (pages of the
 /// pool's GPU view from their homes).
 fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    read_pages(b, at, len, len, true)
+}
+
+/// The first `len` bytes of a texture's console layout of `whole` bytes
+/// at `at`, the head the title holds, in a buffer of the whole layout:
+/// the rest, and pages the title has not mapped, are zeros.
+fn read_head(b: &Backend, at: u64, len: u64, whole: u64) -> anyhow::Result<Vec<u8>> {
+    read_pages(b, at, len.min(whole), whole, false)
+}
+
+/// `len` bytes at `at` into a buffer of `whole` bytes; a page that is not
+/// there is an error (`strict`) or reads zeros.
+fn read_pages(b: &Backend, at: u64, len: u64, whole: u64, strict: bool) -> anyhow::Result<Vec<u8>> {
     // Diagnostics read whatever a draw pushed (not always an address): only
     // memory known to be title memory the CPU reads (run vk26 crashed in a
     // copy from address 0 here).
     anyhow::ensure!(at != 0 && cpu_readable(b, at, len), "{at:#x} is not title memory the CPU reads");
     let m = memory(b);
-    let mut out = vec![0u8; len as usize];
+    let mut out = vec![0u8; whole as usize];
     let mut done = 0u64;
     while done < len {
         let here = at + done;
         let page_left = PAGE - (here % PAGE);
         let n = page_left.min(len - done);
-        let (cpu, _) = m.cpu_of(here).filter(|&(c, _)| c != 0).ok_or_else(|| anyhow::anyhow!("title memory at {here:#x} has no CPU view"))?;
+        let cpu = m.cpu_of(here).filter(|&(c, _)| c != 0);
+        anyhow::ensure!(cpu.is_some() || !strict, "title memory at {here:#x} has no CPU view");
         // The kernel makes the copy: a page the title has decommitted or
         // unmapped since (a V# of a capture's walk names any range) is an
         // error here, not a fault (run gi6 ended in one).
@@ -975,8 +992,8 @@ fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let mut copied = 0;
         // SAFETY: the destination is `n` bytes of `out`; the kernel checks the source.
-        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), cpu as *const _, out.as_mut_ptr().add(done as usize).cast(), n as usize, &mut copied) };
-        anyhow::ensure!(ok != 0, "title memory at {here:#x} is not readable");
+        let ok = cpu.is_some_and(|(cpu, _)| unsafe { ReadProcessMemory(GetCurrentProcess(), cpu as *const _, out.as_mut_ptr().add(done as usize).cast(), n as usize, &mut copied) } != 0);
+        anyhow::ensure!(ok || !strict, "title memory at {here:#x} is not readable");
         done += n;
     }
     Ok(out)
@@ -1005,6 +1022,12 @@ fn mesh(b: &Backend) -> Option<&'static victory_vk::ash::ext::mesh_shader::Devic
 /// `Create*View` / `CreateSampler`: the descriptor into the title's slot.
 pub(crate) fn write_descriptor(handle: u64, view: &crate::descriptor::View) {
     descriptors::write(handle, view);
+}
+
+/// A copy call copied `count` view slots from `src` to `dst`: the slots
+/// name the textures the sources name (`images/named.rs`).
+pub(crate) fn descriptors_copied(dst: u64, src: u64, count: u32) {
+    images::slots_copied(dst, src, count);
 }
 
 
