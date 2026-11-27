@@ -505,6 +505,20 @@ impl Lift<'_> {
         if a16 || d16 || x.len() != if wide { 12 } else { 11 } {
             return Err(unsupported(off, "a ray/node test with 16-bit operands"));
         }
+        if !bvh_builder() {
+            // No structures: a box enters no child, anything else is missed.
+            let k6 = self.k32(6);
+            let pair = self.spv(op::BITWISE_AND, Ty::U32, &[x[0], k6]);
+            let k4 = self.k32(4);
+            let is_box = self.spv(op::I_EQUAL, Ty::BOOL, &[pair, k4]);
+            let none = self.k32(BVH_NONE);
+            for (k, miss) in BVH_MISS.into_iter().enumerate() {
+                let miss = self.k32(miss.to_bits());
+                let c = self.spv(op::SELECT, Ty::U32, &[is_box, none, miss]);
+                self.def(inst, Reg::V(reg + k as u8), R::D(c));
+            }
+            return Ok(());
+        }
         let ptr = if wide { self.u64_of(x[0], x[1]) } else { self.spv(op::U_CONVERT, Ty::U64, &[x[0]]) };
         let ray: Vec<V> = x[if wide { 2 } else { 1 }..].iter().map(|&v| self.f32v(v)).collect();
         let w: Vec<V> = (0..2).map(|k| self.opnd_dw(inst, &rsrc, k, false).map(|v| self.u32v(v))).collect::<Res<_>>()?;
@@ -534,6 +548,40 @@ impl Lift<'_> {
         }
         Ok(())
     }
+}
+
+/// A child pointer that is not there (a box the ray does not enter).
+pub(super) const BVH_NONE: u32 = 0xffff_ffff;
+
+/// What a node test that hits no triangle returns: the distance's
+/// numerator +infinity over the denominator 1.0, no weights.
+pub(super) const BVH_MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to translate with the structure builder on or off.
+    pub(crate) static TEST_BVH_BUILDER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the title's ray-tracing structure builder runs:
+/// `VICTORY_BVH_BUILDER=1`, the switch the host reads to run the builder's
+/// dispatches (`victory-gpu` `vulkan/record.rs` `bvh_builder`; off by
+/// default). While it is off nothing builds the structures the title's
+/// ray-traced passes walk, and a node test would read whatever bytes lie
+/// where a structure would be: not the scene, different from launch to
+/// launch, in a walk the title bounds at 65,535 steps a wave. So a node
+/// test then answers "no hit" and reads nothing: a box node enters no
+/// child and any other node is missed, as in a scene with nothing in it;
+/// every ray leaves at its first test and shadow rays find no occluder
+/// (origin/main `emit/intersect.rs` `no_hit`). The switch's value is part
+/// of the stage cache key (`translation_fingerprint`), so both forms are
+/// kept.
+fn bvh_builder() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BVH_BUILDER.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v != "0")
 }
 
 /// One image instruction being lowered: its fields, the address cursor and

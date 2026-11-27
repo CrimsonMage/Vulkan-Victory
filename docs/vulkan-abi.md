@@ -452,7 +452,12 @@ translation-index --pack <pack>` runs it over a whole dump and writes
 
 Known gaps (the program translates; the result differs from the console):
 
-- Ray/node tests (`image_bvh*_intersect_ray`) run in software
+- Ray/node tests (`image_bvh*_intersect_ray`): while the title's
+  structure builder does not run (the default; `VICTORY_BVH_BUILDER=1`
+  runs it, read by the host and by the translator, part of the stage cache
+  key) a node test reads nothing and answers "no hit": a box node
+  (pointer kinds 4, 5) four times `0xffffffff`, any other node the
+  triangle miss (+inf, 1.0, 0, 0). With the builder on they run in software
   (`Helper::BvhRay`, one function per module): the node is read from
   title memory at `(T# base << 8) + (pointer >> 3) * 64` through the map
   (128 bytes in one range, else the zero block); slab tests and the

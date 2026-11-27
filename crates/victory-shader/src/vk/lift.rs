@@ -982,6 +982,8 @@ fn atomic_op(name: &str) -> Option<u16> {
 // Instruction families live in their own files.
 #[path = "lift_image.rs"]
 mod image;
+#[cfg(test)]
+pub(crate) use image::TEST_BVH_BUILDER;
 #[path = "lift_io.rs"]
 mod io_;
 #[path = "lift_mem.rs"]

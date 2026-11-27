@@ -11,9 +11,13 @@ The stage cache key (`victory-gpu`'s `vulkan/stage_cache.rs`) is
 
 ## Kept
 
-None. Since the DXIL translator went (2026-11-26, `docs/kiss.md`) this
-crate reads no switch (`VICTORY_BVH_MISS` went with `emit/`); the tables
-below are the history of the removed translator.
+| Switch | Where | Default | Other value |
+|---|---|---|---|
+| `VICTORY_BVH_BUILDER` | `vk/lift_image.rs` `bvh_builder` (the host reads the same name in `victory-gpu` `vulkan/record.rs`) | unset or `0`: the title's structure builder does not run, and a ray/node test answers "no hit" and reads nothing (a box enters no child, anything else is missed; origin/main `emit/intersect.rs` `no_hit`) | `1`: the builder's dispatches run and node tests read the nodes (`emit_bvh.rs`) |
+
+Its value is part of the stage cache key, so both forms are cached. The
+tables below are the history of the removed DXIL translator
+(`VICTORY_BVH_MISS` went with `emit/`).
 
 ## Removed (default kept)
 
