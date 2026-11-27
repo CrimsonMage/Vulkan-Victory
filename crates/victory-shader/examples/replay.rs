@@ -11,13 +11,14 @@
 //! channel), `missing.txt` (memory read that the capture lacks, as
 //! ranges), `notes.txt` (what replay assumed) and `reads.txt` (each image
 //! slot the program read: how often, and the range of what came back);
+//! `stores.txt` the title memory it stored to;
 //! `images.txt` is what every image of the capture holds, read or not
 //! (`SHOW=<slot>,...` writes some of them as tone-mapped pictures).
 //!
 //! Assumed: every sampler filters linearly and clamps to the edge (no
 //! sampler state is captured); level 0 only (an explicit level, bias or
 //! gradient is ignored); depth comparison is less-or-equal; block-compressed
-//! formats read 0. Environment: `STRIDE=n` runs every n-th group (compute)
+//! formats read 0 (`UNDECODED=<float>`: that value). Environment: `STRIDE=n` runs every n-th group (compute)
 //! or block (pixel), `LIMIT=n` block visits a wave, `DISPATCH="x y z"` the
 //! groups of an indirect dispatch (the capture has no size for it),
 //! `GROUP="x y z"` that group only, `WATCH=n,m|all` (with `LANES=n`) the
@@ -66,10 +67,13 @@ struct Capture {
     program: Vec<(String, String, String)>,
     push: Vec<u32>,
     dispatch: Option<[u32; 3]>,
-    /// An indirect dispatch's argument address (`indirect kind 2 ... src`):
-    /// the capture's program ends there (captures before the host closed
-    /// one at an indirect dispatch run on into the next program's lines).
+    /// An indirect dispatch's argument address (`dispatch-indirect src`).
     indirect: Option<u64>,
+    /// An `indirect` line was seen: it is the next indirect execution's
+    /// (a capture opens after its own program's), so the lines after it
+    /// are another program's (captures made before the host closed one at
+    /// an indirect dispatch run on).
+    sealed: bool,
     viewport: Option<[f32; 4]>,
     mem: Vec<(u64, PathBuf)>,
     /// `root <param> <dwords>`: the root parameters as the title set them.
@@ -140,13 +144,14 @@ fn read_capture(dir: &Path) -> Capture {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.first().copied() {
             Some("program") if w.len() >= 4 => c.program.push((w[1].into(), w[2].into(), w[3].into())),
-            Some("push") if c.dispatch.is_none() && c.viewport.is_none() && c.indirect.is_none() => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
+            Some("push") if c.dispatch.is_none() && c.viewport.is_none() && !c.sealed => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
             Some("mem") => c.mem.push((hex(w[1]), dir.join(format!("mem/{}.bin", w[1])))),
             Some("root") if w.len() >= 2 => {
                 c.roots.insert(w[1].parse().unwrap_or(0), w[2..].iter().map(|x| hex(x) as u32).collect());
             }
-            Some("indirect") if w.get(2) == Some(&"2") => c.indirect = after(&w, "src").map(hex),
-            Some("dispatch") if c.indirect.is_none() => c.dispatch = Some([1, 2, 3].map(|i| w.get(i).and_then(|x| x.parse().ok()).unwrap_or(1))),
+            Some("indirect") => c.sealed = true,
+            Some("dispatch-indirect") if !c.sealed => c.indirect = after(&w, "src").map(hex),
+            Some("dispatch") if !c.sealed => c.dispatch = Some([1, 2, 3].map(|i| w.get(i).and_then(|x| x.parse().ok()).unwrap_or(1))),
             Some("did") => c.viewport = viewport(line),
             Some("image") if w.get(2) != Some(&"none") => {
                 if let Some((slot, s)) = parse_image(dir, &w, &mut files) {
@@ -425,8 +430,11 @@ impl State {
         }
         let (bytes, known) = texel_bytes(&s.view_format);
         if !known {
-            self.notes.insert(format!("slot {slot:x}: format {} not decoded (reads 0)", s.view_format));
-            return [0; 4];
+            // UNDECODED=<float>: what a format replay cannot decode reads
+            // (to see whether a program's result hangs on such an image)
+            let v = std::env::var("UNDECODED").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            self.notes.insert(format!("slot {slot:x}: format {} not decoded (reads {v})", s.view_format));
+            return [u64::from(v.to_bits()); 4];
         }
         if s.missing_mip {
             self.notes.insert(format!("slot {slot:x}: the view starts past level 0 (level 0 read)"));
@@ -755,6 +763,32 @@ struct Run<'a> {
     stops: BTreeMap<String, u32>,
     /// Watched values (WATCH), in the order computed.
     log: Vec<String>,
+    /// Title memory the program stored to: dword address -> the last value.
+    stored: BTreeMap<u64, u32>,
+}
+
+/// `stores.txt`: the runs of title memory the program stored to (dwords
+/// no more than 64 bytes apart are one run), with how many dwords were
+/// stored, how many of them not zero, and the first few.
+fn stores_text(stored: &BTreeMap<u64, u32>) -> String {
+    let mut out = String::new();
+    let mut run: Vec<(u64, u32)> = Vec::new();
+    let mut flush = |run: &mut Vec<(u64, u32)>| {
+        if let (Some(first), Some(last)) = (run.first(), run.last()) {
+            let nonzero = run.iter().filter(|(_, v)| *v != 0).count();
+            let head: Vec<String> = run.iter().take(8).map(|(_, v)| format!("{v:08x}")).collect();
+            let _ = writeln!(out, "{:x}..{:x}: {} dwords stored, {nonzero} not zero: {}", first.0, last.0 + 4, run.len(), head.join(" "));
+        }
+        run.clear();
+    };
+    for (&a, &v) in stored {
+        if run.last().is_some_and(|(p, _)| a > p + 64) {
+            flush(&mut run);
+        }
+        run.push((a, v));
+    }
+    flush(&mut run);
+    out
 }
 
 impl<'a> Run<'a> {
@@ -785,7 +819,7 @@ impl<'a> Run<'a> {
         for (a, (n, _)) in std::mem::take(&mut m.mem.missing) {
             *self.missing.entry(a).or_default() += n;
         }
-        m.mem.stored.clear();
+        self.stored.append(&mut m.mem.stored);
         self.mem = std::mem::take(&mut m.mem);
         m
     }
@@ -834,7 +868,7 @@ fn main() {
         images.0.borrow_mut().notes.insert("no push line: user data built from the root lines".into());
     }
     let lanes = if native.wave64 { 64 } else { 32 };
-    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new() };
+    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new(), stored: BTreeMap::new() };
     if std::env::var_os("DUMP").is_some() {
         victory_shader::vk::tir::dump(&f);
     }
@@ -877,6 +911,7 @@ fn main() {
     let _ = std::fs::write(out.join("missing.txt"), missing_ranges(&run.missing));
     let _ = std::fs::write(out.join("notes.txt"), notes.join("\n") + "\n");
     let _ = std::fs::write(out.join("reads.txt"), st.reads_text());
+    let _ = std::fs::write(out.join("stores.txt"), stores_text(&run.stored));
     print!("{census}");
     println!("{} missing ranges; notes: {}", missing_ranges(&run.missing).lines().count(), notes.join("; "));
 }
@@ -895,6 +930,9 @@ fn compute(run: &mut Run<'_>, threads: [u32; 3], stride: usize) {
     });
     if let Some(a) = args {
         run.images.0.borrow_mut().notes.insert(format!("indirect dispatch: {} {} {} groups in the captured memory", a[0], a[1], a[2]));
+    }
+    if run.cap.sealed && args.is_none() && given.is_none() {
+        run.images.0.borrow_mut().notes.insert("an indirect dispatch whose arguments the capture does not name: one group run (DISPATCH sets it)".into());
     }
     let [gx, gy, gz] = given.or(run.cap.dispatch).or(args).unwrap_or([1, 1, 1]);
     let per = (threads.iter().product::<u32>() as usize).div_ceil(run.lanes);
