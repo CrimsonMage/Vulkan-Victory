@@ -150,6 +150,48 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (later): **card memory accounted for** (runs vm1–vm7,
+  `docs/vulkan-host.md` "Card memory the driver takes"). vk103's 6.9 GB
+  for the process were 3.3 GB of ours (images 2.56, scratch 0.48, pool
+  0.26), 1.4 GB of the driver's inside the heap's count and 2.1 GB
+  outside any heap's count. Both driver parts come from pipelines:
+  - **Outside the heaps** is the driver's per-thread local memory: a
+    program's own variables (SPIR-V `Private` and `Function`) are kept
+    on the card for 32,768 threads, as big as the worst pipeline of each
+    kind of stage, and never given back. The constant tables of a
+    program's code (the tone-map fix of tag `batch-2026-11-27b`) are
+    `Private` arrays: the nine tables of one ray-trace program (47.7 KiB)
+    held 1.7 GiB. That is the ~1.2 GB by which runs on tag b sit above
+    runs on the tag before. No shape of variable avoids it (probed);
+    **tables must become memory read by address: a translator change,
+    open.** Until then a module over 16 KiB a thread is refused before
+    it compiles (today that program alone; its dispatches are skipped,
+    and with the structure builder off its rays find nothing anyway).
+    Next: the BC1/3/7 compressors (357 MiB for 44 scratch arrays).
+  - **Inside the heap** are the pipelines themselves, in arenas that
+    double and are never given back (~1.06 GiB for 3,624 stages). The
+    game's background bake compiled the 266 slow stages a second time
+    in every run (368 MiB): it leaves them alone now.
+  - Ours: every command buffer kept the most scratch it ever used
+    (478 MiB, growing); scratch is lent by the timeline now (39 MiB).
+    The images are the title's own targets (2.2 GB over 2.0 GB of title
+    memory) and textures (0.5 GB), not copies kept past use. The seven
+    3840x2160 targets (233 MiB) are the title's interface plane and its
+    depth and colour targets: it reads Series S, renders the world at
+    1280x720 into a 1920x1080 plane and still draws its interface at
+    3840x2160, whatever display mode is listed.
+  - The card-memory line adds up now: `process_mb` (what `nvidia-smi`
+    shows for the process) `= ours_mb + driver_mb + outside_mb`.
+  - With the driver's share smaller the images get room. On tag
+    `batch-2026-11-27c`: int56 (run vmi56) was killed by the watchdog at
+    frame ~1,830 with 7.7 GB on the card (the process 6.9 GB, 45,901
+    images refused at its limit); with these changes (run vm7s) the card
+    peaks at 6.2 GB (the process 5.4 GB), no kill, frame 2,310 in the
+    same 420 s, 1,461 images refused: the ground is lit, with shadows.
+    RAM peaks 0.45 GB higher (17.07 against 16.61 GB): not traced, open.
+  - Storage usage on every colour image (899741d) costs no card memory
+    (168,918 images: the same size and alignment with and without it).
+
 - 2026-11-27 (indirect light): why everything the sun does not hit was
   black, found by walking back from the tiled lighting with pass captures
   (runs gi5 to gi9, branch `worktree-agent-a8a715585abfc9ff1`).

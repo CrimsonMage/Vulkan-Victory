@@ -622,7 +622,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         let bytes: Vec<u8> = vs.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
         let _ = std::fs::write(dir.join(format!("{hash}.{:?}.spv", vs.stage)), bytes);
     }
-    if let Some(why) = limits(b).refuses(&usage) {
+    if let Some(why) = limits(b).refuses(&usage).or_else(|| victory_vk::limits::thread_memory_refused(&vs.spirv)) {
         if cfg!(feature = "diagnostics") {
             tracing::info!(stage = ?vs.stage, hash = %hash, why = %why, "Vulkan part: refused before compiling");
         }
@@ -632,11 +632,11 @@ fn make(b: &Backend, shader: &Shader) -> State {
     let fitted = victory_vk::limits::fit_float_controls(&vs.spirv, b.host.caps.signed_zero_inf_nan);
     let code = fitted.as_deref().unwrap_or(&vs.spirv);
     // SAFETY: the translator's words, a SPIR-V module.
-    let module = unsafe {
+    let module = victory_vk::account::traced(&b.host, "shader module", || unsafe {
         b.host
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
-    };
+    });
     STATS[6].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     let module = match module {
         Ok(m) => m,
@@ -842,6 +842,27 @@ fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {
 /// `geometry` behind it if given; pixel: fragment shader) or a compute
 /// pipeline.
 pub(super) fn compile(
+    b: &Backend,
+    stage: HwStage,
+    module: vk::ShaderModule,
+    samplers: &[[u32; 4]],
+    geometry: Option<vk::ShaderModule>,
+) -> anyhow::Result<vk::Pipeline> {
+    let what = match stage {
+        HwStage::Cs => "compile cs",
+        HwStage::Ms => "compile ms",
+        HwStage::Ps => "compile ps",
+        _ => "compile vs",
+    };
+    let (p, outside, heap) =
+        victory_vk::account::traced_with(&b.host, what, || compile_part(b, stage, module, samplers, geometry));
+    if outside.abs().max(heap.abs()) >= 2 << 20 {
+        tracing::info!(?stage, outside_kb = outside >> 10, heap_kb = heap >> 10, thread = std::thread::current().name().unwrap_or("?"), "Vulkan: a stage compile moved card memory");
+    }
+    p
+}
+
+fn compile_part(
     b: &Backend,
     stage: HwStage,
     module: vk::ShaderModule,

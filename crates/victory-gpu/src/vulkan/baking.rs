@@ -117,7 +117,12 @@ struct Shared {
 }
 
 /// The stages left (smallest first) and the rows of earlier bakes.
-fn prepare(b: &Backend) -> (Shared, Vec<Row>) {
+/// `slow_again`: stages an earlier bake found slow are compiled again,
+/// last (`victory bake`; the game compiles them itself when the title
+/// makes their pipelines: a second pipeline of each, made and destroyed
+/// in the background, only took card memory the driver does not give
+/// back).
+fn prepare(b: &Backend, slow_again: bool) -> (Shared, Vec<Row>) {
     let names: BTreeMap<String, String> = stage_cache::names().into_iter().collect();
     let device = device_key(b);
     let before = stage_cache::baked(&device);
@@ -126,7 +131,7 @@ fn prepare(b: &Backend) -> (Shared, Vec<Row>) {
     for (hash, file) in stage_cache::all() {
         let name = names.get(&hash).cloned().unwrap_or_default();
         match before.get(&hash) {
-            Some(line) if !slow::is_slow(line) => done.push(row_before(hash, name, line)),
+            Some(line) if !slow_again || !slow::is_slow(line) => done.push(row_before(hash, name, line)),
             // Slow before: compiled again, last.
             Some(_) => left.push((true, std::fs::metadata(&file).map_or(0, |m| m.len()), hash, file)),
             None => left.push((false, std::fs::metadata(&file).map_or(0, |m| m.len()), hash, file)),
@@ -153,7 +158,7 @@ fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, owner: Owner) ->
         }
     }
     let row = |status, slow| Row { hash: hash.into(), name: name.clone(), kind: kind_of(vs.stage), words, slow, status };
-    if let Some(why) = stages::limits(b).refuses(&victory_vk::limits::usage(&vs.spirv)) {
+    if let Some(why) = stages::limits(b).refuses(&victory_vk::limits::usage(&vs.spirv)).or_else(|| victory_vk::limits::thread_memory_refused(&vs.spirv)) {
         return (row(Status::Refused(format!("over the device: {why}")), false), false);
     }
     let d = &b.host.device;
@@ -242,7 +247,7 @@ pub(super) fn prune() -> usize {
 pub(super) fn run(jobs: Option<usize>, index: Option<PathBuf>) -> anyhow::Result<()> {
     let b = backend().ok_or_else(|| anyhow::anyhow!("no Vulkan device"))?;
     stages::layout(b).ok_or_else(|| anyhow::anyhow!("no pipeline layout"))?;
-    let (shared, before) = prepare(b);
+    let (shared, before) = prepare(b, true);
     let shared = Arc::new(shared);
     let jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 2)).max(1);
     println!("bake: {} stages to compile (smallest first), {} done by earlier bakes, {jobs} threads", shared.total, before.len());
@@ -327,7 +332,7 @@ pub(super) fn in_background(b: &'static Backend) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("victory-vk-bake".into()).spawn(move || {
-            let (shared, before) = prepare(b);
+            let (shared, before) = prepare(b, false);
             tracing::info!(left = shared.total, baked_before = before.len(), "Vulkan: background bake of the stage cache");
             work(b, &shared, -2, Owner::Background);
             tracing::info!(baked = lock(&shared.rows).len(), "Vulkan: background bake done");

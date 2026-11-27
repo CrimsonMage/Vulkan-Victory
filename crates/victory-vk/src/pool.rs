@@ -144,7 +144,7 @@ impl PoolView {
         let d = &host.device;
         let len = len.next_multiple_of(PAGE);
         // SAFETY: valid create infos; everything is destroyed by `destroy`.
-        let buffer = unsafe {
+        let buffer = crate::account::traced(host, "sparse buffer", || unsafe {
             d.create_buffer(
                 &vk::BufferCreateInfo::default()
                     .flags(
@@ -155,7 +155,7 @@ impl PoolView {
                     .usage(TITLE_USAGE),
                 None,
             )
-        }
+        })
         .context("the pool view's sparse buffer")?;
         let needs = unsafe { d.get_buffer_memory_requirements(buffer) };
         ensure!(
