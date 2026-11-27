@@ -528,6 +528,9 @@ pub(crate) fn execute(queue: This, lists: &[This]) {
     let t = Instant::now();
     crate::list::join(lists);
     split(Split::Join, t);
+    // What the CPU stored since the last flush reaches the card's copies
+    // ahead of these lists (before the engine's lock: it asks `xmem`).
+    super::paging::flush_written(b, false);
     let mut e = engine(b);
     let mut parts = VecDeque::new();
     for &l in lists {

@@ -1590,70 +1590,163 @@ of each stays. What went, and what was kept for the Vulkan path:
 - Still on the host's `d3d12.dll`: the title's root signature
   serialization (`root.rs`), which the title calls itself.
 
-### Handoff: write tracking for card copies of title memory (2026-11-27, not built)
+### Write tracking for card copies of title memory (2026-11-27, branch `worktree-agent-ae0e3bf350bf8a526`)
 
 Goal (coordinator): the card never reads a stale copy of title memory;
-write tracking instead of polling; no extra RAM or VRAM. This section is
-the evaluation and plan; the agent that wrote it ran out of room before
-building it.
+write tracking instead of polling; no extra RAM or VRAM.
 
 **Where the card holds copies.** (1) The pool's GPU view: one card page per
-physical 64 KiB page (`victory-vk/src/pool.rs`, `vulkan/paging.rs`), filled
-at mapping and at announced writes. (2) Images filled from title memory
-(`images/fill.rs`), refreshed by fingerprint polling (`refresh`). Imports
-(regions, sections, loose) are zero-copy and need nothing. vk-world census
-(`stale.rs`, one page in 8): sampled 3,786, stale 1,997.
+physical 64 KiB page (`victory-vk/src/pool.rs`, `vulkan/paging.rs`). (2)
+Images filled from title memory (`images/fill.rs`). Imports (regions,
+sections, loose) are zero-copy and need nothing. Before, both were filled
+only at mapping and at announced writes, and images also by fingerprint
+polling on a backoff schedule; the census (one pool page in 8) found
+1,997 of 3,786 sampled pages changed by the CPU after the card's copy.
 
-**Announced writes today** (the only places the card copy is refreshed):
-- `files.rs` `ReadFile` (host kernel32 `ReadFile` writes the title buffer,
-  then `title_memory_written`), `fread` (a Rust copy, then announced);
-- `dstorage.rs`: positioned host `ReadFile` straight into title memory for
-  uncompressed requests, `xmem::write_physical` for decompressed ones, then
-  `pages_written` / `title_memory_written`;
-- `xmem.rs:757` (`pages_written`), `engine.rs:452` (CPU-landed bottom-of-pipe
-  writes).
+**As built** (`victory-gpu/src/track.rs`, `victory-hle/.../xmem/tracked.rs`).
 
-**Plan.**
-1. A bit per physical page (`PageKey`): `protected`, `dirty`, `hot` (frames
-   dirty in a row). Kept in xmem (it knows every view of a physical page:
-   `Physical::shown`).
-2. Protect after the copy is *queued*, before it is *taken*: the order must be
-   protect (all views of the page, `VirtualProtect` PAGE_READONLY) -> fill
-   (`PoolView::written` / image refill reading the home) so that a write
-   between faults and re-marks the page. Protect only pages that have a card
-   page now (pool: resident, not evicted; images: the pages under images the
-   title fills, not card-written ones).
-3. Fault path: xmem's vectored handler `on_fault` already sees writes. A write
-   into a protected page: set `dirty`, make every view of that page
-   PAGE_READWRITE again, `EXCEPTION_CONTINUE_EXECUTION`. It must take no lock
-   our own writers may hold: use a lock-free page set (the bits in an atomic
-   array by page index, or a separate small mutex never held across a
-   title-memory write), not `PHYSICAL` and not `memory(b)`.
-4. Flush at present (and in `buffer_over`/`ensure` for pages a recording names):
-   dirty pages -> `title_memory_written` (pool refill; images over them get
-   `cpu_changed` and refill), clear `dirty`, protect again. A page dirty 8
-   frames running becomes `hot`: left writable and re-copied every frame (no
-   fault storm); a hot page clean for 8 frames is protected again.
-5. Host writes that do not fault in user mode: Wine's `NtReadFile` checks the
-   buffer with `virtual_check_buffer_for_write`, which touches each page under
-   its own `__TRY`; whether our VEH sees that fault first under Wine 11 must be
-   checked in a run. Safe either way: before every host call that writes title
-   memory (`ReadFile` in files.rs and dstorage.rs), unprotect the range and mark
-   it dirty; log any `ERROR_NOACCESS` / `STATUS_ACCESS_VIOLATION` from such
-   calls ("a host call failed on a protected title page") so a missed site
-   shows itself.
-6. Our own Rust writers (bottom-of-pipe CPU writes, decompression into title
-   memory, CPU copies) fault into the same handler; it is lock-free per (3).
-7. Then delete `stale.rs` (keep one counter line: faults, pages re-copied,
-   pages kept writable) and image fingerprint polling for images whose pages
-   are tracked.
+- **State**: one byte per 64 KiB page of title address space, in 4 KiB
+  leaves made for each 256 MiB stretch that holds a tracked page:
+  protected, written, hot, an image may lie over it, counted this frame,
+  and a streak of frames (3 bits). No page is mirrored.
+- **Protect, then copy.** Before the card copies title memory, the pages
+  are made read-only in every CPU view that shows them (`track::protect`):
+  at a page mapping of the pool's GPU view (`title_pages_aliased`) and at
+  each image fill (`detile`). `xmem` answers which addresses show a page
+  (`tracked::places`: the views of a physical page, the page itself in a
+  region), under its page-table lock, so no view comes or goes meanwhile.
+- **The fault** (`xmem::on_fault` -> `track::write_fault`): the mark goes
+  protected -> written by one compare-and-swap, the page is opened
+  (`VirtualProtect`) and then listed. It takes only the list's own small
+  lock: victory's own writers (bottom-of-pipe writes, copies) fault there
+  too. Listing after opening is what makes the race with a flush safe: a
+  page that is open is in the list, or will be.
+- **The flush** (`paging::flush_written`, before every `ExecuteCommandLists`
+  hands work to the engine and at every present): each listed page is
+  resolved to its places; if the card holds a copy (a page of the pool's
+  GPU view on the card, or an image filled from it) its CPU views are
+  protected again and then the pool pages are copied again in one
+  submission (`PoolView::stored`) and the images queued to be filled
+  again (`images::written`). If the card holds nothing (evicted, dropped,
+  unmapped), tracking of the page ends. So data the CPU stored before it
+  submitted a list is on the card before that list runs.
+- **Hot pages**: a page that 8 flushes running found written (the title
+  writes it all the time) stays open for 32 frames; its pool page is
+  copied at every flush. An image over a hot page is not filled at every
+  flush (a fill detiles the whole texture): while its page is hot it is
+  checked by fingerprint, as untracked memory is. Then the page is
+  protected once to see whether the title still writes it. In the world
+  no page became hot (the pages written are written about once a frame,
+  not in every one of its ~19 flushes).
+- **Host calls that write title memory from the kernel** do not fault,
+  they fail (Wine's `NtReadFile` returns `STATUS_ACCESS_VIOLATION` for a
+  read-only buffer; nothing reaches the vectored handler). Such a call
+  holds `track::writing(range)`: tracked pages there are opened and
+  listed, and no flush protects a page of the range until the guard is
+  dropped. Sites: `files.rs` `ReadFile` and `fread`, `dstorage.rs`
+  requests with an address destination, and the driver's pinning of a
+  region for an import (`import_regions`). A failed `ReadFile` with `ERROR_NOACCESS` is
+  logged ("the host could not write the buffer").
+- **Victory's own views** (each section's whole view, used by
+  DirectStorage page destinations and by the GPU side for pool pages) are
+  never protected: every writer through them announces
+  (`pages_written`, `write_now`). This is the one place the build differs
+  from the handoff's plan ("every CPU view"): streamed data, the bulk of
+  what is written, then costs no fault and no protection change at all.
+- **Views that come and go** (`xmem`): an unmapped view's marks go, and
+  stores not yet flushed are told through another place that shows the
+  page; a new view of a page shown elsewhere is listed (it is open). The
+  title's own `VirtualProtect`, a commit at an address and a free let go
+  of the pages first (`tracked::title_protects`); the next flush protects
+  again what the card still has a copy of.
+- **Evicted pool pages** are not unprotected at eviction (no host call
+  for nothing): the first store into one faults once, the flush finds no
+  copy and tracking ends. A page brought back under the memory lock
+  (`ensure`, an announced write) is listed as copied, not written
+  (`track::copied`): the next flush protects it and copies it once more,
+  and leaves the images over it alone.
+- **Which images a written page belongs to**: the registry keeps the
+  images the title fills by each 64 KiB page they lie over
+  (`Registry::over`, a few pointers a page), so a write (found or
+  announced) names its images without a walk over every image that could
+  reach the address (that walk was most of the flush's time in the first
+  run: the widest image is 39 MiB).
+- **Other code that looked at protections**: loose imports take a
+  read-only page of ours as usable (`loose::usable`), and the console
+  instruction emulator writes read-only title memory (the write faults
+  inside its handler into ours).
 
-**Cost estimate to verify.** ~700 pool pages went stale a frame in an
-every-page experiment. A fault under Wine is a signal plus VEH dispatch
-(tens of µs) plus two `VirtualProtect` per view; 700 a frame is several ms.
-The hot-page rule bounds it; measure faults/frame, pages/frame and ms/frame
-in the 10 s line. If it stays over ~3 ms: track pool pages only and keep the
-fingerprint polling for images, or copy hot pages unconditionally.
+**Deleted**: `vulkan/stale.rs` (the sampling census) and the fingerprint
+taken at every fill of a tracked image. Fingerprint polling (`refresh`)
+stays only for images whose memory cannot be tracked: memory `xmem` does
+not map, and textures the card writes too (their title memory is not
+their content unless the CPU stores into it; a page-sized store elsewhere
+must not overwrite the card's content).
+
+**The 10 s line** (`Vulkan: write tracking`): faults, faults/frame, pool
+pages copied again/frame, pages under images written/frame, hot pages,
+flushes/frame, flush ms/frame, fault ms/frame, and what one fault and one
+protection change cost on this host (measured once on a page of our own).
+
+**Measured** (on the 8 GB card under Proton):
+
+- Runs wt2 and wt3 (the gate run, 420 s, Series S profile): frames 1,754
+  and 1,780, no title crash, no file-read failure, no GPU fault, no
+  `ERROR_NOACCESS`.
+- In the world (wt3, frames ~1,500 to 1,780, ~19 flushes a frame):
+  **130 to 160 faults a frame**, 92% of them on pages under images; **25
+  to 105 pool pages copied again a frame**; 115 to 145 written pages a
+  frame had images over them (filled again); no page hot.
+- **Cost a frame**: the flushes 2.5 to 4.5 ms (about 3.5), the faults 0.3
+  to 0.8 ms (2.2 to 5.7 us each, measured in the world with each line; one
+  protection change 0.8 to 2.7 us; 14 us and 5.8 us in wt1 while another
+  job loaded the machine), and about 3 ms more in the image fills the
+  written pages cause (the frame split's `flush_ms` 9.3 against 6.3).
+  About 7 ms of a ~600 ms frame; the ~3 ms target is not met. Wine's
+  exception dispatch is not what costs: the flushes are (a host-line
+  submission for the pool copies and one for the image fills at most
+  flushes).
+- What is written: the images filled most often are 35 to 260 texel wide
+  one-row `R8G8B8A8_SRGB` textures (curves) at unaligned addresses, 450 to
+  540 fills each in the run: small textures inside pages the title writes
+  every frame.
+- Polling left: 2,050 of 19,972 live images are checked by fingerprint
+  (textures the card writes too), 17,119 are tracked; 2,149 MB
+  fingerprinted in the run against 14,981 MB, 18 fills found by
+  fingerprint against 5,731.
+- RAM peak 15.2 GB (wt3) and 16.2 GB (wt2) against 16.0 GB; card memory
+  peak 6.56 GB and 6.43 GB against 6.6 GB. The marks are 4 KiB for each
+  256 MiB that holds a tracked page; the images' page index is a few
+  pointers for each page under a filled image (~2 MiB).
+- The captures: the text they show (the account prompt, the "NINE MONTHS
+  AGO" card) is whole, as it already was in vk80; the world frames are the
+  same flat grey as before, so its HUD text is not judged.
+- wt1 (the first build) crashed at frame ~1,370 on a store into a page
+  read-only with no protected mark: a flush protected an already
+  protected second view of a page (mark, then protection) while a store
+  into it was in the handler (mark, then opening). Since then a flush
+  leaves a protected view alone, and the handler opens any page its mark
+  says is open. wt1 also filled the images over every page the pool
+  brought back (105 to 280 ms a frame of fills): those are listed as
+  copied, not written, now.
+
+**Open.**
+
+- The cost: (1) one submission for a flush's pool copies and image fills
+  instead of two; (2) a small image under a written page filled again
+  only if its bytes changed (its fingerprint is nearly free; most of the
+  130 pages a frame are neighbours' writes); either should bring the
+  frame's cost under 3 ms.
+
+- Textures the card also writes (unordered-access textures the CPU fills
+  now and then) are still polled; tracking them needs the fingerprint as a
+  filter on the store, not a schedule.
+- A store by the *card* into title memory under an image filled from it is
+  not seen (no CPU fault); none is known.
+- Above 2^40 (titles that ask `XMemVirtualAlloc` for more address bits)
+  nothing is tracked; images there are polled.
+- An overlapped `ReadFile` that completes after the call returns would
+  write a page protected again (Wine completes file reads in the call).
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 

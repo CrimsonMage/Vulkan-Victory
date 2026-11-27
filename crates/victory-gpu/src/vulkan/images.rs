@@ -133,6 +133,10 @@ pub(crate) struct Image {
     /// The CPU changed it after its first fill (a glyph cache, a movie
     /// plane): checked often from then on.
     dynamic: AtomicBool,
+    /// Its last fill protected its title memory against stores
+    /// (`crate::track`): a store has it filled again, and no fingerprint
+    /// is taken.
+    tracked: AtomicBool,
     /// Its title memory changed under the CPU since the last fill (the
     /// fingerprint): filled again even over memory the card also writes
     /// (the CPU's write is the newer content, as on the console).
@@ -287,9 +291,34 @@ struct Registry {
     /// The most title bytes any image made so far covers: how far before
     /// an address an image over it can start.
     widest: u64,
+    /// The images the title fills, by each 64 KiB page of title memory
+    /// they lie over: a write names its pages ([`fill::written`]).
+    over: std::collections::HashMap<u64, Vec<Arc<Image>>>,
 }
 
 impl Registry {
+    /// Puts `img` into, or takes it out of, the pages it lies over.
+    fn page(&mut self, img: &Arc<Image>, add: bool) {
+        for page in img.key.address >> 16..=(img.key.address + img.bytes.max(1) - 1) >> 16 {
+            let there = self.over.entry(page).or_default();
+            there.retain(|i| !Arc::ptr_eq(i, img));
+            if add {
+                there.push(img.clone());
+            } else if there.is_empty() {
+                self.over.remove(&page);
+            }
+        }
+    }
+
+    /// Takes the image of `key` out, for its dropping.
+    fn take(&mut self, key: &Key) -> Option<Arc<Image>> {
+        let img = self.images.remove(key)?;
+        if !img.card_written() || self.over.contains_key(&(key.address >> 16)) {
+            self.page(&img, false);
+        }
+        Some(img)
+    }
+
     /// The key every image that may cover `at` sorts at or after.
     fn first_over(&self, at: u64) -> Key {
         Key { address: at.saturating_sub(self.widest), dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false }
@@ -311,7 +340,7 @@ impl Registry {
             .collect();
         let value = b.timeline.last();
         for k in gone {
-            if let Some(img) = self.images.remove(&k) {
+            if let Some(img) = self.take(&k) {
                 if cfg!(feature = "diagnostics") && DROPPED[Dropped::Overlaid as usize].load(Ordering::Relaxed) < 12 {
                     tracing::info!(
                         new_at = %format_args!("{at:#x}+{len:#x}"),
@@ -382,6 +411,7 @@ pub(crate) fn report() {
     if cfg!(feature = "diagnostics") {
         let (biggest, by_kind) = biggest();
         tracing::info!(biggest = %biggest, by_kind = %by_kind, "Vulkan: where image memory goes");
+        tracing::info!(tracked = %fill::tracking(), "Vulkan: images by how a CPU store reaches them, and the ones filled most often");
     }
 }
 
@@ -441,7 +471,7 @@ pub(crate) fn resource_gone(b: &Backend, address: u64, desc: &ResourceDesc) {
     let Some(key) = key_of(address, desc) else { return };
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
-    if let Some(img) = r.images.remove(&key) {
+    if let Some(img) = r.take(&key) {
         super::descriptors::image_gone(img.id);
         r.dropped.push((b.timeline.last(), img));
         DROPPED[Dropped::Resource as usize].fetch_add(1, Ordering::Relaxed);
@@ -521,6 +551,7 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
             r.widest = r.widest.max(img.bytes);
             if !img.card_written() {
                 r.drop_overlaid(b, address, img.bytes.max(1));
+                r.page(&img, true);
             }
             // Into GENERAL and cleared at the next flush (ahead of anything
             // that uses it); filled after that unless the card writes it.
@@ -683,6 +714,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         next_check: AtomicU64::new(0),
         check_every: std::sync::atomic::AtomicU32::new(1),
         dynamic: AtomicBool::new(false),
+        tracked: AtomicBool::new(false),
         cpu_changed: AtomicBool::new(false),
     })
 }
