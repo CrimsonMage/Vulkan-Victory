@@ -419,6 +419,56 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-27 (later): **why the final frame was grey: the tone-map table
+  was one value** (branch `cg-composite`; the translator fix awaits a
+  batch bake).
+  - **Walked back with captures** (runs cg1, cg2): PS_CompositeNMB replayed
+    from its captured inputs gives the card's grey (0.19-0.22); the input
+    that greys it is the 64x64x64 RGBA16F table at 0x99fd00000, every
+    texel 0.2063 (0x35 of 255: the grey on screen). Exposure is sound (the
+    title clamps it to -5.5 EV, 0.0221; average luminance 5.76; replay =
+    card), so are the 33-cube grading tables and the two 4096x1 curves.
+  - **Its writer**, CS_BakeACESWithGamutCompressLUT_QuasiLogShaper (no
+    image inputs, dispatch 4x4x64), gives the same flat table in the
+    interpreter: it read 28 bytes at address 0x320c nine million times.
+    That is its own code: the ACES spline coefficients (-4, -4, -3.157,
+    -0.485, 1.848 ...) sit after `s_endpgm` and are read by
+    `global_load_dwordx3` at `s_getpc_b64` + a constant + a segment index
+    each lane holds (`v_lshlrev_b64`, `v_add_co_u32`, `v_add_co_ci_u32`).
+    Only scalar loads knew code tables; a vector load read title memory
+    at the code offset: the zero block.
+  - **Fix (translator, lift_mem.rs `flat_code_load`)**: a `global_load_dword*`
+    whose address is made of an `s_getpc_b64` plus a constant through
+    additions, copies, selections and phis reads the code's table
+    (`Helper::CodeTable`). Oracle:
+    `constant_tables_in_the_code_read_by_vector_loads` (fails before), and
+    a vector load elsewhere in such a
+    program stays memory. Replay: the table is a tone curve (0 .. 1), no
+    missing memory. Golden: 25 of 1,527 programs change, each with its
+    table after the code: this bake, 19 CS_InterpolateStrands (hair: a
+    table of jitter offsets), CS_MainBlur (depth of field: tap counts and
+    offsets), two CS_ReconstructRaymarchClassified*,
+    CS_ScreenProbes_DownsampleDepthCoordMinMaxBuffer. The 25 modules pass
+    spirv-val.
+  - **Shown on the card without a bake** (run cg3, branch `cg-exp-lut`, an
+    experiment not to merge: the replayed table copied over the card's
+    before each composite): the final frame shows the opening shot (the
+    window, the yard, chairs, a long shadow, the low sun). The card's
+    10-bit target after the composite equals the interpreter's within one
+    step (129,600 pixels, worst 2.2), so the composite and the copy to
+    the back buffer are right. What it shows is still wrong upstream:
+    the picture is black and amber only (the HDR buffer itself holds
+    3.3 / 0.81 / 0.11 in the yard, the sky is brown), the crosshatch
+    pattern of the HDR targets, a black interior, dark blocks in the sky.
+  - **Tools**: a capture's small memory blocks are written by a thread of
+    their own (thirteen thousand files in one folder held the recording
+    threads half a minute and the title gave up: run vk100 saved no
+    images; six passes now capture in a second). `replay` takes a pixel
+    program's inputs per pixel (`INPUTS="loc.comp=a,b,c;..."`: a + b x +
+    c y) and prints nodes (`NODES`): PS_CompositeNMB takes its texture
+    coordinates and the exposure from VS_PassthroughComposite, and the
+    interpreter's made-up inputs replayed it as noise. (For it:
+    `INPUTS="1.0=0,0.00052083333,0;1.1=0,0,0.00092592593;1.2=<exposure>;2.0=<EV>"`.)
 - 2026-11-27 (late): wave64 and waterfalls, proven offline (branch
   `worktree-agent-af78a0a95bd2278bc`; nothing baked or run).
   - **Tests**: origin/main's wave64 and waterfall cases are in
