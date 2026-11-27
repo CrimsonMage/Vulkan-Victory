@@ -694,6 +694,16 @@ fn make(b: &Backend, shader: &Shader) -> State {
         .filter(|i| i.input && vs.stage != HwStage::Ps)
         .map(|i| (i.semantic.clone(), i.index, i.location))
         .collect();
+    // The module is needed again only for a vertex program's rectangle
+    // part (`rect.rs`); the driver's copy of every other module's words
+    // goes once its part is made (over 700 MiB for a run's 3,500 stages).
+    let module = if vs.stage == HwStage::Vs {
+        module
+    } else {
+        // SAFETY: the part is made; nothing else names the module.
+        unsafe { b.host.device.destroy_shader_module(module, None) };
+        vk::ShaderModule::null()
+    };
     State::Done(Arc::new(Stage {
         stage: vs.stage,
         module,
