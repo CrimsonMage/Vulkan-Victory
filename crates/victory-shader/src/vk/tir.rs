@@ -108,10 +108,90 @@ pub enum Helper {
     /// direction xyz, inverse direction xyz) -> uvec4: the ray/node test
     /// of `image_bvh*_intersect_ray` (emit_bvh.rs).
     BvhRay,
-    /// (dword index u32) -> u32: dword `index` of `Func::tables[k]`, 0
-    /// past its end: a constant table in the program's own code, read
-    /// through `s_getpc_b64` (lift_mem.rs `code_table`).
+    /// (dword index u32) -> u32: dword `index` of table k of
+    /// `Func::tables`, 0 past its end: a constant table in the program's
+    /// own code, read through `s_getpc_b64` (lift_mem.rs `code_table`).
     CodeTable(u16),
+}
+
+/// The most dwords of code a constant table read through `s_getpc_b64`
+/// takes (from its start on).
+const CODE_TABLE_DWORDS: usize = 4096;
+
+/// One constant table of a program's code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeTable {
+    /// Where it starts in the code (a byte offset).
+    pub start: u32,
+    /// Its first dword in [`CodeTables::words`].
+    pub first: u32,
+    /// Its dwords (0 until laid out, and when nothing reads it).
+    pub dwords: u32,
+}
+
+/// The constant tables of a program's code (`Helper::CodeTable`): memory
+/// the host keeps for the program, read by address
+/// (`docs/vulkan-abi.md` section 3.1). As variables of the module, NVIDIA
+/// kept them on the card for 32,768 threads (one program's nine tables:
+/// 1.7 GiB).
+#[derive(Debug, Clone, Default)]
+pub struct CodeTables {
+    pub tables: Vec<CodeTable>,
+    /// The tables' bytes, as little-endian dwords.
+    pub words: Vec<u32>,
+}
+
+impl CodeTables {
+    /// The table that starts at code byte `start` (made once a start).
+    pub fn at(&mut self, start: u32) -> u16 {
+        let k = self.tables.iter().position(|t| t.start == start).unwrap_or_else(|| {
+            self.tables.push(CodeTable { start, ..CodeTable::default() });
+            self.tables.len() - 1
+        });
+        k as u16
+    }
+
+    /// Lays the tables something reads (`used`, by table) out in `words`:
+    /// each is the code from its start to the code's end,
+    /// [`CODE_TABLE_DWORDS`] at most; tables that overlap share their
+    /// bytes (one run of code) where they start whole dwords apart.
+    pub fn lay_out(&mut self, code: &[u8], used: &[bool]) {
+        let mut order: Vec<usize> = (0..self.tables.len()).filter(|&k| used.get(k) == Some(&true)).collect();
+        order.sort_by_key(|&k| self.tables[k].start);
+        let mut bytes: Vec<u8> = Vec::new();
+        // the runs of code in `bytes`: (first code byte, end, its place)
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for k in order {
+            let from = (self.tables[k].start as usize).min(code.len());
+            let to = code.len().min(from + 4 * CODE_TABLE_DWORDS);
+            // in a run that holds all of it, else in the last run if it
+            // begins there (the run grows), else in a new run
+            let begins = |&(s, e, _): &(usize, usize, usize)| from >= s && from <= e && (from - s) % 4 == 0;
+            let holds = runs.iter().position(|r| begins(r) && to <= r.1);
+            let r = holds.or_else(|| runs.len().checked_sub(1).filter(|&l| begins(&runs[l]))).unwrap_or_else(|| {
+                bytes.resize(bytes.len().next_multiple_of(4), 0);
+                runs.push((from, from, bytes.len()));
+                runs.len() - 1
+            });
+            let (s, e, at) = runs[r];
+            if to > e {
+                bytes.extend_from_slice(&code[e..to]);
+                runs[r].1 = to;
+            }
+            let at = at + (from - s);
+            self.tables[k].first = (at / 4) as u32;
+            self.tables[k].dwords = (to - from).div_ceil(4) as u32;
+        }
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        self.words = bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    }
+
+    /// Dword `i` of table `k`, 0 past its end: what the module reads from
+    /// the host's copy of `words`.
+    pub fn dword(&self, k: u16, i: u32) -> u32 {
+        let t = self.tables[usize::from(k)];
+        if i < t.dwords { self.words[(t.first + i) as usize] } else { 0 }
+    }
 }
 
 /// Image access kinds.
@@ -293,9 +373,7 @@ pub struct Func {
     pub prelude: Vec<V>,
     pub blocks: Vec<Block>,
     /// Constant tables of the program's code (`Helper::CodeTable`).
-    pub tables: Vec<Vec<u32>>,
-    /// Each table's code offset.
-    pub tables_at: Vec<u32>,
+    pub tables: CodeTables,
     global: HashMap<Node, V>,
 }
 
@@ -531,6 +609,46 @@ mod tests {
         let x = f.push(Node { op: Op::Spv(op::COMPOSITE_EXTRACT), ty: Ty::F16, args: vec![s], imm: vec![0] });
         f.blocks.push(Block { phis: vec![], preds: vec![], body: vec![Item::N(x)], term: Term::Return });
         assert!(check(&f).is_err());
+    }
+
+    /// Every table reads the code from its start on (0 past the end, a
+    /// last dword short of bytes padded with zeros), whatever shares bytes.
+    #[test]
+    fn code_tables_laid_out_read_the_code_from_their_starts() {
+        let code: Vec<u8> = (0..4 * CODE_TABLE_DWORDS as u32 + 4096 + 3).map(|i| (i * 7 + i / 251) as u8).collect();
+        let reference = |start: usize, i: usize| -> u32 {
+            let at = start + 4 * i;
+            if i >= CODE_TABLE_DWORDS || at >= code.len() {
+                return 0;
+            }
+            (0..4).rev().fold(0, |w, b| w << 8 | u32::from(code.get(at + b).copied().unwrap_or(0)))
+        };
+        // overlapping whole dwords apart, one a byte off, one capped at
+        // the most dwords, one nothing reads, one past the code's end
+        let starts = [4096u32, 16384, 4104, 16385, 8, 12000, code.len() as u32 + 40, 18000];
+        let mut t = CodeTables::default();
+        for &s in &starts {
+            t.at(s);
+        }
+        assert_eq!(t.at(4104), 2);
+        let mut used = vec![true; starts.len()];
+        used[5] = false;
+        t.lay_out(&code, &used);
+        for (k, &s) in starts.iter().enumerate() {
+            for i in (0..CODE_TABLE_DWORDS + 8).step_by(if k == 0 { 1 } else { 37 }).chain([CODE_TABLE_DWORDS - 1, CODE_TABLE_DWORDS]) {
+                let want = if used[k] { reference(s as usize, i) } else { 0 };
+                assert_eq!(t.dword(k as u16, i as u32), want, "table {k} dword {i}");
+            }
+        }
+        assert_eq!(t.dword(0, u32::MAX), 0);
+        // one run from 8 to the code's end (4096, 4104, 16384 and 18000
+        // begin in it), and 16385 apart
+        let shared = (code.len() - 8).div_ceil(4);
+        let apart = (code.len() - 16385).div_ceil(4);
+        assert_eq!(t.words.len(), shared + apart);
+        assert_eq!(t.tables[2].first, t.tables[0].first + 2);
+        assert_eq!(t.tables[5].dwords, 0);
+        assert_eq!(t.tables[6].dwords, 0);
     }
 }
 

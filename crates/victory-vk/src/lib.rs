@@ -32,6 +32,7 @@ pub mod present;
 #[cfg(windows)]
 mod probe;
 pub mod swapchain;
+pub mod tables;
 pub mod timeline;
 
 /// `victory vkprobe`: runs every step and prints one line per step.

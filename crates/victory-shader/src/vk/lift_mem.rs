@@ -2,10 +2,6 @@
 
 use super::*;
 
-/// The most dwords of code a constant table read through `s_getpc_b64`
-/// takes (from its start on).
-const CODE_TABLE_DWORDS: usize = 4096;
-
 impl Lift<'_> {
     pub(super) fn translate(&mut self, addr: V) -> V {
         self.emit(Op::Call(Helper::Translate), Ty::U64, vec![addr])
@@ -100,21 +96,10 @@ impl Lift<'_> {
     }
 
     /// The table of the program's code from byte `start` on (made once a
-    /// start).
+    /// start; its bytes are laid out once the program is lifted,
+    /// `tir::CodeTables::lay_out`).
     fn code_table(&mut self, start: u32) -> u16 {
-        let k = match self.f.tables_at.iter().position(|&s| s == start) {
-            Some(k) => k,
-            None => {
-                let code = &self.native.code;
-                let from = (start as usize).min(code.len());
-                let to = code.len().min(from + 4 * CODE_TABLE_DWORDS);
-                let words = code[from..to].chunks(4).map(|c| c.iter().rev().fold(0u32, |w, &b| w << 8 | u32::from(b))).collect();
-                self.f.tables.push(words);
-                self.f.tables_at.push(start);
-                self.f.tables.len() - 1
-            }
-        };
-        k as u16
+        self.f.tables.at(start)
     }
 
     /// Dword `first + i` of code table `k`.

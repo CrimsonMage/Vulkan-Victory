@@ -55,6 +55,7 @@ mod images;
 pub(crate) mod record;
 mod stage_cache;
 mod stages;
+mod tables;
 mod writes;
 
 pub use paging::{GpuPage, title_pages_aliased};
@@ -645,7 +646,7 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
     if m.import_regions(&b.host) {
         m.rebuild_map();
     }
-    (m.map.generation, m.map.block(zero, sink))
+    (m.map.generation, m.map.block(zero, sink, tables::address(b)))
 }
 
 /// The map's generation now (regions wanted imported first).

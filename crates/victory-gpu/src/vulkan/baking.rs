@@ -170,7 +170,7 @@ fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, owner: Owner) ->
     let flight = (!known).then(|| stages::Flight::take(words as u64));
     let running = slow::compiling(hash, &name, &vs.spirv, owner, known);
     let t = Instant::now();
-    let made = stages::compile(b, vs.stage, module, &vs.samplers, None);
+    let made = stages::compile(b, vs.stage, module, &vs.samplers, &vs.tables, None);
     let ms = t.elapsed().as_millis() as u64;
     let turned = running.finish() && !known;
     drop(flight);

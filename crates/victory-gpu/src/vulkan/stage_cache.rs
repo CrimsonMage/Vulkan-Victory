@@ -17,7 +17,7 @@ use victory_shader::{HwStage, RootType};
 /// The file encoding's version: bump it when `encode`/`decode` change.
 /// (The key used to hash this whole file, so any edit here, even one that
 /// left the encoding alone, threw every kept translation away.)
-const MAGIC: &[u8; 8] = b"vkstage4";
+const MAGIC: &[u8; 8] = b"vkstage5";
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -291,6 +291,28 @@ pub(crate) fn save_immediates(list: &[[u32; 4]]) {
     }
 }
 
+/// The places of programs' code tables in the tables buffer that earlier
+/// runs gave (`tables.rs`, `victory_vk::tables`): a line a place, in the
+/// order given. Kept apart from the translations, as the immediate
+/// samplers' slots: the places are the host's, and what the driver's cache
+/// knows a pipeline by.
+pub(crate) fn code_table_lines() -> Vec<String> {
+    let text = dir().and_then(|d| std::fs::read_to_string(d.join("code-tables.txt")).ok()).unwrap_or_default();
+    text.lines().map(str::to_string).collect()
+}
+
+/// Keeps a new place of code tables.
+pub(crate) fn note_code_table(line: &str) {
+    append_line("code-tables.txt", line);
+}
+
+/// Drops the places kept (they are given anew).
+pub(crate) fn forget_code_tables() {
+    if let Some(d) = dir() {
+        let _ = std::fs::remove_file(d.join("code-tables.txt"));
+    }
+}
+
 /// Keeps `vs`, the translation of the container `full`.
 pub(crate) fn write(full: &[u8; 32], vs: &VkShader) {
     let Some(p) = path(full) else { return };
@@ -372,6 +394,8 @@ fn encode(vs: &VkShader) -> Vec<u8> {
     }
     w.push(vs.spirv.len() as u32);
     w.extend(&vs.spirv);
+    w.push(vs.tables.len() as u32);
+    w.extend(&vs.tables);
     let mut out = MAGIC.to_vec();
     out.extend(w.iter().flat_map(|x| x.to_le_bytes()));
     out
@@ -424,5 +448,7 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     }
     let n = r.next()? as usize;
     let spirv = r.take(n)?.to_vec();
-    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id, mesh_parts })
+    let n = r.next()? as usize;
+    let tables = r.take(n)?.to_vec();
+    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id, mesh_parts, tables })
 }

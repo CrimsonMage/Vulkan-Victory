@@ -6,8 +6,8 @@ use anyhow::{Result, bail, ensure};
 
 /// Ranges a map holds at most.
 pub const MAX_RANGES: usize = 64;
-/// Bytes of a map block: the header (zero, sink, count, padding) and 64
-/// ranges of 32 bytes.
+/// Bytes of a map block: the header (zero, sink, count, padding, the
+/// tables buffer) and 64 ranges of 32 bytes.
 pub const BLOCK_BYTES: usize = 32 + MAX_RANGES * 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,13 +110,16 @@ impl MemoryMap {
             .map(|r| r.device_base + (title - r.title_start))
     }
 
-    /// The block programs read (ABI v1), little-endian.
-    pub fn block(&self, zero: u64, sink: u64) -> Vec<u8> {
+    /// The block programs read (ABI v1), little-endian. `tables`: the
+    /// device address of the buffer that holds the programs' code tables
+    /// (section 3.1; read only by programs that have tables).
+    pub fn block(&self, zero: u64, sink: u64, tables: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(BLOCK_BYTES);
         out.extend_from_slice(&zero.to_le_bytes());
         out.extend_from_slice(&sink.to_le_bytes());
         out.extend_from_slice(&(self.ranges.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0; 12]);
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&tables.to_le_bytes());
         for r in &self.ranges {
             out.extend_from_slice(&r.title_start.to_le_bytes());
             out.extend_from_slice(&r.title_size.to_le_bytes());
@@ -161,11 +164,12 @@ mod tests {
     fn block_layout() {
         let mut m = MemoryMap::default();
         m.insert(r(0x1000, 0x2000, 0xabc0_0000)).unwrap();
-        let b = m.block(0x11, 0x22);
+        let b = m.block(0x11, 0x22, 0x33);
         assert_eq!(b.len(), BLOCK_BYTES);
         assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 0x11);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0x22);
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(b[24..32].try_into().unwrap()), 0x33);
         assert_eq!(u64::from_le_bytes(b[32..40].try_into().unwrap()), 0x1000);
         assert_eq!(u64::from_le_bytes(b[40..48].try_into().unwrap()), 0x2000);
         assert_eq!(

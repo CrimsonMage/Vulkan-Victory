@@ -150,6 +150,38 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (code tables): a program's constant tables are memory it
+  reads by address, not variables of its module (branch
+  `worktree-agent-a237c60fd3ce29af8`; offline only, awaiting a bake).
+  - **Why**: NVIDIA keeps a module's own variables (`Private` and
+    `Function` storage) on the card for 32,768 threads, sized by the worst
+    pipeline of each stage kind, outside every heap's count, for good. The
+    tables a console program keeps after its code were private arrays with
+    initialisers: CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar
+    (6d7fe7745ab9c6d8) had nine, 47.7 KiB, 1.7 GiB on the card at its
+    compile. No shape of variable avoids it.
+  - **Now** (`docs/vulkan-abi.md` section 3.1, ABI v5 amended): the
+    translator hands the tables' bytes to the host (`VkShader::tables`,
+    overlapping tables sharing bytes: that program's are 9.2 KiB); the
+    host keeps them in one 2 MiB host-visible buffer (`vulkan/tables.rs`),
+    whose address is in the memory map (byte 24, padding until now); the
+    module loads a dword at that address + its place in the buffer
+    (specialization constant 1) + the table's offset. Modules of programs
+    without tables do not change (the stage cache's files do: the tables
+    are in them).
+  - **The driver's cache**: a specialization constant is part of a cached
+    pipeline's key, and a buffer's address differs from process to process:
+    as the constant it would have made every run compile every program
+    with tables again (155 of the used 3,408; the last bake's 75 stages
+    took 403 s). So the constant is the place in the buffer, given once
+    and kept beside the translations (`code-tables.txt`, as
+    `immediate-samplers.txt`): the same in the bake and in every run.
+  - **Measured offline** (the used set, 3,408 modules): the most bytes of
+    variables a module has went from 47,748 to 11,460; 155 modules
+    changed, all pass spirv-val; the golden file's behaviours not at all.
+    The pack: 662 of 25,889 programs have tables, 300 KiB, 139 KiB as 217
+    distinct sets.
+
 - 2026-11-27 (indirect light): why everything the sun does not hit was
   black, found by walking back from the tiled lighting with pass captures
   (runs gi5 to gi9, branch `worktree-agent-a8a715585abfc9ff1`).

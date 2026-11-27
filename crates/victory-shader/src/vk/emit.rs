@@ -44,6 +44,12 @@ pub struct Stage {
     pub no_sel: HashSet<usize>,
 }
 
+/// The specialization constant (u32, default 0) of a program with code
+/// tables: where its tables' bytes lie in the host's tables buffer, in
+/// bytes from the buffer's start (`docs/vulkan-abi.md` section 3.1).
+/// (0: the memory map has one range; 100 + n: immediate sampler n.)
+pub const SPEC_CODE_TABLES: u32 = 1;
+
 pub struct Emitted {
     /// Selections a jump had to leave through a dispatch (the attempt is
     /// redone with them as block constructs).
@@ -167,6 +173,8 @@ pub struct Emit<'a> {
     images64: HashMap<(u8, bool, bool), Id>,
     samplers: Id,
     spec_samplers: HashMap<u32, Id>,
+    /// Specialization constant [`SPEC_CODE_TABLES`] (0: not declared).
+    spec_tables: Id,
     helpers: HashMap<Helper, Id>,
     picks: HashMap<V, Id>,
     /// Merges of the selections `open_if` opened.
@@ -252,6 +260,7 @@ impl<'a> Emit<'a> {
             images64: HashMap::new(),
             samplers: 0,
             spec_samplers: HashMap::new(),
+            spec_tables: 0,
             helpers: HashMap::new(),
             picks: HashMap::new(),
             if_merge: Vec::new(),

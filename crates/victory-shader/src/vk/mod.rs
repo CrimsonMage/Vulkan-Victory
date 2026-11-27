@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io};
+pub use emit::SPEC_CODE_TABLES;
 pub use lift::Approx;
 pub use report::{Report, report};
 pub use semantics::Semantics;
@@ -86,6 +87,11 @@ pub struct VkShader {
     /// host dispatches y × `mesh_parts` groups in y, `docs/vulkan-abi.md`
     /// section 6).
     pub mesh_parts: u32,
+    /// The constant tables of the program's code, as dwords (empty: the
+    /// program has none). The host keeps them in its tables buffer and
+    /// gives the module their place in it, specialization constant
+    /// [`SPEC_CODE_TABLES`] (`docs/vulkan-abi.md` section 3.1).
+    pub tables: Vec<u32>,
 }
 
 struct SigRow {
@@ -208,6 +214,7 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         ir_insts,
         guard_id: guard_id(container),
         mesh_parts,
+        tables: f.tables.words,
     })
 }
 
@@ -294,6 +301,14 @@ fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], strid
     ifconv::if_convert(&mut f);
     tir::dce(&mut f);
     let placed = tir::placed(&f);
+    // the code tables something still reads, as the bytes the host keeps
+    let mut read = vec![false; f.tables.tables.len()];
+    for (n, _) in f.nodes.iter().zip(&placed).filter(|(_, p)| **p) {
+        if let tir::Op::Call(tir::Helper::CodeTable(k)) = n.op {
+            read[usize::from(k)] = true;
+        }
+    }
+    f.tables.lay_out(&native.code, &read);
     for (v, r, a) in std::mem::take(&mut iface.unless_uniform) {
         let read = placed.get(r as usize).copied().unwrap_or(false);
         if read && !uni.get(v as usize).copied().unwrap_or(false) && !iface.approximate.contains(&a) {

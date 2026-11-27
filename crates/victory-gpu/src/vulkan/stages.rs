@@ -274,6 +274,9 @@ pub(crate) struct Stage {
     pub(crate) inputs: Vec<(String, u32, u8)>,
     /// Immediate samplers (the part's specialisation).
     samplers: Vec<[u32; 4]>,
+    /// The program's code tables (the part's specialisation: their place
+    /// in the tables buffer, `tables.rs`).
+    tables: Vec<u32>,
     /// The vertex part with the rectangle geometry stage behind it, made
     /// at the first rectangle-list draw (`rect.rs`).
     rect: std::sync::OnceLock<Option<vk::Pipeline>>,
@@ -295,7 +298,7 @@ impl Stage {
                 return None;
             }
             let gs = super::rect::module(b)?;
-            compile(b, self.stage, self.module, &self.samplers, Some(gs))
+            compile(b, self.stage, self.module, &self.samplers, &self.tables, Some(gs))
                 .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "Vulkan: the rectangle part does not compile"))
                 .ok()
         })
@@ -727,6 +730,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         user_data: vs.user_data.clone(),
         inputs,
         samplers: vs.samplers.clone(),
+        tables: vs.tables.clone(),
         rect: std::sync::OnceLock::new(),
         words: vs.spirv.len(),
         guard_id: vs.guard_id,
@@ -758,7 +762,7 @@ fn compile_timed(b: &Backend, shader: &Shader, vs: &victory_shader::vk::VkShader
     let owner = if worker { Owner::Worker } else { Owner::Background };
     let running = slow::compiling(&hash, &shader.name, &vs.spirv, owner, known);
     let (t, cpu) = (Instant::now(), thread_cpu_us());
-    let p = compile(b, vs.stage, module, &vs.samplers, None);
+    let p = compile(b, vs.stage, module, &vs.samplers, &vs.tables, None);
     let cpu_ms = thread_cpu_us().saturating_sub(cpu) / 1000;
     if running.finish() && worker {
         retire();
@@ -840,12 +844,14 @@ fn dynamic(b: &Backend, fragment: bool) -> Vec<vk::DynamicState> {
 
 /// Compiles one stage: a library part (vertex: pre-rasterisation, with
 /// `geometry` behind it if given; pixel: fragment shader) or a compute
-/// pipeline.
+/// pipeline. `tables`: the program's code tables (`VkShader::tables`),
+/// put into the tables buffer here.
 pub(super) fn compile(
     b: &Backend,
     stage: HwStage,
     module: vk::ShaderModule,
     samplers: &[[u32; 4]],
+    tables: &[u32],
     geometry: Option<vk::ShaderModule>,
 ) -> anyhow::Result<vk::Pipeline> {
     let layout = layout(b).ok_or_else(|| anyhow::anyhow!("no pipeline layout"))?;
@@ -857,7 +863,9 @@ pub(super) fn compile(
     };
     let name = c"main";
     // Specialisation (ABI v1): constant 0 false (the map has more than one
-    // range), constant 100 + n the heap slot of immediate sampler n.
+    // range), constant 100 + n the heap slot of immediate sampler n,
+    // constant 1 the place of the program's code tables in the tables
+    // buffer (section 3.1).
     let mut data: Vec<u32> = vec![vk::FALSE];
     let mut entries = vec![
         vk::SpecializationMapEntry::default()
@@ -873,6 +881,15 @@ pub(super) fn compile(
                 .size(4),
         );
         data.push(immediate_slot(*words));
+    }
+    if !tables.is_empty() {
+        entries.push(
+            vk::SpecializationMapEntry::default()
+                .constant_id(victory_shader::vk::SPEC_CODE_TABLES)
+                .offset(4 * data.len() as u32)
+                .size(4),
+        );
+        data.push(super::tables::place(b, tables)?);
     }
     let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
     let spec = vk::SpecializationInfo::default()

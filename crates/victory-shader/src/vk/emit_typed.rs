@@ -76,33 +76,47 @@ pub(crate) fn format_table() -> [u32; 128] {
 }
 
 impl Emit<'_> {
-    /// `CodeTable(t)`: the program's code from the table's start, a private
-    /// array with its constant, at the dword index (0 past the end).
+    /// `CodeTable(t)`: the table's dword at the index (0 past its end),
+    /// read from the host's copy of the program's tables
+    /// (`docs/vulkan-abi.md` section 3.1): at the tables buffer's address
+    /// (the memory map's `tables`) + the program's place in that buffer
+    /// (specialization constant [`SPEC_CODE_TABLES`]) + the table's place
+    /// in the program's bytes. (A private array with the table as its
+    /// constant until 2026-11-27: NVIDIA keeps a module's variables on the
+    /// card for 32,768 threads.)
     pub(super) fn write_code_table(&mut self, fid: Id, t: usize) {
-        let (u, b) = (self.t.u32_, self.t.bool_);
-        let table = self.f.tables[t].clone();
-        let len = table.len().max(1) as u32;
-        let arr = self.m.t_array_plain(u, len);
-        let words: Vec<Id> = if table.is_empty() { vec![self.c32(0)] } else { table.iter().map(|&w| self.c32(w)).collect() };
-        let init = self.m.c_composite(arr, &words);
-        let pa = self.m.t_ptr(en::SC_PRIVATE, arr);
-        let var = self.m.variable_init(pa, en::SC_PRIVATE, init);
-        self.interface.push(var);
+        let (u, b, q) = (self.t.u32_, self.t.bool_, self.t.u64_);
+        let table = self.f.tables.tables[t];
         let fty = self.m.global_fn_type(u, &[u]);
         self.m.op_to(op::FUNCTION, u, fid, &[0, fty]);
         let i = self.m.id();
         self.m.op_to(55, u, i, &[]);
         let entry = self.m.id();
         self.m.label(entry);
-        let last = self.c32(len - 1);
-        let at = self.m.ext(glsl::U_MIN, u, &[i, last]);
-        let pu = self.m.t_ptr(en::SC_PRIVATE, u);
-        let ep = self.m.op(op::ACCESS_CHAIN, pu, &[var, at]);
-        let e = self.m.op(op::LOAD, u, &[ep]);
-        let past = self.m.op(op::U_GREATER_THAN, b, &[i, last]);
-        let past = if table.is_empty() { self.m.c_bool(true) } else { past };
         let z = self.c32(0);
-        let r = self.m.op(op::SELECT, u, &[past, z, e]);
+        let r = if table.dwords == 0 {
+            z
+        } else {
+            if self.spec_tables == 0 {
+                self.spec_tables = self.m.spec_u32(u, 0);
+                self.m.decorate(self.spec_tables, en::DEC_SPEC_ID, &[SPEC_CODE_TABLES]);
+            }
+            let last = self.c32(table.dwords - 1);
+            let at = self.m.ext(glsl::U_MIN, u, &[i, last]);
+            let first = self.c32(table.first);
+            let dword = self.m.op(op::I_ADD, u, &[at, first]);
+            let two = self.c32(2);
+            let byte = self.m.op(op::SHIFT_LEFT_LOGICAL, u, &[dword, two]);
+            let place = self.m.op(op::I_ADD, u, &[byte, self.spec_tables]);
+            let place = self.m.op(op::U_CONVERT, q, &[place]);
+            let buffer = self.map_load(q, &[3]);
+            let addr = self.m.op(op::I_ADD, q, &[buffer, place]);
+            let p = self.m.t_ptr(en::SC_PHYSICAL_STORAGE_BUFFER, u);
+            let ptr = self.m.op(op::CONVERT_U_TO_PTR, p, &[addr]);
+            let e = self.m.op(op::LOAD, u, &[ptr, en::MEM_ALIGNED, 4]);
+            let past = self.m.op(op::U_GREATER_THAN, b, &[i, last]);
+            self.m.op(op::SELECT, u, &[past, z, e])
+        };
         self.m.op_void(254, &[r]); // OpReturnValue
         self.m.op_void(op::FUNCTION_END, &[]);
     }

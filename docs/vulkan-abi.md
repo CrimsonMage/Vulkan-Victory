@@ -7,7 +7,10 @@ host groups in y; v3 2026-11-26: the loop guard buffer in push dwords 2–3; v2
 2026-11-26: semantic registry, six-layer 2D-array views of cubes on set 0
 binding 2, T# check word; v1 2026-11-26, v0 2026-11-25; v1
 amended the same day: immediate samplers in set 1 by specialization
-constant, change 8). v1 takes the host's
+constant, change 8; v5 amended 2026-11-27: a program's code tables in the
+host's tables buffer, section 3.1: the memory map's `tables` and
+specialization constant 1, read only by programs that have tables, so no
+module made before it changes and the version stays). v1 takes the host's
 proposals (`docs/vulkan-host.md` section 6). Owner of the translator side:
 `crates/victory-shader/src/vk/`. Owner of the host side: the Vulkan host
 (branch `worktree-agent-a5b010d38d592dbd0`). Change this file first, then
@@ -28,6 +31,9 @@ reads it:
   host's `Create*View` put them, exactly as the console's scalar loads read
   them. A V# is dereferenced as an address; a T# or S# carries the index of
   a Vulkan descriptor the host made for it.
+- **Its own code** (constant tables the console program keeps after its
+  code and reads through `s_getpc_b64`) from the host's copy of those
+  bytes, by address (section 3.1).
 
 Nothing is traced, guessed or looked up per access beyond that.
 
@@ -123,7 +129,8 @@ struct MemoryMap {            // uniform buffer, set 3 binding 0 (std140; offset
     u64 zero;                 // device address of >= 256 bytes of zeros (never written)
     u64 sink;                 // device address of >= 256 writable bytes nobody reads (dropped stores)
     u32 count;                // ranges in use, 1..=64
-    u32 pad[3];
+    u32 pad;
+    u64 tables;               // device address of the tables buffer (section 3.1; byte 24)
     struct {
         u64 title_start;      // first title address of the range
         u64 title_size;       // bytes
@@ -153,6 +160,60 @@ against 0.26 s).
 
 Translation happens once per distinct base (a V#'s base, a table
 address, a root address): every access then only adds its offset.
+
+### 3.1 Code tables
+
+A console program may keep constant tables after its own code and read
+them at `s_getpc_b64` plus a constant plus an index, by scalar loads or by
+`global_load_dword*` (662 of the pack's 25,889 programs: tone-map spline
+coefficients, hair jitter, blur taps, the ray binning's nine tables;
+300 KiB of tables, 139 KiB as 217 distinct sets). A
+table is the code from its start to the code's end, 4,096 dwords at most;
+a dword past it reads 0.
+
+The translator lists the bytes of all of a program's tables as
+`VkShader::tables` (dwords; empty for a program without tables): each
+table from its start, tables that overlap sharing their bytes where they
+start whole dwords apart (`tir::CodeTables::lay_out`). Where each table
+begins in them is in the module. The host keeps these bytes in **the
+tables buffer**: one buffer for every program, with a device address, that
+lives as long as any stage; it puts the buffer's address into the memory
+map (`tables`) and tells each program with tables where its bytes begin:
+**specialization constant 1** (u32, default 0), bytes from the buffer's
+start, a multiple of 4. The module reads dword i of a table at
+
+```
+map.tables + constant 1 + 4 * (the table's first dword in the program's bytes + i)
+```
+
+with a 4-byte-aligned load through a physical pointer, i clamped to the
+table and the result 0 past its end. A module of a program with tables
+declares the map with `tables` (member 3, `Offset` 24, the ranges member
+4); the other modules declare the map without it, as before.
+
+**A place is given once.** The constant's value is part of what the
+driver's pipeline cache knows a pipeline by, and a baked pipeline must be
+found again by every later run. The buffer's address is another in every
+process (as the constant it would have cost a compile of every such
+program in every run: 155 of the used set's 3,408 programs have tables,
+and the last bake of 75 changed stages took 403 s); so the constant is
+only the place
+in the buffer, and the host keeps each place it gives beside the
+translations (`code-tables.txt`: a hash of the bytes, their length, the
+offset; `victory_vk::tables`), as it keeps the immediate samplers' slots.
+Programs with the same bytes share a place. A lost file costs compiles,
+not correctness; so does the list starting again when it has filled half
+the buffer (2 MiB; places are never taken back).
+
+Why memory: until 2026-11-27 a table was a `Private` array of the module
+with the table as its initialiser. NVIDIA keeps a module's own variables
+(`Private` and `Function` storage) on the card for 32,768 threads, sized
+by the pipeline of each stage kind that has most, outside every heap's
+count, and does not give them back: the nine tables of
+CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar (47.7 KiB as
+variables; 9.2 KiB as shared bytes) took 1.7 GiB. No shape of variable
+avoided it (`NonWritable`, a `Function` variable with the initialiser, one
+stored once).
 
 ## 4. Buffers: V# (4 dwords)
 
@@ -209,7 +270,9 @@ partially bound), so every stage of every pipeline has the same layout.
 Set 2 is unused.
 
 Specialization constants: **0** (bool, default true) the memory map has
-one range (section 3); **100 + n** (u32, default 0) the sampler-heap slot
+one range (section 3); **1** (u32, default 0) the place of the program's
+code tables in the tables buffer (section 3.1; declared only by programs
+with tables); **100 + n** (u32, default 0) the sampler-heap slot
 of immediate sampler n (section 5.3). The array sizes are fixed (descriptor
 buffers need them at layout creation); the host never hands out a slot
 past them.
@@ -474,6 +537,7 @@ pub struct VkShader {
     pub local_size: [u32; 3],            // compute / mesh
     pub approximate: Vec<Approx>,        // approximations taken (note, opcode), section 9
     pub mesh_parts: u32,                 // mesh: host groups per console group in y (section 6)
+    pub tables: Vec<u32>,                // the code tables' bytes, for the tables buffer at spec constant 1 (section 3.1)
 }
 ```
 

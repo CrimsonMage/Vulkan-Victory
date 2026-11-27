@@ -302,6 +302,99 @@ fn vector_loads_elsewhere_stay_memory_beside_a_code_table() {
     });
 }
 
+/// Ours: a code table is memory the host keeps (`Func::tables`: the code
+/// from the table's start on), read by address: the tables buffer's
+/// address from the memory map (member 3, byte 24), the program's place in
+/// it from specialization constant 1, a load through a physical pointer.
+/// The module has no variable for it: NVIDIA keeps a module's `Private`
+/// and `Function` variables on the card for 32,768 threads (nine tables of
+/// CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar, 47.7 KiB as
+/// private arrays, held 1.7 GiB).
+#[test]
+fn code_tables_are_memory_read_by_address_not_variables() {
+    use crate::vk::spirv::en;
+    const TABLE: [u32; 5] = [0x3F80_0000, 7, 0xDEAD_BEEF, 0, 0x4120_0000];
+    let body = |dist: u32| {
+        vec![
+            0xBE86_1F00,              // s_getpc_b64 s[6:7]
+            sop2(0x00, 6, 6, 255),    // s_add_u32 s6, s6, dist
+            dist,
+            sop2(0x04, 7, 7, 0x80),   // s_addc_u32 s7, s7, 0
+            0x3D << 26 | 13 << 6 | 3, // s_load_dword s13, s[6:7], 0
+            125 << 25,
+            vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+        ]
+    };
+    let start = build_cs(&body(0), 1, 0).native.code.len() as u32;
+    // the table begins one dword after the code's end: the host's bytes
+    // begin at the table, not at the code
+    let mut shader = build_cs(&body(start + 4 - 32), 1, 0);
+    shader.native.code.extend(0x1234_5678u32.to_le_bytes());
+    shader.native.code.extend(TABLE.iter().flat_map(|w| w.to_le_bytes()));
+    let (tables, words) = module_of(&shader);
+    assert_eq!(tables, TABLE);
+    let insts = instructions(&words);
+    let has = |op: u32, a: &[u32]| insts.iter().any(|&(o, x)| o == op && x == a);
+    // no array but the push constants' and the map's ranges: no table
+    assert_eq!(insts.iter().filter(|i| i.0 == 28).count(), 2, "arrays of the module");
+    // no variable of the module's own but the loop guard's count
+    let own: Vec<&[u32]> = insts.iter().filter(|i| i.0 == 59 && matches!(i.1[2], en::SC_PRIVATE | en::SC_FUNCTION)).map(|i| i.1).collect();
+    assert!(own.len() <= 1, "variables of the module's own: {own:?}");
+    // specialization constant 1 (u32, default 0)
+    let spec: Vec<&[u32]> = insts.iter().filter(|i| i.0 == 50).map(|i| i.1).collect();
+    assert_eq!(spec.len(), 1);
+    assert_eq!(spec[0][2], 0, "the default");
+    assert!(has(71, &[spec[0][1], en::DEC_SPEC_ID, crate::vk::SPEC_CODE_TABLES]));
+    assert_eq!(crate::vk::SPEC_CODE_TABLES, 1);
+    // the map's member 3 at byte 24, the tables buffer's address, and
+    // the ranges after it
+    let map = insts.iter().find(|i| i.0 == 72 && i.1[1..] == [4, en::DEC_OFFSET, 32]).expect("the map with five members").1[0];
+    assert!(has(72, &[map, 3, en::DEC_OFFSET, 24]));
+    // read through a physical pointer to a dword
+    let psb: Vec<u32> = insts.iter().filter(|i| i.0 == 32 && i.1[1] == en::SC_PHYSICAL_STORAGE_BUFFER).map(|i| i.1[0]).collect();
+    let made: Vec<u32> = insts.iter().filter(|i| i.0 == 120 && psb.contains(&i.1[0])).map(|i| i.1[1]).collect();
+    assert!(insts.iter().any(|i| i.0 == 61 && made.contains(&i.1[2]) && i.1[3..] == [en::MEM_ALIGNED, 4]));
+    // a program without a table: the map as it was (four members), no
+    // specialization constant
+    let (tables, words) = module_of(&build_cs(&[vop1(0x001, 0, sgpr(0))], 1, 0));
+    assert!(tables.is_empty());
+    let insts = instructions(&words);
+    assert!(insts.iter().all(|i| i.0 != 50 && !(i.0 == 72 && i.1[1] == 4)));
+    assert!(insts.iter().any(|i| i.0 == 72 && i.1[1..] == [3, en::DEC_OFFSET, 32]));
+}
+
+/// The code tables' bytes and the module of a synthetic compute program,
+/// as the translation makes them.
+fn module_of(shader: &HostShader) -> (Vec<u32>, Vec<u32>) {
+    let (f, iface) = crate::vk::thread_ir_native(&shader.native).unwrap();
+    let g = crate::vk::graph::Graph::new(&f).unwrap();
+    let st = crate::vk::emit::Stage {
+        stage: HwStage::Cs,
+        local_size: [32, 1, 1],
+        out_types: Default::default(),
+        locs: Default::default(),
+        mesh: (0, 0),
+        mesh_split: None,
+        loop_limit: 1 << 14,
+        guard_id: 0,
+        no_sel: Default::default(),
+    };
+    let words = crate::vk::emit::Emit::new(&f, &g, &iface, &st).run().unwrap().words;
+    (f.tables.words, words)
+}
+
+/// A module's instructions: (opcode, operands).
+fn instructions(words: &[u32]) -> Vec<(u32, &[u32])> {
+    let mut out = Vec::new();
+    let mut at = 5;
+    while at < words.len() {
+        let n = (words[at] >> 16) as usize;
+        out.push((words[at] & 0xFFFF, &words[at + 1..at + n]));
+        at += n;
+    }
+    out
+}
+
 /// Ours (not theirs): `v_cvt_pkrtz_f16_f32 v0, v1, v2` rounds toward zero,
 /// past the largest half too (±65504, not infinity), whatever the host's
 /// own conversion rounds by.

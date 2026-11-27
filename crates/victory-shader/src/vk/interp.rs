@@ -714,7 +714,7 @@ impl<'a> Machine<'a> {
                 let x = self.arg(n, 1, l);
                 typed_pack(a as u32, [x[0] as u32, x[1] as u32, x[2] as u32, x[3] as u32], self.arg(n, 2, l)[0] != 0)
             }
-            Helper::CodeTable(k) => [u64::from(self.f.tables[usize::from(k)].get(a as usize).copied().unwrap_or(0)), 0, 0, 0],
+            Helper::CodeTable(k) => [u64::from(self.f.tables.dword(k, a as u32)), 0, 0, 0],
             Helper::BvhRay => return Err(format!("helper {h:?}")),
         })
     }

@@ -28,14 +28,25 @@ impl Emit<'_> {
             }
             let arr = self.m.t_array(range, 64);
             self.m.decorate(arr, en::DEC_ARRAY_STRIDE, &[32]);
-            let st = self.m.t_struct(&[q, q, u, arr], 4);
-            for (k, o) in [0u32, 8, 16, 32].iter().enumerate() {
+            // A program with code tables reads the tables buffer's address
+            // too: member 3, at byte 24, the ranges then member 4 (other
+            // programs' modules stay as they were).
+            let (members, offsets): (&[Id], &[u32]) =
+                if self.map_ranges() == 4 { (&[q, q, u, q, arr], &[0, 8, 16, 24, 32]) } else { (&[q, q, u, arr], &[0, 8, 16, 32]) };
+            let st = self.m.t_struct(members, 4);
+            for (k, o) in offsets.iter().enumerate() {
                 self.m.member_decorate(st, k as u32, en::DEC_OFFSET, &[*o]);
             }
             self.m.decorate(st, en::DEC_BLOCK, &[]);
             self.map = st;
         }
         self.map
+    }
+
+    /// The member of the map that holds its ranges: 3, or 4 in a program
+    /// with code tables (whose member 3 is the tables buffer's address).
+    pub(super) fn map_ranges(&self) -> u32 {
+        if self.f.tables.words.is_empty() { 3 } else { 4 }
     }
 
     /// The memory map: a uniform buffer, set 3 binding 0 (read with uniform
@@ -471,7 +482,7 @@ impl Emit<'_> {
             let bytes = if range { self.m.op(op::U_CONVERT, q, &[ps[1]]) } else { 0 };
             // device address and byte limit through range `i` (an id)
             let through = |e: &mut Self, i: Id| -> (Id, Id) {
-                let (k3, k0, k1, k2) = (e.c32(3), e.c32(0), e.c32(1), e.c32(2));
+                let (k3, k0, k1, k2) = (e.c32(e.map_ranges()), e.c32(0), e.c32(1), e.c32(2));
                 let start = e.map_load_at(map, q, &[k3, i, k0]);
                 let size = e.map_load_at(map, q, &[k3, i, k1]);
                 let base = e.map_load_at(map, q, &[k3, i, k2]);
@@ -509,7 +520,7 @@ impl Emit<'_> {
                 let ks = self.c32(step);
                 let mid = self.m.op(op::I_ADD, u, &[lo, ks]);
                 let inside = self.m.op(op::U_LESS_THAN, b, &[mid, count]);
-                let k3 = self.c32(3);
+                let k3 = self.c32(self.map_ranges());
                 let k63 = self.c32(63);
                 let midc = self.m.ext(glsl::U_MIN, u, &[mid, k63]);
                 let start = self.map_load_at(map, q, &[k3, midc, z]);
