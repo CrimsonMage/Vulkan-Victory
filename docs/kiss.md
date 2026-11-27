@@ -150,6 +150,86 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (indirect light, the stand-in): **an estimate from the frame
+  instead of the constant, on by default while the structure builder is
+  off** (runs am1 to am6 on the cache of `batch-2026-11-27d`, host only;
+  branch `worktree-agent-afc0e2c73452079b8`; `vulkan/ambient.rs`,
+  `ambient.comp`).
+  - **What it is**: VIctory-NVIDIA's method as one host compute program
+    (GLSL, compiled offline, its words in `ambient/words.rs`) run in three
+    dispatches right after CS_ScreenProbes_TemporalResolve_*: (1) 32x18
+    cells: the mean of the light visible surfaces sent out the frame
+    before (the half-size image CS_CacheScreenSpaceRadiance keeps,
+    0x9a0560000, B10G11R11: the lighting buffer before fog) and where
+    each cell is (from the depth); (2) 160x90 points: the mean of the
+    cells by the share of the point's surroundings each covers, and its
+    first moments, a direction per colour; (3) every texel of the diffuse
+    light the resolve wrote: the four points around at its own depth,
+    along its normal (from the depth), shaded in creases (12 depth taps
+    within 0.6 m), a fifth of it the slow mean of the whole picture,
+    stored as the shared-exponent word; what the title left there stays
+    up to four times the estimate. Inputs are the title's own images,
+    named by T#s in the resolve's tables (root 0: depth dword 688, albedo
+    560; root 1: its history 72, its output 176) and in the keeping
+    program's (root 1 dword 16). One buffer of 0.7 MB is all it owns.
+  - **Two things differ from the model.** (a) The tiled lighting adds
+    about 0.85 x albedo x light (run am1, a wall: light 2.39 / 0.72 /
+    0.47, albedo 0.36 / 0.30 / 0.25, lit 0.74 / 0.18 / 0.10), not albedo x
+    light / pi as the entry below has it. Fed its own reflected light, the
+    estimate times pi ran away (am1: walls 180 / 111 / 77, the window
+    white), and at the model's 0.8 it settles dark (am2: walls 53 / 39 /
+    34). So the cells hold **one bounce**: what the lighting added for the
+    stand-in the frame before (0.85 x albedo x the resolve's history) is
+    taken out of the kept light, and the number is free: `VICTORY_AMBIENT`
+    unset = 2.5 (set on this one shot: the window wall is lit only from
+    behind the camera, where the picture shows nothing). (b) 32x18 cells
+    instead of 64x36: 0.35 ms a frame instead of 0.71.
+  - **Mean R / G / B, final frame (bytes), frame 2010** (places: the
+    window frame's face to the room above the head; the wall left of the
+    window; the yard; the sky; the bunk; the character's back):
+
+    | | frame | wall | yard | sky | bunk | back |
+    |---|---|---|---|---|---|---|
+    | no stand-in (am5, `VICTORY_AMBIENT=0`) | 24 / 11 / 3 | 13 / 2 / 0 | 124 / 85 / 52 | 220 / 194 / 176 | 55 / 38 / 30 | 16 / 7 / 7 |
+    | constant 0.5 (am6) | 82 / 84 / 95 | 99 / 99 / 88 | 127 / 92 / 58 | 242 / 230 / 223 | 14 / 8 / 4 | 27 / 11 / 9 |
+    | estimate, default (am4) | 46 / 41 / 50 | 72 / 64 / 62 | 125 / 96 / 62 | 238 / 223 / 214 | 13 / 6 / 4 | 23 / 12 / 8 |
+    | estimate x 2 (am3) | 50 / 38 / 41 | 75 / 60 / 55 | 124 / 92 / 60 | 238 / 223 / 213 | 79 / 61 / 54 | 30 / 14 / 11 |
+    | reference | 73 / 66 / 72 | 97 / 92 / 83 | 116 / 80 / 45 | 208 / 178 / 158 | 53 / 54 / 54 | 69 / 27 / 15 |
+
+    The light itself on the wall (am4): 0.31 / 0.24 / 0.28, on the yard
+    0.94 / 0.70 / 0.80, none on the sky; the constant is 0.5 / 0.49 / 0.47
+    everywhere.
+  - **Against the reference** (/mnt/data/victory/capture/am4/frame-2010.png):
+    the window frame is blue-grey, the walls grey with the creases and the
+    bunk's recess shaded, the yard keeps its gold; darker than the
+    console's walls by a quarter. Not the light's doing, and unchanged:
+    the **jumpsuit is dark** because its albedo is (0.074 / 0.016 / 0.008
+    in the G-buffer, every run); the **bunk and the window frame are black
+    in some runs** because their albedo is (bunk 0.0003 in am1, am2 and
+    am4 and 0.29 in am3; the frame 0.016 / 0.021 / 0.028 in am1, a tenth
+    of the 0.17 / 0.22 / 0.31 of am2 to am4): the albedo that differs between runs is the next
+    thing to trace, no light can show it. The **sky is not less exposed**
+    with a stand-in but more (220 without, 238 with the estimate, 242 with
+    the constant; 208 in the reference): the entry below read that the
+    other way. The light indoors is still rather even: most of what the
+    window wall gets is the slow mean (its sources are off screen).
+  - **Cost**: 0.35 ms of the card a frame (the pass run 100 times a frame
+    from frame 1850 on in am3: 426 -> 460 ms a frame; with 64x36 cells in
+    am2: 424 -> 495); card time a frame 410 with (am4), 412 without (am5):
+    within the noise. Card memory: the 0.7 MB buffer. Card total at peak
+    (default ceiling 5,504 MiB): 6,680 (am4), 6,724 (am5), 6,741 (am6),
+    6,682 to 6,801 MiB (am1 to am3).
+  - **Seen besides**: `VICTORY_VK_GPU_TIME` covered only the first part of
+    the frame it was asked for (am1: 107 ms, up to the screen probes' ray
+    binning; the resolve and the lighting are not in it); "a submission has not finished (a
+    hang?)" 3 to 8 times a run shortly after the world starts, in five of
+    the six runs, the one without a stand-in too (none in vk106).
+  - **Open**: reflections (CS_RayMiss still gives the sky's light
+    indoors; the model's part for it is a fourth dispatch along the
+    reflected direction); the air of a room (the model bounds what it
+    scatters); the number 2.5 is one shot's; lamp-lit rooms at night and
+    open daylight were not seen.
+
 - 2026-11-27 (colour): **where the world's colour goes: stage by stage**
   (runs col1 to col3 on tag `batch-2026-11-27d`, branch
   `worktree-agent-aea8d1272ae4e7c80`; host only, no translator change).
