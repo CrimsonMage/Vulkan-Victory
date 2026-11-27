@@ -411,6 +411,26 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (midnight): the fog pass, tables, float controls.
+  - **CS_ApplyCombinedDeferred** (fog apply) has finite inputs (census of
+    every float image, volumes whole, just before it: none holds an
+    infinity or NaN) and leaves a per-pixel red stipple over the sky.
+    Reading: `v_mul_legacy_f32` of inf by 0 (a sky tap's weight) is 0 on
+    the console; our select form is only that while the driver keeps the
+    `== 0` tests, and no float controls were declared. Every module now
+    declares SignedZeroInfNanPreserve (compile time unchanged on NVIDIA).
+    To confirm in a run.
+  - **Constant tables in a program's own code** (`s_getpc_b64` + offset):
+    368 programs of the pack read zeros for them (blur taps, jitter
+    angles, filter kernels); now a constant array in the module.
+  - **Pool pages stale on the card**: half the sampled pages (1,997 of
+    3,786) were changed by the CPU after the card's copy. Write tracking
+    (protect pages with a card copy, copy again on write; no extra RAM or
+    VRAM; replaces the fingerprint polling) is being built: handoff in
+    docs/vulkan-host.md.
+  - **Frame**: the card 100 ms, the CPU ~550 ms (recording): profile next.
+  - Removed: VICTORY_VK_NO_WIDE, VICTORY_VK_POOL_RESYNC. A first stage's
+    user data ends at entry 28 (no layout of the pack goes past 20).
 - 2026-11-26 (night, later): measured.
   - **Wave-uniform values need no exchange** (vk/uniform.rs): mesh
     exchange calls 7,607 -> 1,094 over the used set, no counted barriers
