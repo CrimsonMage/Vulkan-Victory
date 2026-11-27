@@ -15,7 +15,10 @@
 //! sampler state is captured); level 0 only (an explicit level, bias or
 //! gradient is ignored); depth comparison is less-or-equal; block-compressed
 //! formats read 0. Environment: `STRIDE=n` runs every n-th group (compute)
-//! or block (pixel), `LIMIT=n` block visits a wave.
+//! or block (pixel), `LIMIT=n` block visits a wave, `DISPATCH="x y z"` the
+//! groups of an indirect dispatch (the capture has no size for it),
+//! `GROUP="x y z"` that group only, `WATCH=n,m|all` (with `LANES=n`) the
+//! values computed into `trace.txt`, `DUMP=1` the thread IR.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +55,8 @@ struct Capture {
     dispatch: Option<[u32; 3]>,
     viewport: Option<[f32; 4]>,
     mem: Vec<(u64, PathBuf)>,
+    /// `root <param> <dwords>`: the root parameters as the title set them.
+    roots: HashMap<u8, Vec<u32>>,
     slots: HashMap<u32, Slot>,
     lines: Vec<String>,
 }
@@ -103,7 +108,9 @@ fn parse_image(dir: &Path, w: &[&str], files: &mut HashMap<String, Rc<Vec<u8>>>)
 fn viewport(line: &str) -> Option<[f32; 4]> {
     let s = line.split("viewport Some((").nth(1)?;
     let v: Vec<f32> = s.split([',', ')']).filter_map(|x| x.trim().parse().ok()).collect();
-    Some([v[0], v[1], *v.get(2)?, *v.get(3)?])
+    let (x, y, w, h) = (*v.first()?, *v.get(1)?, *v.get(2)?, *v.get(3)?);
+    // a negative height flips: the viewport covers y + h .. y
+    Some([x.min(x + w), y.min(y + h), w.abs(), h.abs()])
 }
 
 fn read_capture(dir: &Path) -> Capture {
@@ -116,6 +123,9 @@ fn read_capture(dir: &Path) -> Capture {
             Some("program") if w.len() >= 4 => c.program.push((w[1].into(), w[2].into(), w[3].into())),
             Some("push") if c.dispatch.is_none() && c.viewport.is_none() => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
             Some("mem") => c.mem.push((hex(w[1]), dir.join(format!("mem/{}.bin", w[1])))),
+            Some("root") if w.len() >= 2 => {
+                c.roots.insert(w[1].parse().unwrap_or(0), w[2..].iter().map(|x| hex(x) as u32).collect());
+            }
             Some("dispatch") => c.dispatch = Some([1, 2, 3].map(|i| w.get(i).and_then(|x| x.parse().ok()).unwrap_or(1))),
             Some("did") => c.viewport = viewport(line),
             Some("image") if w.get(2) != Some(&"none") => {
@@ -211,8 +221,12 @@ fn channel(name: &str, t: &[u8], c: usize) -> (f32, u32) {
 
 /// The packed and depth formats: (floats, integers).
 fn packed(name: &str, t: &[u8]) -> Option<([f32; 4], [u32; 4])> {
-    let v = u32::from_le_bytes([t[0], t[1], t.get(2).copied().unwrap_or(0), t.get(3).copied().unwrap_or(0)]);
+    let v = u32::from_le_bytes([0, 1, 2, 3].map(|i| t.get(i).copied().unwrap_or(0)));
     Some(match name {
+        n if n.starts_with("E5B9G9R9") => {
+            let e = 2f32.powi((v >> 27) as i32 - 24);
+            ([(v & 0x1FF) as f32 * e, (v >> 9 & 0x1FF) as f32 * e, (v >> 18 & 0x1FF) as f32 * e, 1.0], [0, 0, 0, 1])
+        }
         n if n.starts_with("B10G11R11") => ([small_float(v & 0x7FF, 6), small_float(v >> 11 & 0x7FF, 6), small_float(v >> 22, 5), 1.0], [0, 0, 0, 1]),
         n if n.starts_with("A2B10G10R10") => {
             let i = [v & 0x3FF, v >> 10 & 0x3FF, v >> 20 & 0x3FF, v >> 30];
@@ -358,12 +372,12 @@ impl State {
         out
     }
 
-    fn gather(&mut self, slot: u32, comp: u8, c: [f32; 4], off: [i64; 2]) -> W {
+    fn gather(&mut self, slot: u32, comp: u8, c: [f32; 4], off: [i64; 2], uint: bool) -> W {
         let (w, h, _, base) = self.dims(slot);
         let (u, v) = (c[0] * w - 0.5 + off[0] as f32, c[1] * h - 0.5 + off[1] as f32);
         let (x0, y0) = (u.floor() as i64, v.floor() as i64);
         let k = usize::from(comp.min(3));
-        [(0, 1), (1, 1), (1, 0), (0, 0)].map(|(dx, dy)| self.texel(slot, x0 + dx, y0 + dy, i64::from(base), false)[k])
+        [(0, 1), (1, 1), (1, 0), (0, 0)].map(|(dx, dy)| self.texel(slot, x0 + dx, y0 + dy, i64::from(base), uint)[k])
     }
 }
 
@@ -383,31 +397,54 @@ fn cube(c: [f32; 4]) -> [f32; 4] {
     [(sc / ma + 1.0) / 2.0, (tc / ma + 1.0) / 2.0, face + 6.0 * c[3].round(), 0.0]
 }
 
+impl State {
+    /// Notes an integer view read through a float image, or the reverse.
+    fn check_class(&mut self, slot: u32, kind: ImageKind, uint: bool, word7: u64) {
+        let Some(s) = self.slots.get(&slot) else { return };
+        let int_view = !s.view_format.starts_with('D') && (s.view_format.contains("UINT") || s.view_format.contains("SINT"));
+        if int_view != uint && !matches!(kind, ImageKind::Size | ImageKind::Levels) {
+            let read = if uint { "integer" } else { "float" };
+            let line = format!("MISMATCH slot {slot:x} ({}): {kind:?} reads it as {read} (word 7 {word7:x}), view {}", s.name, s.view_format);
+            self.notes.insert(line);
+        }
+    }
+
+    /// `image_sample*`: filtered floats, an integer image's texel, or a
+    /// depth comparison.
+    fn sample_op(&mut self, slot: u32, class: ImageClass, f: [f32; 4], off: [i64; 2], uint: bool, dref: Option<W>) -> W {
+        let c = if class.dim == 3 && !class.cube_layers { cube(f) } else { f };
+        let cl = if class.dim == 3 { ImageClass { dim: 1, arrayed: true, ..class } } else { class };
+        if uint {
+            // an integer image filters as nearest: its texel's integers
+            let (w, h, _, base) = self.dims(slot);
+            let (u, v) = ((c[0] * w).floor() as i64 + off[0], (c[1] * h).floor() as i64 + off[1]);
+            return self.texel(slot, u, v, i64::from(base), true);
+        }
+        let v = self.sample(slot, cl, c, off);
+        let Some(r) = dref else { return v.map(|f| u64::from(f.to_bits())) };
+        self.notes.insert("depth comparison taken as less-or-equal".into());
+        let r = f32::from_bits(r[0] as u32);
+        [u64::from(if r <= v[0] { 1f32 } else { 0.0 }.to_bits()), 0, 0, 0]
+    }
+}
+
 impl Images for Replay {
     fn image(&mut self, kind: ImageKind, class: ImageClass, sampler: Sampler, flags: u16, a: &[W], _lane: usize) -> W {
         let st = &mut *self.0.borrow_mut();
-        let slot = (a.first().map_or(0, |w| w[0]) & 0xFF_FFFF) as u32;
+        let word7 = a.first().map_or(0, |w| w[0]);
+        let slot = (word7 & 0xFF_FFFF) as u32;
+        // integer reads: the class's, or the T#'s INTEGER bit (word 7 bit 24)
+        let uint = class.uint || (class.dynamic && word7 >> 24 & 1 != 0);
+        st.check_class(slot, kind, uint, word7);
         let x = args_of(sampler, flags, a);
         let f = x.coord.map(|v| f32::from_bits(v as u32));
         let off = x.offset.map_or([0, 0], |o| [o[0] as i32 as i64, o[1] as i32 as i64]);
         let i = x.coord.map(|v| v as i32 as i64);
         let layered = |i: [i64; 4]| if class.dim == 2 || class.arrayed { i[2] } else { 0 };
         match kind {
-            ImageKind::Sample { .. } => {
-                let c = if class.dim == 3 && !class.cube_layers { cube(f) } else { f };
-                let cl = if class.dim == 3 { ImageClass { dim: 1, arrayed: true, ..class } } else { class };
-                let v = st.sample(slot, cl, c, off);
-                match x.dref {
-                    Some(r) => {
-                        st.notes.insert("depth comparison taken as less-or-equal".into());
-                        let r = f32::from_bits(r[0] as u32);
-                        [u64::from(if r <= v[0] { 1f32 } else { 0.0 }.to_bits()), 0, 0, 0]
-                    }
-                    None => v.map(|f| u64::from(f.to_bits())),
-                }
-            }
-            ImageKind::Gather { comp, .. } => st.gather(slot, comp, f, off),
-            ImageKind::Load { .. } => st.texel(slot, i[0], i[1], layered(i), class.uint),
+            ImageKind::Sample { .. } => st.sample_op(slot, class, f, off, uint, x.dref),
+            ImageKind::Gather { comp, .. } => st.gather(slot, comp, f, off, uint),
+            ImageKind::Load { .. } => st.texel(slot, i[0], i[1], layered(i), uint),
             ImageKind::Store { .. } => {
                 let (w, h, _, _) = st.dims(slot);
                 let idx = ((layered(i).max(0) * h as i64 + i[1].max(0)) * w as i64 + i[0].max(0)) as usize;
@@ -501,10 +538,9 @@ fn write_image(out: &Path, name: &str, w: u32, h: u32, px: &[[f32; 4]], census: 
 fn memory(c: &Capture) -> Memory {
     let mut mem = Memory { range: (0, u64::MAX), ..Default::default() };
     for (at, path) in &c.mem {
-        let bytes = std::fs::read(path).unwrap_or_default();
-        let words: Vec<u32> = bytes.chunks(4).map(|b| b.iter().rev().fold(0u32, |w, &x| w << 8 | u32::from(x))).collect();
-        mem.put(*at, &words);
+        mem.blocks.push((*at, std::sync::Arc::new(std::fs::read(path).unwrap_or_default())));
     }
+    mem.blocks.sort_by_key(|b| b.0);
     mem
 }
 
@@ -540,6 +576,8 @@ struct Run<'a> {
     lanes: usize,
     missing: BTreeMap<u64, u32>,
     stops: BTreeMap<String, u32>,
+    /// Watched values (WATCH), in the order computed.
+    log: Vec<String>,
 }
 
 impl<'a> Run<'a> {
@@ -549,8 +587,13 @@ impl<'a> Run<'a> {
         m.push.resize(64, 0);
         m.limit = env("LIMIT", 1 << 22);
         m.images = Some(Box::new(self.images.clone()));
+        if let Ok(w) = std::env::var("WATCH") {
+            m.watch = if w == "all" { (0..self.f.nodes.len() as u32).collect() } else { w.split(',').filter_map(|x| x.trim_start_matches('%').parse().ok()).collect() };
+            m.watch_lanes = env("LANES", 4) as usize;
+        }
         setup(&mut m);
         let stop = m.run();
+        self.log.append(&mut m.log);
         *self.stops.entry(match stop {
             Stop::Returned => "returned".into(),
             s => format!("{s:?}"),
@@ -564,6 +607,31 @@ impl<'a> Run<'a> {
     }
 }
 
+/// VIEW_AS="slot:FORMAT,...": read a slot's texels as another format of
+/// the same size (the view the title meant, to test a host view).
+fn view_as(cap: &mut Capture) {
+    for (slot, fmt) in std::env::var("VIEW_AS").unwrap_or_default().split(',').filter_map(|x| x.split_once(':')) {
+        if let Some(s) = cap.slots.get_mut(&(hex(slot) as u32)) {
+            s.view_format = fmt.to_owned();
+        }
+    }
+}
+
+/// Without a push line: the user data from the root parameters, each at
+/// its user-data dwords, as many as it has SGPRs.
+fn push_from_roots(cap: &Capture, native: &victory_shader::native::NativeProgram) -> Vec<u32> {
+    let mut push = vec![0; 64];
+    for p in &native.layout {
+        let Some(words) = cap.roots.get(&p.slot) else { continue };
+        for (k, w) in words.iter().take(p.sgprs as usize).enumerate() {
+            if let Some(d) = push.get_mut(4 + usize::from(p.user_data) + k) {
+                *d = *w;
+            }
+        }
+    }
+    push
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(&args[1]);
@@ -571,11 +639,19 @@ fn main() {
     let out = args.get(3).map_or_else(|| dir.join("out"), PathBuf::from);
     std::fs::create_dir_all(&out).expect("out dir");
     let mut cap = read_capture(&dir);
+    view_as(&mut cap);
     let (f, _, native) = thread_ir(&container).expect("translation");
     let state = State { slots: std::mem::take(&mut cap.slots), written: BTreeMap::new(), notes: BTreeSet::new() };
     let images = Replay(Rc::new(RefCell::new(state)));
+    if cap.push.is_empty() {
+        cap.push = push_from_roots(&cap, &native);
+        images.0.borrow_mut().notes.insert("no push line: user data built from the root lines".into());
+    }
     let lanes = if native.wave64 { 64 } else { 32 };
-    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new() };
+    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new() };
+    if std::env::var_os("DUMP").is_some() {
+        victory_shader::vk::tir::dump(&f);
+    }
     let stride = env("STRIDE", 1).max(1) as usize;
     let mut census = String::new();
     match (&native.io, native.stage) {
@@ -600,6 +676,9 @@ fn main() {
     notes.push(format!("stops: {:?}", run.stops));
     notes.push("samplers: linear, clamp to edge (no sampler state captured); level 0 only".into());
     let _ = std::fs::write(out.join("census.txt"), &census);
+    if !run.log.is_empty() {
+        let _ = std::fs::write(out.join("trace.txt"), run.log.join("\n") + "\n");
+    }
     let _ = std::fs::write(out.join("missing.txt"), missing_ranges(&run.missing));
     let _ = std::fs::write(out.join("notes.txt"), notes.join("\n") + "\n");
     print!("{census}");
@@ -607,9 +686,20 @@ fn main() {
 }
 
 fn compute(run: &mut Run<'_>, threads: [u32; 3], stride: usize) {
-    let [gx, gy, gz] = run.cap.dispatch.unwrap_or([1, 1, 1]);
+    // DISPATCH="x y z" for an indirect dispatch (its size is the card's)
+    let given = std::env::var("DISPATCH").ok().map(|v| {
+        let n: Vec<u32> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        [0, 1, 2].map(|i| n.get(i).copied().unwrap_or(1))
+    });
+    let [gx, gy, gz] = given.or(run.cap.dispatch).unwrap_or([1, 1, 1]);
     let per = (threads.iter().product::<u32>() as usize).div_ceil(run.lanes);
     let groups: Vec<[u32; 3]> = (0..gz).flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| [x, y, z]))).collect();
+    // GROUP="x y z": that group only
+    let only: Option<Vec<u32>> = std::env::var("GROUP").ok().map(|v| v.split_whitespace().filter_map(|x| x.parse().ok()).collect());
+    let groups: Vec<[u32; 3]> = match only {
+        Some(g) => vec![[0, 1, 2].map(|i| g.get(i).copied().unwrap_or(0))],
+        None => groups,
+    };
     for g in groups.iter().step_by(stride) {
         for wave in 0..per {
             run.wave(|m| {

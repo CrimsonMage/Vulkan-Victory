@@ -41,6 +41,9 @@ pub struct Memory {
     pub noise: Option<u64>,
     /// What a missing dword reads.
     pub fill: u32,
+    /// Read-only blocks of bytes by start address, sorted (a capture's
+    /// memory: a dword stored or put shadows them).
+    pub blocks: Vec<(u64, std::sync::Arc<Vec<u8>>)>,
 }
 
 impl Memory {
@@ -56,6 +59,15 @@ impl Memory {
             return 0;
         }
         let d = a & !3;
+        if !self.blocks.is_empty() && !self.dwords.contains_key(&d) {
+            // the last few blocks starting at or before `a` (they may overlap)
+            let k = self.blocks.partition_point(|b| b.0 <= a);
+            for (start, bytes) in self.blocks[k.saturating_sub(8)..k].iter().rev() {
+                if let Some(&b) = bytes.get((a - start) as usize) {
+                    return b;
+                }
+            }
+        }
         match self.dwords.get(&d) {
             Some(&w) => (w >> (8 * (a & 3))) as u8,
             None if self.noise.is_some() => (noise(d, self.noise.unwrap_or(0)) >> (8 * (a & 3))) as u8,
