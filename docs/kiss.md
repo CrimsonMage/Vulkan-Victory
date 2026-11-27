@@ -396,6 +396,40 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-26 (late): the world, after the shader piece.
+  - **Read another fork** (Belobug/VIctory-Belobug-AMD, same upstream and
+    licence; D3D12, a right picture at ~22 fps on an RX 7900 XTX, ~30 GB of
+    RAM). Taken as ideas, no code: its instruction-level tests as an
+    offline oracle for our translator (being ported), and three facts
+    about the title: its indirect light and lamp/sun shadows are software
+    ray traced by its own compute programs; a partly working structure
+    builder (XboxBvhBuilder.dll) writes garbage into title memory and
+    crashes the title; on NVIDIA its frame is ~12x AMD's because of wave64
+    on 32-lane subgroups.
+  - **The structure builder's dispatches are left out** unless
+    `VICTORY_BVH_BUILDER=1` (312,000 a run). Since then: no title crash, no
+    guard hit, card time 890 -> 670 ms a frame.
+  - **Reverted**: the V# "reaches its range's end" rule (faulted the card
+    at world start, bisected); spilled user-data entries as push dwords
+    outside compute (a draw's stages share the push constants).
+  - **Diagnostics that found things**: `VICTORY_VK_DUMP_TARGETS` /
+    `VICTORY_VK_DUMP_AT` (the G-buffer and depth are right mid-frame; the
+    HDR target's R and A are inf/NaN after the tiled lighting while G and B
+    are sane), `VICTORY_VK_GPU_TIME` (85% of a frame's card time is five
+    mesh program pairs).
+  - **Mesh cost, the disassembly's answer**: MS_VS_Transform has no real
+    cross-lane flow (0 LDS, 5 readfirstlane all of wave-uniform values, 2
+    barriers that only order the output count), yet we emit exchanges,
+    polls and counted barriers for it. Being fixed by a wave-uniformity
+    rule in the lift.
+  - **RAM**: 21.8 GiB peak -> 16.5: no pipeline cache of ours (the driver's
+    disk cache serves; ours was 2.3 GiB read whole), modules destroyed once
+    their part is made. Title memory itself is 9.2 GiB of it.
+  - **Open**: the lighting inputs (R/A inf: a shared factor is inf where
+    G/B inputs are 0; the shader itself checks out in the interpreter);
+    glyph boxes; ~700 pool pages a frame the CPU changes after the card
+    copied them (write tracking planned, no extra RAM); 670 ms of card
+    time a frame.
 - 2026-11-26 (night): the shader piece, towards "complete".
   - **Indexes**: `docs/translation-index.md` (xtask, every container of a
     pack: coverage, refusals, approximations) and
