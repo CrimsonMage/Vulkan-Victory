@@ -111,7 +111,7 @@ driver errors and no new crash, and the captures look no worse.
 | | Start (2026-11-25) | Now |
 |---|---|---|
 | Rust lines | 128,292 | 78,027 (154,557 before the D3D12 back end went) |
-| `VICTORY_*` switches | 224 | 43 |
+| `VICTORY_*` switches | 224 | 45 |
 | `diagnostics`-only blocks | 283 | 71 |
 | World frame time (Proton, 8 GB card) | 0.5–5 s | ~295 ms (~3.3 fps), Series S (run p20) |
 
@@ -150,6 +150,98 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (the jumpsuit): **why the character's suit is dark maroon in
+  most runs and orange in some: the textures its material picks by index
+  are gone from the card, or their slots show other textures** (runs sh1
+  to sh6 on the cache of `batch-2026-11-27d`, branch
+  `worktree-agent-ad8acb26bd2985605`; host only, nothing baked).
+  - **Not the lighting.** The suit's texel of the albedo G-buffer
+    (0xb0a5a0000) has one writer a frame (`VICTORY_VK_WATCH`, below): the
+    mesh draw MS_VS_PedTransformPreSkinD + PS_DeferredPedTexturedNC
+    (94d281151ca58b4f). It writes 229 / 114 / 82 with class 7 (SHEEN; a
+    maroon sheen colour 85 / 35 / 21 in the sixth target) in runs sh2 and
+    ch8, and 79 / 30 / 16 with class 5 (TRANSLUCENCY) in sh1, sh3, sh4,
+    sh5, vk106 and am2 to am4. Nothing overwrites it. The tiled lighting
+    then shades what it is given (class 5: TL_PS_PBR_MATERIAL_TRANSLUCENCY;
+    class 7: ..._SHEEN). The window frame's class flips the same way (0 in
+    sh2, sh3, sh5; 5 in sh1, sh4, sh6), the bunk's albedo too.
+  - **What that program reads** (replays of its captures with the
+    descriptor heap in them): three textures named by index in the draw's
+    record (root table 2 + 0x2014: heap indices; in sh4 a BC1 512x512, an
+    R8G8B8A8 256x256 and a BC5 512x512 of two layers) and, through the
+    second one, the material records of a 4.9 MB buffer (0x99ae00000, its
+    V# in root table 0 + 0x280; the draw's offset at + 0x200c). The second
+    texture is a map of material numbers (bytes 0 to 13 a channel, in
+    blocks): each texel picks the records whose textures (heap indices
+    again) and constants give albedo, class (7 where a record's float is
+    under a computed one, else 5 or 0) and the rest. So one wrong texture
+    here changes colour and class together.
+  - **What it gets on the card.** Run sh4 (maroon): two of the layer
+    textures (heap 0x19c5b, 0x19c5c: BC7 1024x1024, shown from level 1 and
+    level 3) have slots with no image; the replay without the layers gives
+    class 5 and a black albedo, as the card. Run sh5 (maroon, streaked):
+    the map's descriptor (heap 0x8bc5: R8G8B8A8 256x256 at 0x57ea7a000)
+    carries slot 0x7c96, which the host has given to the image of another
+    texture since (BC1 sRGB 512x1024 at 0x765eb4000); the first texture's
+    slot 0x61fa shows a BC7 1024x256 of another address; five layer
+    textures have no image. **A title descriptor keeps its slot when its
+    image goes; the slot reads the null image, and after its reuse another
+    texture.** A program that picks descriptors by index never has them
+    written again.
+  - **Why images go** (the 10 s line, a 7-minute run): 150,000 images made
+    for 20,000 alive; 100,000 dropped as overlaid (`drop_overlaid`), 31,000
+    for remapped pages, 300 for released resources; 300,000 fills
+    (13.5 GB). The overlaid rule takes a texture's whole console layout as
+    its memory. The console stores the small levels first and level 0 last
+    (`victory_formats::texture`: 1024x1024 BC1, 0xab000 bytes: level 0 at
+    0x2b000), and the title places streamed textures 0x4000 apart: each
+    new texture drops its neighbours (log: `new_at=0x59c268000+0xab000
+    old_at=0x59c264000+0xab000`). Which ones are alive when a material is
+    drawn is a matter of order: the run-to-run picture.
+  - **Tried, not merged** (commit after this entry's, see the branch): a
+    texture owns the bytes through the most detailed level a view has
+    named (`Image::own`), and only those count for `drop_overlaid` and for
+    remapped pages. Overlaid drops 100,000 -> 64,000 (most views name
+    level 0 of textures 0x4000 apart, so the rule knows no better there),
+    filled images alive 19,000 / 505 MB -> 24,800 / 935 MB. Under the
+    ceiling that room is not there: sh5 had 19 image blocks refused (the
+    view at 1,344 MiB), and with image blocks let through while the view
+    can give memory back (tried in `budget::fits`: sh6) the view fell to
+    448 MiB and the character's body and the far buildings went (the
+    pool-page matter of the entry below). Neither is in. `ResourceMinLODClamp`
+    is not how the title says which levels are there (no view of sh6 had
+    one).
+  - **Tools** (diagnostics builds, `docs/switches-gpu.md`):
+    `VICTORY_VK_WATCH=<address>,<x>,<y>[,c][;...]` reads a texel before
+    and after every draw that has the image attached and every dispatch of
+    the first dumped frame, logs the ones that changed it and captures the
+    next execution of the last writers of the texels marked `c` (a draw is
+    known again by its pixel program and fourth root parameter). A watch
+    capture holds the descriptor heaps as memory and the textures whose
+    heap indices stand three in a row in a block near the roots, so a
+    replay follows a material's picks. Captures: a block taken first as a
+    table and then whole is no longer written over with its first 4 KiB
+    (the material buffer came out 4 KiB long); root constants that are
+    addresses by themselves are followed. Scripts:
+    /mnt/data/victory/scratch-agent/sh/ (tr.py: a node's value and
+    definition from a replay's `WATCH=all` trace; deps.py; classes.py).
+  - **Open**, most important first: (1) which bytes of its layout a
+    streamed texture owns, from the title (its views name level 0 of
+    textures whose large levels cannot be there: the residency must come
+    from somewhere else: the page mappings under it are the candidate), so
+    that no live texture's image is dropped and none is kept; (2) card
+    memory for what then stays alive (about 0.45 GB more; image blocks hold
+    3.6 GB for 3.2 GB bound: 0.4 GB lies in fragments); (3) a slot must not
+    show another texture while title descriptors may carry it (a
+    generation in the T#'s host word, checked by the translator, is the
+    clean form: translator and ABI); (4) the lettering: no separate decal
+    draw writes the suit's texels; it is part of the same layered material
+    (not seen in either state: the orange state is the one with fewer
+    textures); (5) the material map is sampled at an explicit level and
+    loses two levels to texture quality: numbers blend at block edges (the
+    pale seams); maps of numbers need level 0 kept; (6) hair and window
+    frame: with the estimate of the entry below they are a matter of
+    albedo and class as well (the frame's class 0 or 5 by run).
 - 2026-11-27 (indirect light, the stand-in): **an estimate from the frame
   instead of the constant, on by default while the structure builder is
   off** (runs am1 to am6 on the cache of `batch-2026-11-27d`, host only;

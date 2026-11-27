@@ -24,6 +24,7 @@ decisions log). What victory-gpu still reads:
 | `VICTORY_DISPLAY_MODE` | the PC's screen | display mode the title is told (`dxgi.rs`) |
 | `VICTORY_VK_DUMP`, `VICTORY_VK_STAGES`, `VICTORY_VK_DRAW_TEST`, `VICTORY_VK_COMPOSE_TEST`, `VICTORY_DIAG_NO_INDIRECT` | off | Vulkan backend diagnostics (`docs/vulkan-host.md`) |
 | `VICTORY_VK_TRACE_DRAWS`, `VICTORY_VK_CEILING_MB`, `VICTORY_VK_ROOM_MB` | off | diagnostics builds: every draw of the programs named (parts of names, comma separated) in the first dumped frame as a log line; the card-memory rule's ceiling and room in MiB (`vulkan/budget.rs`), to see a run with no image refused and no pool page evicted |
+| `VICTORY_VK_WATCH`, `VICTORY_VK_WATCH_CAPTURE` | off | diagnostics builds, with `VICTORY_VK_DUMP_TARGETS`: `<address>,<x>,<y>[,c][;...]` (hex address, up to four): in the first dumped frame the texel of the image over that address is read before and after every draw that has it attached and every dispatch; the ones that changed it are logged, and the next execution of the last writers (3 unless `VICTORY_VK_WATCH_CAPTURE` says) of the texels marked `c` is captured as `VICTORY_VK_DUMP_AT` captures a program, with the descriptor heaps and the textures picked by index (`vulkan/watch.rs`) |
 
 ## Removed (before the D3D12 back end went)
 
