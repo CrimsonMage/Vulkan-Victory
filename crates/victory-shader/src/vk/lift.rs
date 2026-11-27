@@ -24,7 +24,7 @@ use crate::ir::{self, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, StageIo};
 
 /// Which half of a console wave64 mask a register dword holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Half {
     Lo,
     Hi,
@@ -61,9 +61,12 @@ pub struct Interface {
     /// Workgroup memory in dwords.
     pub lds_dwords: u32,
     pub approximate: Vec<Approx>,
-    /// Approximations that hold unless the value is wave-uniform (then the
-    /// translation is exact: [`super::uniform`] decides).
-    pub unless_uniform: Vec<(V, Approx)>,
+    /// Approximations that hold unless the value read (the first) is
+    /// wave-uniform (then the translation is exact: [`super::uniform`]
+    /// decides) or the value made of it (the second) is read by nothing
+    /// the program does (a step of a whole-wave section whose result
+    /// became a subgroup reduction).
+    pub unless_uniform: Vec<(V, V, Approx)>,
     /// Pixel: depth / stencil / sample mask exported.
     pub depth: bool,
     pub demotes: bool,
@@ -229,6 +232,14 @@ pub struct Lift<'a> {
     /// A console wave64 run as two host subgroups that exchange whole-wave
     /// values (lift_wave.rs).
     xwave: bool,
+    /// Scalar values whose bits at the lanes that hold no work are all 0
+    /// or all 1, where one host subgroup stands for the wave (lift_hi.rs).
+    idle: HashMap<Value, bool>,
+    /// By lane mask and dword: those bits for the values read so far,
+    /// where they agree and are known.
+    idle_of: HashMap<(V, Half), Option<bool>>,
+    /// Approximations taken so far (every one, also those listed before).
+    approx_taken: u32,
     /// The exchanged dwords of masks, per block.
     words: HashMap<V, (V, V)>,
     /// An LDS access since the halves last met (lift_wave.rs).
@@ -338,6 +349,9 @@ impl<'a> Lift<'a> {
             cse: HashMap::new(),
             open: None,
             xwave: Self::paired_halves(native),
+            idle: if Self::idle_lanes(native) { hi::idle_bits(p) } else { HashMap::new() },
+            idle_of: HashMap::new(),
+            approx_taken: 0,
             words: HashMap::new(),
             lds_dirty: false,
             cur_block: 0,
@@ -583,6 +597,7 @@ impl<'a> Lift<'a> {
     }
 
     fn approx(&mut self, note: &'static str) {
+        self.approx_taken += 1;
         let a = self.approx_here(note);
         if !self.iface.approximate.contains(&a) {
             self.iface.approximate.push(a);
@@ -595,10 +610,11 @@ impl<'a> Lift<'a> {
         Approx { note, opcode }
     }
 
-    /// An approximation taken unless `v` turns out wave-uniform.
-    fn approx_unless_uniform(&mut self, note: &'static str, v: V) {
+    /// An approximation taken in computing `r` from `v`, unless `v` turns
+    /// out wave-uniform or nothing reads `r`.
+    fn approx_unless_uniform(&mut self, note: &'static str, v: V, r: V) {
         let a = self.approx_here(note);
-        self.iface.unless_uniform.push((v, a));
+        self.iface.unless_uniform.push((v, r, a));
     }
 
     /// A data dword as a lane mask half.
@@ -649,16 +665,38 @@ impl<'a> Lift<'a> {
 
     fn value(&mut self, v: Value, offset: usize) -> Res<R> {
         if let Some(&r) = self.vals.get(&v) {
-            return Ok(r);
+            return Ok(self.settled(v, r));
         }
         // An input.
         let p = self.p;
         if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == v) {
             let r = self.input(reg, v, offset)?;
             self.vals.insert(v, r);
-            return Ok(r);
+            return Ok(self.settled(v, r));
         }
         Err(unsupported(offset, "a value read before it is defined"))
+    }
+
+    /// A register value as read: of a lane mask's dword, what is known of
+    /// its bits at the lanes that hold no work (lift_hi.rs) is kept by its
+    /// mask (`mask_word` reads it; two values of one mask that differ in
+    /// it: nothing known).
+    fn settled(&mut self, v: Value, r: R) -> R {
+        if let R::M(b, half) = r
+            && Self::idle_lanes(self.native)
+        {
+            let known = self.idle.get(&v).copied();
+            self.idle_of.entry((b, half)).and_modify(|k| *k = k.filter(|_| *k == known)).or_insert(known);
+        }
+        r
+    }
+
+    /// Whether the console wave has lanes that hold no work the host
+    /// subgroup has no invocation for: a pixel program's subgroup (partly
+    /// filled; the whole upper half of a wave64), and any other wave64
+    /// that one subgroup stands for.
+    fn idle_lanes(native: &NativeProgram) -> bool {
+        native.stage == HwStage::Ps || (native.wave64 && !Self::paired_halves(native))
     }
 
     fn global_node(&mut self, op: Op, ty: Ty, args: Vec<V>) -> V {
@@ -1004,6 +1042,8 @@ mod vops;
 mod flow;
 #[path = "lift_wave.rs"]
 mod wave;
+#[path = "lift_hi.rs"]
+mod hi;
 #[path = "lift_fold.rs"]
 mod fold;
 #[path = "lift_lane.rs"]

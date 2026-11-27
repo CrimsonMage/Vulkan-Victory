@@ -111,9 +111,34 @@ impl Lift<'_> {
         if self.xwave {
             self.approx("a wave64 mask read as a number inside a guard (per half)");
         }
+        // the bits of the lanes that hold no work (lift_hi.rs)
+        let idle = self.idle_of.get(&(b, half)).copied().flatten();
         match half {
-            Half::Lo => self.ballot(b),
+            Half::Lo => {
+                let own = self.ballot(b);
+                if self.native.stage != HwStage::Ps {
+                    return own;
+                }
+                // a fragment subgroup may lack lanes: the console's mask has
+                // their bits
+                match idle {
+                    Some(false) => own,
+                    Some(true) => {
+                        let live = self.live();
+                        let rest = self.spv(op::NOT, Ty::U32, &[live]);
+                        self.spv(op::BITWISE_OR, Ty::U32, &[own, rest])
+                    }
+                    None => {
+                        self.approx("a lane mask read as a number: the bits of the lanes a pixel subgroup lacks are not known");
+                        own
+                    }
+                }
+            }
             Half::Hi => {
+                // one subgroup for the wave: its upper half holds no work
+                if let Some(ones) = idle {
+                    return self.k32(if ones { u32::MAX } else { 0 });
+                }
                 if self.wave64_halves() {
                     self.approx("a wave64 mask's high half read as a number");
                 }
@@ -143,6 +168,22 @@ impl Lift<'_> {
         let k32 = self.k32(32);
         let upper = self.spv(op::U_GREATER_THAN_EQUAL, Ty::BOOL, &[l, k32]);
         Some(self.spv(op::SELECT, Ty::U32, &[upper, hi, lo]))
+    }
+
+    /// Whether lane number `l` of a wave64 is in the lower half, or is the
+    /// -1 of a search that found no lane (the console then reads lane 63,
+    /// which holds no work where one subgroup stands for the wave: nobody's
+    /// value): a constant, the first set bit of one dword (a mask's lower
+    /// dword, its upper one known to be 0: lift_hi.rs), or a select of
+    /// such.
+    pub(super) fn lower_lane(&self, l: V) -> bool {
+        let n = self.f.node(l);
+        match n.op {
+            Op::Const(c) => c < 32 || c == u64::from(u32::MAX),
+            Op::Glsl(glsl::FIND_I_LSB) => true,
+            Op::Spv(op::SELECT) => self.lower_lane(n.args[1]) && self.lower_lane(n.args[2]),
+            _ => false,
+        }
     }
 
     /// Lane-mask registers `code`, `code + 1` as this invocation's bit. In

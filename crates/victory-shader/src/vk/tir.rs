@@ -402,6 +402,30 @@ pub fn dce(f: &mut Func) {
     f.prelude.retain(|v| live[*v as usize]);
 }
 
+/// Which nodes the function holds (in a block's phis or body, or the
+/// prelude), by node: after [`dce`], the ones something still reads or
+/// that have an effect.
+pub fn placed(f: &Func) -> Vec<bool> {
+    fn items(list: &[Item], out: &mut [bool]) {
+        for it in list {
+            match it {
+                Item::N(v) => out[*v as usize] = true,
+                Item::Guard { body, phis, .. } => {
+                    items(body, out);
+                    phis.iter().for_each(|&p| out[p as usize] = true);
+                }
+            }
+        }
+    }
+    let mut out = vec![false; f.nodes.len()];
+    for b in &f.blocks {
+        b.phis.iter().for_each(|&p| out[p as usize] = true);
+        items(&b.body, &mut out);
+    }
+    f.prelude.iter().for_each(|&v| out[v as usize] = true);
+    out
+}
+
 /// Prints the function (debugging).
 pub fn dump(f: &Func) {
     fn items(f: &Func, list: &[Item], depth: usize) {

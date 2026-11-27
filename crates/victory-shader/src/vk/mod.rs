@@ -290,14 +290,16 @@ fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], strid
     let threads = lift::Lift::host_threads(native);
     let paired = native.wave64 && matches!(native.stage, HwStage::Cs | HwStage::Ms) && threads >= 64 && threads % 64 == 0;
     let uni = if uniform { uniform::simplify(&mut f, paired).1 } else { Vec::new() };
-    for (v, a) in std::mem::take(&mut iface.unless_uniform) {
-        if !uni.get(v as usize).copied().unwrap_or(false) && !iface.approximate.contains(&a) {
-            iface.approximate.push(a);
-        }
-    }
     tir::fold_branches(&mut f);
     ifconv::if_convert(&mut f);
     tir::dce(&mut f);
+    let placed = tir::placed(&f);
+    for (v, r, a) in std::mem::take(&mut iface.unless_uniform) {
+        let read = placed.get(r as usize).copied().unwrap_or(false);
+        if read && !uni.get(v as usize).copied().unwrap_or(false) && !iface.approximate.contains(&a) {
+            iface.approximate.push(a);
+        }
+    }
     tir::check(&f).map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
     Ok((f, iface))
 }

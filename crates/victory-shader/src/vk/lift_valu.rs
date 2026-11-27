@@ -945,12 +945,13 @@ impl Lift<'_> {
                     self.sdst(inst, &v.dst, 0, R::D(r));
                     return Ok(());
                 }
-                if self.wave64_halves() && self.f.as_const(l).is_none_or(|c| c >= 32) {
-                    self.approx_unless_uniform("v_readlane_b32 of a lane in the other half of a wave64", x);
-                }
+                let other = self.wave64_halves() && !self.lower_lane(l);
                 let k31 = self.k32(31);
                 let l = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);
                 let r = self.readlane_live(x, l);
+                if other {
+                    self.approx_unless_uniform("v_readlane_b32 of a lane in the other half of a wave64", x, r);
+                }
                 self.sdst(inst, &v.dst, 0, R::D(r));
                 Ok(())
             }

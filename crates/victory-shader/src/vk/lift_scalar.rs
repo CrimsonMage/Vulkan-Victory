@@ -209,6 +209,7 @@ impl Lift<'_> {
 
     fn sop_bcnt(&mut self, s: &Sop) -> Res<()> {
         let inst = s.inst;
+        let taken = self.approx_taken;
         let mut sum = self.k32(0);
         for k in 0..s.dwords() {
             let a = self.opnd_dw(inst, &s.src[0], k, false)?;
@@ -217,7 +218,7 @@ impl Lift<'_> {
             let c = self.spv(op::BIT_COUNT, Ty::U32, &[a]);
             sum = self.spv(op::I_ADD, Ty::U32, &[sum, c]);
         }
-        if s.b64 && self.wave64_halves() {
+        if s.b64 && self.wave64_halves() && self.approx_taken != taken {
             self.approx("a wave64 mask counted (s_bcnt1_i32_b64)");
         }
         self.sdst(inst, s.dst, 0, R::D(sum));
@@ -229,13 +230,14 @@ impl Lift<'_> {
     fn sop_bits(&mut self, s: &Sop) -> Res<()> {
         let inst = s.inst;
         if s.base == "ff1" || s.base == "ff0" {
+            let taken = self.approx_taken;
             let mut w = Vec::new();
             for k in 0..s.dwords() {
                 let a = self.opnd_dw(inst, &s.src[0], k, false)?;
                 let a = self.u32v(a);
                 w.push(if s.base == "ff0" { self.spv(op::NOT, Ty::U32, &[a]) } else { a });
             }
-            if s.b64 && self.wave64_halves() {
+            if s.b64 && self.wave64_halves() && self.approx_taken != taken {
                 self.approx("a wave64 mask searched (s_ff1_i32_b64)");
             }
             let x = match w[..] {
