@@ -97,9 +97,13 @@ impl Walk<'_> {
         Some(bytes)
     }
 
-    /// The descriptors and pointers in a block's first bytes.
+    /// The descriptors and pointers in a block's first bytes; in all of a
+    /// root view (a program reads its table past 4 KiB: the G-buffers of
+    /// CS_GenerateMaterialMasks sit at 0x1240 and 0x13c0, a constant buffer
+    /// it branches on at 0x1620, and none of them was captured).
     fn scan(&mut self, bytes: &[u8], depth: u32) {
-        let w: Vec<u32> = bytes[..bytes.len().min(TABLE as usize)].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let most = if depth == 0 { bytes.len() } else { bytes.len().min(TABLE as usize) };
+        let w: Vec<u32> = bytes[..most].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let mut k = 0;
         while k + 4 <= w.len() {
             if k % 8 == 0 && k + 8 <= w.len() && w[k + 6] ^ w[k + 7] == 0x7A3C_5E91 {
