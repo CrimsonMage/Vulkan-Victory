@@ -581,6 +581,19 @@ impl Rec {
             }
         }
         super::passes::note(|| format!("push {}", words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
+        if cfg!(feature = "diagnostics") {
+            for st in stages {
+                for ud in st.user_data.iter().filter(|u| matches!(u.root, RootType::Descriptor) && u.dword == 0) {
+                    let at = u64::from(root.word(ud.slot, 0)) | u64::from(root.word(ud.slot, 1)) << 32;
+                    if at != 0 && super::root_view_short(b, at) {
+                        let mut names = lock(&SHORT_ROOTS);
+                        if names.len() < 4096 {
+                            *names.entry(format!("{:?} {:#x}", st.stage, st.guard_id)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
         if self.pushed && words == self.last_push {
             return;
         }
@@ -1005,6 +1018,17 @@ fn draw_stages(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], me
 }
 
 /// The recording's part of the 10 s line.
+/// Diagnostics: programs (stage, guard id) pushed a root view whose range
+/// is short -> times.
+static SHORT_ROOTS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The ten programs most often pushed a short root view.
+pub(crate) fn short_root_programs() -> String {
+    let mut all: Vec<(String, u64)> = lock(&SHORT_ROOTS).iter().map(|(k, &v)| (k.clone(), v)).collect();
+    all.sort_by_key(|p| std::cmp::Reverse(p.1));
+    format!("{} programs; {}", all.len(), all.iter().take(10).map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", "))
+}
+
 pub(crate) fn report() {
     let s: Vec<u64> = STATS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
     let v: Vec<u64> = super::descriptors::STATS.iter().map(|a| a.load(Ordering::Relaxed)).collect();

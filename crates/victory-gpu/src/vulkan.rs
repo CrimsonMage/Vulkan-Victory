@@ -627,6 +627,24 @@ fn map_generation(b: &Backend) -> u64 {
     m.map.generation
 }
 
+/// Diagnostics: root views by how much of their memory-map range is left
+/// from their address (a root view's V# has 4 GiB of records): [in a range
+/// with 4 GiB left, in a range with less (it reads zeros), in no range].
+pub(crate) static ROOT_VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Diagnostics: a root view at `at` is pushed for a draw or dispatch.
+/// True when its range has less than 4 GiB left or there is none.
+pub(crate) fn root_view_short(b: &Backend, at: u64) -> bool {
+    let left = memory(b).map.range_of(at).map(|r| r.title_start + r.title_size - at);
+    let k = match left {
+        Some(l) if l >= u64::from(u32::MAX) => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    ROOT_VIEWS[k].fetch_add(1, Ordering::Relaxed);
+    k != 0
+}
+
 /// Diagnostics: whether the current memory map has a range holding `at`.
 fn map_reaches(b: &Backend, at: u64) -> bool {
     memory(b).map.range_of(at).is_some()
@@ -868,6 +886,8 @@ fn report(b: &Backend, frame: u64) {
     );
     if cfg!(feature = "diagnostics") {
         tracing::info!(ops = %ops_text(frames), "Vulkan: recording by call (a frame; the stream's op numbers)");
+        let r = |k: usize| ROOT_VIEWS[k].load(Ordering::Relaxed);
+        tracing::info!(whole = r(0), short = r(1), unmapped = r(2), programs = %record::short_root_programs(), "Vulkan: root views pushed, by whether their map range has their V#'s 4 GiB left (short and unmapped read zeros)");
     }
     let (flights, held, lines) = engine::report_text(b, frames);
     let m = memory(b);
