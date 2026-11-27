@@ -102,7 +102,11 @@ impl Lift<'_> {
         let base = if matches!(stage, HwStage::Ms | HwStage::Gs | HwStage::Es | HwStage::Hs | HwStage::Ls) { 8 } else { 0 };
         let users = match &self.native.io {
             StageIo::Cs(cs) => u32::from(cs.user_sgprs()),
-            _ => 32,
+            // the pixel program's window has 32 dwords; a first stage's
+            // has 28, the pixel window follows it (no layout of the pack
+            // goes past entry 20)
+            _ if stage == HwStage::Ps => 32,
+            _ => 28,
         };
         // A compute program's spilled user-data table (spill.rs): its
         // entries at index 16 and above arrive in push dwords too. Only a
