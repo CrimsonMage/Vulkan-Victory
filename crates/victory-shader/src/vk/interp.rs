@@ -200,6 +200,11 @@ pub struct Machine<'a> {
     /// A pixel program's invocations as 2 x 2 quads of an 8 x 4 block at
     /// this pixel (else lane % 8, lane / 8 from the origin).
     pub frag_block: Option<[u32; 2]>,
+    /// Pixel inputs given as functions of the pixel: (location, component)
+    /// -> a, b, c of a + b x + c y at the pixel's centre (what a vertex
+    /// program's outputs are over a full-screen triangle). The others stay
+    /// the per-lane values of [`input`].
+    pub pixel_inputs: BTreeMap<(u8, u8), [f32; 3]>,
     /// The work group's size, for local invocation ids (zero: x only).
     pub local_size: [u32; 3],
     /// Images read texels that differ by lane: each float channel scaled
@@ -367,6 +372,7 @@ impl<'a> Machine<'a> {
             image_stores: Vec::new(),
             images: None,
             frag_block: None,
+            pixel_inputs: BTreeMap::new(),
             local_size: [0; 3],
             image_vary: false,
             watch_lanes: 4,
@@ -636,6 +642,13 @@ impl<'a> Machine<'a> {
                 }
                 _ => self.texel(l),
             },
+            Op::Input { loc, comp, .. } if self.pixel_inputs.contains_key(&(*loc, *comp)) => {
+                let [a, b, c] = self.pixel_inputs[&(*loc, *comp)];
+                let [ox, oy] = self.frag_block.unwrap_or_default();
+                let (lane, q) = (l as u32, l as u32 / 4);
+                let (x, y) = (ox + q % 4 * 2 + (lane & 1), oy + q / 4 * 2 + (lane >> 1 & 1));
+                s(u64::from((a + b * (x as f32 + 0.5) + c * (y as f32 + 0.5)).to_bits()))
+            }
             Op::Input { loc, comp, .. } | Op::PerVertex { loc, comp, .. } => s(input(*loc, *comp, l, n.ty)),
         })
     }

@@ -19,7 +19,13 @@
 //! groups of an indirect dispatch (the capture has no size for it),
 //! `GROUP="x y z"` that group only, `WATCH=n,m|all` (with `LANES=n`) the
 //! values computed into `trace.txt`, `DUMP=1` the thread IR, `CARD=1` the
-//! card's floats (`vk::interp::card_floats`: denormals are zeros).
+//! card's floats (`vk::interp::card_floats`: denormals are zeros),
+//! `INPUTS="loc.comp=a[,b,c];..."` a pixel program's inputs as a + b x +
+//! c y at each pixel's centre (what its vertex program gives it: without
+//! them an input is a made-up value per lane, and a pass that takes its
+//! texture coordinates or its exposure from the vertex program replays as
+//! noise), `NODES=n,m` prints those nodes of the thread IR (the prelude's
+//! inputs and constants, which `DUMP` leaves out).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -633,6 +639,13 @@ impl<'a> Run<'a> {
             m.watch = if w == "all" { (0..self.f.nodes.len() as u32).collect() } else { w.split(',').filter_map(|x| x.trim_start_matches('%').parse().ok()).collect() };
             m.watch_lanes = env("LANES", 4) as usize;
         }
+        for (at, k) in std::env::var("INPUTS").unwrap_or_default().split(';').filter_map(|x| x.split_once('=')) {
+            let k: Vec<f32> = k.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let (Some((loc, comp)), Some(&a)) = (at.trim().split_once('.'), k.first()) {
+                let at = (loc.parse().unwrap_or(0), comp.parse().unwrap_or(0));
+                m.pixel_inputs.insert(at, [a, k.get(1).copied().unwrap_or(0.0), k.get(2).copied().unwrap_or(0.0)]);
+            }
+        }
         setup(&mut m);
         let stop = m.run();
         self.log.append(&mut m.log);
@@ -693,6 +706,11 @@ fn main() {
     let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new() };
     if std::env::var_os("DUMP").is_some() {
         victory_shader::vk::tir::dump(&f);
+    }
+    for v in std::env::var("NODES").unwrap_or_default().split(',').filter_map(|x| x.trim_start_matches('%').parse::<u32>().ok()) {
+        if (v as usize) < f.nodes.len() {
+            eprintln!("%{v} = {:?}", f.node(v));
+        }
     }
     if std::env::var_os("CARD").is_some() {
         victory_shader::vk::interp::card_floats(true);
