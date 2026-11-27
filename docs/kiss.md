@@ -449,6 +449,20 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (morning): **the world is lit in the lighting buffer** (run
+  vk98, batch `batch-2026-11-27` baked into a fresh driver cache, exe
+  int54): class depth written (458k texels with classes), the HDR target
+  after the tiled lighting holds the opening shot (window, yard in low
+  sun; max 987 / 211 / 99), no infinities; the upscaled 1920x1080 HDR
+  (0x99e980000) holds it too at present. Still wrong:
+  - **the final frame is grey**: the 10-bit target after the composite
+    (0xb3a8f0000) and the back buffers are flat; the picture is lost in
+    exposure / colour grading / `PS_CompositeNMB`. Captures of those
+    passes are the next step (replay them).
+  - interiors black (no ray-traced bounce light: the builder is off), a
+    dither pattern in the HDR targets, card 330-470 ms a frame now that
+    lighting runs (2-3 frames a second), RAM 21-26 GB in diagnostics runs
+    (a full target dump alone adds gigabytes), VRAM 6.5-7.2 GB.
 - 2026-11-27 (night): the batch bake, and why two of them were lost.
   - **Every pixel classed as sky**: CS_GenerateMaterialMasks tests the main
     depth's stencil with a float compare; the stencil integers are
