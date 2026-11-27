@@ -158,6 +158,9 @@ pub(crate) struct Rec {
     pushed: bool,
     /// The open pass's attachment images (draws are counted on them).
     attached: Vec<Arc<Image>>,
+    /// Diagnostics: the readings of the watched texels before the draw
+    /// being recorded (`watch.rs`).
+    watched: Vec<(usize, u64)>,
     /// Bounded indirect records in the command buffer's scratch.
     indirect: indirect::Windows,
     /// Diagnostics: the last push constants, and the last draw's vertex
@@ -217,6 +220,7 @@ impl Default for Rec {
             state_set: None,
             pushed: false,
             attached: Vec::new(),
+            watched: Vec::new(),
             indirect: indirect::Windows::default(),
             last_push: [0; 64],
             last_inputs: (0, 0),
@@ -676,9 +680,19 @@ impl Rec {
                 super::targets::tables(b, &s.name, &self.graphics.slots);
                 let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
                 // SAFETY: as above.
-                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.graphics.slots) };
-                told = Some(s.name.as_str());
+                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.graphics.slots, &[]) };
+                told = Some(s.name.clone());
             }
+        }
+        if told.is_none()
+            && let Some(name) = super::watch::capture(shaders, &self.graphics.slots)
+        {
+            // a writer of a watched texel, known again
+            self.end_pass(b);
+            let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
+            // SAFETY: outside rendering, in our command buffer.
+            unsafe { super::passes::before(b, cmd, &programs, &name, &self.graphics.slots, &self.heaps) };
+            told = Some(name);
         }
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
@@ -690,13 +704,19 @@ impl Rec {
             return None;
         };
         if let Some(name) = told {
-            self.tell_draw(name, gs);
+            self.tell_draw(&name, gs);
             // the capture takes the colour targets as they are before the
             // draw (and `drawn` after it): rendering is closed for the
             // copies and opened again
             self.end_pass(b);
             // SAFETY: outside rendering, in our command buffer.
             unsafe { super::passes::targets(b, cmd, &self.attached, "before") };
+            self.begin_pass(b, cmd)?;
+        }
+        if super::watch::on() && super::watch::touches(&self.attached) {
+            self.end_pass(b);
+            // SAFETY: outside rendering, in our command buffer.
+            self.watched = unsafe { super::watch::read(b, cmd, Some(&self.attached)) };
             self.begin_pass(b, cmd)?;
         }
         let key = DrawKey { pipeline: self.pipeline as usize, formats, count, depth, rect: self.topology == RECTANGLES, mesh };
@@ -852,6 +872,19 @@ impl Rec {
             }
         }
         super::passes::close();
+        if !self.watched.is_empty()
+            && let Some(b) = super::backend()
+        {
+            let before = std::mem::take(&mut self.watched);
+            self.end_pass(b);
+            if let Some(cmd) = self.cmd.as_ref().map(|r| r.cmd)
+                && let Some((shaders, _)) = crate::pipeline::parts(self.pipeline)
+            {
+                // SAFETY: outside rendering, in our command buffer.
+                let after = unsafe { super::watch::read(b, cmd, Some(&self.attached)) };
+                super::watch::entry(&before, &after, shaders, &self.graphics.slots, what);
+            }
+        }
         self.note(|| what.to_owned());
         self.trace_draw(what);
         let n = STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -954,8 +987,11 @@ impl Rec {
             let mut lap = super::Lap::start(57);
             self.watch_cull(b, Some([x, y, z]), None);
             lap.next();
+            // SAFETY: outside rendering, in our command buffer.
+            let watched = if super::watch::on() { unsafe { super::watch::read(b, cmd, None) } } else { Vec::new() };
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
+            self.watched_dispatch(b, cmd, &watched, &format!("dispatch {x}x{y}x{z}"));
             if super::ambient::on()
                 && let Some((shaders, _)) = crate::pipeline::parts(self.pipeline)
                 && shaders.iter().any(|s| super::ambient::follows(&s.name))
@@ -969,6 +1005,19 @@ impl Rec {
             self.note_as(|| format!("dispatch {x}x{y}x{z} ud5-8={:08x} {:08x} {:08x} {:08x}", ud[0], ud[1], ud[2], ud[3]), true);
             super::passes::note(|| format!("dispatch {x} {y} {z}"));
             super::passes::close();
+        }
+    }
+
+    /// Diagnostics: the watched texels after a dispatch, held against the
+    /// readings before it.
+    fn watched_dispatch(&self, b: &Backend, cmd: vk::CommandBuffer, before: &[(usize, u64)], what: &str) {
+        if before.is_empty() {
+            return;
+        }
+        if let Some((shaders, _)) = crate::pipeline::parts(self.pipeline) {
+            // SAFETY: outside rendering, in our command buffer.
+            let after = unsafe { super::watch::read(b, cmd, None) };
+            super::watch::entry(before, &after, shaders, &[], what);
         }
     }
 
@@ -1017,8 +1066,13 @@ impl Rec {
                 super::targets::tables(b, &s.name, &self.compute.slots);
                 let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
                 // SAFETY: as above.
-                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.compute.slots) };
+                unsafe { super::passes::before(b, cmd, &programs, &s.name, &self.compute.slots, &[]) };
             }
+        }
+        if let Some(name) = super::watch::capture(shaders, &[]) {
+            let programs: Vec<_> = shaders.iter().map(|p| (p.name.clone(), p.hash.clone(), p.stage)).collect();
+            // SAFETY: outside rendering, in our command buffer.
+            unsafe { super::passes::before(b, cmd, &programs, &name, &self.compute.slots, &[]) };
         }
         lap.next();
         self.indirect.clear();

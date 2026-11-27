@@ -123,13 +123,14 @@ pub(super) fn tables(b: &Backend, name: &str, roots: &[Vec<u32>]) {
 /// Whether a mid-frame dump of an earlier frame waits to be saved (its
 /// list has been executed by now).
 pub(super) fn pending(frame: u64) -> bool {
-    lock(&PENDING).iter().any(|p| p.born + super::passes::SETTLE < frame) || super::passes::pending(frame)
+    lock(&PENDING).iter().any(|p| p.born + super::passes::SETTLE < frame) || super::passes::pending(frame) || super::watch::pending(frame)
 }
 
 /// At a present with the queue idle: the mid-frame dumps of earlier
 /// frames are saved.
 pub(super) fn save_pending(b: &Backend, frame: u64) {
     super::passes::save_pending(b, frame);
+    super::watch::report(frame);
     let (ready, later): (Vec<Plan>, Vec<Plan>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born + super::passes::SETTLE < frame);
     lock(&PENDING).extend(later);
     for p in ready {
@@ -143,7 +144,7 @@ const DUMPS: u64 = 3;
 static DONE: AtomicU64 = AtomicU64::new(0);
 
 /// The first frame dumped (`VICTORY_VK_DUMP_TARGETS=<frame>`), if any.
-fn from() -> Option<u64> {
+pub(super) fn from() -> Option<u64> {
     static FROM: OnceLock<Option<u64>> = OnceLock::new();
     *FROM.get_or_init(|| {
         let v = std::env::var("VICTORY_VK_DUMP_TARGETS").ok()?;

@@ -39,6 +39,7 @@ mod baking;
 mod slow;
 mod passes;
 mod targets;
+mod watch;
 mod budget;
 mod compose;
 mod descriptors;

@@ -509,6 +509,8 @@ impl Rec {
         let Some(cmd) = self.prepare_dispatch(b) else {
             return;
         };
+        // SAFETY: outside rendering, in our command buffer.
+        let watched = if super::super::watch::on() { unsafe { super::super::watch::read(b, cmd, None) } } else { Vec::new() };
         for k in 0..u64::from(max) {
             // SAFETY: outside rendering, the title's compute pipeline bound;
             // our scratch.
@@ -518,6 +520,7 @@ impl Rec {
                     .cmd_dispatch_indirect(cmd, buffer, at + 12 * k)
             };
         }
+        self.watched_dispatch(b, cmd, &watched, "dispatch indirect");
         super::STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

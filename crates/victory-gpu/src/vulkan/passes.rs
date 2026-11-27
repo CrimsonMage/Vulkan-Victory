@@ -235,7 +235,7 @@ fn level0(img: &Image, aspect: vk::ImageAspectFlags) -> u64 {
 ///
 /// # Safety
 /// Recording into `cmd`, outside rendering.
-pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(String, String, &str)], name: &str, roots: &[Vec<u32>]) {
+pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(String, String, &str)], name: &str, roots: &[Vec<u32>], heaps: &[u64]) {
     let Some(folder) = crate::capture::folder() else { return };
     let born = super::present::FRAME.load(std::sync::atomic::Ordering::Relaxed);
     let dir = folder.join(format!("pass-{born}-{name}"));
@@ -249,13 +249,62 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
         meta.push(format!("maprange {:x} {:x} {:x}", r.title_start, r.title_size, r.device_base));
     }
     let mut walk = Walk { b, dir: &dir, have: BTreeMap::new(), total: 0, slots: BTreeSet::new(), todo: VecDeque::new(), meta: Vec::new(), later: Vec::new() };
+    // The descriptor heaps as memory first (the capture's room is theirs
+    // before the ranges'): the resource heap's first table is read, the
+    // rest is taken unread.
+    let mut heap = None;
+    for (k, &h) in heaps.iter().enumerate().filter(|(_, h)| **h != 0) {
+        meta.push(format!("heap {h:x}"));
+        if let Some(bytes) = walk.take(h, RANGE) {
+            walk.meta.push(format!("mem {h:x} {:x}", bytes.len()));
+            if k == 0 {
+                walk.scan(&bytes, 2);
+                heap = Some(bytes);
+            }
+        }
+    }
     for (param, r) in roots.iter().enumerate() {
         meta.push(format!("root {param} {}", r.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
         for p in r.chunks_exact(2) {
             walk.todo.push_back((u64::from(p[0]) | u64::from(p[1]) << 32, VIEW, 0));
         }
+        // a root constant that is an address by itself (a ped draw's
+        // material record sits at a 32-bit address in its constants)
+        for &w in r.iter().filter(|&&w| w >= 0x1_0000 && w % 4 == 0) {
+            walk.todo.push_back((u64::from(w), VIEW, 2));
+        }
     }
     walk.run();
+    // A program that picks descriptors by index (a material's textures)
+    // names them in the heap: where a small block taken (a root table, a
+    // material record) has three dwords in a row that are indices of
+    // texture descriptors of the heap, those textures are taken too, before
+    // the others (the blocks nearest the roots first).
+    let mut picked: Vec<u32> = Vec::new();
+    if let Some(heap) = &heap {
+        let entries = heap.len() / 32;
+        let word = |at: usize| u32::from_le_bytes([heap[at], heap[at + 1], heap[at + 2], heap[at + 3]]);
+        let slot = |v: u32| {
+            let at = v as usize * 32;
+            ((1024..entries).contains(&(v as usize)) && word(at + 24) ^ word(at + 28) == 0x7A3C_5E91).then(|| word(at + 28) & 0xff_ffff)
+        };
+        for (_, bytes) in &walk.later {
+            let found: Vec<Option<u32>> = bytes.chunks_exact(4).map(|c| slot(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+            let mut k = 0;
+            while k < found.len() {
+                let run = found[k..].iter().take_while(|f| f.is_some()).count();
+                if run >= 3 {
+                    for s in found[k..k + run].iter().flatten() {
+                        if picked.len() < 768 && !picked.contains(s) {
+                            picked.push(*s);
+                        }
+                    }
+                }
+                k += run.max(1);
+            }
+        }
+        meta.push(format!("picked {}", picked.len()));
+    }
     meta.append(&mut walk.meta);
     let later = std::mem::take(&mut walk.later);
     std::thread::spawn(move || {
@@ -265,7 +314,8 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
     });
     // the images its T#s name
     let (mut items, mut at, mut seen) = (Vec::new(), 0u64, BTreeSet::new());
-    for &slot in &walk.slots {
+    let rest: Vec<u32> = walk.slots.iter().copied().filter(|s| !picked.contains(s)).collect();
+    for &slot in picked.iter().chain(&rest) {
         let Some((img, key)) = super::descriptors::slot_image(slot) else {
             meta.push(format!("image {slot:x} none"));
             continue;
