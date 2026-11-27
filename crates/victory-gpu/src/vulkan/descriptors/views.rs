@@ -280,14 +280,24 @@ fn note_wide_uav(image: &Image, resource_format: u32, view_format: u32, format: 
 
 /// The view's format and aspect for the title's `view_format`, and
 /// whether it reads stencil.
-fn view_format(image: &Image, view_format: u32) -> (vk::Format, vk::ImageAspectFlags, bool) {
+fn view_format(image: &Image, view_format: u32, storage: bool) -> (vk::Format, vk::ImageAspectFlags, bool) {
     if image.depth() {
         let stencil = images::reads_stencil(view_format);
         let aspect = if stencil { vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
         return (image.format, aspect, stencil);
     }
     let f = images::color_format(view_format, image.card_written()).unwrap_or(image.format);
-    let f = if images::format_bytes(f) == images::format_bytes(image.format) { f } else { image.format };
+    let f = if images::format_bytes(f) == images::format_bytes(image.format) {
+        f
+    } else if !storage && crate::resource::pc_format(view_format) == 67 && images::format_bytes(image.format) == 4 {
+        // DXGI_FORMAT_R9G9B9E5_SHAREDEXP read from a 4-byte image the card
+        // writes as packed words (a compute program packs them into a
+        // 32_UINT view): sampled as what the words are, not as integers
+        // (the fog inscatter read as R32_UINT gave 2e9 in red).
+        vk::Format::E5B9G9R9_UFLOAT_PACK32
+    } else {
+        image.format
+    };
     (f, vk::ImageAspectFlags::COLOR, false)
 }
 
@@ -333,7 +343,7 @@ fn texture_words(
     };
     let mapping = if unordered { 0 } else { desc.map_or(0, |d| d[2]) };
     let shape = shape(&image, dimension, desc, unordered);
-    let (format, aspect, stencil) = view_format(&image, title_format);
+    let (format, aspect, stencil) = view_format(&image, title_format, unordered);
     if unordered {
         note_wide_uav(&image, rdesc.format, title_format, format);
     }

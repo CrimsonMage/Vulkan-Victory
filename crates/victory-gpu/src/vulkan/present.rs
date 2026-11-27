@@ -191,7 +191,7 @@ fn show(b: &'static Backend, s: &mut Swapchain, frame: u64, planes: &[compose::S
             log_texels(frame, &probes, mapped);
         }
         if let Some(p) = dump {
-            super::targets::save(b, frame, p);
+            super::targets::save(frame, p);
         }
     }
 }

@@ -122,7 +122,7 @@ pub(super) fn save_pending(b: &Backend, frame: u64) {
     lock(&PENDING).extend(later);
     for p in ready {
         let born = p.born;
-        save(b, born, p);
+        save(born, p);
     }
 }
 
@@ -206,7 +206,7 @@ pub(super) unsafe fn record(d: &victory_vk::ash::Device, cmd: vk::CommandBuffer,
 }
 
 /// Saves what [`record`] copied and frees the dump (the queue is idle).
-pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
+pub(super) fn save(frame: u64, p: Plan) {
     for (n, (img, at)) in p.items.iter().enumerate() {
         let (w, h, t) = (img.extent.width as usize, img.extent.height as usize, texel(img) as usize);
         // SAFETY: the mapped readback buffer; the copy into it has finished.

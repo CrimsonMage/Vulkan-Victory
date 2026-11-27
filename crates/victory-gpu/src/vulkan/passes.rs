@@ -39,9 +39,9 @@ struct Shot {
 }
 
 static PENDING: Mutex<Vec<Shot>> = Mutex::new(Vec::new());
-/// The capture later records of its program go to (push constants, the
-/// draw or dispatch): the recording thread's own, lists are recorded side
-/// by side.
+// The capture later records of its program go to (push constants, the
+// draw or dispatch): the recording thread's own, lists are recorded side
+// by side.
 thread_local! {
     static OPEN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
