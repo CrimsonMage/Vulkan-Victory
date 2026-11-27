@@ -7,6 +7,17 @@ files the user supplies. This fork runs the title's Direct3D 12.X on
 SPIR-V ahead of time, and the layer is kept thin. It is developed on Linux
 under stock Proton with an NVIDIA card.
 
+**It is meant to work with a dump of any Xbox Series title**, not one game.
+The loader, the reimplemented console services, the Direct3D 12.X surface
+and the shader translator follow what the console does, and what a title
+needs (its shaders, its pipelines, its memory layout) is taken from the dump
+the user supplies at run time. That is the goal, not yet the state: it has
+been developed and tested against one title only, and a few pieces still
+key on that title (the stand-in for indirect light and some diagnostics
+find their place by the names of its programs; per-build hooks in the
+loader). Other titles are expected to need work where they use console
+features this one does not.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
@@ -43,7 +54,7 @@ developer or publisher.
 
 ## Status (2026-11-27)
 
-**Not playable.** Tested on one machine: Linux (stock Proton), an Intel CPU,
+**Not playable.** Tested with one title, on one machine: Linux (stock Proton), an Intel CPU,
 NVIDIA RTX 5060 Ti 8 GB, 31 GB RAM; the Series S profile.
 
 | | |
