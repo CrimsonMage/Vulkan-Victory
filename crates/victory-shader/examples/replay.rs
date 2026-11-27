@@ -9,7 +9,9 @@
 //! to and each render target as `<name>.f32` (RGBA f32, rows tight) and a
 //! `.png` (clamped to 0..1), `census.txt` (min, max and non-finite count a
 //! channel), `missing.txt` (memory read that the capture lacks, as
-//! ranges) and `notes.txt` (what replay assumed).
+//! ranges), `notes.txt` (what replay assumed) and `reads.txt` (each image
+//! slot the program read: how often, and the range of what came back);
+//! `images.txt` is what every image of the capture holds, read or not.
 //!
 //! Assumed: every sampler filters linearly and clamps to the edge (no
 //! sampler state is captured); level 0 only (an explicit level, bias or
@@ -44,6 +46,7 @@ type W = [u64; 4];
 /// One `image` line and its data.
 struct Slot {
     name: String,
+    address: u64,
     w: u32,
     h: u32,
     d: u32,
@@ -101,6 +104,7 @@ fn parse_image(dir: &Path, w: &[&str], files: &mut HashMap<String, Rc<Vec<u8>>>)
         slot,
         Slot {
             name: format!("slot{slot:x}-{}", w.get(fmt_at + 2)?),
+            address: after(w, "address").map_or(0, hex),
             w: dims.first().copied().unwrap_or(1),
             h: dims.get(1).copied().unwrap_or(1),
             d: dims.get(2).copied().unwrap_or(1),
@@ -316,6 +320,49 @@ struct State {
     /// Stores: slot -> texel index -> the channels (bits).
     written: BTreeMap<u32, BTreeMap<usize, W>>,
     notes: BTreeSet<String>,
+    /// What the program read of each slot (`reads.txt`).
+    reads: BTreeMap<u32, ReadStat>,
+}
+
+/// The reads of one slot: how many, of which kinds, and the range of what
+/// came back a channel (as floats; integer reads as their numbers).
+#[derive(Default)]
+struct ReadStat {
+    count: u64,
+    nonzero: u64,
+    kinds: BTreeSet<String>,
+    min: [f64; 4],
+    max: [f64; 4],
+}
+
+impl State {
+    fn note_read(&mut self, slot: u32, kind: ImageKind, uint: bool, v: &W) {
+        let r = self.reads.entry(slot).or_insert_with(|| ReadStat { min: [f64::INFINITY; 4], max: [f64::NEG_INFINITY; 4], ..Default::default() });
+        r.count += 1;
+        r.nonzero += u64::from(v.iter().any(|x| *x != 0));
+        let name = format!("{kind:?}");
+        let name = name.split([' ', '{']).next().unwrap_or("").to_string() + if uint { ":int" } else { "" };
+        r.kinds.insert(name);
+        for k in 0..4 {
+            let x = if uint { v[k] as u32 as f64 } else { f64::from(f32::from_bits(v[k] as u32)) };
+            if x.is_finite() {
+                r.min[k] = r.min[k].min(x);
+                r.max[k] = r.max[k].max(x);
+            } else {
+                r.kinds.insert("NONFINITE".into());
+            }
+        }
+    }
+
+    fn reads_text(&self) -> String {
+        let mut out = String::new();
+        for (slot, r) in &self.reads {
+            let what = self.slots.get(slot).map_or("no image".to_string(), |s| format!("{} {}x{}x{} layers {}", s.view_format, s.w, s.h, s.d, s.layers));
+            let range: Vec<String> = (0..4).map(|k| format!("{:.5}..{:.5}", r.min[k], r.max[k])).collect();
+            let _ = writeln!(out, "slot {slot:x} {what}: {} reads ({} nonzero) {:?} [{}]", r.count, r.nonzero, r.kinds, range.join(", "));
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -489,7 +536,7 @@ impl Images for Replay {
         let off = x.offset.map_or([0, 0], |o| [o[0] as i32 as i64, o[1] as i32 as i64]);
         let i = x.coord.map(|v| v as i32 as i64);
         let layered = |i: [i64; 4]| if class.dim == 2 || class.arrayed { i[2] } else { 0 };
-        match kind {
+        let v = match kind {
             ImageKind::Sample { .. } => st.sample_op(slot, class, f, off, uint, x.dref),
             ImageKind::Gather { comp, .. } => st.gather(slot, comp, f, off, uint),
             ImageKind::Load { .. } => st.texel(slot, i[0], i[1], layered(i), uint),
@@ -508,8 +555,62 @@ impl Images for Replay {
                 st.notes.insert(format!("{kind:?} reads 0"));
                 [0; 4]
             }
+        };
+        if matches!(kind, ImageKind::Sample { .. } | ImageKind::Gather { .. } | ImageKind::Load { .. }) {
+            st.note_read(slot, kind, uint, &v);
         }
+        v
     }
+}
+
+/// `images.txt`: what level 0 of every image of the capture holds (a
+/// sample of its texels): the share that is not zero and a channel's range
+/// and mean, read as its view's format.
+fn image_census(slots: &HashMap<u32, Slot>) -> String {
+    let mut ids: Vec<&u32> = slots.keys().collect();
+    ids.sort();
+    let mut seen: HashMap<(*const Vec<u8>, &str), u32> = HashMap::new();
+    let mut out = String::new();
+    for id in ids {
+        let s = &slots[id];
+        let head = format!("slot {id:x} {:x} {} {}x{}x{} layers {}", s.address, s.view_format, s.w, s.h, s.d, s.layers);
+        if let Some(first) = seen.get(&(Rc::as_ptr(&s.data), s.view_format.as_str())) {
+            let _ = writeln!(out, "{head}: as slot {first:x}");
+            continue;
+        }
+        seen.insert((Rc::as_ptr(&s.data), s.view_format.as_str()), *id);
+        let (bytes, known) = texel_bytes(&s.view_format);
+        if !known {
+            let nonzero = s.data.iter().step_by(61).filter(|b| **b != 0).count();
+            let _ = writeln!(out, "{head}: {} bytes, not decoded, nonzero bytes {:.3}", s.data.len(), nonzero as f64 * 61.0 / s.data.len().max(1) as f64);
+            continue;
+        }
+        let texels = s.data.len() / bytes;
+        let step = (texels / 400_000).max(1) | 1;
+        let uint = !s.view_format.starts_with('D') && (s.view_format.contains("UINT") || s.view_format.contains("SINT"));
+        let (mut min, mut max, mut sum) = ([f64::INFINITY; 4], [f64::NEG_INFINITY; 4], [0f64; 4]);
+        let (mut n, mut nonzero, mut bad) = (0u64, 0u64, 0u64);
+        for i in (0..texels).step_by(step) {
+            let t = &s.data[i * bytes..(i + 1) * bytes];
+            n += 1;
+            nonzero += u64::from(t.iter().any(|b| *b != 0));
+            let v = decode(&s.view_format, t, uint);
+            for k in 0..4 {
+                let x = if uint { v[k] as u32 as f64 } else { f64::from(f32::from_bits(v[k] as u32)) };
+                if x.is_finite() {
+                    min[k] = min[k].min(x);
+                    max[k] = max[k].max(x);
+                    sum[k] += x;
+                } else {
+                    bad += 1;
+                }
+            }
+        }
+        let ch = if packed(&s.view_format, &[0; 4]).is_some() { 3 } else { channels(&s.view_format) };
+        let ranges: Vec<String> = (0..ch).map(|k| format!("{:.4}..{:.4} mean {:.4}", min[k], max[k], sum[k] / n.max(1) as f64)).collect();
+        let _ = writeln!(out, "{head}: nonzero {:.3} non-finite {bad} [{}]", nonzero as f64 / n.max(1) as f64, ranges.join(" | "));
+    }
+    out
 }
 
 // ---- output ----
@@ -695,8 +796,9 @@ fn main() {
     std::fs::create_dir_all(&out).expect("out dir");
     let mut cap = read_capture(&dir);
     view_as(&mut cap);
+    let _ = std::fs::write(out.join("images.txt"), image_census(&cap.slots));
     let (f, _, native) = thread_ir(&container).expect("translation");
-    let state = State { slots: std::mem::take(&mut cap.slots), written: BTreeMap::new(), notes: BTreeSet::new() };
+    let state = State { slots: std::mem::take(&mut cap.slots), written: BTreeMap::new(), notes: BTreeSet::new(), reads: BTreeMap::new() };
     let images = Replay(Rc::new(RefCell::new(state)));
     if cap.push.is_empty() {
         cap.push = push_from_roots(&cap, &native);
@@ -745,6 +847,7 @@ fn main() {
     }
     let _ = std::fs::write(out.join("missing.txt"), missing_ranges(&run.missing));
     let _ = std::fs::write(out.join("notes.txt"), notes.join("\n") + "\n");
+    let _ = std::fs::write(out.join("reads.txt"), st.reads_text());
     print!("{census}");
     println!("{} missing ranges; notes: {}", missing_ranges(&run.missing).lines().count(), notes.join("; "));
 }
