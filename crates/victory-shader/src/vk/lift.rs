@@ -70,6 +70,9 @@ pub struct Interface {
     /// Pixel: depth / stencil / sample mask exported.
     pub depth: bool,
     pub demotes: bool,
+    /// Pixel: the console tests depth and stencil before the program runs
+    /// (`vk::early_depth`: the module declares `EarlyFragmentTests`).
+    pub early_depth: bool,
     /// Reads barycentrics or per-vertex values (fragmentShaderBarycentric).
     pub per_vertex: bool,
     /// Clip and cull distances (`PA_CL_VS_OUT_CNTL`): how many of each.

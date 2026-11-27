@@ -566,11 +566,20 @@ impl<'a> Emit<'a> {
         match self.st.stage {
             HwStage::Ps => {
                 self.m.execution_mode(fid, en::EM_ORIGIN_UPPER_LEFT, &[]);
-                if self.outputs.contains_key(&OUT_DEPTH) {
+                let (depth, stencil) = (self.outputs.contains_key(&OUT_DEPTH), self.outputs.contains_key(&OUT_STENCIL));
+                if depth {
                     self.m.execution_mode(fid, en::EM_DEPTH_REPLACING, &[]);
                 }
-                if self.outputs.contains_key(&OUT_STENCIL) {
+                if stencil {
                     self.m.execution_mode(fid, en::EM_STENCIL_REF_REPLACING, &[]);
+                }
+                // The console's depth and stencil tests (and writes) before
+                // the program (`Interface::early_depth`): a pixel they
+                // reject does not run, so nothing it would store lands,
+                // and a kill keeps the depth already written. Never for a
+                // program that gives the tests their depth or stencil.
+                if self.iface.early_depth && !depth && !stencil {
+                    self.m.execution_mode(fid, en::EM_EARLY_FRAGMENT_TESTS, &[]);
                 }
             }
             HwStage::Cs => {

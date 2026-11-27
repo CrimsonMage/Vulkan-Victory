@@ -10,7 +10,8 @@ card. "theirs" = origin/main, "ours" = this tree **before** the fix named in the
 
 Verdicts: SAME; DIFFERENT (what); FIXED (was DIFFERENT, now theirs; commit subject and oracle test);
 OPEN (DIFFERENT, not changed, why); theirs missing / ours missing. Tests are in
-`vk/oracle/` (`origin1.rs`, `sections.rs`, `intersect.rs`, `valu1.rs`, `valu2.rs`).
+`vk/oracle/` (`origin1.rs`, `sections.rs`, `intersect.rs`, `valu1.rs`, `valu2.rs`; `nvidia.rs`:
+cases of trustno1-coder/VIctory-NVIDIA `0f0ada1`, a Direct3D 12 fork of the same upstream).
 
 ## Summary
 
@@ -37,6 +38,7 @@ OPEN (DIFFERENT, not changed, why); theirs missing / ours missing. Tests are in
 | `v_mad_legacy_f32` | 6,040 | **FIXED** | RDNA 2: fused, sources flushed, zero-factor rule; ours legacy product then add. | `legacy_mad_fuses_its_product_and_flushes_its_sources` (theirs) |
 | `image_bvh64_intersect_ray`, `image_bvh_intersect_ray` | 24 / 40 | **FIXED** | Builder off: theirs answers no hit and reads nothing; ours read the node. | `intersect.rs` |
 | every register read before a write | all | **FIXED** | Theirs 0; ours `OpUndef`. | `a_register_nothing_wrote_reads_zero` |
+| `DB_SHADER_CONTROL` DEPTH_BEFORE_SHADER (bit 12 of a pixel program's control word) | 3,009 (223 of 414 used pixel programs, all 130 `TL_PS_*`) | **FIXED** | The console tests depth and stencil (and writes them) before the program. Ours parsed the word and never used it: the host tested after the program (every pixel module demotes, most can store), so hidden pixels were shaded and their stores landed. Now `EarlyFragmentTests`, unless the program gives the tests their depth or stencil (none of the 3,009 does). Theirs (trustno1-coder/VIctory-NVIDIA 41b4a05): the same rule behind a switch. | `the_consoles_early_depth_test_is_declared` (`oracle/nvidia.rs`) |
 | V# with NUM_RECORDS −1 (root views; all MUBUF/MTBUF/`s_buffer_load_*`) | 165 of 313 used vertex/mesh programs | OPEN, fix on a side branch | Theirs: a root view has no bounds. Ours: zero block unless the map range has 4 GiB − 1 left. Branch `…-vsharp-range`: limit = min(V# bytes, bytes left in the range). | `a_view_of_all_memory_reads_to_the_end_of_its_range` (on that branch) |
 | `ds_swizzle_b32`, DPP `quad_perm`, `s_wqm_b32/b64` | 6,270; 1,574 / 8,717 | OPEN | Theirs: quad operations (see helper lanes); `s_wqm` = every lane. Ours: shuffles and a ballot by `SubgroupLocalInvocationId & !3`, an inactive source reads 0. Equal while helpers are present and counted; undefined where the host leaves helper invocations out of shuffles/ballots. Needs `OpGroupNonUniformQuadSwap/Broadcast` (and a quad-aware `s_wqm`). | none |
 | `image_gather4_l`, `image_gather4_l_o` | 16 / 16 | **FIXED** (2D) | Theirs: four texel loads at the rounded level, offsets in that level's texels. Ours dropped the level: `OpImageGather` read the base level (meshlet culling against the depth pyramid). Now four loads at the level. | `a_gather_at_a_named_level_reads_four_texels_of_that_level` |

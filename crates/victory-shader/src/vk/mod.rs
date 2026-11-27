@@ -141,6 +141,49 @@ pub fn native(container: &[u8]) -> Result<(Container<'_>, NativeProgram), Shader
     Ok((c, native))
 }
 
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program: the
+/// depth and stencil tests (and their writes) run before the program, as
+/// HLSL's `[earlydepthstencil]` asks.
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+/// `DB_SHADER_CONTROL`'s Z_EXPORT_ENABLE, STENCIL_TEST_VAL_EXPORT_ENABLE and
+/// STENCIL_OP_VAL_EXPORT_ENABLE: the program gives the tests their depth
+/// or stencil.
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+/// What a pixel program gets of its console code's early depth test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyDepth {
+    /// The console tests after the program where it must (the hardware's
+    /// choice otherwise), and so does the host.
+    NotAsked,
+    /// The host's early test (`EarlyFragmentTests`).
+    Given,
+    /// The late test: the program writes depth or stencil, which an early
+    /// test would not take.
+    Exports,
+}
+
+/// [`EarlyDepth`] of a pixel program with `db_shader_control` and the
+/// output signature `osg` (trustno1-coder/VIctory-NVIDIA 41b4a05
+/// `early_depth_of`, there behind a switch). Without it the host tests
+/// after any program that stores, kills or may give up a loop (every one
+/// of ours: the loop guard's count), and what a hidden pixel stores lands:
+/// the title's transparent pass keeps its nearest depth and motion with
+/// 64-bit atomics into a texture a later full-screen draw writes into the
+/// scene's depth and motion, so glass behind a character's hair took the
+/// hair's place there.
+fn early_depth(db_shader_control: u32, osg: &[SigRow]) -> EarlyDepth {
+    // SV_Depth, SV_DepthGreaterEqual, SV_DepthLessEqual, SV_StencilRef
+    let exported = |r: &SigRow| matches!(r.sv, 65 | 67 | 68 | 69);
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 {
+        EarlyDepth::NotAsked
+    } else if db_shader_control & DEPTH_STENCIL_EXPORT != 0 || osg.iter().any(exported) {
+        EarlyDepth::Exports
+    } else {
+        EarlyDepth::Given
+    }
+}
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -293,6 +336,8 @@ fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], strid
         lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
     }
     let (mut f, mut iface) = lift.run()?;
+    iface.early_depth =
+        matches!(&native.io, crate::native::StageIo::Ps { db_shader_control, .. } if early_depth(*db_shader_control, osg) == EarlyDepth::Given);
     // every console wave two full host subgroups: wave64 groups of whole waves
     let threads = lift::Lift::host_threads(native);
     let paired = native.wave64 && matches!(native.stage, HwStage::Cs | HwStage::Ms) && threads >= 64 && threads % 64 == 0;

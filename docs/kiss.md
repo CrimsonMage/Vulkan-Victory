@@ -151,6 +151,58 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (translator, from trustno1-coder/VIctory-NVIDIA `0f0ada1`;
+  branch `tr-batch`; proven offline, nothing baked or run):
+  - **The console's early depth test is the module's.** A pixel program
+    whose `DB_SHADER_CONTROL` has DEPTH_BEFORE_SHADER (bit 12: the source
+    shader's `[earlydepthstencil]`, the tests and their writes before the
+    program) declares `EarlyFragmentTests`, unless it gives the tests
+    their depth or stencil (export bits 0-2, an `SV_Depth*` or
+    `SV_StencilRef` output, or a module that writes either): theirs
+    `early_depth_of` (41b4a05), there behind a switch that is off; here
+    always (`vk::early_depth`, `Interface::early_depth`, emit.rs).
+    - Pack: 3,009 of the 12,056 pixel programs that translate ask for it
+      and all get it (none exports depth or stencil); used set: 223 of
+      414, among them all 130 `TL_PS_*` (65 `TL_PS_NoDir_*`; the pack has
+      240), the tiled lighting's full-screen draws that the console
+      rejects per pixel by the material's stencil. Their word is 0x1010
+      (bit 12, Z_ORDER early then late, no kill); the others' 0x1410,
+      0x1050, 0x1450 (bit 10, run for no-op colour writes, is set exactly
+      in the 919 that store to memory or storage images: 80 used; bit 6,
+      kill, in 2,409: 23 used).
+    - **Why the driver did not test early by itself:** every one of our
+      pixel modules demotes (the kill of the lanes outside EXEC at the
+      `done` export), and every one with a loop can store (the loop
+      guard's count: an atomic add and a store through a pointer). 140 of
+      the 223 have no store but that, 80 store on their own, 3 neither.
+      So each `TL_PS_*` draw shaded every pixel of the screen and was
+      tested after.
+    - **Kills.** With the mode a killed pixel has written its depth and
+      stencil before it ran: so it has on the console, whose bit says the
+      same of the same shader (Mesa's AMD drivers set it for a shader's
+      `early_fragment_tests`: as remembered, their source was not at
+      hand; in the pack the neighbouring bits agree with that reading,
+      bit 10 being set in exactly the programs that store). Our demotes keep their meaning for colour and for
+      what the program stores after them. No program is left out for
+      killing.
+    - **Stores.** A pixel the tests reject no longer runs, so what it
+      would store does not land: the transparent pass's 64-bit atomics
+      (glass behind hair took the hair's place in depth and motion), the
+      80 used programs above.
+    - Proof: `the_consoles_early_depth_test_is_declared` (oracle/nvidia.rs:
+      theirs' two tests; fails without the mode); every one of the 3,009
+      modules differs from before by that one instruction and passes
+      `spirv-val`; no other module of the pack changes; `shader-golden`:
+      1,527 programs, 0 changed (the interpreter runs no depth test).
+      **Needs the bake:** the 223 used pixel programs.
+    - **Left as it is, to decide:** 191 used pixel programs do not ask
+      (126 of them 0x10: early then late, no kill, nothing exported, no
+      store of their own; the console's hardware tests those early by
+      itself). Ours cannot be tested early by the driver either (41 for
+      the loop guard's store, all for the demote). Declaring the mode for
+      them would be our choice, not the console's word: it would change
+      nothing they write unless a draw uses alpha to coverage with them.
+
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
   its latest view names; a slot stays its texture's** (runs tx0 to tx7 on
