@@ -720,7 +720,7 @@ fn buffer_over(b: &Backend, title: u64, len: u64) -> Option<(vk::Buffer, u64)> {
     }
     // In a region not imported yet: imported now (the map follows at the
     // next command buffer).
-    if m.want(title) && m.import_regions(&b.host) {
+    if m.want_range(title, len) && m.import_regions(&b.host) {
         m.rebuild_map();
     }
     m.buffer_of(title)
@@ -738,12 +738,18 @@ fn device_of(b: &Backend, title: u64, len: u64) -> Option<u64> {
 /// before the next command buffer binds the map; in the pool's GPU view,
 /// its page comes back if it was evicted (a root view: its first page).
 pub(crate) fn touch(at: u64) {
+    touch_range(at, 1);
+}
+
+/// An API call named title memory `[at, at + len)` (a view of a buffer):
+/// as [`touch`], and loose memory is imported to the end of the range.
+pub(crate) fn touch_range(at: u64, len: u64) {
     if at == 0 {
         return;
     }
     if let Some(b) = backend() {
         let mut m = memory(b);
-        m.want(at);
+        m.want_range(at, len);
         paging::ensure(b, &mut m, at, 1);
     }
 }
@@ -772,14 +778,36 @@ pub(crate) fn heap_created(start: u64, size: u64, kind: u32, visible: bool, plac
 }
 
 impl Memory {
-    /// Marks the memory holding `at` wanted: its region, or for memory in
-    /// no region, view or pool (a committed block of the title's own
-    /// allocator, the Rust heap) the committed run of pages holding it,
-    /// as a region of its own (the D3D12 path's "loose" heaps). Whether
-    /// something is still to import.
+    /// Marks the memory holding `at` wanted ([`Memory::want_range`] of one
+    /// byte).
     fn want(&mut self, at: u64) -> bool {
+        self.want_range(at, 1)
+    }
+
+    /// Marks the memory holding `[at, at + len)` wanted: the region of
+    /// `at`, or for memory in no region, view or pool (a committed block
+    /// of the title's own allocator, the Rust heap) the committed run of
+    /// pages holding it, as a region of its own (the D3D12 path's "loose"
+    /// heaps). Whether something is still to import.
+    ///
+    /// Loose memory is taken to the end of the range: a buffer the title
+    /// keeps in memory mapped page by page (views of physical pages, each
+    /// an allocation of its own) is named by its first address only, and
+    /// the run of pages holding that address is one 64 KiB page. The
+    /// title's 50 MB buffer of skinned vertices (written by
+    /// CS_PedStandardSkinning_*, read by the peds' mesh programs) had its
+    /// first page in the memory map and nothing else: the stores went to
+    /// the sink, the mesh programs read zeros and no character was drawn.
+    fn want_range(&mut self, at: u64, len: u64) -> bool {
+        let end = (at.saturating_add(len.max(1)) as usize).next_multiple_of(PAGE as usize);
+        // A loose region that ends inside the range grows below, if pages
+        // that may join it follow.
+        let grows = self.regions.range(..=at as usize).next_back().is_some_and(|(&base, r)| {
+            let over = base + r.len;
+            r.loose && !r.refused && (at as usize) < over && over < end && loose::usable_end(over, self.loose_limit(over, end)) > over
+        });
         match self.regions.range_mut(..=at as usize).next_back() {
-            Some((&base, r)) if at < (base + r.len) as u64 => {
+            Some((&base, r)) if at < (base + r.len) as u64 && !grows => {
                 if r.import.is_none() && !r.refused {
                     r.wanted = true;
                     return true;
@@ -809,23 +837,61 @@ impl Memory {
             }
             return false;
         };
+        // To the end of the range named, over the pages that follow as
+        // other allocations, as far as they are committed read-write
+        // memory and no region, pool or view of their own.
+        let len = if base + len < end {
+            let stop = self.loose_limit(base + len, end);
+            let reached = loose::usable_end(base + len, stop);
+            if reached < end {
+                static SHORT: AtomicU64 = AtomicU64::new(0);
+                if SHORT.fetch_add(1, Ordering::Relaxed) < 24 {
+                    tracing::warn!(
+                        at = format_args!("{at:#x}"),
+                        named_kb = (end - at as usize) >> 10,
+                        reached = format_args!("{reached:#x}"),
+                        "Vulkan: loose title memory the card reads is not committed read-write memory to the end of the range named; the card reads zeros past it"
+                    );
+                }
+            }
+            reached - base
+        } else {
+            len
+        };
         // Over loose memory imported before (the allocation has grown, or
         // was touched first at a higher address): one region of the union;
         // the old imports go once the card is done with them.
         let (base, len) = self.join_neighbours(base, len);
         let (base, len) = self.merge_loose(base, len);
         tracing::info!(at = format_args!("{at:#x}"), base = format_args!("{base:#x}"), mb = len >> 20, "Vulkan: loose title memory the card reads, imported as a region");
-        self.regions.insert(
-            base,
-            Region {
-                len,
-                import: None,
-                refused: false,
-                wanted: true,
-                loose: true,
-            },
-        );
+        // Pages of a region joined here may have been freed since it was
+        // imported (a block of the process heap: no call of the title's
+        // says so). Imported whole, the union was refused for the free
+        // pages and everything in it read zeros for the rest of the run
+        // (vk105: 143 MB from the world's load on). Each run of pages
+        // still there is a region.
+        for (base, len) in loose::usable_runs(base, base + len) {
+            self.regions.insert(
+                base,
+                Region {
+                    len,
+                    import: None,
+                    refused: false,
+                    wanted: true,
+                    loose: true,
+                },
+            );
+        }
         true
+    }
+
+    /// Where loose memory from `from` on may reach at most: `end`, or the
+    /// first region that is not loose, pool or big view before it.
+    fn loose_limit(&self, from: usize, end: usize) -> usize {
+        let region = self.regions.range(from..end).find(|(_, r)| !r.loose).map(|(&a, _)| a);
+        let view = self.views.range(from..end).next().map(|(&a, _)| a);
+        let pool = self.pools.iter().map(|p| p.title_start as usize).filter(|&a| a >= from && a < end).min();
+        [region, view, pool].into_iter().flatten().fold(end, usize::min)
     }
 }
 

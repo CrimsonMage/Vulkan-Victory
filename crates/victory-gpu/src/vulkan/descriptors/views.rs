@@ -60,16 +60,22 @@ pub(crate) fn write(handle: u64, view: &View) {
     let Some(h) = heaps(b) else { return };
     let started = std::time::Instant::now();
     // The heap the slot is in, and the memory a buffer view names, are read
-    // by the card.
+    // by the card: the buffer whole (a view names its first address, and
+    // may begin anywhere in it).
     super::super::touch(handle);
     match view {
-        View::Constant(address, _) => super::super::touch(*address),
+        View::Constant(address, size) => super::super::touch_range(*address, u64::from(*size)),
         View::Shader(r, _) | View::Unordered(r, _, _) => {
-            if let Some((data, _)) = crate::resource::buffer_bytes(*r as crate::object::This) {
-                super::super::touch(data as u64);
+            if let Some((data, len)) = crate::resource::buffer_bytes(*r as crate::object::This) {
+                super::super::touch_range(data as u64, len);
             }
         }
-        View::Placed(_, _, desc) => super::super::touch(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+        View::Placed(_, rdesc, desc) => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            // SAFETY: the resource description is these 14 words.
+            let r: crate::resource::ResourceDesc = unsafe { std::ptr::read_unaligned(rdesc.as_ptr().cast()) };
+            super::super::touch_range(address, if rdesc[0] == 1 { r.width } else { 1 });
+        }
         _ => {}
     }
     let words: Vec<u32> = match view {

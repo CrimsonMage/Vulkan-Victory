@@ -72,6 +72,35 @@ pub(super) fn all_usable(lo: usize, hi: usize) -> bool {
     true
 }
 
+/// Where the committed read-write pages from `lo` on end, at most `hi`
+/// (`lo` itself when its page is not such memory).
+pub(super) fn usable_end(lo: usize, hi: usize) -> usize {
+    let mut p = lo;
+    while p < hi {
+        let Some(i) = page_info(p).filter(usable) else { return p };
+        p = i.BaseAddress as usize + i.RegionSize;
+    }
+    hi
+}
+
+/// The runs of committed read-write pages in `[lo, hi)`, as (first
+/// address, bytes).
+pub(super) fn usable_runs(lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut p = lo;
+    while p < hi {
+        let end = usable_end(p, hi);
+        if end > p {
+            runs.push((p, end - p));
+            p = end;
+        } else {
+            // to the end of what is there instead (free, reserved or protected pages)
+            p = page_info(p).map_or(hi, |i| (i.BaseAddress as usize + i.RegionSize).max(p + 4096));
+        }
+    }
+    runs
+}
+
 /// The committed read-write run of pages holding `at` (one allocation),
 /// from the allocation's base, so that an address below one touched
 /// earlier in the same allocation is in it too.
