@@ -21,6 +21,7 @@ the twin; it implements only what is truly console-only.
 | D3D12.X device and command lists (`d3d12_xs`) | Vulkan, recorded from the calls the title's threads write down | `victory-gpu` (`device`, `list`, `vulkan/`) | works; the only GPU back end since 2026-11-26 |
 | Console GPU code (RDNA2 machine code, no HLSL or DXIL shipped) | Decoder → IR → **SPIR-V** (`docs/vulkan-abi.md`), translated once per stage and kept on disk | `victory-shader` (`vk/`) | works |
 | Console tiled texture layouts | Detiled into card images when the data arrives | `victory-gpu/vulkan/images*` | works |
+| Streamed textures: placed with every level, the levels held said by the view the title writes into its descriptor slot | A card image of the levels the latest view names, alive while a slot of the title names the texture; a host slot stays its texture's | `victory-gpu/vulkan/images/{levels,named}.rs`, `descriptors.rs` | works |
 | Ray tracing (console BVH format, title's own builder DLL) | Not yet on the SPIR-V path (the DXIL builder went with the D3D12 back end) | `victory-shader/vk/` | open |
 | 64-lane waves | 32-lane PC waves with emulation in the translator | `victory-shader` | works; keep |
 | Console DirectStorage (`XCRDAPI`) | One shared handle per file; each request does one positioned read of exactly its source range when it runs (uncompressed straight into title memory, compressed into a reused worker buffer, then inflate/unpack on the CPU); one FIFO worker pool, no lock per request (`dstorage streaming` line every 10 s) | `victory-hle/dstorage.rs` | built, not yet run |
@@ -150,6 +151,167 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (streamed textures): **a texture the title places lives
+  while one of the title's descriptor slots names it, and has the levels
+  its latest view names; a slot stays its texture's** (runs tx0 to tx7 on
+  the cache of `batch-2026-11-27d`, branch
+  `worktree-agent-a1b8109f1aac12c0f`; host only, nothing baked). The suit
+  is orange with its lettering in every run since, the bunk, the window
+  frame and the walls have their own textures, and the final frame is the
+  reference's picture.
+  - **How the title streams textures** (run tx0: the baseline with
+    `VICTORY_VK_CENSUS`, 225,686 texture views to the end of the world's
+    load; `vulkan/images/levels.rs`):
+    - It has no resource for them: 219,180 of the views are views of
+      memory it placed itself (`CreatePlaced…View`), each with the
+      texture's whole description, every level. The console's four extra
+      words of the view are (0, 0, 0, 3) throughout and no view has a
+      `ResourceMinLODClamp`; the pages under the layout say little (the
+      neighbours' pages are mapped).
+    - **Which levels are there is the view's first level.** One slot of
+      the title's heap (1,216,000 slots at 0x57b0000; textures in the
+      first ~110,000) belongs to one texture object. Slot 0x6990: a view
+      of address 0 when the object is made; from level 1 at 0x5aff28000
+      when its data is placed (frame 894); from level 1 at 0x69a648000
+      when it moves to a piece of 0xc000 bytes, its whole layout (frame
+      1290); from level 0 there a frame later (the level came in, in
+      place); from level 1 again (frame 1317: let go); from level 1 at
+      0x710338000 (frame 1321: moved to a smaller piece).
+    - The levels held are the head of the console layout (the block of
+      the small levels first, then the others from the smallest up, level
+      0 last), and the pieces are packed by it: a 1024x1024 BC1 texture
+      (0xab000 bytes) viewed from level 3 holds 0x3000 and its neighbour
+      starts 0x4000 on; viewed from level 2 it holds 0xb000 and the next
+      starts 0xc000 on; 512x512 ones viewed from level 3 lie 0x1000
+      apart. Of the views that name a level above 0 or a texture of one
+      level, 123,994 of 124,659 had every byte through the named level
+      mapped.
+    - **A view from level 0 is not that statement.** While it places a
+      texture the title first writes a view of all its levels into a
+      scratch slot (eight textures in a row into slot 36,054 in frame
+      1005), and the object's own slot gets the view from the level held
+      up to five frames later: 43,152 views from level 0 were followed by
+      one from a higher level, 33,625 of them in another slot; 30,025 of
+      the 53,741 level-0 views of textures with levels claimed bytes that
+      were not mapped. The last view written is the one that counts.
+      Most textures of the test scene are then cut down again (the
+      sequences of first levels 0, 3, 8 and 0, 3, 7 and 0, 1, 6 lead).
+  - **What was wrong.** `drop_overlaid` took a texture's whole layout as
+    its memory, so every texture placed took the images of its neighbours
+    out, and the scratch views of all levels did it for the textures that
+    are small on the card too. At the end of the load the title's slots
+    named 48,432 textures and 20,428 had an image, another set in every
+    run. A fill read the whole layout, so it failed where a page of the
+    levels not held was not mapped. A dropped image's slots went to the
+    next image made: a descriptor the title kept showed another texture.
+  - **The rules as built:**
+    - *Levels* (`levels.rs`, `fill::renamed`): the image of a texture the
+      title fills has the levels from the one its latest view names on
+      (less those texture quality cuts), and is filled from the head of
+      the layout that holds them; pages that are not mapped read zeros.
+      A view that names another first level has the image made again;
+      the texture's slots show the new one once the card has filled it.
+    - *Life* (`named.rs`): a slot of the title names the texture of the
+      last view call that wrote it (a copy call carries the name along).
+      A texture no slot names for four frames goes. Nothing else ends a
+      texture the title fills: no neighbour (`drop_overlaid` is gone), no
+      remapped page (it is filled again from the pages shown now), no
+      resource the title makes over its memory and releases while the
+      slot goes on naming it (3,300 a run).
+    - *Slots* (`descriptors.rs`): a slot belongs to a texture (title
+      address and shape) and a view of it, and stays theirs. Without an
+      image it reads the null image; when the texture has an image again
+      its slots show it and the old descriptors work. The last 65,536
+      textures that went keep their slots; only past that, or with all
+      2^20 given, are the longest-gone texture's slots given again.
+      The clean form is a generation in the T# that the translated code
+      checks: `docs/vulkan-host.md`, proposal 8 (not built).
+    - *Texture quality* cuts block-compressed textures only: an
+      uncompressed texture the title fills is data as often as colour
+      (the suit's 256x256 map of material numbers, read at an explicit
+      level: the pale seams), and all of them are 9 MB.
+  - **Room on the card.** With the levels the views name, the 25,300
+    textures alive when the scene stands take 422 MB (before: 18,900 in
+    519 MB, every level under texture quality; the title's levels without
+    texture quality would be about 1.1 GB). Image blocks are 64 MiB, the
+    pool view's size (256 before; images of 16 MiB and more, the title's
+    3840x2160 targets, take exactly their size): 2,913 to 2,977 MiB held
+    for 2,664 bound where twelve 256 MiB blocks held 3,072, and a block
+    the images need is the pool's to give at once (`budget::fits` counts
+    the pool's blocks on their way out and waits a moment for the memory
+    lock: before, the image that asked was refused and its descriptor
+    stayed null). The pool's view: a page counts as texture memory when
+    the textures' own bytes cover it whole (not when one texture's layout
+    reaches over it), never when a buffer resource lies over it, and a
+    page textures no longer cover takes a card page again
+    (`pool_read_by_programs_not_on_card_mb`: 0 once the scene stands).
+    The ceiling is as it was (5,504 MiB); nothing was refused.
+  - **Numbers** (7 minutes; before: tx0, after: tx3, tx4, tx6, tx7 on one
+    build):
+
+    | | before | after |
+    |---|---|---|
+    | images made | 160,933 | 162,150 to 168,557 |
+    | dropped: overlaid / remapped / resource | 107,255 / 32,881 / 369 | 0 / 0 / 2,700 to 3,040 |
+    | dropped: no slot names it / made again for levels | - | 52,000 to 55,200 / 79,300 to 82,100 |
+    | images refused | 0 | 0 |
+    | textures the title's slots name / with an image | 48,432 / 20,428 (end of load) | 26,250 to 26,600 (scene standing) / all |
+    | title descriptors reading the null image | not counted | 0 of 74,000 |
+    | filled images alive, card MB | 18,925, 519 | 25,070 to 25,410, 422 |
+    | image blocks MiB / bound | 3,072 / 2,761 | 2,913 to 2,977 / 2,664 |
+    | card peak MB (`vram.txt`) | 6,731 | 6,722 to 6,735 (tx6: one sample of 6,823) |
+    | RAM peak MB | 17,125 | 16,215 to 16,818 |
+    | card ms a frame (direct0, from frame 1500) | 389 (tx0), 441, 447 (sh2, sh4) | 441 to 445 |
+
+    Images made did not fall: 66,000 placements and 88,000 changes of
+    the first level are the title's own streaming in this load (a texture
+    is placed with a scratch view of all levels, viewed from level 3,
+    then cut to its small levels), and each makes an image. What went is
+    the 107,000 images taken out by neighbours. A frame costs the card
+    what it cost in the runs where the suit happened to be orange (sh2:
+    441 ms): more is drawn (hair, the layered materials' textures).
+  - **The picture** (albedo 0xb0a5a0000 at frame 1620, final frames
+    1920 to 1950): in tx1 to tx4, tx6 and tx7 the orange suit with INMATE
+    across the back, the blue window frame, the pale wall with its
+    texture, the bunk's blue frame, the posters, the people in orange in
+    the yard. The ponytail is in tx1, tx3, tx4, tx6 and tx7 and not in tx2
+    (a few strands at the neck; before the pool's pages that textures no
+    longer cover came back to the card). Against the reference the final
+    frame is the same picture; seen and not examined: the reference's
+    lettering is sharper and its hair denser, with a hair tie, and the
+    character's shadow on the left wall is darker there.
+  - **Runs**: tx0 the baseline with the census; tx1, tx2 the rule as it
+    grew; tx3, tx4, tx6, tx7 the build as it is (one exe, in a row). tx5
+    ended 57 s in, before the world: a null read in the title's own code
+    (+0x10823c) while a page beside the object it read was being shown
+    again; seven logs of the day under other builds end in title faults
+    of this kind. The trial branch `sh-texture-own-trial` (the largest
+    level any view named) is superseded: the latest view is the word.
+  - **Tools**: `VICTORY_VK_CENSUS=<file>` (diagnostics builds): every
+    texture view, announced write, page mapping and dropped image as a
+    line (`images/census.rs`; the scripts that read it:
+    /mnt/data/victory/scratch-agent/tx/py/). The 10 s lines say how many
+    textures the title's slots name, how many of them have no image, and
+    how many texture descriptors in the title's heaps carry a slot that
+    reads the null image.
+  - **Open**, most important first: (1) the ponytail was missing in one
+    run of six (tx2, the build before pool pages that textures no longer
+    cover came back to the card: 76 to 150 MB of pages programs read
+    were off the card during the load); the four runs since have it, the
+    cause is not proven; (2) the card's time a frame is at the top of
+    what the runs before had (441 to 445 ms against 389 to 447): the
+    textures are there to be read; (3) a title descriptor
+    older than the 65,536 textures gone since shows its slot's new
+    texture: the generation in the T# (translator and ABI); (4) a view
+    written while no card memory can be had gets the null descriptor and
+    is not tried again (none in these runs; a slot given before the image
+    is made would let a later flush make it); (5) descriptor bytes the
+    title copies itself are not seen by the naming (none read null here);
+    (6) the title's scratch views make an image of all levels (under
+    texture quality) that is made again a few frames later: made at the
+    flush instead, most would never be made; (7) the ceiling: the images
+    hold 2.9 GiB where 2.66 are bound, the card-written ones 2.24 of
+    them, the seven 3840x2160 interface targets 233 MiB.
 - 2026-11-27 (the jumpsuit): **why the character's suit is dark maroon in
   most runs and orange in some: the textures its material picks by index
   are gone from the card, or their slots show other textures** (runs sh1

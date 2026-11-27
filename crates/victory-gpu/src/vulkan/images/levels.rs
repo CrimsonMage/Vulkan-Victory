@@ -1,7 +1,7 @@
 //! Which levels of a texture the title fills are on the card, and which
 //! bytes of its console layout they are.
 //!
-//! The title streams a texture's levels (runs tx0 to tx3, `docs/kiss.md`).
+//! The title streams a texture's levels (run tx0, `docs/kiss.md` 2026-11-27).
 //! It places every texture with its whole description, all levels, in a
 //! piece of its texture pool sized for the levels it holds: the console
 //! stores the block of the small levels first, then the others from the

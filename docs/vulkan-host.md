@@ -337,7 +337,11 @@ So title textures keep a host `VkImage` in card memory:
   base address stays the title's.
 - **Twins stay** where the title reads a target's memory as a buffer, or
   uses a depth texture as a UAV (no storage depth formats on NVIDIA).
-- **Levels on demand** (`tiles.rs`) become sparse-residency images.
+- **Levels on demand**: as built (2026-11-27, `images/levels.rs`), no
+  sparse images. The title says which levels of a streamed texture it
+  holds in the first level of the view it writes into its slot; the
+  image has those levels (less texture quality's) and is made again when
+  a view names another first level. See "Streamed textures" below.
 
 **Victory's own memory.** A few 64 MiB blocks per memory type with a
 simple suballocator. The M1 probe makes a handful of dedicated
@@ -372,10 +376,16 @@ Per `docs/vulkan-abi.md` v0:
     partially bound and variable count, written by
     `vkUpdateDescriptorSets` at view creation. The shader side is the
     same.
-- **Slots** are allocated per distinct (image, view description) and
-  freed when the resource is released (`release.rs`). The title copies
-  descriptors bytewise, so a slot cannot be freed when one heap slot is
-  overwritten. Deduplication bounds the count by the distinct views.
+- **Slots** belong to a texture (title address and shape) and a view of
+  it, as the console's descriptor names memory and a shape, and stay
+  theirs (as built, 2026-11-27, `descriptors.rs`): the title keeps its
+  descriptors and programs pick them by heap index, so a slot is never
+  given to another texture while its own may come back. Without an image
+  the slot reads the null image; an image made again for the texture is
+  shown by the slots it had. The last 65,536 textures that went keep
+  their slots; past that, or with all 2^20 given, the longest-gone
+  texture's slots are given again. See "Streamed textures" below and
+  proposal 8.
 - **Samplers** are deduplicated by description. NVIDIA's
   `maxSamplerAllocationCount` is about 4,000.
 - vkprobe prints the driver's descriptor sizes, offset alignment and
@@ -1886,6 +1896,50 @@ protection change cost on this host (measured once on a page of our own).
 - An overlapped `ReadFile` that completes after the call returns would
   write a page protected again (Wine completes file reads in the call).
 
+### Streamed textures: levels, life and slots (tx0–tx7, 2026-11-27, branch `worktree-agent-a1b8109f1aac12c0f`)
+
+What the title does, measured with `VICTORY_VK_CENSUS` (`docs/kiss.md`,
+2026-11-27 "streamed textures", has the numbers):
+
+- A streamed texture has no resource. The title places it in a piece of
+  its texture pool and writes a view of that memory
+  (`CreatePlacedShaderResourceView`: the whole description, every level)
+  into the texture object's slot of its descriptor heap. Programs pick
+  the slot by index (material records hold heap indices).
+- The piece is sized for the levels held. The console layout has the
+  block of the small levels first, then the others from the smallest up,
+  level 0 last, so the levels held are the head of the layout; the rest
+  of the layout's address range is the next textures' pieces.
+- The view's first level (`MostDetailedMip`) is the first level held.
+  Levels come and go in place while the piece has room (the view is
+  written again with another first level); otherwise the texture moves
+  (a view of the new address into the same slot).
+- While a texture is being placed the title also writes a view of all
+  its levels into a scratch slot, which the next texture's overwrites.
+  It says nothing of the levels held; the latest view of a texture does.
+
+What the host does with it:
+
+| The title | The host |
+|---|---|
+| writes a view of a texture into a slot | the slot names the texture (`images/named.rs`); the image is made if there is none, with the levels from the view's first level on (`images/levels.rs`), and filled from the head of the layout that holds them (unmapped pages read zeros) |
+| writes a view with another first level | the image is made again with those levels at the next flush, filled, and shown by the texture's slots once the card has filled it; the old one goes after that |
+| writes the slot over (another texture, a buffer view, the null view) | the texture has a name less; with none for four frames its image goes |
+| copies slots with a copy call | the destinations name what the sources name |
+| announces a write, stores into the memory, shows other pages there | the image is filled again |
+| makes and releases a resource over the memory of a texture a slot names | nothing (the slot is how the title knows the texture) |
+| frees or unmaps the memory | the image goes, as before |
+
+Card-written images (targets, depth, unordered access) are as they were:
+made by the first view or use, gone with their resource or memory.
+
+Not seen: descriptor bytes the title copies itself. A copy would outlive
+its source's image only if the title wrote the source slot over and went
+on using the copy, which on the console reads memory given to another
+texture. The 10 s line counts the texture descriptors in the title's
+heaps whose slot reads the null image (0 of 74,000 when the test scene
+stands).
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
@@ -1932,6 +1986,24 @@ protection change cost on this host (measured once on a page of our own).
 7. **The map's `device_base` is read per distinct base** (v0 section 3):
    agreed. The host keeps the map in card memory and never rewrites a
    live one. With the window it never changes during a run.
+8. **A generation in the T#** (not built; host-only form in place since
+   2026-11-27). The title keeps descriptors it never writes again
+   (programs pick textures by heap index), so a T# may carry a slot long
+   after its image went. The host now keeps a slot with its texture
+   (address, shape, view) and reads null while the texture has no image,
+   but the 2^20 slots are finite: once the slots of long-gone textures
+   are given again, an old T# shows the new texture. Exact form: WORD7
+   bits 31:26 (0 today) hold the slot's generation when the T# was
+   written, `GEN[5:0]`; WORD6 stays `WORD7 ^ 0x7A3C5E91`, so the check
+   word covers it. The host keeps one byte a slot, the slot's current
+   generation, in a 1 MiB buffer the stages read (a binding of set 3
+   beside the memory map, or a range of the map's block), and adds one
+   when it gives a slot to another texture. The translator, where it
+   takes the slot out of WORD7 (once a T# load, not once a sample),
+   reads that byte and uses slot 0 unless it equals `GEN`. Cost: one
+   byte load a distinct T#, an ABI version, a bake. Six bits wrap after
+   64 owners of one slot; the host can skip a slot whose generation
+   would wrap onto a value it last gave out less than a session ago.
 
 ## 7. Open questions
 
