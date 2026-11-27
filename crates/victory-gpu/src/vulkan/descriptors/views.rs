@@ -321,6 +321,16 @@ fn texture_words(
     };
     let title_format = desc.map_or(0, |d| d[0]);
     let title_format = if title_format == 0 { rdesc.format } else { title_format };
+    // A storage view of a depth buffer: the stores go to the colour image
+    // over its memory (`images::written_plane`).
+    let (image, title_format) = if unordered && image.depth() && image.samples == 1 {
+        match images::written_plane(b, &image, address, rdesc) {
+            Some(p) => (p, 41),
+            None => (image, title_format),
+        }
+    } else {
+        (image, title_format)
+    };
     let mapping = if unordered { 0 } else { desc.map_or(0, |d| d[2]) };
     let shape = shape(&image, dimension, desc, unordered);
     let (format, aspect, stencil) = view_format(&image, title_format);

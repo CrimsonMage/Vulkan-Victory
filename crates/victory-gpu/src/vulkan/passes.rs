@@ -40,8 +40,11 @@ struct Shot {
 
 static PENDING: Mutex<Vec<Shot>> = Mutex::new(Vec::new());
 /// The capture later records of its program go to (push constants, the
-/// draw or dispatch).
-static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// draw or dispatch): the recording thread's own, lists are recorded side
+/// by side.
+thread_local! {
+    static OPEN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 fn append(dir: &std::path::Path, lines: &[String]) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("meta.txt")) {
@@ -53,14 +56,16 @@ fn append(dir: &std::path::Path, lines: &[String]) {
 
 /// A later record of the program being captured.
 pub(super) fn note(line: impl FnOnce() -> String) {
-    if let Some(dir) = lock(&OPEN).as_ref() {
-        append(dir, &[line()]);
-    }
+    OPEN.with(|o| {
+        if let Some(dir) = o.borrow().as_ref() {
+            append(dir, &[line()]);
+        }
+    });
 }
 
 /// The program's draw or dispatch is recorded: its capture takes no more.
 pub(super) fn close() {
-    *lock(&OPEN) = None;
+    OPEN.with(|o| *o.borrow_mut() = None);
 }
 
 /// Title memory reached from the roots.
@@ -76,10 +81,14 @@ struct Walk<'a> {
 
 impl Walk<'_> {
     fn take(&mut self, at: u64, want: u64) -> Option<Vec<u8>> {
-        if self.have.get(&at).is_some_and(|&l| l >= want) || self.total >= MEMORY || self.have.len() >= BLOCKS {
+        let inside = self.have.range(..=at).next_back().is_some_and(|(&a, &l)| at + want.min(super::title_left(self.b, at)) <= a + l);
+        if inside || self.total >= MEMORY || self.have.len() >= BLOCKS {
             return None;
         }
-        let bytes = [want, VIEW.min(want), TABLE.min(want)].into_iter().find_map(|len| read_title(self.b, at, len).ok())?;
+        // to the end of its allocation at most (a constant buffer of a few
+        // hundred bytes is a whole allocation's tail)
+        let left = super::title_left(self.b, at);
+        let bytes = [want, VIEW.min(want), TABLE.min(want)].into_iter().map(|len| len.min(left)).filter(|&len| len != 0).find_map(|len| read_title(self.b, at, len).ok())?;
         if std::fs::write(self.dir.join(format!("mem/{at:x}.bin")), &bytes).is_err() {
             return None;
         }
@@ -211,7 +220,7 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
         }
     }
     append(&dir, &meta);
-    *lock(&OPEN) = Some(dir.clone());
+    OPEN.with(|o| *o.borrow_mut() = Some(dir.clone()));
     let Ok(buf) = Buffer::new(&b.host, at.max(16), vk::BufferUsageFlags::TRANSFER_DST, Place::Readback) else { return };
     // SAFETY: as the caller says.
     unsafe {
@@ -229,15 +238,38 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
     lock(&PENDING).push(Shot { dir, mapped: buf.mapped as usize, held: buf, items, born });
 }
 
-/// Whether a capture of an earlier frame waits to be saved.
+/// Frames a readback waits before it is read: its copies are recorded in
+/// a list of the title's, which may be executed a frame or two after it
+/// was recorded (read at the next present, the buffer was freed before the
+/// card wrote it: a copy-engine fault, runs vk82 and vk87).
+pub(super) const SETTLE: u64 = 4;
+/// Frames a readback buffer is kept after its read.
+const KEPT: u64 = 600;
+
+/// Readback buffers read, with the frame of the read.
+static GRAVE: Mutex<Vec<(u64, Buffer)>> = Mutex::new(Vec::new());
+
+/// A readback buffer was read at `frame`: it is destroyed much later.
+pub(super) fn bury(buffer: Buffer, frame: u64) {
+    lock(&GRAVE).push((frame, buffer));
+}
+
+/// Whether a capture of an earlier frame waits to be saved, or a buffer
+/// to be destroyed.
 pub(super) fn pending(frame: u64) -> bool {
-    lock(&PENDING).iter().any(|p| p.born < frame)
+    lock(&PENDING).iter().any(|p| p.born + SETTLE < frame) || lock(&GRAVE).iter().any(|(at, _)| at + KEPT < frame)
 }
 
 /// At a present with the queue idle: the images of earlier frames'
 /// captures are written.
 pub(super) fn save_pending(b: &Backend, frame: u64) {
-    let (ready, later): (Vec<Shot>, Vec<Shot>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born < frame);
+    let (old, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *lock(&GRAVE)).into_iter().partition(|(at, _)| at + KEPT < frame);
+    lock(&GRAVE).extend(kept);
+    for (_, buffer) in old {
+        // SAFETY: the queue is idle and its copies ran hundreds of frames ago.
+        unsafe { buffer.destroy(&b.host) };
+    }
+    let (ready, later): (Vec<Shot>, Vec<Shot>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born + SETTLE < frame);
     lock(&PENDING).extend(later);
     for p in ready {
         for (_, _, at, bytes, file) in &p.items {
@@ -246,7 +278,6 @@ pub(super) fn save_pending(b: &Backend, frame: u64) {
             let _ = std::fs::write(p.dir.join(file), src);
         }
         append(&p.dir, &["images written".to_string()]);
-        // SAFETY: the queue is idle and nothing else names the buffer.
-        unsafe { p.held.destroy(&b.host) };
+        bury(p.held, frame);
     }
 }

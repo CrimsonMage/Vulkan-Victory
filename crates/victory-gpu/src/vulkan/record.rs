@@ -511,7 +511,15 @@ impl Rec {
             att.push(image);
         }
         if key.extent.0 == u32::MAX {
-            return None;
+            // A draw with no targets at all (its pixel program writes
+            // storage views only: fog volume and light proxies) is drawn
+            // over its scissor; one whose targets have no image is not.
+            let none_asked = self.depth.is_none() && self.colors[..self.color_count as usize].iter().all(Option::is_none);
+            let area = self.scissors.first().map(|r| (r.offset.x.max(0) as u32 + r.extent.width, r.offset.y.max(0) as u32 + r.extent.height));
+            match area.filter(|a| none_asked && a.0 != 0 && a.1 != 0) {
+                Some(a) => key.extent = (a.0.min(16384), a.1.min(16384)),
+                None => return None,
+            }
         }
         self.keep.extend(att.iter().cloned());
         self.attached = att;
@@ -522,6 +530,26 @@ impl Rec {
             return Some((formats, key.count, depth_format));
         }
         self.end_pass(b);
+        // What compute stored into the depth buffer's memory goes into its
+        // depth plane first.
+        if let Some(depth) = self.attached.iter().find(|i| i.depth())
+            && let Some(plane) = depth.plane()
+            && b.host.caps.maintenance8
+        {
+            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+            let region = vk::ImageCopy::default()
+                .src_subresource(layers(vk::ImageAspectFlags::COLOR))
+                .dst_subresource(layers(vk::ImageAspectFlags::DEPTH))
+                .extent(vk::Extent3D { width: depth.extent.width.min(plane.extent.width), height: depth.extent.height.min(plane.extent.height), depth: 1 });
+            // SAFETY: outside rendering in our command buffer; live images in GENERAL.
+            unsafe {
+                images::full_barrier(&b.host.device, cmd);
+                b.host.device.cmd_copy_image(cmd, plane.image, vk::ImageLayout::GENERAL, depth.image, vk::ImageLayout::GENERAL, &[region]);
+                images::full_barrier(&b.host.device, cmd);
+            }
+            PLANE_COPIES.fetch_add(1, Ordering::Relaxed);
+            self.keep.push(plane.clone());
+        }
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()
                 .image_view(view)
@@ -1035,6 +1063,8 @@ fn draw_stages(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], me
 /// The recording's part of the 10 s line.
 /// Draws left out because no target of theirs has an image.
 static NO_PASS: AtomicU64 = AtomicU64::new(0);
+/// Copies of a depth buffer's stored plane into its depth plane.
+static PLANE_COPIES: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostics: programs (stage, guard id) pushed a root view whose range
 /// is short -> times.
@@ -1044,7 +1074,7 @@ static SHORT_ROOTS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(
 pub(crate) fn short_root_programs() -> String {
     let mut all: Vec<(String, u64)> = lock(&SHORT_ROOTS).iter().map(|(k, &v)| (k.clone(), v)).collect();
     all.sort_by_key(|p| std::cmp::Reverse(p.1));
-    format!("draws without a pass {}; {} programs; {}", NO_PASS.load(Ordering::Relaxed), all.len(), all.iter().take(10).map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", "))
+    format!("draws without a pass {}; depth plane copies {}; {} programs; {}", NO_PASS.load(Ordering::Relaxed), PLANE_COPIES.load(Ordering::Relaxed), all.len(), all.iter().take(10).map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", "))
 }
 
 pub(crate) fn report() {

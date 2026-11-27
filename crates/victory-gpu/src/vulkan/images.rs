@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_vk::ash::vk;
 use victory_vk::memory::Buffer;
@@ -105,6 +105,12 @@ pub(crate) struct Image {
     /// Bytes of its console layout.
     pub(crate) bytes: u64,
     views: Mutex<Vec<(ViewKey, vk::ImageView)>>,
+    /// A depth image the title also writes through a storage view (a
+    /// compute program storing into a depth buffer's memory, plain memory
+    /// on the console): the colour image over the same memory that takes
+    /// those stores ([`written_plane`]), copied into the depth plane
+    /// before the depth image is next attached.
+    plane: OnceLock<Arc<Image>>,
     /// A fill is queued.
     pending: AtomicBool,
     /// The ticket of the last submission of ours that names it (its
@@ -142,6 +148,11 @@ impl Image {
 }
 
 impl Image {
+    /// The colour image that takes the stores into this depth image.
+    pub(crate) fn plane(&self) -> Option<&Arc<Image>> {
+        self.plane.get()
+    }
+
     pub(crate) fn card_written(&self) -> bool {
         self.card_written.load(Ordering::Relaxed)
     }
@@ -235,7 +246,11 @@ pub(crate) fn depth_format(dxgi: u32) -> Option<vk::Format> {
     Some(match dxgi {
         19..=22 => F::D32_SFLOAT_S8_UINT,
         39..=41 => F::D32_SFLOAT,
-        44..=47 | 118..=120 => F::D24_UNORM_S8_UINT,
+        // The console's 24-bit depth formats are 32-bit float planes too
+        // (its hardware has Z16 and Z32F): the title writes one with a
+        // 32_FLOAT view of the same memory (the material classes the
+        // tiled lighting tests EQUAL against).
+        44..=47 | 118..=120 => F::D32_SFLOAT_S8_UINT,
         53 | 55 | 56 => F::D16_UNORM,
         _ => return None,
     })
@@ -459,6 +474,19 @@ pub(crate) fn of_resource(b: &Backend, resource: This) -> Option<Arc<Image>> {
     at(b, data as u64, &desc, false)
 }
 
+/// The colour image that takes storage writes into depth image `depth`
+/// (over `address`, the resource `desc`): a 32-bit float image of its
+/// shape, made the first time. A depth image has no storage views.
+pub(crate) fn written_plane(b: &Backend, depth: &Arc<Image>, address: u64, desc: &ResourceDesc) -> Option<Arc<Image>> {
+    if let Some(p) = depth.plane() {
+        return Some(p.clone());
+    }
+    // DXGI_FORMAT_R32_FLOAT
+    let plain = ResourceDesc { format: 41, flags: (desc.flags & !DEPTH_STENCIL) | UNORDERED, sample_count: 1, mip_levels: 1, ..*desc };
+    let p = at(b, address, &plain, true)?;
+    Some(depth.plane.get_or_init(|| p).clone())
+}
+
 /// The image over `address` of `desc`'s shape, made the first time
 /// (`by_view`: a descriptor named it first, else a resource did).
 pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) -> Option<Arc<Image>> {
@@ -474,6 +502,8 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
         .images
         .range(Key { dimension: 0, width: 0, height: 0, depth_or_array: 0, mips: 0, element: 0, samples: 0, depth: false, ..key }..)
         .take_while(|(k, _)| k.address == address)
+        // a depth image's card memory holds nothing a colour image reads
+        .filter(|(k, _)| k.depth == key.depth)
         .map(|(_, i)| i.clone())
         .max_by_key(|i| lock(&PLACES).get(&i.id).map_or(0, |p| p.2));
     let made = make(b, r, key, desc, alias.as_ref());
@@ -644,6 +674,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         alias: alias.is_some(),
         bytes,
         views: Mutex::new(Vec::new()),
+        plane: OnceLock::new(),
         pending: AtomicBool::new(false),
         last_use: AtomicU64::new(0),
         fresh: AtomicBool::new(true),

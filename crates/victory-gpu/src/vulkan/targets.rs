@@ -111,14 +111,14 @@ pub(super) fn tables(b: &Backend, name: &str, roots: &[Vec<u32>]) {
 /// Whether a mid-frame dump of an earlier frame waits to be saved (its
 /// list has been executed by now).
 pub(super) fn pending(frame: u64) -> bool {
-    lock(&PENDING).iter().any(|p| p.born < frame) || super::passes::pending(frame)
+    lock(&PENDING).iter().any(|p| p.born + super::passes::SETTLE < frame) || super::passes::pending(frame)
 }
 
 /// At a present with the queue idle: the mid-frame dumps of earlier
 /// frames are saved.
 pub(super) fn save_pending(b: &Backend, frame: u64) {
     super::passes::save_pending(b, frame);
-    let (ready, later): (Vec<Plan>, Vec<Plan>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born < frame);
+    let (ready, later): (Vec<Plan>, Vec<Plan>) = std::mem::take(&mut *lock(&PENDING)).into_iter().partition(|p| p.born + super::passes::SETTLE < frame);
     lock(&PENDING).extend(later);
     for p in ready {
         let born = p.born;
@@ -293,8 +293,7 @@ pub(super) fn save(b: &Backend, frame: u64, p: Plan) {
         tracing::info!(part = n, programs = %part.join(" "), "Vulkan: the programs of the first dumped frame, in the order of their first use");
     }
     tracing::info!(frame, images = p.items.len(), label = %p.label, "Vulkan: the card-written images dumped beside the frame");
-    // SAFETY: the queue is idle and nothing else names the buffer.
-    unsafe { p.held.destroy(&b.host) };
+    super::passes::bury(p.held, frame);
 }
 
 /// Draws by depth target and the state that decides depth (the dump tells

@@ -688,6 +688,16 @@ fn cpu_readable(b: &Backend, at: u64, len: u64) -> bool {
         || m.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| at + len <= (a + r.len) as u64)
 }
 
+/// Diagnostics: the bytes of title memory the CPU reads from `at` to the
+/// end of its allocation or pool view (0: none there).
+fn title_left(b: &Backend, at: u64) -> u64 {
+    let m = memory(b);
+    if let Some(p) = m.pools.iter().find(|p| p.contains(at)) {
+        return p.title_start + p.len - at;
+    }
+    m.regions.range(..=at as usize).next_back().map_or(0, |(&a, r)| ((a + r.len) as u64).saturating_sub(at))
+}
+
 /// The buffer and offset of title address `title` (one page of it named:
 /// [`buffer_over`]).
 fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
