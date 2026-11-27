@@ -64,7 +64,7 @@ pub struct Origin {
 }
 
 /// A container in a file: as is, or packed in an SGD5 record.
-enum Source<'a> {
+pub(crate) enum Source<'a> {
     Raw { offset: usize, data: &'a [u8] },
     Packed(sgd5::Record<'a>),
 }
@@ -119,7 +119,7 @@ pub fn run(root: &Path, pack: &Path, out: &Path, jobs: usize) -> Result<()> {
 }
 
 /// The pack, or every file under it in name order.
-fn files(pack: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn files(pack: &Path) -> Result<Vec<PathBuf>> {
     anyhow::ensure!(pack.exists(), "{} does not exist", pack.display());
     if pack.is_file() {
         return Ok(vec![pack.to_owned()]);
@@ -164,7 +164,7 @@ fn translate_file(data: &[u8], ctx: &Ctx<'_>, jobs: usize) -> Vec<Program> {
 }
 
 /// The packed records of SGD5 data, and every container stored as is.
-fn sources(data: &[u8]) -> Vec<Source<'_>> {
+pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     let mut out: Vec<Source<'_>> = Vec::new();
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));

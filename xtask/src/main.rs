@@ -2,6 +2,8 @@
 
 mod complexity;
 #[cfg(feature = "index")]
+mod golden;
+#[cfg(feature = "index")]
 mod index;
 #[cfg(feature = "index")]
 mod index_md;
@@ -68,6 +70,37 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         jobs: usize,
     },
+    /// Run every program of the shader golden file in the interpreter with
+    /// seeded inputs and print those whose behaviour changed (xtask/src/golden.rs).
+    ShaderGolden {
+        /// The title's shader pack, or a directory of its files.
+        #[arg(long)]
+        pack: PathBuf,
+        /// The golden file (default: docs/shader-golden.txt).
+        #[arg(long)]
+        golden: Option<PathBuf>,
+        /// The programs (a file with a hash per line) instead of the golden
+        /// file's, for a first --bless.
+        #[arg(long)]
+        list: Option<PathBuf>,
+        /// Write the golden file from this run.
+        #[arg(long)]
+        bless: bool,
+        /// Worker threads.
+        #[arg(long, default_value_t = 3)]
+        jobs: usize,
+    },
+    /// Write one container of the pack (by hash) to a file, for
+    /// `examples/replay`.
+    ShaderExtract {
+        #[arg(long)]
+        pack: PathBuf,
+        /// The first 16 hex digits of its blake3 (as the logs name it).
+        #[arg(long)]
+        hash: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -92,6 +125,11 @@ fn main() -> Result<()> {
             let out = out.unwrap_or_else(|| root.join("docs/translation-index.md"));
             translation_index(&root, &pack, &out, jobs)
         }
+        Cmd::ShaderGolden { pack, golden, list, bless, jobs } => {
+            let golden = golden.unwrap_or_else(|| root.join("docs/shader-golden.txt"));
+            shader_golden(&pack, &golden, list.as_deref(), bless, jobs)
+        }
+        Cmd::ShaderExtract { pack, hash, out } => shader_extract(&pack, &hash, &out),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -115,10 +153,36 @@ fn translation_index(root: &Path, pack: &Path, out: &Path, jobs: usize) -> Resul
     index::run(root, pack, out, jobs.max(1))
 }
 
+#[cfg(feature = "index")]
+fn shader_golden(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, jobs: usize) -> Result<()> {
+    golden::run(pack, golden, list, bless, jobs)
+}
+
+#[cfg(feature = "index")]
+fn shader_extract(pack: &Path, hash: &str, out: &Path) -> Result<()> {
+    golden::extract(pack, hash, out)
+}
+
+#[cfg(not(feature = "index"))]
+fn shader_extract(_pack: &Path, _hash: &str, _out: &Path) -> Result<()> {
+    with_translator()
+}
+
+#[cfg(not(feature = "index"))]
+fn shader_golden(_pack: &Path, _golden: &Path, _list: Option<&Path>, _bless: bool, _jobs: usize) -> Result<()> {
+    with_translator()
+}
+
 /// Without the translator: the same command again, from a release build
 /// that has it (the index should show what the shipped translator does).
 #[cfg(not(feature = "index"))]
 fn translation_index(_root: &Path, _pack: &Path, _out: &Path, _jobs: usize) -> Result<()> {
+    with_translator()
+}
+
+/// The same command again from a release build with the translator.
+#[cfg(not(feature = "index"))]
+fn with_translator() -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
         .args([
@@ -134,7 +198,7 @@ fn translation_index(_root: &Path, _pack: &Path, _out: &Path, _jobs: usize) -> R
         .args(std::env::args_os().skip(1))
         .status()
         .context("running cargo")?;
-    anyhow::ensure!(status.success(), "translation-index failed");
+    anyhow::ensure!(status.success(), "the command with the translator failed");
     Ok(())
 }
 
