@@ -992,13 +992,7 @@ impl Rec {
             // SAFETY: outside rendering, the pipeline bound.
             unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
             self.watched_dispatch(b, cmd, &watched, &format!("dispatch {x}x{y}x{z}"));
-            if super::ambient::on()
-                && let Some((shaders, _)) = crate::pipeline::parts(self.pipeline)
-                && shaders.iter().any(|s| super::ambient::follows(&s.name))
-            {
-                // SAFETY: outside rendering, in our command buffer.
-                unsafe { super::ambient::after(b, cmd, &self.compute.slots) };
-            }
+            self.ambient(b, cmd);
             lap.next();
             STATS[1].fetch_add(1, Ordering::Relaxed);
             let ud = [self.last_push[9], self.last_push[10], self.last_push[11], self.last_push[12]];
@@ -1018,6 +1012,21 @@ impl Rec {
             // SAFETY: outside rendering, in our command buffer.
             let after = unsafe { super::watch::read(b, cmd, None) };
             super::watch::entry(before, &after, shaders, &[], what);
+        }
+    }
+
+    /// After a dispatch of a program the stand-in for indirect light
+    /// follows (`ambient.rs`): its own dispatches, after which the title's
+    /// pipeline and push constants are set again.
+    fn ambient(&mut self, b: &'static Backend, cmd: vk::CommandBuffer) {
+        if super::ambient::on()
+            && let Some((shaders, _)) = crate::pipeline::parts(self.pipeline)
+            && let Some(role) = shaders.iter().find_map(|s| super::ambient::role(&s.name))
+            // SAFETY: outside rendering, in our command buffer, after `prepare_dispatch`.
+            && unsafe { super::ambient::after(b, cmd, role, &self.compute.slots) }
+        {
+            self.bound_compute = vk::Pipeline::null();
+            self.pushed = false;
         }
     }
 
@@ -1100,7 +1109,7 @@ impl Rec {
 }
 
 /// `VICTORY_BVH_BUILDER=1`: the title's ray-tracing structure builder runs.
-fn bvh_builder() -> bool {
+pub(super) fn bvh_builder() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v != "0"))
 }

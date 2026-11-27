@@ -521,6 +521,7 @@ impl Rec {
             };
         }
         self.watched_dispatch(b, cmd, &watched, "dispatch indirect");
+        self.ambient(b, cmd);
         super::STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
