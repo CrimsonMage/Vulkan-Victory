@@ -46,6 +46,8 @@ struct Slot {
     swizzle: [i32; 4],
     data: Rc<Vec<u8>>,
     missing_mip: bool,
+    /// A depth image's stencil plane (`img/<id>.stencil.bin`, a byte a texel).
+    stencil: Option<Rc<Vec<u8>>>,
 }
 
 #[derive(Default)]
@@ -101,6 +103,7 @@ fn parse_image(dir: &Path, w: &[&str], files: &mut HashMap<String, Rc<Vec<u8>>>)
             swizzle: [0, 1, 2, 3].map(|i| swizzle.get(i).copied().unwrap_or(0)),
             data,
             missing_mip: ranges.first().is_some_and(|r| r.0 > 0),
+            stencil: std::fs::read(dir.join(format!("img/{file}.stencil.bin"))).ok().map(Rc::new),
         },
     ))
 }
@@ -260,6 +263,33 @@ fn decode(name: &str, t: &[u8], uint: bool) -> W {
     if uint { ints.map(u64::from) } else { x.map(|f| u64::from(f.to_bits())) }
 }
 
+/// Value `i` (0..16) of a BC4 block (8 bytes), 0..1 (or -1..1 signed).
+fn bc4(b: &[u8], i: usize, snorm: bool) -> f32 {
+    let (r0, r1) = if snorm { (b[0] as i8 as f32 / 127.0, b[1] as i8 as f32 / 127.0) } else { (b[0] as f32 / 255.0, b[1] as f32 / 255.0) };
+    let bits = b[2..8].iter().rev().fold(0u64, |a, &x| a << 8 | u64::from(x));
+    let k = (bits >> (3 * i) & 7) as usize;
+    let six = if snorm { (b[0] as i8) > (b[1] as i8) } else { b[0] > b[1] };
+    match (k, six) {
+        (0, _) => r0,
+        (1, _) => r1,
+        (k, true) => ((8 - k) as f32 * r0 + (k - 1) as f32 * r1) / 7.0,
+        (6, false) => if snorm { -1.0 } else { 0.0 },
+        (7, false) => 1.0,
+        (k, false) => ((6 - k) as f32 * r0 + (k - 1) as f32 * r1) / 5.0,
+    }
+}
+
+/// Texel (x, y) of a BC4 or BC5 image (`slice` blocks before it): R (and G).
+fn bc45(data: &[u8], w: u32, x: i64, y: i64, slice: i64, two: bool, snorm: bool) -> W {
+    let size = if two { 16 } else { 8 };
+    let block = (slice + y / 4 * i64::from(w.div_ceil(4)) + x / 4) as usize * size;
+    let i = (y % 4 * 4 + x % 4) as usize;
+    let Some(b) = data.get(block..block + size) else { return [0; 4] };
+    let r = bc4(&b[..8], i, snorm);
+    let g = if two { bc4(&b[8..16], i, snorm) } else { 0.0 };
+    [r, g, 0.0, 1.0].map(|f| u64::from(f.to_bits()))
+}
+
 /// The view's swizzle (VkComponentSwizzle: 0 identity, 1 zero, 2 one, 3..6 r..a).
 fn swizzled(s: &[i32; 4], x: W, uint: bool) -> W {
     let one = if uint { 1 } else { u64::from(1f32.to_bits()) };
@@ -321,6 +351,17 @@ impl State {
         let idx = ((z * s.h as i64 + y) * s.w as i64 + x) as usize;
         if let Some(v) = self.written.get(&slot).and_then(|m| m.get(&idx)) {
             return *v;
+        }
+        // an integer read of a depth-stencil image: its stencil
+        if uint && s.view_format.starts_with('D') && s.view_format.contains("S8") {
+            let v = s.stencil.as_ref().and_then(|st| st.get(idx)).copied();
+            if v.is_none() {
+                self.notes.insert(format!("slot {slot:x}: stencil read, no stencil plane (reads 0)"));
+            }
+            return [u64::from(v.unwrap_or(0)), 0, 0, 1];
+        }
+        if s.view_format.starts_with("BC4") || s.view_format.starts_with("BC5") {
+            return bc45(&s.data, s.w, x, y, z * i64::from(s.h.div_ceil(4) * s.w.div_ceil(4)), s.view_format.starts_with("BC5"), s.view_format.contains("SNORM"));
         }
         let (bytes, known) = texel_bytes(&s.view_format);
         if !known {
