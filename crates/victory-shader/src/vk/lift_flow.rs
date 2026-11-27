@@ -164,6 +164,11 @@ impl Lift<'_> {
             if i + 1 == n && branch {
                 break;
             }
+            // a whole-wave section ends here: what it leaves, before the
+            // restore of EXEC
+            if self.sections[b].contains_key(&i) {
+                self.section_values(b, i)?;
+            }
             self.inst(inst)?;
         }
         self.close();
