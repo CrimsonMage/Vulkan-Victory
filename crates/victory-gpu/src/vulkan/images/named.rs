@@ -118,6 +118,11 @@ pub(super) fn let_go() -> Vec<Key> {
     gone
 }
 
+/// Whether a slot of the title names `key`.
+pub(super) fn is(key: &Key) -> bool {
+    NAMED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|n| n.holders.contains_key(key))
+}
+
 /// Diagnostics: the textures slots name for which `has_image` says no.
 pub(super) fn without(has_image: impl Fn(&Key) -> bool) -> usize {
     let guard = NAMED.lock().unwrap_or_else(|e| e.into_inner());

@@ -321,14 +321,19 @@ pub(super) fn heat(b: &super::Backend, m: &mut Memory, at: u64, len: u64) {
 
 /// Every frame, after the pool's views gave card memory back: what the
 /// textures made or dropped since cools or warms, and the pages programs
-/// read that lost their card page with a block take a cold page's.
+/// read that lost their card page with a block, or while textures covered
+/// them, take a cold page's. A page a buffer resource of the title lies
+/// over is never texture memory, whatever a texture's view claims: the
+/// title's first view of a texture it is loading names every level, and
+/// the layout of all of them reaches over its neighbours in the pool
+/// (`images/levels.rs`), geometry among them.
 pub(super) fn settle(b: &super::Backend, m: &mut Memory) {
     let Memory { pools, sections, tick, .. } = m;
     let asked = std::mem::take(&mut *super::lock(&TEXTURES));
     for view in pools.iter_mut() {
         for &(at, len, over) in &asked {
             if view.contains(at) {
-                view.cool((at, len), over);
+                view.cool((at, len), over && !super::under_buffer(at, len));
             }
         }
         if let Err(e) = view.recover(&b.host, &b.timeline, *tick, |key| source_in(sections, key)) {

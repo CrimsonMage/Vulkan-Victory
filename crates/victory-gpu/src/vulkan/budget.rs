@@ -5,8 +5,9 @@
 //! card's budget (`VK_EXT_memory_budget`: what the driver, the spills of
 //! shaders and other programs leave us).
 //!
-//! - Images come first. A new image block that would cross the limit by
-//!   more than half the room is refused (counted as `images_refused`).
+//! - Images come first: a new image block takes the pool's GPU view's
+//!   blocks if it must ([`fits`]). One that would still cross the limit is
+//!   refused (counted as `images_refused`).
 //! - The pool's GPU view takes what the images leave: it grows a block
 //!   while ours stays under the limit, and past it evicts its least
 //!   recently touched page (a map never fails). Every frame, a view over
@@ -72,26 +73,47 @@ fn rule() -> (u64, u64) {
     })
 }
 
+/// The memory lock, waited for a few milliseconds at most: the caller
+/// holds the images' lock, which a thread that holds this one may want.
+fn memory_soon(b: &Backend) -> Option<std::sync::MutexGuard<'_, super::Memory>> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(m) = b.memory.try_lock() {
+            return Some(m);
+        }
+        if start.elapsed() > std::time::Duration::from_millis(5) {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// Whether `bytes` more of ours (an image block) may be allocated: never
-/// past the limit. Images come first: the pool's views give blocks back
-/// for them now (down to [`LEAST`]) if the memory lock is free; otherwise
-/// at the next frame, and the image waits for its next naming.
+/// past the limit for longer than the card takes to let go of what the
+/// pool's views give back. Images come first: the views give blocks back
+/// for them now (down to [`LEAST`]), and the blocks on their way out
+/// count as gone. Before, they counted until the card had freed them and
+/// the lock was only tried: the image that asked was refused, its
+/// descriptor read the null image, and a texture programs pick by index
+/// is not named again (run tx1: six images in the world's load).
 pub(super) fn fits(b: &Backend, bytes: u64) -> bool {
     let host = &b.host;
-    let over = || (account::card_total() + bytes).saturating_sub(limit(host));
-    if over() > 0
-        && let Ok(mut m) = b.memory.try_lock()
+    let over = |leaving: u64| (account::card_total() + bytes).saturating_sub(limit(host) + leaving);
+    let mut leaving = 0;
+    if over(0) > 0
+        && let Some(mut m) = memory_soon(b)
     {
-        let mut need = over();
+        let mut need = over(0);
         for p in &mut m.pools {
             let has = p.card_bytes();
             let target = has.saturating_sub(need).max(LEAST);
             if target < has && p.shrink(host, &b.timeline, target).is_ok() {
                 need = need.saturating_sub(has - p.card_bytes());
             }
+            leaving += p.retiring();
         }
     }
-    let fits = over() == 0;
+    let fits = over(leaving) == 0;
     if !fits {
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {

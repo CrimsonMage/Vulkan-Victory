@@ -24,8 +24,14 @@
 //! texture has no image its slots read the null image; when it has one
 //! again (made again for other levels, or after its memory came back)
 //! they show it, and the old descriptors work again. Slots are given in
-//! order; only when all 2^20 are given does a new view take the slots of
-//! the texture that has been without an image longest.
+//! order. The last 65,536 textures that went keep theirs ([`KEPT`]: what
+//! the bookkeeping of a long session may cost); past that, and when all
+//! 2^20 are given, a new view takes the slots of the texture that has
+//! been without an image longest.
+//!
+//! shortcut: a descriptor older than that shows the slot's new texture.
+//! The clean form is a generation in the T# that the translated code
+//! checks (`docs/vulkan-host.md`, proposals for the ABI).
 //!
 //! **Every slot holds a valid descriptor at all times** (vk41: a graphics
 //! shader faulted with "Illegal Instruction Parameter"): every slot of
@@ -47,6 +53,8 @@ use super::stages;
 use super::{Backend, lock};
 
 const IMAGE_SLOTS: u32 = 1 << 20;
+/// Textures without an image that keep their slots.
+const KEPT: usize = 1 << 16;
 /// Map blocks kept (one per generation, reused round).
 const MAPS: u64 = 256;
 const MAP_BLOCK: u64 = 4096;
@@ -434,13 +442,17 @@ impl Heaps {
             return Some(slot);
         }
         let image = &s.shown.get(&image.key).cloned().unwrap_or_else(|| image.clone());
-        let slot = match s.free.pop() {
-            Some(slot) => slot,
-            None if s.next < IMAGE_SLOTS => {
-                s.next += 1;
-                s.next - 1
+        let slot = loop {
+            if let Some(slot) = s.free.pop() {
+                break slot;
             }
-            None => self.take_back(b, &mut s)?,
+            if s.next < IMAGE_SLOTS {
+                s.next += 1;
+                break s.next - 1;
+            }
+            if !self.take_back(b, &mut s) {
+                return None;
+            }
         };
         if !self.write_slot(b, slot, image, key) {
             self.null_slot(slot);
@@ -498,26 +510,22 @@ impl Heaps {
         }
     }
 
-    /// Every slot is given: the slots of the texture that has been without
-    /// an image longest (and that the card is past) are taken back; one
-    /// of them.
-    fn take_back(&self, b: &Backend, s: &mut State) -> Option<u32> {
-        let completed = b.timeline.completed(&b.host);
-        while s.free.is_empty() {
-            let &(value, key) = s.gone.front()?;
-            if value > completed {
-                return None;
-            }
-            s.gone.pop_front();
-            if s.shown.contains_key(&key) {
-                continue;
-            }
+    /// The slots of the texture that has been without an image longest
+    /// are given again (not one that has an image again). False when
+    /// there is no such texture the card is past.
+    fn take_back(&self, b: &Backend, s: &mut State) -> bool {
+        let Some(&(value, key)) = s.gone.front() else { return false };
+        if value > b.timeline.completed(&b.host) {
+            return false;
+        }
+        s.gone.pop_front();
+        if !s.shown.contains_key(&key) {
             for (view, slot) in s.by_texture.remove(&key).unwrap_or_default() {
                 s.views.remove(&(key, view));
                 s.free.push(slot);
             }
         }
-        s.free.pop()
+        true
     }
 
     /// The slot of a sampler (made the first time).
@@ -682,6 +690,7 @@ pub(crate) fn image_gone(image: &Image) {
     if slots > 0 {
         s.gone.push_back((b.timeline.last(), image.key));
     }
+    while s.gone.len() > KEPT && h.take_back(b, &mut s) {}
 }
 
 /// `image` was made: the slots its texture has from an earlier image

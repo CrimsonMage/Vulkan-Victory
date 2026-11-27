@@ -540,10 +540,20 @@ fn registry() -> std::sync::MutexGuard<'static, Option<Registry>> {
 /// done with it (its card memory when no alias uses it any more). A later
 /// resource of the same shape at the address gets an image of its own,
 /// filled, not this one's stale contents.
+///
+/// Not a texture the title fills that one of its descriptor slots names:
+/// the title makes resources over the memory of textures it has placed
+/// and views itself, and lets them go again (to copy into them, it
+/// seems), while its slot goes on naming the texture (run tx1: 3,300
+/// images went this way, 58 of them still named when the scene stood).
+/// Such a texture goes when its slot is written over (`named.rs`).
 pub(crate) fn resource_gone(b: &Backend, address: u64, desc: &ResourceDesc) {
     let Some(key) = key_of(address, desc) else { return };
     let mut guard = registry();
     let Some(r) = guard.as_mut() else { return };
+    if r.images.get(&key).is_some_and(|i| !i.card_written()) && named::is(&key) {
+        return;
+    }
     r.drop_image(b, &key, Dropped::Resource, 0);
 }
 

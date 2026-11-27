@@ -494,6 +494,11 @@ pub(crate) fn buffer_resource(at: u64, len: u64, gone: bool) {
     }
 }
 
+/// Whether a buffer resource of the title lies over any of `[at, at + len)`.
+fn under_buffer(at: u64, len: u64) -> bool {
+    lock(&BUFFERS).range(..at + len).next_back().is_some_and(|(&b, &(l, _))| b + l > at)
+}
+
 /// `[at, at + len)` and the buffer resource holding `at`, as one range.
 fn with_buffer(at: u64, len: u64) -> (u64, u64) {
     let end = at.saturating_add(len.max(1));
@@ -1106,7 +1111,7 @@ fn report(b: &Backend, frame: u64) {
             a.hot_evicted += p.stats.hot_evicted;
             a
         });
-    let cold = m.pools.iter().map(|p| p.cold_pages()).fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
+    let cold = m.pools.iter().map(|p| p.cold_pages()).fold((0, 0, 0), |a, c| (a.0 + c.0, a.1 + c.1, a.2 + c.2));
     tracing::info!(
         frame,
         timeline = b.timeline.last(),
@@ -1130,6 +1135,7 @@ fn report(b: &Backend, frame: u64) {
         pool_evicted_read_by_programs = pool.hot_evicted,
         pool_texture_mb = (cold.0 * PAGE) >> 20,
         pool_texture_card_mb = (cold.1 * PAGE) >> 20,
+        pool_read_by_programs_not_on_card_mb = (cold.2 * PAGE) >> 20,
         pool_refilled = pool.refilled,
         pool_binds = pool.binds,
         "Vulkan: queues, timeline and title memory"

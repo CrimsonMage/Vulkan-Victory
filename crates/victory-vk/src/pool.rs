@@ -400,6 +400,12 @@ impl PoolView {
         Ok(())
     }
 
+    /// Bytes of the blocks given back that are not freed yet (the card has
+    /// not passed their unbinds).
+    pub fn retiring(&self) -> u64 {
+        self.retired.len() as u64 * u64::from(BLOCK_PAGES) * PAGE
+    }
+
     /// The live block whose most recently touched page is the oldest (an
     /// empty block is the coldest).
     fn coldest_block(&self) -> Option<usize> {
@@ -657,7 +663,11 @@ impl PoolView {
 
     /// The pages shown in `[at, at + len)` are cold (`cold`: a filled
     /// texture lies over them: only the title pages wholly inside count)
-    /// or not (a buffer view names the range: every page it reaches).
+    /// or not (a buffer view names the range, or the textures no longer
+    /// cover it: every page it reaches). A page that is no longer cold and
+    /// lost its card page while it was takes one again
+    /// ([`PoolView::recover`]): programs may read it by address, and
+    /// before only a recording that named it brought it back.
     pub fn cool(&mut self, (at, len): (u64, u64), cold: bool) {
         let end = at.saturating_add(len);
         let (lo, hi) = if cold { (at.next_multiple_of(PAGE), end / PAGE * PAGE) } else { (at, end) };
@@ -675,6 +685,8 @@ impl PoolView {
             p.cold = cold;
             if p.slot.is_some() {
                 self.lru.insert((p.rank(), key));
+            } else if !cold {
+                self.lost.push(key);
             }
         }
     }
@@ -706,10 +718,13 @@ impl PoolView {
         self.refresh(host, timeline, keys, (tick, Why::Named), source).map(drop)
     }
 
-    /// Pages that are cold, and of them those on the card (diagnostics).
-    pub fn cold_pages(&self) -> (u64, u64) {
+    /// Pages that are cold, of them those on the card, and pages programs
+    /// may read by address that are not on the card: they read zeros
+    /// (diagnostics).
+    pub fn cold_pages(&self) -> (u64, u64, u64) {
         let cold = self.pages.values().filter(|p| p.cold);
-        (cold.clone().count() as u64, cold.filter(|p| p.slot.is_some()).count() as u64)
+        let zeros = self.pages.values().filter(|p| !p.cold && p.slot.is_none()).count();
+        (cold.clone().count() as u64, cold.filter(|p| p.slot.is_some()).count() as u64, zeros as u64)
     }
 
     /// Whether the page shown at title address `title` is on the card now.

@@ -1,6 +1,13 @@
-//! Card memory for images: 256 MiB blocks with first-fit free lists;
-//! images over 64 MiB get memory of their own. Images over the same title
+//! Card memory for images: 64 MiB blocks with first-fit free lists;
+//! images over 16 MiB get memory of their own. Images over the same title
 //! memory share one piece (`PLACES`, `USERS`).
+//!
+//! The blocks were 256 MiB: twelve held 3,072 MiB for 2,660 MiB of images
+//! (the big targets left holes only big targets fill), and a thirteenth
+//! had to be had from the pool's view in one piece. As big as the pool's
+//! own blocks, a block is traded one for one, an emptied one goes back to
+//! the driver sooner, and the targets of 16 MiB and more (the title's
+//! 3840x2160 ones) take exactly their size.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -10,7 +17,7 @@ use victory_vk::ash::vk;
 use super::super::{Backend, lock};
 
 
-const BLOCK: u64 = 256 << 20;
+const BLOCK: u64 = 64 << 20;
 
 pub(super) struct Block {
     memory: vk::DeviceMemory,
