@@ -14,6 +14,8 @@ mod valu1;
 
 mod valu2;
 
+mod origin1;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.

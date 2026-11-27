@@ -34,11 +34,7 @@ impl Lift<'_> {
         let o = self.spv(op::I_ADD, Ty::U32, &[so, k]);
         let words = if name.starts_with("s_buffer_") {
             let vs = self.vsharp(inst, &base)?;
-            self.smem_words(inst, d, n, |l, at, m, fl| {
-                let ka = l.k32(at * 4);
-                let oo = l.spv(op::I_ADD, Ty::U32, &[o, ka]);
-                l.buffer_load_raw(&vs, oo, m, fl)
-            })?
+            self.buffer_dwords(inst, &vs, o, u32::from(n), |k| Reg::S(d + k as u8))
         } else if let Some(start) = self.code_base(inst, &base)? {
             self.code_words(inst, &base, o, start, d, n)?
         } else {
@@ -299,10 +295,49 @@ impl Lift<'_> {
             .collect()
     }
 
-    pub(super) fn buffer_load_raw(&mut self, vs: &VSharp, o: V, n: u32, float: bool) -> Res<V> {
-        let kb = self.k32(4 * n);
-        let a = self.access_addr(vs, o, kb, false);
-        Ok(self.emit(Op::Load { align: 4 }, Ty::vec(if float { S::F32 } else { S::U32 }, n as u8), vec![a]))
+    /// The device address of each of `n` dwords from byte offset `o` of a
+    /// V# on. The console bounds every dword of a load or store on its own
+    /// (origin/main `emit/lower.rs` `raw_dwords`: "The console checks each
+    /// dword on its own"): the dwords inside the V# are real, one past its
+    /// end reads the zero block (stores: the sink). A `float3` at the end
+    /// of a 340-byte constant view is read by a four-dword load at byte
+    /// 328.
+    pub(super) fn dword_addrs(&mut self, vs: &VSharp, o: V, n: u32, store: bool) -> Vec<V> {
+        // whole dwords from `o` to the limit (none past it)
+        let at = self.gl(glsl::U_MIN, Ty::U32, &[o, vs.limit]);
+        let room = self.spv(op::I_SUB, Ty::U32, &[vs.limit, at]);
+        let two = self.k32(2);
+        let inside = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[room, two]);
+        let o64 = self.spv(op::U_CONVERT, Ty::U64, &[o]);
+        let base = self.spv(op::I_ADD, Ty::U64, &[vs.dev, o64]);
+        let fallback = self.fallback(store);
+        (0..n)
+            .map(|k| {
+                let kk = self.k32(k);
+                let ok = self.spv(op::U_LESS_THAN, Ty::BOOL, &[kk, inside]);
+                let k4 = self.f.konst(Ty::U64, u64::from(4 * k));
+                let a = if k == 0 { base } else { self.spv(op::I_ADD, Ty::U64, &[base, k4]) };
+                self.spv(op::SELECT, Ty::U64, &[ok, a, fallback])
+            })
+            .collect()
+    }
+
+    /// `n` dwords loaded from byte offset `o` of a V#, each bounded on its
+    /// own ([`Self::dword_addrs`]); floats where `inst` writes them to
+    /// registers (`reg(k)`) read as such, by groups of four as the scalar
+    /// loads take them.
+    pub(super) fn buffer_dwords(&mut self, inst: &Inst, vs: &VSharp, o: V, n: u32, reg: impl Fn(u32) -> Reg) -> Vec<V> {
+        let addrs = self.dword_addrs(vs, o, n, false);
+        let mut out = Vec::new();
+        for (g, group) in addrs.chunks(4).enumerate() {
+            let first = 4 * g as u32;
+            let fl = self.floats(inst, (first..first + group.len() as u32).map(&reg));
+            let ty = if fl { Ty::F32 } else { Ty::U32 };
+            for &a in group {
+                out.push(self.emit(Op::Load { align: 4 }, ty, vec![a]));
+            }
+        }
+        out
     }
 
     /// Whether the values `inst` writes to `regs` are read as floats.
@@ -338,6 +373,24 @@ impl Lift<'_> {
         }
         if let Kind::VStore(ch, d16) = kind {
             return self.buffer_vstore(inst, &vs, o, &src, ch, d16);
+        }
+        if let Kind::Dwords(n) = kind
+            && n > 1
+        {
+            // each dword bounded on its own
+            if load {
+                let vals = self.buffer_dwords(inst, &vs, o, n, |k| Reg::V(reg + k as u8));
+                for (i, v) in vals.into_iter().enumerate() {
+                    self.def(inst, Reg::V(reg + i as u8), R::D(v));
+                }
+            } else {
+                let addrs = self.dword_addrs(&vs, o, n, true);
+                for (i, a) in addrs.into_iter().enumerate() {
+                    let x = self.opnd_dw(inst, &src, i as u8, false)?;
+                    self.store_kind(a, Kind::Dwords(1), &[x])?;
+                }
+            }
+            return Ok(());
         }
         if load {
             let kind = match kind {

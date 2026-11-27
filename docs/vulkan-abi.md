@@ -177,9 +177,15 @@ The shader computes the console's address
 check from the V# at run time: with stride 0, the access is in bounds when
 `offset + size <= NUM_RECORDS`; with stride > 0, when
 `index < NUM_RECORDS` (and the offset < stride for swizzled forms, not
-used by the title). An out-of-bounds access reads zeros / drops the write
-(whole access, not per dword). Typed loads and stores decode FORMAT in
-the shader. The V#'s bytes are counted up to the end of the memory map
+used by the title). The V#'s bytes are NUM_RECORDS × max(stride, 1). **A
+load or store of several dwords (`s_buffer_load_dwordx2`…`x16`,
+`buffer_load_dwordx2`…`x4`, `buffer_store_dwordx2`…`x4`) is bounded dword
+by dword**, as the console does it: the dwords inside the V#'s bytes are
+read or written, one past its end reads zero / is dropped (a `float3` at
+the end of a 340-byte constant view is read by a four-dword load at byte
+328; origin/main `emit/lower.rs` `raw_dwords`. Until 2026-11-27 the whole
+access read zeros). A typed element is bounded as a whole. Typed loads and
+stores decode FORMAT in the shader. The V#'s bytes are counted up to the end of the memory map
 range its base lies in at most (`Helper::RangeLeft`): a V# larger than
 the memory under it (NUM_RECORDS -1, as the console's BVH builder makes
 for a raw pointer) reaches all of that range, and a base in no range
