@@ -99,6 +99,37 @@ impl Lift<'_> {
     }
 
     /// Legacy multiply: 0 times anything (infinity, NaN) is 0.
+    /// A float to a 32-bit integer as the console converts: toward zero,
+    /// saturated at the type's ends, 0 for a NaN (origin/main
+    /// `emit/lower.rs`, `v_cvt_u32_f32`: "D3D's conversions saturate and
+    /// give 0 for NaN, as the hardware does (checked on the RX 6700 XT and
+    /// WARP)"). SPIR-V's conversions are undefined for a value the type
+    /// does not hold, so the value is clamped to what converts exactly
+    /// first and the ends are selected.
+    pub(super) fn f_to_int(&mut self, a: V, signed: bool) -> V {
+        // the least and the greatest floats that convert without overflow
+        let (lo, hi, over, most) = if signed {
+            (-2147483648.0f32, 2147483520.0f32, 2147483648.0f32, 0x7FFF_FFFFu32)
+        } else {
+            (0.0, 4294967040.0, 4294967296.0, 0xFFFF_FFFF)
+        };
+        let (klo, khi) = (self.kf(lo), self.kf(hi));
+        let c = self.gl(glsl::N_CLAMP, Ty::F32, &[a, klo, khi]);
+        let o = if signed { op::CONVERT_F_TO_S } else { op::CONVERT_F_TO_U };
+        let x = self.spv(o, Ty::U32, &[c]);
+        let kover = self.kf(over);
+        let past = self.spv(op::F_ORD_GREATER_THAN_EQUAL, Ty::BOOL, &[a, kover]);
+        let kmost = self.k32(most);
+        let x = self.spv(op::SELECT, Ty::U32, &[past, kmost, x]);
+        if !signed {
+            // (the clamp took a NaN to 0)
+            return x;
+        }
+        let nan = self.spv(op::IS_NAN, Ty::BOOL, &[a]);
+        let z = self.k32(0);
+        self.spv(op::SELECT, Ty::U32, &[nan, z, x])
+    }
+
     pub(super) fn mul_legacy(&mut self, a: V, b: V) -> V {
         let p = self.spv(op::F_MUL, Ty::F32, &[a, b]);
         // A constant that is not zero (and finite) leaves the product exact.
@@ -525,8 +556,7 @@ impl Lift<'_> {
                     let s = self.spv(op::F_ADD, Ty::F32, &[a, h]);
                     a = self.gl(glsl::FLOOR, Ty::F32, &[s]);
                 }
-                let o = if name == "v_cvt_u32_f32" { op::CONVERT_F_TO_U } else { op::CONVERT_F_TO_S };
-                let x = self.spv(o, Ty::U32, &[a]);
+                let x = self.f_to_int(a, name != "v_cvt_u32_f32");
                 f(self, x)
             }
             "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {

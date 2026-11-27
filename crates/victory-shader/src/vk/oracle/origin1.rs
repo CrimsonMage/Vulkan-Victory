@@ -266,3 +266,43 @@ fn a_pixels_position_w_is_w_not_its_reciprocal() {
     assert_eq!(f.as_const(v.args[0]), Some(u64::from(1.0f32.to_bits())));
     assert_eq!(f.node(v.args[1]).op, Op::Builtin(Builtin::FragCoord(3)));
 }
+
+/// Float to integer as the console converts: toward zero, saturated, 0
+/// for a NaN (origin/main `emit/lower.rs`, `v_cvt_u32_f32`: "D3D's
+/// conversions saturate and give 0 for NaN, as the hardware does (checked
+/// on the RX 6700 XT and WARP)"). SPIR-V's conversion is undefined there:
+/// the interpreter answers `CONVERT_POISON` for an unclamped one.
+#[test]
+fn float_to_integer_conversions_saturate_and_take_nan_to_zero() {
+    let f = |x: f32| x.to_bits();
+    // (input bits, u32, i32, floor to i32, round-half-up to i32)
+    let cases: &[(u32, u32, u32, u32, u32)] = &[
+        (f(0.0), 0, 0, 0, 0),
+        (0x8000_0000, 0, 0, 0, 0),
+        (f(1.5), 1, 1, 1, 2),
+        (f(-1.5), 0, -1i32 as u32, -2i32 as u32, -1i32 as u32),
+        (f(-0.25), 0, 0, -1i32 as u32, 0),
+        (f(255.999), 255, 255, 255, 256),
+        (f(4294967040.0), 0xFFFF_FF00, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (f(4294967296.0), 0xFFFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (f(1e30), 0xFFFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (f(2147483520.0), 0x7FFF_FF80, 0x7FFF_FF80, 0x7FFF_FF80, 0x7FFF_FF80),
+        (f(2147483648.0), 0x8000_0000, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (f(-2147483648.0), 0, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (f(-1e30), 0, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (f(f32::INFINITY), 0xFFFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (f(f32::NEG_INFINITY), 0, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (0x7FC0_0000, 0, 0, 0, 0),
+        (0xFFC0_0001, 0, 0, 0, 0),
+        (0x7F80_0001, 0, 0, 0, 0),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    // v_cvt_u32_f32 7, v_cvt_i32_f32 8, v_cvt_rpi_i32_f32 12, v_cvt_flr_i32_f32 13
+    for (opc, pick) in [(7u16, 1usize), (8, 2), (13, 3), (12, 4)] {
+        let shader = build_valu_cs(&[vop1(opc, 0, vgpr(1))]);
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = [cases[i].1, cases[i].2, cases[i].3, cases[i].4][pick - 1];
+            assert_eq!(got, want, "{backend}: opcode {opc} of {:#010x} = {got:#010x}, want {want:#010x}", inp[0]);
+        });
+    }
+}

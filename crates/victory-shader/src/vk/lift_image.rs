@@ -453,7 +453,7 @@ impl Lift<'_> {
         let one = self.kf(1.0);
         let x = self.spv(op::F_SUB, Ty::F32, &[s, one]);
         let y = self.spv(op::F_SUB, Ty::F32, &[t, one]);
-        let fi = self.spv(op::CONVERT_F_TO_U, Ty::U32, &[face]);
+        let fi = self.f_to_int(face, false);
         let (k3, k7, k6) = (self.k32(3), self.k32(7), self.k32(6));
         let slice = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[fi, k3]);
         let f = self.spv(op::BITWISE_AND, Ty::U32, &[fi, k7]);
@@ -473,7 +473,7 @@ impl Lift<'_> {
         let u = self.spv(op::F_MUL, Ty::F32, &[u, two]);
         let v = self.spv(op::F_SUB, Ty::F32, &[t, k15]);
         let v = self.spv(op::F_MUL, Ty::F32, &[v, two]);
-        let fi = self.spv(op::CONVERT_F_TO_U, Ty::U32, &[face]);
+        let fi = self.f_to_int(face, false);
         let k7 = self.k32(7);
         let fi = self.spv(op::BITWISE_AND, Ty::U32, &[fi, k7]);
         let nu = self.spv(op::F_NEGATE, Ty::F32, &[u]);
