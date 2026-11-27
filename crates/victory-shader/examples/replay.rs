@@ -144,6 +144,9 @@ fn read_capture(dir: &Path) -> Capture {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.first().copied() {
             Some("program") if w.len() >= 4 => c.program.push((w[1].into(), w[2].into(), w[3].into())),
+            // the program's own push is the first: a second one before any
+            // draw or dispatch is the next program's (the capture ran on)
+            Some("push") if c.dispatch.is_none() && c.viewport.is_none() && !c.sealed && !c.push.is_empty() => c.sealed = true,
             Some("push") if c.dispatch.is_none() && c.viewport.is_none() && !c.sealed => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
             Some("mem") => c.mem.push((hex(w[1]), dir.join(format!("mem/{}.bin", w[1])))),
             Some("root") if w.len() >= 2 => {
@@ -423,7 +426,9 @@ impl State {
             if v.is_none() {
                 self.notes.insert(format!("slot {slot:x}: stencil read, no stencil plane (reads 0)"));
             }
-            return [u64::from(v.unwrap_or(0)), 0, 0, 1];
+            // (the host's stencil views hold the stencil in every channel,
+            // as the console's: a load takes the first, a gather the second)
+            return [u64::from(v.unwrap_or(0)); 4];
         }
         if s.view_format.starts_with("BC4") || s.view_format.starts_with("BC5") {
             return bc45(&s.data, s.w, x, y, z * i64::from(s.h.div_ceil(4) * s.w.div_ceil(4)), s.view_format.starts_with("BC5"), s.view_format.contains("SNORM"));
@@ -510,7 +515,8 @@ impl State {
     /// Notes an integer view read through a float image, or the reverse.
     fn check_class(&mut self, slot: u32, kind: ImageKind, uint: bool, word7: u64) {
         let Some(s) = self.slots.get(&slot) else { return };
-        let int_view = !s.view_format.starts_with('D') && (s.view_format.contains("UINT") || s.view_format.contains("SINT"));
+        // (a depth image's view is its stencil when the T# says integers)
+        let int_view = if s.view_format.starts_with('D') { word7 >> 24 & 1 != 0 } else { s.view_format.contains("UINT") || s.view_format.contains("SINT") };
         if int_view != uint && !matches!(kind, ImageKind::Size | ImageKind::Levels) {
             let read = if uint { "integer" } else { "float" };
             let line = format!("MISMATCH slot {slot:x} ({}): {kind:?} reads it as {read} (word 7 {word7:x}), view {}", s.name, s.view_format);
@@ -861,6 +867,11 @@ fn main() {
     let _ = std::fs::write(out.join("images.txt"), image_census(&cap.slots));
     show(&cap.slots, &out);
     let (f, _, native) = thread_ir(&container).expect("translation");
+    // SPV=<file>: the program's module as the card gets it (for spirv-val)
+    if let (Some(path), Ok(shader)) = (std::env::var_os("SPV"), victory_shader::vk::translate(&container)) {
+        let bytes: Vec<u8> = shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
     let state = State { slots: std::mem::take(&mut cap.slots), written: BTreeMap::new(), notes: BTreeSet::new(), reads: BTreeMap::new() };
     let images = Replay(Rc::new(RefCell::new(state)));
     if cap.push.is_empty() {

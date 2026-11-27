@@ -466,3 +466,28 @@ fn a_gather_at_a_named_level_reads_four_texels_of_that_level() {
     // image_gather4_lz (0x47)
     assert_eq!((count(0x47, gathers), count(0x47, loads)), (1, 0));
 }
+
+/// A gather of an integer view gives the texels' integers: whether the
+/// view is one, its T# says when the program runs, as for a load (the
+/// title's CS_Tiling_Generate_Opaque gathers the stencil of the material
+/// classes and tests its bits; read through the float image the card gave
+/// nothing, no tile had a class and every tiled pass after it ran on no
+/// tile, runs gi5 to gi8). A comparison is of floats and stays one.
+#[test]
+fn a_gather_reads_integers_from_an_integer_view() {
+    use crate::vk::tir::{ImageKind, Op};
+    let class_of = |opcode: u32| {
+        let (f, _) = crate::vk::thread_ir_native(&sampling(opcode).native).expect("translation");
+        let found = f.nodes.iter().find_map(|n| match &n.op {
+            Op::Image { kind: ImageKind::Gather { dref, .. }, class, .. } => Some((*dref, class.dynamic)),
+            _ => None,
+        });
+        found.expect("a gather")
+    };
+    // image_gather4 (0x40), image_gather4_lz (0x47): by the T#
+    for opcode in [0x40, 0x47] {
+        assert_eq!(class_of(opcode), (false, true), "opcode {opcode:#x}");
+    }
+    // image_gather4_c_lz (0x4f): a comparison
+    assert_eq!(class_of(0x4f), (true, false));
+}
