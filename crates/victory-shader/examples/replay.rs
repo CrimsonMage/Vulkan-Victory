@@ -66,6 +66,10 @@ struct Capture {
     program: Vec<(String, String, String)>,
     push: Vec<u32>,
     dispatch: Option<[u32; 3]>,
+    /// An indirect dispatch's argument address (`indirect kind 2 ... src`):
+    /// the capture's program ends there (captures before the host closed
+    /// one at an indirect dispatch run on into the next program's lines).
+    indirect: Option<u64>,
     viewport: Option<[f32; 4]>,
     mem: Vec<(u64, PathBuf)>,
     /// `root <param> <dwords>`: the root parameters as the title set them.
@@ -136,12 +140,13 @@ fn read_capture(dir: &Path) -> Capture {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.first().copied() {
             Some("program") if w.len() >= 4 => c.program.push((w[1].into(), w[2].into(), w[3].into())),
-            Some("push") if c.dispatch.is_none() && c.viewport.is_none() => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
+            Some("push") if c.dispatch.is_none() && c.viewport.is_none() && c.indirect.is_none() => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
             Some("mem") => c.mem.push((hex(w[1]), dir.join(format!("mem/{}.bin", w[1])))),
             Some("root") if w.len() >= 2 => {
                 c.roots.insert(w[1].parse().unwrap_or(0), w[2..].iter().map(|x| hex(x) as u32).collect());
             }
-            Some("dispatch") => c.dispatch = Some([1, 2, 3].map(|i| w.get(i).and_then(|x| x.parse().ok()).unwrap_or(1))),
+            Some("indirect") if w.get(2) == Some(&"2") => c.indirect = after(&w, "src").map(hex),
+            Some("dispatch") if c.indirect.is_none() => c.dispatch = Some([1, 2, 3].map(|i| w.get(i).and_then(|x| x.parse().ok()).unwrap_or(1))),
             Some("did") => c.viewport = viewport(line),
             Some("image") if w.get(2) != Some(&"none") => {
                 if let Some((slot, s)) = parse_image(dir, &w, &mut files) {
@@ -882,7 +887,16 @@ fn compute(run: &mut Run<'_>, threads: [u32; 3], stride: usize) {
         let n: Vec<u32> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
         [0, 1, 2].map(|i| n.get(i).copied().unwrap_or(1))
     });
-    let [gx, gy, gz] = given.or(run.cap.dispatch).unwrap_or([1, 1, 1]);
+    // an indirect dispatch: the three counts in the captured memory
+    let args = run.cap.indirect.and_then(|at| {
+        let (base, block) = run.mem.blocks.iter().rev().find(|(b, d)| *b <= at && at + 12 <= *b + d.len() as u64)?;
+        let o = (at - base) as usize;
+        Some([0, 4, 8].map(|k| u32::from_le_bytes([block[o + k], block[o + k + 1], block[o + k + 2], block[o + k + 3]])))
+    });
+    if let Some(a) = args {
+        run.images.0.borrow_mut().notes.insert(format!("indirect dispatch: {} {} {} groups in the captured memory", a[0], a[1], a[2]));
+    }
+    let [gx, gy, gz] = given.or(run.cap.dispatch).or(args).unwrap_or([1, 1, 1]);
     let per = (threads.iter().product::<u32>() as usize).div_ceil(run.lanes);
     let groups: Vec<[u32; 3]> = (0..gz).flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| [x, y, z]))).collect();
     // GROUP="x y z": that group only

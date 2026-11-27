@@ -842,8 +842,15 @@ fn read_title(b: &Backend, at: u64, len: u64) -> anyhow::Result<Vec<u8>> {
         let page_left = PAGE - (here % PAGE);
         let n = page_left.min(len - done);
         let (cpu, _) = m.cpu_of(here).filter(|&(c, _)| c != 0).ok_or_else(|| anyhow::anyhow!("title memory at {here:#x} has no CPU view"))?;
-        // SAFETY: committed title memory (or a section page's home).
-        unsafe { std::ptr::copy_nonoverlapping(cpu as *const u8, out.as_mut_ptr().add(done as usize), n as usize) };
+        // The kernel makes the copy: a page the title has decommitted or
+        // unmapped since (a V# of a capture's walk names any range) is an
+        // error here, not a fault (run gi6 ended in one).
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut copied = 0;
+        // SAFETY: the destination is `n` bytes of `out`; the kernel checks the source.
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), cpu as *const _, out.as_mut_ptr().add(done as usize).cast(), n as usize, &mut copied) };
+        anyhow::ensure!(ok != 0, "title memory at {here:#x} is not readable");
         done += n;
     }
     Ok(out)

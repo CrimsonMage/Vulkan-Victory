@@ -303,6 +303,9 @@ impl Rec {
             DISPATCH => {
                 self.dispatch_indirect(b, buffer, at, spec.max);
                 self.watch_cull(b, None, Some((spec.src, spec.count)));
+                // the captured program ends here (left open, the next
+                // program's push and dispatch lines went into its capture)
+                super::super::passes::close();
             }
             MESH => self.mesh_indirect(b, buffer, at, counted, spec.max),
             _ => self.draw_indirect(
