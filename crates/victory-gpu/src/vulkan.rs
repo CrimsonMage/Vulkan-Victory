@@ -91,6 +91,7 @@ fn backend() -> Option<&'static Backend> {
             });
             match made {
                 Ok(b) => {
+                    victory_vk::account::start(&b.host);
                     // Texture quality from the card's own memory, as the
                     // D3D12 host decides it.
                     let dedicated = b.host.heaps().iter().filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|(h, _)| h.size).max();
@@ -987,6 +988,14 @@ fn report(b: &Backend, frame: u64) {
 /// (`baking.rs`).
 pub fn bake(jobs: Option<usize>, index: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     baking::run(jobs, index)
+}
+
+/// `victory vkprobe` with `VICTORY_VK_PROBE_SPV` set: compute modules
+/// compiled as the game's, and the card memory each takes (`budget.rs`).
+pub fn probe_spv(dir: &std::path::Path) -> anyhow::Result<()> {
+    let b = backend().ok_or_else(|| anyhow::anyhow!("no Vulkan device"))?;
+    stages::layout(b).ok_or_else(|| anyhow::anyhow!("no pipeline layout"))?;
+    budget::probe_spv(b, dir)
 }
 
 /// `victory bake`, before compiling: the containers (BLAKE3, the first 16

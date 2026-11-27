@@ -190,6 +190,52 @@ pub fn fit_float_controls(words: &[u32], preserve: [bool; 3]) -> Option<Vec<u32>
     Some(out)
 }
 
+/// A module's own variables may take this much for each thread.
+pub const THREAD_BYTES: u64 = 16 << 10;
+
+/// Bytes of a module's `Private` and `Function` variables: what each
+/// thread of the program keeps for itself.
+///
+/// NVIDIA holds this ("local memory") on the card for 32,768 threads,
+/// outside every heap's count, sized by the pipeline that asks most, and
+/// never gives it back, not even when the pipeline is destroyed. Whether a
+/// variable is ever written does not matter: 47.7 KiB of constant tables
+/// in one compute program (`Private` arrays with initialisers) held
+/// 1.7 GiB (`docs/vulkan-host.md`, "Card memory the driver takes").
+pub fn thread_bytes(words: &[u32]) -> u64 {
+    use std::collections::HashMap;
+    let (mut size, mut value, mut pointee) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let mut total = 0u64;
+    let mut i = 5;
+    while let Some(&head) = words.get(i) {
+        let n = ((head >> 16) as usize).max(1);
+        let Some(a) = words.get(i + 1..i + n) else { break };
+        let of = |id: Option<&u32>| id.and_then(|id| size.get(id)).copied().unwrap_or(0u64);
+        match (head & 0xFFFF, a) {
+            (20, [id]) => drop(size.insert(*id, 4)),
+            (21 | 22, [id, width, ..]) => drop(size.insert(*id, u64::from(*width / 8))),
+            (23 | 24, [id, part, count]) => drop(size.insert(*id, of(Some(part)) * u64::from(*count))),
+            (28, [id, part, length]) => drop(size.insert(*id, of(Some(part)) * value.get(length).copied().unwrap_or(1))),
+            (30, [id, members @ ..]) => drop(size.insert(*id, members.iter().map(|m| of(Some(m))).sum())),
+            (32, [id, _, to]) => drop(pointee.insert(*id, *to)),
+            (43, [_, id, low, ..]) => drop(value.insert(*id, u64::from(*low))),
+            (59, [ty, _, 6 | 7, ..]) => total += of(pointee.get(ty)),
+            _ => {}
+        }
+        i += n;
+    }
+    total
+}
+
+/// Why the card cannot take a module of `words` for its threads' own
+/// memory, if it cannot ([`thread_bytes`] over [`THREAD_BYTES`]).
+pub fn thread_memory_refused(words: &[u32]) -> Option<String> {
+    let bytes = thread_bytes(words);
+    (bytes > THREAD_BYTES).then(|| {
+        format!("{bytes} bytes of variables for each thread over {THREAD_BYTES} (the driver keeps them on the card for 32,768 threads)")
+    })
+}
+
 fn invocations(u: &Usage) -> u64 {
     u.local_size.iter().map(|&v| u64::from(v.max(1))).product()
 }
@@ -238,6 +284,30 @@ mod tests {
         let u = usage(crate::compute::SPIRV);
         assert_eq!(u.model, MODEL_COMPUTE);
         assert!(u.local_size[0] >= 1);
+    }
+
+    #[test]
+    fn counts_what_each_thread_keeps() {
+        // uint, uint 600, uint[600], pointers to it (Private, Function),
+        // one variable of each, and a Uniform one that does not count
+        let m = [
+            0x0723_0203, 0x0001_0600, 0, 9, 0,
+            4 << 16 | 21, 1, 32, 0,
+            4 << 16 | 43, 1, 2, 600,
+            4 << 16 | 28, 3, 1, 2,
+            4 << 16 | 32, 4, 6, 3,
+            4 << 16 | 32, 5, 7, 3,
+            4 << 16 | 32, 6, 2, 3,
+            4 << 16 | 59, 4, 7, 6,
+            4 << 16 | 59, 5, 8, 7,
+            4 << 16 | 59, 6, 9, 2,
+        ];
+        assert_eq!(thread_bytes(&m), 4800);
+        assert_eq!(thread_memory_refused(&m), None);
+        let mut big = m.to_vec();
+        big[12] = 6000;
+        assert!(thread_memory_refused(&big).unwrap().starts_with("48000 bytes"));
+        assert_eq!(thread_bytes(crate::compute::SPIRV), 0);
     }
 
     #[test]

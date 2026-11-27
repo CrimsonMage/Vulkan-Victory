@@ -214,7 +214,7 @@ impl Image {
             })
             .push_next(&mut narrowed);
         // SAFETY: a live image of ours; the view goes with it.
-        match unsafe { b.host.device.create_image_view(&info, None) } {
+        match victory_vk::account::traced(&b.host, "image view", || unsafe { b.host.device.create_image_view(&info, None) }) {
             Ok(view) => {
                 views.push((v, view));
                 Some(view)
@@ -412,28 +412,41 @@ pub(crate) fn report() {
         "Vulkan: images"
     );
     if cfg!(feature = "diagnostics") {
-        let (biggest, by_kind) = biggest();
-        tracing::info!(biggest = %biggest, by_kind = %by_kind, "Vulkan: where image memory goes");
+        let (biggest, by_kind, sums) = biggest();
+        tracing::info!(sums = %sums, biggest = %biggest, by_kind = %by_kind, "Vulkan: where image memory goes");
         tracing::info!(tracked = %fill::tracking(), "Vulkan: images by how a CPU store reaches them, and the ones filled most often");
     }
 }
 
-/// Diagnostics: the 8 live images with the most card memory, and card
-/// memory by format and whether the card writes them (each piece of memory
-/// counted once, at its first image).
-fn biggest() -> (String, String) {
+/// Diagnostics: the 8 live images with the most card memory, card memory
+/// by format and whether the card writes them (each piece of memory
+/// counted once, at its first image), and the sums: card memory of the
+/// images the card writes against the title memory under them (more card
+/// than title memory: images of memory the title has since reused), of
+/// the textures the title fills, and of images waiting to be destroyed.
+fn biggest() -> (String, String, String) {
     // The registry before the places, as `at` takes them.
     let guard = registry();
-    let Some(r) = guard.as_ref() else { return (String::new(), String::new()) };
+    let Some(r) = guard.as_ref() else { return (String::new(), String::new(), String::new()) };
     let places = lock(&PLACES);
     let mut seen = std::collections::HashSet::new();
     let mut sized: Vec<(u64, &Arc<Image>)> = Vec::new();
     let mut kinds: std::collections::HashMap<(vk::Format, bool), (u64, u64)> = std::collections::HashMap::new();
+    // [card-written, filled]: images, card bytes, title bytes under them
+    // (overlaps once; the registry is in address order).
+    let mut sums = [[0u64; 3]; 2];
+    let mut end = [0u64; 2];
     for img in r.images.values() {
         let Some(&(memory, offset, size, _)) = places.get(&img.id) else { continue };
+        let s = usize::from(!img.card_written());
+        sums[s][0] += 1;
+        let (from, to) = (img.key.address.max(end[s]), img.key.address + img.bytes);
+        sums[s][2] += to.saturating_sub(from);
+        end[s] = end[s].max(to);
         if !seen.insert((memory, offset)) {
             continue;
         }
+        sums[s][1] += size;
         sized.push((size, img));
         let k = kinds.entry((img.format, img.card_written())).or_insert((0, 0));
         k.0 += size;
@@ -457,7 +470,20 @@ fn biggest() -> (String, String) {
         .take(8)
         .map(|((f, w), (size, n))| format!("{:?}{} {}MB n={n}", f, if *w { " card-written" } else { "" }, size >> 20))
         .collect();
-    (biggest.join("; "), by_kind.join("; "))
+    let waiting: u64 = r.dropped.iter().filter_map(|(_, i)| places.get(&i.id)).map(|p| p.2).sum();
+    let sums = format!(
+        "card-written n={} {}MB over {}MB of title memory; filled n={} {}MB over {}MB; dropped, waiting for the card n={} {}MB; blocks {}",
+        sums[0][0],
+        sums[0][1] >> 20,
+        sums[0][2] >> 20,
+        sums[1][0],
+        sums[1][1] >> 20,
+        sums[1][2] >> 20,
+        r.dropped.len(),
+        waiting >> 20,
+        r.blocks.len(),
+    );
+    (biggest.join("; "), by_kind.join("; "), sums)
 }
 
 static UNFIT: AtomicU64 = AtomicU64::new(0);
@@ -669,7 +695,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let d = &b.host.device;
     // SAFETY: valid create info; destroyed with the registry entry.
-    let image = unsafe { d.create_image(&info, None) }.ok()?;
+    let image = victory_vk::account::traced(&b.host, "image", || unsafe { d.create_image(&info, None) }).ok()?;
     // SAFETY: a live image.
     let needs = unsafe { d.get_image_memory_requirements(image) };
     // Over an earlier image's memory when it fits there.
