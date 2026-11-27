@@ -891,11 +891,22 @@ impl Lift<'_> {
                 } else if self.f.as_const(a_exec) == Some(1) {
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_BROADCAST_FIRST, u32::MAX), Ty::U32, vec![x])
                 } else {
+                    // With no lane in EXEC the console reads lane 0; here the
+                    // first lane that is there (origin/main `emit/lower.rs`
+                    // `first_lane`), not lane 31 of an empty ballot.
                     let b = self.ballot(a_exec);
-                    let l = self.gl(glsl::FIND_I_LSB, Ty::U32, &[b]);
-                    let k31 = self.k32(31);
-                    let l = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);
+                    let l = self.first_lane_of(b);
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, l])
+                };
+                // A helper lane takes its own value: in whole-quad mode the
+                // console has helper lanes in EXEC and a waterfall loop
+                // serves them too; a host may leave them out of ballots
+                // (origin/main `emit/lower.rs` `helper_reads_own`).
+                let r = if self.native.stage == HwStage::Ps && self.f.ty(x) == Ty::U32 {
+                    let h = self.f.global(Op::Builtin(Builtin::Helper), Ty::BOOL);
+                    self.spv(op::SELECT, Ty::U32, &[h, x, r])
+                } else {
+                    r
                 };
                 self.sdst(inst, &v.dst, 0, R::D(r));
                 Ok(())

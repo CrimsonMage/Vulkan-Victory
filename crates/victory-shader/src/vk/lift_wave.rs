@@ -389,10 +389,22 @@ impl Lift<'_> {
     /// The host subgroup's live invocations: a console wave has all its
     /// lanes, a host subgroup may be partly filled (pixels), and reading a
     /// lane that is not there gives an undefined value.
-    fn live(&mut self) -> V {
+    pub(super) fn live(&mut self) -> V {
         let t = self.kb(true);
         let v4 = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_BALLOT, u32::MAX), Ty::vec(S::U32, 4), vec![t]);
         self.extract(v4, 0)
+    }
+
+    /// The first lane of the ballot `b`, or with none in it the first
+    /// lane the subgroup has.
+    pub(super) fn first_lane_of(&mut self, b: V) -> V {
+        let live = self.live();
+        let z = self.k32(0);
+        let any = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[b, z]);
+        let m = self.spv(op::SELECT, Ty::U32, &[any, b, live]);
+        let l = self.gl(glsl::FIND_I_LSB, Ty::U32, &[m]);
+        let k31 = self.k32(31);
+        self.spv(op::BITWISE_AND, Ty::U32, &[l, k31])
     }
 
     /// Whether lane `l` (0-31) of the host subgroup is live.
