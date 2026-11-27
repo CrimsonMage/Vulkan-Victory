@@ -33,6 +33,7 @@ use victory_vk::pool::{PAGE, PageKey, PoolView, Source};
 use victory_vk::swapchain::Swapchain;
 use victory_vk::timeline::Timeline;
 
+mod ambient;
 mod bound;
 mod baking;
 mod slow;
