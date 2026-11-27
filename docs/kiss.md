@@ -111,10 +111,10 @@ driver errors and no new crash, and the captures look no worse.
 
 | | Start (2026-11-25) | Now |
 |---|---|---|
-| Rust lines | 128,292 | 78,027 (154,557 before the D3D12 back end went) |
-| `VICTORY_*` switches | 224 | 45 |
+| Rust lines | 128,292 | 100,007 on 2026-11-27, about 10,000 of them tests and tools (78,027 right after the D3D12 back end went; 154,557 just before) |
+| `VICTORY_*` switches | 224 | 38 |
 | `diagnostics`-only blocks | 283 | 71 |
-| World frame time (Proton, 8 GB card) | 0.5–5 s | ~295 ms (~3.3 fps), Series S (run p20) |
+| World frame time (Proton, 8 GB card) | 0.5–5 s | ~440 ms on the card with the whole scene lit and textured (2026-11-27, run tx7); ~295 ms on 2026-11-25 with most of the picture missing |
 
 ## Workstreams
 

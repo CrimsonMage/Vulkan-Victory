@@ -52,26 +52,64 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status (2026-11-27)
+## Where it stands (2026-11-27)
 
-**Not playable.** Tested with one title, on one machine: Linux (stock Proton), an Intel CPU,
-NVIDIA RTX 5060 Ti 8 GB, 31 GB RAM; the Series S profile.
+**Not playable: about 2 frames a second.** Tested with one title, on one
+machine: Linux (stock Proton), an Intel CPU, NVIDIA RTX 5060 Ti 8 GB, 31 GB
+RAM; the Series S profile.
 
 | | |
 |---|---|
 | Boot, menus, opening | reached by scripted input in every test run |
-| The world | the opening scene is on screen and matches the console in layout: geometry, characters, sky, direct sun, an estimate in place of indirect light |
-| Known to be wrong | surface colours differ from run to run (streamed textures are dropped and their descriptor slots reused); no ray-traced light or shadows (the title's structure builder is left out); over-exposed sky; lettering on clothing missing |
-| Frame rate | about 2 to 3 frames a second in the world (the card needs 320 to 420 ms a frame) |
-| Memory | about 16.5 GB of RAM and 6.7 GB on the card at peak |
+| The world | the opening scene matches the console's picture: geometry, characters with their materials and lettering, hair, the sky, direct sun, fog; surface colours are the same every run |
+| Indirect light | an estimate from the frame before stands in for it: the title's ray tracing does not run (its structure builder is left out), so there is no ray-traced bounce light, reflection or shadow |
+| Known to be wrong | over-exposed sky; flat interior light; lettering and hair less sharp than the console's; the title sometimes crashes during the load |
+| Frame rate | about 2 frames a second in the world: the card needs about 440 ms a frame |
+| Memory | about 16.5 GB of RAM and 6.7 GB on the card at peak (the aim is a Series S's amounts) |
 | Shaders | 25,694 of 25,889 console programs translate (the rest are unused geometry programs); the used set is compiled ahead of time by `victory bake` |
 
-How it works, what was found and what is open: `docs/kiss.md` (the
-decisions log), `docs/vulkan-host.md`, `docs/vulkan-abi.md`.
+`docs/kiss.md` is the working record: the principle, the Xbox → PC map,
+the rules, the measures and a dated decisions log of every finding (what
+was wrong, how it was found, what fixed it). `docs/vulkan-host.md` and
+`docs/vulkan-abi.md` describe the Vulkan host and the contract between
+translated programs and the host; `docs/origin-findings.md` and
+`docs/opcode-audit.md` compare the translator with the Direct3D 12 path it
+was audited against.
 
 The indices the tools write from a dump (`docs/pipeline-index.md`,
 `docs/translation-index.md`, `docs/shader-golden.txt`) are generated on your
 machine and are not part of this repository.
+
+## What was removed from VIctory, and why (KISS)
+
+The fork this grew out of had become hard to reason about: about 128,000
+lines of Rust and over 200 `VICTORY_*` switches, with the same behaviour
+reachable through several paths. The rule since 2026-11-25 is *keep it
+simple*: **each Xbox-specific behaviour is turned back into the plain PC
+API it was ported from, at the moment the title asks for it; nothing is
+watched, guessed or mirrored when an API call already says what happens;
+one behaviour has one code path.**
+
+| Removed | Why | What stands in its place |
+|---|---|---|
+| The Direct3D 12 back end (device, host, draw binding, descriptor host heaps) and with it vkd3d-proton, DXC and `d3dcompiler` beside the exe on Linux | Two GPU back ends meant every fix twice; on Linux D3D12 was itself a translation to Vulkan, with translated shaders compiled twice | The title's D3D12.X recorded straight into Vulkan (`crates/victory-gpu/src/vulkan`) |
+| The DXIL shader translator (`emit/` with its bitcode encoder, HLSL helpers, resource and structure analysis: about 40,000 lines) | Its programs carried a page-directory lookup on every memory access and took 0.5 to 10 s each to compile | A translator to SPIR-V in which title addresses are device addresses through a small memory map (`crates/victory-shader/src/vk`, contract in `docs/vulkan-abi.md`) |
+| Memory mirroring: the 64 KiB page directory and card page cache, unified/shadow/gather/indirect views and windows, write watches, guards and canary pages | The title's memory was copied and re-checked every frame; this was the main cost in time and memory | Title memory imported into Vulkan by host pointer (zero copy); the few copies the card needs are refreshed when a write is seen, not by polling |
+| The D3D12 pipeline catalog, library and translated-shader cache | They existed to hide slow compiles at run time | Stages translated once and kept on disk; `victory bake` compiles the used set before playing |
+| D3D12 FSR, compose and capture paths; the old frame-time and process-memory lines | Tied to the removed back end | One Vulkan composition pass; one log line every 10 s |
+| About 180 `VICTORY_*` switches (215 → 38) | Experiments had been left in as switches; nobody could say which combination was "the" behaviour | A switch exists only for a user-facing choice or a named diagnostic (`docs/switches-gpu.md`) |
+| The ray-tracing structure builder on the DXIL path | It went with the D3D12 back end | Not yet rebuilt on the SPIR-V path: this is why indirect light is an estimate today |
+
+Measured against the point where this work split off (`0b0074e`):
+Rust went from 127,160 lines to 100,007, of which about 10,000 are tests and
+tools that did not exist before (an interpreter of translated programs,
+instruction tests ported from the Direct3D 12 path, a per-program behaviour
+check, pass captures and their replay). `victory-gpu` went from 54,037 to
+25,887 lines and `victory-shader` from 42,540 to 32,366.
+
+What was kept on purpose: the loader, the reimplemented console services
+(`victory-hle`), the audio and storage paths and the format code, which
+already followed the rule.
 
 ## Getting started
 
