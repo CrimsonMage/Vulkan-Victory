@@ -468,6 +468,13 @@ driver errors and no new crash, and the captures look no worse.
     showed black. A bake needs a timeout far past its hour and must end
     by itself. Also: write tracking's fault-cost probe ended a bake (no
     fault handler there): it runs only once a real store has faulted.
+  - **The driver's cache file fills up**: after several full bakes into one
+    directory its data file passed 4 GiB and its index was no longer
+    written (frozen at 01:31 while the data grew to 5.6 GiB): even a bake
+    that ended cleanly left the next game compiling everything. A bake
+    after a translator change starts a fresh driver cache directory (the
+    old one set aside as cache/nv.old-<date>; the launcher is to do it
+    when a cache file is past 3 GiB).
   - Open: in game, on-demand stage loading stalls behind slow compiles
     when the driver cache misses (translated stays at a few hundred).
   - 64-lane approximations in the used set: 76 pixel programs (character
