@@ -50,9 +50,7 @@ impl Memory {
             if let Some(r) = self.regions.remove(&a) {
                 lo = lo.min(a);
                 hi = hi.max(a + r.len);
-                if let Some(i) = r.import {
-                    self.retired.push(i);
-                }
+                self.retired.extend(r.import);
             }
         }
         (lo, hi - lo)

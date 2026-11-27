@@ -57,7 +57,7 @@ pub(super) fn describe(b: &Backend, at: u64) -> String {
             "region {a:#x}+{:#x} loose={} import={}",
             r.len,
             r.loose,
-            r.import.as_ref().map_or("none".into(), |i| format!("device {:#x}", i.device_base))
+            r.import.first().map_or("none".into(), |i| format!("device {:#x}", i.device_base))
         )
     } else if let Some((&a, &(len, section, _))) = m.views.range(..=at as usize).next_back().filter(|(a, v)| at < (**a + v.0) as u64) {
         format!(

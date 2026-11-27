@@ -131,7 +131,8 @@ fn backend() -> Option<&'static Backend> {
 
 struct Region {
     len: usize,
-    import: Option<Imported>,
+    /// The import, in pieces no larger than the driver's largest buffer.
+    import: Vec<Imported>,
     refused: bool,
     wanted: bool,
     /// Loose memory (no `XMemVirtualAlloc` region): joined with loose
@@ -225,7 +226,7 @@ impl Memory {
     fn import_regions(&mut self, host: &Host) -> bool {
         let mut any = false;
         for (&at, r) in self.regions.iter_mut() {
-            if r.import.is_some() || r.refused || !r.wanted {
+            if !r.import.is_empty() || r.refused || !r.wanted {
                 continue;
             }
             // Pages write tracking protects are opened for the driver's
@@ -236,17 +237,36 @@ impl Memory {
             let made = ready.map_err(|e| anyhow::anyhow!(e)).and_then(|()| {
                 // SAFETY: committed read-write pages that stay mapped until
                 // the region is released (`title_memory_released`).
-                unsafe { Imported::new(host, at as *mut _, r.len as u64, vk::BufferUsageFlags::empty()) }
+                let max = host.caps.max_buffer_size.min(host.caps.max_memory_allocation_size);
+                let align = host.caps.min_imported_host_pointer_alignment.max(1);
+                let piece = if max == 0 { r.len as u64 } else { (max / align * align).max(align) };
+                let mut parts = Vec::new();
+                let mut off = 0u64;
+                while off < r.len as u64 {
+                    let n = piece.min(r.len as u64 - off);
+                    match unsafe { Imported::new(host, (at as u64 + off) as *mut _, n, vk::BufferUsageFlags::empty()) } {
+                        Ok(i) => parts.push(i),
+                        Err(e) => {
+                            for i in &parts {
+                                unsafe { i.destroy(host) };
+                            }
+                            return Err(e);
+                        }
+                    }
+                    off += n;
+                }
+                Ok(parts)
             });
             match made {
                 Ok(i) => {
                     tracing::info!(
                         at = format_args!("{at:#x}"),
                         mb = r.len >> 20,
-                        device = format_args!("{:#x}", i.device_base),
+                        device = format_args!("{:#x}", i[0].device_base),
+                        pieces = i.len(),
                         "Vulkan: a region imported in place"
                     );
-                    r.import = Some(i);
+                    r.import = i;
                     any = true;
                 }
                 Err(e) => {
@@ -268,9 +288,9 @@ impl Memory {
         }
         if let Some((&at, r)) = self.regions.range(..=title as usize).next_back()
             && title < (at + r.len) as u64
-            && let Some(i) = &r.import
+            && let Some(i) = r.import.iter().find(|i| title >= i.title_base && title < i.title_base + i.len)
         {
-            return Some((i.buffer, title - at as u64));
+            return Some((i.buffer, title - i.title_base));
         }
         if let Some((&at, &(len, section, offset))) = self.views.range(..=title as usize).next_back()
             && title < (at + len) as u64
@@ -292,11 +312,11 @@ impl Memory {
                 device_base: p.device_base,
             });
         }
-        for (&at, r) in &self.regions {
-            if let Some(i) = &r.import {
+        for r in self.regions.values() {
+            for i in &r.import {
                 add(Range {
-                    title_start: at as u64,
-                    title_size: r.len as u64,
+                    title_start: i.title_base,
+                    title_size: i.len,
                     device_base: i.device_base,
                 });
             }
@@ -381,7 +401,7 @@ pub fn title_region(at: usize, len: usize) {
             at,
             Region {
                 len,
-                import: None,
+                import: Vec::new(),
                 refused: false,
                 wanted: false,
                 loose: false,
@@ -451,8 +471,8 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
     let gone: Vec<usize> = m.regions.range(..end).filter(|&(&a, r)| a + r.len > at && a >= at && a + r.len <= end).map(|(&a, _)| a).collect();
     let mut imports = Vec::new();
     for a in gone {
-        if let Some(Region { import: Some(i), .. }) = m.regions.remove(&a) {
-            imports.push(i);
+        if let Some(r) = m.regions.remove(&a) {
+            imports.extend(r.import);
         }
     }
     let (stale, kept): (Vec<Imported>, Vec<Imported>) =
@@ -532,11 +552,13 @@ pub fn title_memory_released(at: usize, len: usize) {
         .collect();
     let mut dropped = m.drop_stale_loose(b, at, at + len);
     for a in gone {
-        if let Some(Region { import: Some(i), .. }) = m.regions.remove(&a) {
+        if let Some(r) = m.regions.remove(&a) {
             // The card, or a command buffer not yet submitted, may still
             // read it.
-            m.bury(b, i);
-            dropped = true;
+            for i in r.import {
+                m.bury(b, i);
+                dropped = true;
+            }
         }
     }
     if dropped {
@@ -874,7 +896,7 @@ impl Memory {
         });
         match self.regions.range_mut(..=at as usize).next_back() {
             Some((&base, r)) if at < (base + r.len) as u64 && !grows => {
-                if r.import.is_none() && !r.refused {
+                if r.import.is_empty() && !r.refused {
                     r.wanted = true;
                     return true;
                 }
@@ -941,7 +963,7 @@ impl Memory {
                 base,
                 Region {
                     len,
-                    import: None,
+                    import: Vec::new(),
                     refused: false,
                     wanted: true,
                     loose: true,
