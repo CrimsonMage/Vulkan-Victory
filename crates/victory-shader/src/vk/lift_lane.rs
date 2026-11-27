@@ -21,42 +21,111 @@ impl Lift<'_> {
         })
     }
 
-    /// `v_cmp_class`: whether `x` is in one of the classes of `mask`.
+    /// The bits of 32-bit float source `i` of a VALU instruction with its
+    /// modifiers (they move the sign bit).
+    fn fbits(&mut self, inst: &Inst, v: &Valu, i: usize) -> Res<V> {
+        let o = v.src.get(i).ok_or(unsupported(inst.machine.offset, "a missing operand"))?;
+        let x = self.opnd(inst, o)?;
+        let mut x = self.u32v(x);
+        if v.abs >> i & 1 != 0 {
+            let m = self.k32(0x7FFF_FFFF);
+            x = self.spv(op::BITWISE_AND, Ty::U32, &[x, m]);
+        }
+        if v.neg >> i & 1 != 0 {
+            let m = self.k32(0x8000_0000);
+            x = self.spv(op::BITWISE_XOR, Ty::U32, &[x, m]);
+        }
+        Ok(x)
+    }
+
+    /// What a comparison needs of a 32-bit float, from its bits: whether
+    /// it is a NaN, and an integer that orders (signed) as the float does:
+    /// the magnitude, negative under the sign bit, so both zeros are 0.
+    fn float_key(&mut self, bits: V) -> (V, V) {
+        if let Some(c) = self.f.as_const(bits) {
+            let m = c as u32 & 0x7FFF_FFFF;
+            let key = if c as u32 >> 31 != 0 { m.wrapping_neg() } else { m };
+            return (self.kb(m > 0x7F80_0000), self.k32(key));
+        }
+        let (mask, inf, zero) = (self.k32(0x7FFF_FFFF), self.k32(0x7F80_0000), self.k32(0));
+        let m = self.spv(op::BITWISE_AND, Ty::U32, &[bits, mask]);
+        let nan = self.spv(op::U_GREATER_THAN, Ty::BOOL, &[m, inf]);
+        let neg = self.spv(op::S_LESS_THAN, Ty::BOOL, &[bits, zero]);
+        let nm = self.spv(op::I_SUB, Ty::U32, &[zero, m]);
+        (nan, self.spv(op::SELECT, Ty::U32, &[neg, nm, m]))
+    }
+
+    /// A 32-bit float comparison (`rel` as in the `v_cmp_*_f32` names) of
+    /// `a` and `b` given as bits, made with integer operations: the console
+    /// compares denormals as the numbers they are, and the title relies on
+    /// it (CS_GenerateMaterialMasks reads the stencil plane, integers of 0
+    /// to 255, and tests it with `v_cmp_eq_f32 0`: sky or not), while the
+    /// card takes a denormal operand of a float comparison as zero (NVIDIA;
+    /// it has no `shaderDenormPreserveFloat32`), so every pixel was sky and
+    /// the tiled lighting found no material class to light.
+    fn fcmp_bits(&mut self, rel: &str, a: V, b: V) -> Option<V> {
+        // the relation of the keys, and whether a NaN makes it true
+        let (o, unordered) = match rel {
+            "lt" => (op::S_LESS_THAN, false),
+            "eq" => (op::I_EQUAL, false),
+            "le" => (op::S_LESS_THAN_EQUAL, false),
+            "gt" => (op::S_GREATER_THAN, false),
+            "lg" => (op::I_NOT_EQUAL, false),
+            "ge" => (op::S_GREATER_THAN_EQUAL, false),
+            "nge" => (op::S_LESS_THAN, true),
+            "nlg" => (op::I_EQUAL, true),
+            "ngt" => (op::S_LESS_THAN_EQUAL, true),
+            "nle" => (op::S_GREATER_THAN, true),
+            "neq" => (op::I_NOT_EQUAL, true),
+            "nlt" => (op::S_GREATER_THAN_EQUAL, true),
+            _ => return None,
+        };
+        let (na, ka) = self.float_key(a);
+        let (nb, kb) = self.float_key(b);
+        let r = self.spv(o, Ty::BOOL, &[ka, kb]);
+        let nan = self.spv(op::LOGICAL_OR, Ty::BOOL, &[na, nb]);
+        Some(if unordered {
+            self.spv(op::LOGICAL_OR, Ty::BOOL, &[r, nan])
+        } else {
+            let ordered = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[nan]);
+            self.spv(op::LOGICAL_AND, Ty::BOOL, &[r, ordered])
+        })
+    }
+
+    /// `v_cmp_class`: whether `x` is in one of the classes of `mask`. The
+    /// classes are read off the bits (a float comparison on the card takes
+    /// a denormal as zero: `fcmp_bits`).
     pub(super) fn class(&mut self, x: V, mask: V, t: Ty) -> V {
         // a computed mask tests every class against its bit
         let m = self.f.as_const(mask).map_or(0x3FF, |m| m as u32);
-        let z = if t == Ty::F16 { self.f.konst(t, 0) } else { self.kf(0.0) };
-        let nan = self.spv(op::IS_NAN, Ty::BOOL, &[x]);
-        let inf = self.spv(op::IS_INF, Ty::BOOL, &[x]);
-        let neg = self.spv(op::F_ORD_LESS_THAN, Ty::BOOL, &[x, z]);
-        let is0 = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[x, z]);
-        // sign bit (for zeros)
-        let bits = if t == Ty::F16 {
+        let half = t == Ty::F16;
+        let bits = if half {
             let b = self.spv(op::BITCAST, Ty::U16, &[x]);
             self.spv(op::U_CONVERT, Ty::U32, &[b])
         } else {
             self.u32v(x)
         };
-        let sb = self.k32(if t == Ty::F16 { 0x8000 } else { 0x8000_0000 });
+        // sign, infinity's magnitude (the exponent field), the quiet bit
+        let (sb, ib, qb) = if half { (0x8000, 0x7C00, 0x200) } else { (0x8000_0000, 0x7F80_0000, 0x40_0000) };
+        // the smallest normal magnitude: the exponent field's lowest bit
+        let nb = if half { 0x0400 } else { 0x0080_0000 };
+        let (sb, mb, ib, nb, qb, zz) = (self.k32(sb), self.k32(sb - 1), self.k32(ib), self.k32(nb), self.k32(qb), self.k32(0));
         let sbit = self.spv(op::BITWISE_AND, Ty::U32, &[bits, sb]);
-        let zz = self.k32(0);
         let signed = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[sbit, zz]);
-        let absx = self.gl(glsl::F_ABS, t, &[x]);
-        let minn = if t == Ty::F16 { self.f.konst(t, 0x0400) } else { self.kf(f32::MIN_POSITIVE) };
-        let denorm_mag = self.spv(op::F_ORD_LESS_THAN, Ty::BOOL, &[absx, minn]);
-        let nz = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[is0]);
-        let denorm = self.spv(op::LOGICAL_AND, Ty::BOOL, &[denorm_mag, nz]);
-        let finite = {
-            let a = self.spv(op::LOGICAL_OR, Ty::BOOL, &[nan, inf]);
-            self.spv(op::LOGICAL_NOT, Ty::BOOL, &[a])
-        };
-        let normal = {
-            let nd = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[denorm_mag]);
-            self.spv(op::LOGICAL_AND, Ty::BOOL, &[finite, nd])
-        };
         let pos = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[signed]);
+        let mag = self.spv(op::BITWISE_AND, Ty::U32, &[bits, mb]);
+        let nan = self.spv(op::U_GREATER_THAN, Ty::BOOL, &[mag, ib]);
+        let inf = self.spv(op::I_EQUAL, Ty::BOOL, &[mag, ib]);
+        let is0 = self.spv(op::I_EQUAL, Ty::BOOL, &[mag, zz]);
+        let small = self.spv(op::U_LESS_THAN, Ty::BOOL, &[mag, nb]);
+        let nz = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[is0]);
+        let denorm = self.spv(op::LOGICAL_AND, Ty::BOOL, &[small, nz]);
+        let normal = {
+            let finite = self.spv(op::U_LESS_THAN, Ty::BOOL, &[mag, ib]);
+            let big = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[small]);
+            self.spv(op::LOGICAL_AND, Ty::BOOL, &[finite, big])
+        };
         // the quiet bit splits NaNs: signalling (class 0) and quiet (1)
-        let qb = self.k32(if t == Ty::F16 { 0x200 } else { 0x40_0000 });
         let q = self.spv(op::BITWISE_AND, Ty::U32, &[bits, qb]);
         let quiet = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[q, zz]);
         let dynamic = self.f.as_const(mask).is_none();
@@ -71,21 +140,14 @@ impl Lift<'_> {
                     self.spv(op::LOGICAL_AND, Ty::BOOL, &[nan, sig])
                 }
                 1 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[nan, quiet]),
-                2 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, neg]),
-                3 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[normal, neg]),
+                2 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, signed]),
+                3 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[normal, signed]),
                 4 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[denorm, signed]),
                 5 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[is0, signed]),
                 6 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[is0, pos]),
                 7 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[denorm, pos]),
-                8 => {
-                    let p = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[neg]);
-                    let n = self.spv(op::LOGICAL_AND, Ty::BOOL, &[normal, p]);
-                    self.spv(op::LOGICAL_AND, Ty::BOOL, &[n, nz])
-                }
-                _ => {
-                    let p = self.spv(op::LOGICAL_NOT, Ty::BOOL, &[neg]);
-                    self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, p])
-                }
+                8 => self.spv(op::LOGICAL_AND, Ty::BOOL, &[normal, pos]),
+                _ => self.spv(op::LOGICAL_AND, Ty::BOOL, &[inf, pos]),
             };
             let t = if dynamic {
                 let kb = self.k32(1 << bit);
@@ -127,10 +189,9 @@ impl Lift<'_> {
                 if rel == "u" { u } else { self.spv(op::LOGICAL_NOT, Ty::BOOL, &[u]) }
             }
             (_, "f32") => {
-                let o = self.fcmp(rel).ok_or(unsupported(off, name))?;
-                let a = self.fsrc(inst, v, 0)?;
-                let b = self.fsrc(inst, v, 1)?;
-                self.spv(o, Ty::BOOL, &[a, b])
+                let a = self.fbits(inst, v, 0)?;
+                let b = self.fbits(inst, v, 1)?;
+                self.fcmp_bits(rel, a, b).ok_or(unsupported(off, name))?
             }
             (_, "f16") => {
                 let o = self.fcmp(rel).ok_or(unsupported(off, name))?;
