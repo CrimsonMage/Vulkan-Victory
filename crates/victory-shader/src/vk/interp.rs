@@ -36,6 +36,8 @@ pub struct Memory {
     pub missing: BTreeMap<u64, (u32, V)>,
     /// Stores: address -> value (also applied to `dwords`).
     pub stored: BTreeMap<u64, u32>,
+    /// What a missing dword reads.
+    pub fill: u32,
 }
 
 impl Memory {
@@ -57,7 +59,7 @@ impl Memory {
                 if !quiet {
                     self.missing.entry(d).or_insert((0, who)).0 += 1;
                 }
-                0
+                (self.fill >> (8 * (a & 3))) as u8
             }
         }
     }
