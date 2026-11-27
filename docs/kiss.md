@@ -419,6 +419,36 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-27 (late): wave64 and waterfalls, proven offline (branch
+  `worktree-agent-af78a0a95bd2278bc`; nothing baked or run).
+  - **Tests**: origin/main's wave64 and waterfall cases are in
+    `vk/oracle/wave64.rs` (24 run, 2 ignored: a dispatch that counts
+    threads, sums of denormals) and `waterfall.rs` (their 5, and a
+    waterfall of a wave of 64 across its halves). All passed as ported:
+    no translator difference found there.
+  - **The interpreter runs a group as the card does**
+    (`vk/interp_group.rs`): the two halves of a wave64 as machines of
+    their own that meet at the lift's exchanges, and console barriers
+    across waves. Every wave64 oracle case runs as one wave and as halves
+    in both orders and must agree. Over the used set (`cargo xtask
+    shader-golden --halves`, eight seeded runs each): of 1,140 wave64
+    compute and mesh programs 1,002 the same, 114 past the block limit
+    (nothing to compare), 24 the same in the runs where no half stored to
+    a dword the other touched between two meetings (random descriptors
+    that collide; 13 of them differ in such a run), none different
+    otherwise. The card's transport of an exchange (barriers, counters:
+    `emit_xchg.rs`) is not interpreted.
+  - **Pixel programs** have no other half: a fragment subgroup is a
+    console wave whose other lanes hold no work. `lift_hi.rs` finds what a
+    mask read as a number holds for those lanes; the 76 used programs
+    listed as approximate are none now. Six ped programs read 0 for the
+    upper dword of an inverted mask (the console: all ones); eight
+    tiled-light programs ran a section's tree lane by lane for its vector
+    result; one program kept a number in `vcc_lo` and read it back through
+    a ballot (wrong in a partly filled subgroup: a buffer offset).
+    17 modules change (-333 to +114 words; the largest ones not), the
+    golden file's 1,527 behaviours not. `docs/translation-index.md` (the
+    whole pack) still has the old notes: `cargo xtask translation-index`.
 - 2026-11-27 (night): the batch bake, and why two of them were lost.
   - **Every pixel classed as sky**: CS_GenerateMaterialMasks tests the main
     depth's stencil with a float compare; the stencil integers are
@@ -443,7 +473,7 @@ driver errors and no new crash, and the captures look no worse.
   - 64-lane approximations in the used set: 76 pixel programs (character
     shading, particles, mirrors); the wave64 and waterfall tests of
     origin/main are not ported yet, and the interpreter runs a wave as
-    one, not as the two halves the card runs.
+    one, not as the two halves the card runs. (Done: the entry above.)
 - 2026-11-27 (early): what kept the world grey, found with origin/main as
   the reference and with pass captures replayed offline.
   - **Reference**: origin/main (the D3D12 path, lit on NVIDIA) checked out

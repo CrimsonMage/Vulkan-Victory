@@ -21,7 +21,7 @@ OPEN (DIFFERENT, not changed, why); theirs missing / ours missing. Tests are in
 | DIFFERENT when audited | about 70 (most in three cross-cutting rules: bounds, pixel kill, waves) |
 | … FIXED here (17 commits) | the multi-dword loads and stores (10), `exp` (pixel kill), position w, `v_cvt_u32/i32_f32`, `image_sample_c*` with immediate samplers, wave sections (DPP forms, `v_permlanex16_b32`, `v_readlane_b32`), `v_readfirstlane_b32`, `v_mad_legacy_f32`, `image_bvh*_intersect_ray` (builder off), unwritten registers |
 | … OPEN | see "Open differences" (quad reads and `s_wqm`, gathers at a named mip, typed formats, zero signs, unfused mad, …) |
-| Not compared in depth | `s_barrier`, `s_sendmsg`, `s_setpc_b64`, the halves' exchange (`emit_xchg.rs`) |
+| Not compared in depth | `s_sendmsg`; the card's transport of the halves' exchange (`emit_xchg.rs`: barriers, counters). The exchanges themselves, `s_barrier` across waves and the far jump (`s_setpc_b64`) run in `vk/oracle/wave64.rs` (origin's `emit/wave64_tests.rs`, `wave64_after_loop.rs`) as one wave and as two halves; waterfalls in `vk/oracle/waterfall.rs` (origin's `emit/waterfall_tests.rs`) |
 
 ## Differences found, by effect
 

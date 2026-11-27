@@ -421,26 +421,46 @@ are uniform per subgroup, lane masks are per-invocation booleans
 A console wave64 compute or mesh program runs as two subgroups
 ("halves") that exchange whole-wave values (section 9): every scalar value
 is then the same in both. A wave64 vertex or pixel program (and a wave64
-compute or mesh group of at most 32 threads) runs as one subgroup standing
-for the wave; cross-lane operations that reach across 32 lanes there are
-taken per half, and the translator lists them (`VkShader::approximate`):
-the high dword of a lane mask read as a number reads 0
-(`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, `v_mbcnt_hi` and the rest count
-and search the lower half only), and a `v_readlane` of lane 32 or above
-reads lane `l & 31`. A subgroup is then a console wave whose upper half
-no work item fills (a state the console's partly filled waves are in):
-for a mask made of EXEC and compares the high dword 0 is exactly what
-that half gives. It differs where the program set a mask to every lane
-by a constant and then reads it as a number (the console's upper bits
-are set), and at a `v_readlane` of the upper half unless the value read
-is one a lane of the lower half equals (an idempotent reduction: min,
-max, and, or); a sum or exclusive-or reduction across the halves counts
-the lower half twice. Settling each upper-half read as the constant an
-empty lane holds (tried 2026-11-26, a phantom-lane evaluation over the
-whole program after lifting) settled the reads of 65 of the 915 programs
-listed for masks (24 programs whole) and none of the 736 `v_readlane`
-ones: most reads depend on the path the wave took or on lane data. Not
-kept (too little for its weight).
+mesh group of at most 32 threads) runs as one subgroup standing
+for the wave. A fragment subgroup has at most 32 invocations, may be
+partly filled, and cannot meet another one (no shared memory, no barrier),
+so there is no other half to exchange with: the subgroup is a console wave
+in which only its invocations hold work. The other lanes (all of 32-63,
+and the lanes below 32 the subgroup lacks) are **idle**: in EXEC at no
+time the program chose, the state of every partly filled console wave
+(the console packs 16 quads of a draw into a wave, the card 8 into a
+subgroup; which pixels share a wave is the rasterizer's choice on both,
+and no program's pixels may depend on it). The translation is exact for
+that wave:
+
+- **Masks read as numbers.** A ballot has no bits for idle lanes; the
+  console's mask does. Before lifting, `lift_hi.rs` finds for each scalar
+  value whether its bits at idle lanes are all 0 or all 1: EXEC's are 0 at
+  the start, a compare gives 0 to every lane outside EXEC, the bitwise
+  scalar operations, moves, selects, `s_wqm` and the `saveexec` forms
+  compute on them, phis join (optimistically, so a mask a loop narrows
+  keeps its 0). The upper dword of a wave64 mask is then the constant 0
+  or all ones (`s_xor_b64 x, vcc, -1`, the compiler's NOT), and the lower
+  dword of a pixel program's mask is the ballot, or the ballot with the
+  bits of the lanes the subgroup lacks set. `s_bcnt1_i32_b64`,
+  `s_ff1_i32_b64` and the rest count and search those dwords. Unknown
+  (listed in `VkShader::approximate`): a compare made where idle lanes run
+  (inside a whole-wave section, on what those lanes happen to hold).
+- **Numbers kept in VCC** (`s_or_b32 vcc_lo, s15, 12`, read back as a
+  buffer offset) stay numbers outside compute; as lane masks read back
+  through a ballot they lost the bits of the lanes a subgroup lacks.
+- **Whole-wave sections** (`lift_wave.rs`
+  `section_values`): each value a section leaves is the subgroup reduction
+  or scan over the lanes that are there; for a wave64 that includes the
+  vector result, which after the tree's last step holds the whole wave's
+  result in the lower half's lanes (`crate::wave::Section::lower`).
+- **`v_readlane`** of a lane found by a search of one dword
+  (`s_ff1_i32_b64` of a mask whose upper dword is 0) reads a lane of the
+  subgroup. Of lane 32 or above it reads lane `l & 31` and is listed, unless
+  nothing reads the result (a step of a section that became a reduction)
+  or the value is wave-uniform.
+
+No program of the used set is listed any more (76 were, 2026-11-27).
 
 ## 8. What the translator returns
 
@@ -511,6 +531,14 @@ Known gaps (the program translates; the result differs from the console):
   group barrier orders buffer and image memory as well as workgroup
   memory; buffer writes one half reads back from the other without such a
   barrier are not ordered (nor are they in the HLSL the program came from).
+  **Tested offline as the card runs it** (`vk/interp_group.rs`,
+  `Mode::Halves`): each host subgroup a machine of its own, the halves
+  meeting at the lift's exchanges (the k-th with the k-th, one word per
+  half, which must be the same in all its invocations), against the same
+  group run as console waves; `cargo xtask shader-golden --halves` does it
+  for every wave64 compute and mesh program of a list with seeded inputs.
+  The card's transport of an exchange (group barriers, or counters with a
+  bounded wait: `emit_xchg.rs`) is not interpreted.
   **Most of this goes before emission (`vk/uniform.rs`).** A value is
   wave-uniform when every invocation of the console wave computes the same
   bits: constants, user data, the map, the group id (the mesh group input);
