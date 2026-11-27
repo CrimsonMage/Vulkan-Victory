@@ -419,6 +419,43 @@ driver errors and no new crash, and the captures look no worse.
   emit SPIR-V (buffer device address for raw title addresses, descriptor
   buffer), victory-gpu gets a Vulkan host; D3D12 kept behind a switch
   until parity. RAM target: <=12 GB, then ~10 GB (Series S baseline).
+- 2026-11-27 (early): what kept the world grey, found with origin/main as
+  the reference and with pass captures replayed offline.
+  - **Reference**: origin/main (the D3D12 path, lit on NVIDIA) checked out
+    read-only at /mnt/data/victory/scratch-agent/forks/origin-main;
+    docs/origin-findings.md and docs/opcode-audit.md compare its lowering
+    with ours. Twelve translator fixes came of it, each with an oracle
+    test, none baked yet (tag `baked-2026-11-26` is the cache's translator):
+    pixel kills were never emitted; multi-dword loads bounded as a whole;
+    immediate samplers never compared; whole-wave sections with lanes
+    missing; position w; float-to-int saturation; readfirstlane with an
+    empty EXEC; gather_l at its level; no hit with the builder off;
+    unwritten registers; mad_legacy. Golden: 69 of 1,527 programs changed,
+    each explained.
+  - **Host, found by captures and replay (no bake needed)**:
+    - The fog inscatter is shared-exponent words in a 32_UINT image; its
+      R9G9B9E5 view fell back to R32_UINT and read 2e9 in red: now an
+      E5B9G9R9 view. The HDR target is finite after the fog pass.
+    - One stage still compiling made every dispatch wait out the frame's
+      budget (a second a frame): a stage waited out once is skipped until
+      ready. 1.7 -> 9 frames a second; the card (105 ms) is the limit.
+    - Draws with no targets at all (fog volume and light proxies: storage
+      writes only) were dropped; drawn over their scissor now.
+    - The tiled lighting selects pixels by depth EQUAL against a depth
+      buffer (0xb082a0000) that only CS_GenerateMaterialMasks writes,
+      through storage views of its planes. A depth image has none: a
+      colour image per plane (32F depth, 8-bit stencil) takes the stores
+      and is copied in before the buffer is attached. Still open: what
+      the program stores where (integer bits at one view) and that the
+      test then passes; the lighting target stays black until it does.
+    - Dump readbacks were read (and freed) before the card ran their
+      copies: copy-engine faults (vk82, vk87). They settle four frames.
+  - **Write tracking** merged (track.rs; pages with a card copy are
+    read-only until written; ~7 ms a frame; fingerprint polling only for
+    what it cannot track).
+  - **Tools**: `cargo xtask shader-golden`, `examples/replay` on
+    `pass-<frame>-<program>/` captures, recording time by call on the 10 s
+    line.
 - 2026-11-26 (rule, the user's): **no bake per translator change.** A
   translator change ends with offline evidence: the instruction oracle
   (vk/oracle), the golden behaviour of every used program under the
