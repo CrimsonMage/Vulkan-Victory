@@ -90,18 +90,11 @@ pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// on a device without `shaderImageInt64Atomics` or R64_UINT storage atomics.
 fn wide_view(b: &Backend, image: &Image, key: ViewKey) -> Option<vk::ImageView> {
     let two_dwords = matches!(key.format, vk::Format::R32G32_UINT | vk::Format::R32G32_SINT | vk::Format::R32G32_SFLOAT);
-    if !(two_dwords && b.host.caps.image_int64_atomics && r64_atomics(b)) || no_wide() {
+    if !(two_dwords && b.host.caps.image_int64_atomics && r64_atomics(b)) {
         return None;
     }
     let identity = [vk::ComponentSwizzle::IDENTITY; 4];
     image.view(b, ViewKey { format: vk::Format::R64_UINT, components: identity, ..key })
-}
-
-/// `VICTORY_VK_NO_WIDE=1` (diagnostics, an experiment): no R64_UINT views
-/// are written; binding 3 stays null.
-fn no_wide() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_VK_NO_WIDE").is_some())
 }
 
 /// Whether R64_UINT storage images take atomics (optimal tiling).
