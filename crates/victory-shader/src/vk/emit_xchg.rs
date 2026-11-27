@@ -149,8 +149,21 @@ impl Emit<'_> {
     /// invocation runs exactly once.
     fn uneven_barriers(&self, once: &[bool]) -> bool {
         let top = self.top_level(once, &Op::Barrier);
-        let all = self.f.nodes.iter().filter(|n| n.op == Op::Barrier).count();
-        top.len() != all || top.iter().any(|&(o, _)| !o)
+        top.len() != self.placed(&Op::Barrier) || top.iter().any(|&(o, _)| !o)
+    }
+
+    /// The nodes of `op` the program runs (in a block, guarded or not; the
+    /// node list also holds removed ones).
+    fn placed(&self, want: &Op) -> usize {
+        fn count(f: &Func, list: &[Item], want: &Op) -> usize {
+            list.iter()
+                .map(|it| match it {
+                    Item::N(v) => usize::from(f.node(*v).op == *want),
+                    Item::Guard { body, .. } => count(f, body, want),
+                })
+                .sum()
+        }
+        self.f.blocks.iter().map(|b| count(self.f, &b.body, want)).sum()
     }
 
     /// At the program's start: how the waves meet (the barrier form for the
@@ -163,7 +176,7 @@ impl Emit<'_> {
         }
         let once = self.once_blocks();
         self.bar_counted = self.st.stage == HwStage::Ms && self.uneven_barriers(&once);
-        let has_xchg = self.f.nodes.iter().any(|n| n.op == Op::Xchg);
+        let has_xchg = self.placed(&Op::Xchg) > 0;
         if self.counted() && !self.bar_counted {
             self.xv.once = self.top_level(&once, &Op::Xchg).into_iter().filter(|&(o, _)| o).map(|(_, v)| v).collect();
         }

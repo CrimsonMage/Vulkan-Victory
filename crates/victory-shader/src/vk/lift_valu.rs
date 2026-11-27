@@ -811,7 +811,7 @@ impl Lift<'_> {
                     return Ok(());
                 }
                 if self.wave64_halves() && self.f.as_const(l).is_none_or(|c| c >= 32) {
-                    self.approx("v_readlane_b32 of a lane in the other half of a wave64");
+                    self.approx_unless_uniform("v_readlane_b32 of a lane in the other half of a wave64", x);
                 }
                 let k31 = self.k32(31);
                 let l = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);

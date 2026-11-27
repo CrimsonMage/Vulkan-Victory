@@ -18,6 +18,7 @@ pub mod report;
 pub mod semantics;
 pub mod spirv;
 pub mod tir;
+pub mod uniform;
 pub mod usage;
 
 use std::collections::HashMap;
@@ -154,7 +155,7 @@ pub fn translate(container: &[u8]) -> Result<VkShader, ShaderError> {
 /// take their locations from `semantics`.
 pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShader, ShaderError> {
     let (c, native) = native(container)?;
-    let (f, iface) = thread_ir_of(&c, &native)?;
+    let (f, iface) = thread_ir_of(&c, &native, true)?;
     let ir_insts = f.count();
     let osg = c.part(FourCC::OSG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
     let isg = c.part(FourCC::ISG1).map(|p| signature(p.data)).transpose()?.unwrap_or_default();
@@ -238,11 +239,19 @@ fn emit_mesh_fitting(f: &tir::Func, iface: &lift::Interface, st: emit::Stage) ->
 /// translation makes it: for [`interp`] and other offline checks.
 pub fn thread_ir(container: &[u8]) -> Result<(tir::Func, lift::Interface, NativeProgram), ShaderError> {
     let (c, native) = native(container)?;
-    let (f, iface) = thread_ir_of(&c, &native)?;
+    let (f, iface) = thread_ir_of(&c, &native, true)?;
     Ok((f, iface, native))
 }
 
-fn thread_ir_of(c: &Container<'_>, native: &NativeProgram) -> Result<(tir::Func, lift::Interface), ShaderError> {
+/// The thread program without the wave-uniform simplification
+/// ([`uniform`]), to check it against the translation's.
+pub fn thread_ir_plain(container: &[u8]) -> Result<(tir::Func, lift::Interface, NativeProgram), ShaderError> {
+    let (c, native) = native(container)?;
+    let (f, iface) = thread_ir_of(&c, &native, false)?;
+    Ok((f, iface, native))
+}
+
+fn thread_ir_of(c: &Container<'_>, native: &NativeProgram, uniform: bool) -> Result<(tir::Func, lift::Interface), ShaderError> {
     let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // The branches that only skip code when no lane is left for it go: the
     // skipped vector code is guarded by EXEC anyway, and without them the
@@ -263,7 +272,16 @@ fn thread_ir_of(c: &Container<'_>, native: &NativeProgram) -> Result<(tir::Func,
     if native.stage == HwStage::Vs {
         lift.vs_float = isg.iter().filter(|r| r.reg < 32).map(|r| (r.reg as u8, !matches!(r.comp, 1 | 2 | 4 | 5))).collect();
     }
-    let (mut f, iface) = lift.run()?;
+    let (mut f, mut iface) = lift.run()?;
+    // every console wave two full host subgroups: wave64 groups of whole waves
+    let threads = lift::Lift::host_threads(native);
+    let paired = native.wave64 && matches!(native.stage, HwStage::Cs | HwStage::Ms) && threads >= 64 && threads % 64 == 0;
+    let uni = if uniform { uniform::simplify(&mut f, paired).1 } else { Vec::new() };
+    for (v, a) in std::mem::take(&mut iface.unless_uniform) {
+        if !uni.get(v as usize).copied().unwrap_or(false) && !iface.approximate.contains(&a) {
+            iface.approximate.push(a);
+        }
+    }
     tir::fold_branches(&mut f);
     ifconv::if_convert(&mut f);
     tir::dce(&mut f);
