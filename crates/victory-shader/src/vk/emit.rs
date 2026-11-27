@@ -617,11 +617,7 @@ impl<'a> Emit<'a> {
             }
         }
         let (words, at) = self.m.finish();
-        let input_locations: Vec<(u8, usize)> = self.input_locations.iter().map(|&(l, w)| (l, at + w)).collect();
-        // phis of many operands (the ladders' undef-padded ones) as variables;
-        // the input locations' words stay where they are
-        let keep = input_locations.iter().map(|&(_, w)| w + 1).max().unwrap_or(0);
-        let words = super::phivars::phis_to_vars(&words, keep).unwrap_or(words);
+        let input_locations = self.input_locations.iter().map(|&(l, w)| (l, at + w)).collect();
         let vertex_inputs = if self.st.stage == HwStage::Vs { self.inputs.keys().copied().collect() } else { Vec::new() };
         Ok(Emitted { bad_sel: self.bad_sel, words, input_locations, vertex_inputs })
     }
