@@ -381,11 +381,25 @@ pub(crate) fn new_frame() {
 /// passes such as the LUT bakes, a clear drawn as a rectangle), so the
 /// recording waits as a PC game's first use of a pipeline does.
 pub(crate) fn lookup_waiting(b: &'static Backend, shader: &Arc<Shader>) -> Lookup {
+    // Stages a frame's budget ran out on: they are not waited for again
+    // (one program compiling for minutes cost every frame its whole budget:
+    // a second a frame in the world, run vk89), only skipped until ready.
+    static GIVEN_UP: Mutex<Option<std::collections::HashSet<[u8; 32]>>> = Mutex::new(None);
     loop {
         let found = lookup(b, shader);
-        if !matches!(found, Lookup::Waiting) || WAITED_US.load(Ordering::Relaxed) >= WAIT_BUDGET_US {
+        if !matches!(found, Lookup::Waiting) {
             return found;
         }
+        let mut given_up = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+        let set = given_up.get_or_insert_with(Default::default);
+        if set.contains(&shader.full) {
+            return found;
+        }
+        if WAITED_US.load(Ordering::Relaxed) >= WAIT_BUDGET_US {
+            set.insert(shader.full);
+            return found;
+        }
+        drop(given_up);
         let t = Instant::now();
         let q = queue();
         if q.as_ref().is_some_and(|q| matches!(q.states.get(&shader.full), Some(State::Queued))) {
