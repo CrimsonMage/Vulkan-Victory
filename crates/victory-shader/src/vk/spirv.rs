@@ -231,6 +231,7 @@ pub mod en {
     pub const CAP_FRAGMENT_BARYCENTRIC_KHR: u32 = 5284;
     pub const CAP_INT64_ATOMICS: u32 = 12;
     pub const CAP_SAMPLE_RATE_SHADING: u32 = 35;
+    pub const CAP_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4466;
 
     pub const SC_UNIFORM_CONSTANT: u32 = 0;
     pub const SC_INPUT: u32 = 1;
@@ -295,6 +296,7 @@ pub mod en {
     pub const EM_OUTPUT_PRIMITIVES_EXT: u32 = 5270;
     pub const EM_OUTPUT_TRIANGLES_EXT: u32 = 5298;
     pub const EM_STENCIL_REF_REPLACING: u32 = 5027;
+    pub const EM_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4461;
 
     pub const EXEC_VERTEX: u32 = 0;
     pub const EXEC_FRAGMENT: u32 = 4;
@@ -425,6 +427,10 @@ impl Module {
 
     pub fn bound(&self) -> Id {
         self.next
+    }
+
+    pub fn has_capability(&self, cap: u32) -> bool {
+        self.cap_set.contains(&cap)
     }
 
     pub fn capability(&mut self, cap: u32) {

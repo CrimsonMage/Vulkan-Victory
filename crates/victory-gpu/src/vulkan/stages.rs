@@ -615,11 +615,13 @@ fn make(b: &Backend, shader: &Shader) -> State {
         return fail(format!("over the device: {why}"));
     }
     let t = Instant::now();
+    let fitted = victory_vk::limits::fit_float_controls(&vs.spirv, b.host.caps.signed_zero_inf_nan);
+    let code = fitted.as_deref().unwrap_or(&vs.spirv);
     // SAFETY: the translator's words, a SPIR-V module.
     let module = unsafe {
         b.host
             .device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vs.spirv), None)
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
     };
     STATS[6].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     let module = match module {

@@ -277,6 +277,10 @@ pub struct Caps {
     /// `shaderImageInt64Atomics` (VK_EXT_shader_image_atomic_int64): 64-bit
     /// image atomics on R64_UINT storage views (ABI v5 section 5.1).
     pub image_int64_atomics: bool,
+    /// `shaderSignedZeroInfNanPreserveFloat16/32/64`: the translated
+    /// modules' SignedZeroInfNanPreserve execution mode per width (left
+    /// out of a module where false: `limits::fit_float_controls`).
+    pub signed_zero_inf_nan: [bool; 3],
     /// `VK_KHR_maintenance8`: copies between a depth or stencil aspect and
     /// a colour image of matching bits, and sample offsets that are not
     /// constants.
@@ -525,13 +529,15 @@ impl Host {
         let mut m4_props = vk::PhysicalDeviceMaintenance4Properties::default();
         let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v13_props = vk::PhysicalDeviceVulkan13Properties::default();
+        let mut fc_props = vk::PhysicalDeviceFloatControlsProperties::default();
         let mut gpl_props = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let props = {
             let mut p2 = vk::PhysicalDeviceProperties2::default()
                 .push_next(&mut driver_props)
                 .push_next(&mut m4_props)
                 .push_next(&mut v11_props)
-                .push_next(&mut v13_props);
+                .push_next(&mut v13_props)
+                .push_next(&mut fc_props);
             if has(ext::external_memory_host::NAME) {
                 p2 = p2.push_next(&mut host_props);
             }
@@ -814,6 +820,12 @@ impl Host {
             timestamp_period: props.limits.timestamp_period,
             null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
             image_int64_atomics: int64_image.shader_image_int64_atomics == vk::TRUE,
+            signed_zero_inf_nan: [
+                fc_props.shader_signed_zero_inf_nan_preserve_float16,
+                fc_props.shader_signed_zero_inf_nan_preserve_float32,
+                fc_props.shader_signed_zero_inf_nan_preserve_float64,
+            ]
+            .map(|b| b == vk::TRUE),
             maintenance8: m8.on(has(MAINTENANCE8)),
             extensions,
             features,

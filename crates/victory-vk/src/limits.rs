@@ -154,6 +154,42 @@ impl Limits {
     }
 }
 
+/// SignedZeroInfNanPreserve: the capability and the execution mode.
+const CAP_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4466;
+const EM_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4461;
+
+/// The module the device takes: the translator declares
+/// SignedZeroInfNanPreserve for each float width a module uses; the
+/// execution modes of widths the device does not preserve (`preserve`:
+/// 16, 32 and 64 bits) are left out, and the capability with the last of
+/// them. `None`: the module as it is.
+pub fn fit_float_controls(words: &[u32], preserve: [bool; 3]) -> Option<Vec<u32>> {
+    let instructions = || {
+        let mut i = 5;
+        std::iter::from_fn(move || {
+            let n = ((*words.get(i)? >> 16) as usize).max(1);
+            let ins = words.get(i..i + n)?;
+            i += n;
+            Some(ins)
+        })
+    };
+    // an execution mode of this kind: Some(whether the device keeps it)
+    let mode = |ins: &[u32]| match (ins[0] & 0xFFFF, ins.get(2), ins.get(3)) {
+        (16, Some(&EM_SIGNED_ZERO_INF_NAN_PRESERVE), Some(&w)) => Some(matches!((w, preserve), (16, [true, _, _]) | (32, [_, true, _]) | (64, [_, _, true]))),
+        _ => None,
+    };
+    if words.len() < 5 || !instructions().any(|ins| mode(ins) == Some(false)) {
+        return None;
+    }
+    let kept = instructions().any(|ins| mode(ins) == Some(true));
+    let capability = |ins: &[u32]| ins[0] & 0xFFFF == 17 && ins.get(1) == Some(&CAP_SIGNED_ZERO_INF_NAN_PRESERVE);
+    let mut out = words[..5].to_vec();
+    for ins in instructions().filter(|&ins| mode(ins) != Some(false) && (kept || !capability(ins))) {
+        out.extend_from_slice(ins);
+    }
+    Some(out)
+}
+
 fn invocations(u: &Usage) -> u64 {
     u.local_size.iter().map(|&v| u64::from(v.max(1))).product()
 }
@@ -165,6 +201,21 @@ fn group_over(u: &Usage, size: [u32; 3]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_controls_fit_the_device() {
+        let cap = [2 << 16 | 17, CAP_SIGNED_ZERO_INF_NAN_PRESERVE];
+        let mode = |w| [4 << 16 | 16, 1, EM_SIGNED_ZERO_INF_NAN_PRESERVE, w];
+        let mut m = vec![0x0723_0203, 0x0001_0600, 0, 2, 0];
+        m.extend(cap);
+        m.extend(mode(16));
+        m.extend(mode(32));
+        assert_eq!(fit_float_controls(&m, [true, true, true]), None);
+        let mut only32 = m[..7].to_vec();
+        only32.extend(mode(32));
+        assert_eq!(fit_float_controls(&m, [false, true, false]), Some(only32));
+        assert_eq!(fit_float_controls(&m, [false, false, true]), Some(m[..5].to_vec()));
+    }
 
     fn nvidia() -> Limits {
         Limits {
