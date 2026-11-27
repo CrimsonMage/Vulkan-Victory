@@ -336,7 +336,8 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with("s_load_")), "{names:?}");
         // The pointer is gone with the loads; byte 0x10 is index 20, the
         // first root constant, and bytes 0-7 are the first root view.
-        let mut regs: Vec<Reg> = p.inputs.iter().map(|i| i.0).collect();
+        // (EXEC aside: the end reads it)
+        let mut regs: Vec<Reg> = p.inputs.iter().map(|i| i.0).filter(|r| *r != Reg::S(ir::EXEC)).collect();
         regs.sort();
         assert_eq!(regs, [Reg::S(16), Reg::S(17), Reg::S(20)]);
     }

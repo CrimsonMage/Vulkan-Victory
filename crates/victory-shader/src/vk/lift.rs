@@ -280,6 +280,10 @@ pub struct Lift<'a> {
     pub vs_float: HashMap<u8, bool>,
     /// Pixel input rows some site reads per vertex.
     per_vertex: HashSet<u8>,
+    /// The whole-wave sections of each block, by the index of the
+    /// instruction that restores EXEC: the values they leave (lift_wave.rs
+    /// `section_values`).
+    sections: Vec<HashMap<usize, Vec<(Value, crate::wave::Shape)>>>,
 }
 
 type Res<T> = Result<T, ShaderError>;
@@ -368,7 +372,9 @@ impl<'a> Lift<'a> {
                     _ => None,
                 })
                 .collect(),
+            sections: Vec::new(),
         };
+        l.sections = l.find_sections();
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
             StageIo::Ms(ms) => ms.lds_bytes / 4,
@@ -982,6 +988,8 @@ fn atomic_op(name: &str) -> Option<u16> {
 // Instruction families live in their own files.
 #[path = "lift_image.rs"]
 mod image;
+#[cfg(test)]
+pub(crate) use image::TEST_BVH_BUILDER;
 #[path = "lift_io.rs"]
 mod io_;
 #[path = "lift_mem.rs"]

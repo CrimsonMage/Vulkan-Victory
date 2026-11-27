@@ -146,7 +146,16 @@ impl Lift<'_> {
 
     /// The sampler: an immediate S# (constant words) is a static sampler
     /// of the interface; else the S#'s word 3 (its slot) is an argument.
-    fn image_sampler(&mut self, m: &mut Mimg) -> Res<Sampler> {
+    ///
+    /// `compare`: the instruction is a comparison (`_c`). On the console the
+    /// comparison is the instruction's: every S# holds a function, used or
+    /// not. The host's sampler must compare for these and must not for the
+    /// others, so an immediate sampler a comparison uses is listed with
+    /// [`crate::sampler::COMPARES`] set in word 0 (origin/main
+    /// `emit/lower.rs` `cmp_samplers`, `emit/mod.rs`: its static sampler
+    /// gets the comparison filter). Heap samplers compare by the title's
+    /// own description.
+    fn image_sampler(&mut self, m: &mut Mimg, compare: bool) -> Res<Sampler> {
         let s = m.sampler.ok_or(unsupported(m.inst.machine.offset, "a sample without a sampler"))?;
         let mut w = Vec::new();
         for i in 0..4 {
@@ -155,7 +164,8 @@ impl Lift<'_> {
         }
         let c: Option<Vec<u32>> = w.iter().map(|&x| self.f.as_const(x).map(|k| k as u32)).collect();
         if let Some(words) = c {
-            let words = [words[0], words[1], words[2], words[3]];
+            let mark = if compare { crate::sampler::COMPARES } else { 0 };
+            let words = [words[0] | mark, words[1], words[2], words[3]];
             let n = self.iface.samplers.iter().position(|s| *s == words).unwrap_or_else(|| {
                 self.iface.samplers.push(words);
                 self.iface.samplers.len() - 1
@@ -177,7 +187,7 @@ impl Lift<'_> {
         }
         // a cube with derivatives or offsets: its faces as a 2D array
         let layers = m.class.dim == 3 && (md.grad || md.offset);
-        let s = self.image_sampler(m)?;
+        let s = self.image_sampler(m, md.dref)?;
         let off_v = if md.offset { Some(self.next_u(m)?) } else { None };
         let bias_v = if md.bias { Some(self.next_f(m)?) } else { None };
         let dref_v = if md.dref { Some(self.next_f(m)?) } else { None };
@@ -195,6 +205,9 @@ impl Lift<'_> {
             (false, true) => Some(self.next_f(m)?),
             _ => None,
         };
+        if let (true, false, Some(lod), None) = (gather && m.class.dim == 1 && !m.class.arrayed, md.lz, lod_v, dref_v) {
+            return self.gather_at_level(m, coord, lod, off_v);
+        }
         let min_v = if md.min_lod { Some(self.next_f(m)?) } else { None };
         Self::push_opt(m, img::DREF, dref_v);
         Self::push_opt(m, img::BIAS, bias_v);
@@ -218,6 +231,54 @@ impl Lift<'_> {
         let args = std::mem::take(&mut m.args);
         let r = self.emit(Op::Image { kind, class: m.class, sampler: s, flags: m.flags }, Ty::vec(S::F32, 4), args);
         self.sample_result(m, r, gather, dref)
+    }
+
+    /// A gather at a named level (`image_gather4_l`, `_l_o`) of a 2D image:
+    /// the host's gather has no level, so the four texels are read at the
+    /// level (rounded to a whole one), in the gather's order (u0,v1)
+    /// (u1,v1) (u1,v0) (u0,v0), the offset in texels of that level,
+    /// coordinates past the edge clamped (origin/main `emit/lower.rs`,
+    /// "A gather at a named level, done as four texel reads": the title's
+    /// meshlet culling reads a 4x4 block of the depth pyramid this way, and
+    /// a gather of level 0 tested it against the wrong depths).
+    fn gather_at_level(&mut self, m: &mut Mimg, coord: V, lod: V, off: Option<V>) -> Res<()> {
+        let (zero, half, one) = (self.kf(0.0), self.kf(0.5), self.kf(1.0));
+        let l = self.gl(glsl::N_MAX, Ty::F32, &[lod, zero]);
+        let l = self.gl(glsl::ROUND_EVEN, Ty::F32, &[l]);
+        let mip = self.f_to_int(l, false);
+        let class = ImageClass { dynamic: true, ..m.class };
+        let z = self.k32(0);
+        let size = self.emit(Op::Image { kind: ImageKind::Size, class, sampler: Sampler::None, flags: img::LOD }, Ty::vec(S::U32, 2), vec![m.tw, z, mip]);
+        let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        for k in 0..2u32 {
+            let n = self.extract(size, k);
+            let n = self.spv(op::CONVERT_U_TO_F, Ty::F32, &[n]);
+            let last = self.spv(op::F_SUB, Ty::F32, &[n, one]);
+            let c = self.extract(coord, k);
+            let t = self.spv(op::F_MUL, Ty::F32, &[c, n]);
+            let t = self.spv(op::F_SUB, Ty::F32, &[t, half]);
+            let mut first = self.gl(glsl::FLOOR, Ty::F32, &[t]);
+            if let Some(o) = off {
+                let (sh, w) = (self.k32(8 * k), self.k32(6));
+                let by = self.spv(op::BIT_FIELD_S_EXTRACT, Ty::U32, &[o, sh, w]);
+                let by = self.spv(op::CONVERT_S_TO_F, Ty::F32, &[by]);
+                first = self.spv(op::F_ADD, Ty::F32, &[first, by]);
+            }
+            let next = self.spv(op::F_ADD, Ty::F32, &[first, one]);
+            for (to, x) in [(&mut lo, first), (&mut hi, next)] {
+                let x = self.gl(glsl::N_CLAMP, Ty::F32, &[x, zero, last]);
+                to.push(self.f_to_int(x, false));
+            }
+        }
+        let comp = m.dmask.trailing_zeros();
+        let mut vals = Vec::new();
+        for (x, y) in [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])] {
+            let at = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 2), &[x, y]);
+            let r = self.emit(Op::Image { kind: ImageKind::Load { mip: true }, class, sampler: Sampler::None, flags: img::LOD }, Ty::vec(S::U32, 4), vec![m.tw, at, mip]);
+            let v = self.extract(r, comp);
+            vals.push(if m.d16 { self.f32v(v) } else { v });
+        }
+        self.write_result(m.inst, m.dreg, &vals, m.d16)
     }
 
     /// A sample's channels by dmask (a gather's four; a comparison's one).
@@ -377,7 +438,7 @@ impl Lift<'_> {
     }
 
     fn image_lod(&mut self, m: &mut Mimg) -> Res<()> {
-        let s = self.image_sampler(m)?;
+        let s = self.image_sampler(m, false)?;
         let coord = self.next_vec(m, m.coords.min(3), true)?;
         m.args.push(coord);
         let args = std::mem::take(&mut m.args);
@@ -443,7 +504,7 @@ impl Lift<'_> {
         let one = self.kf(1.0);
         let x = self.spv(op::F_SUB, Ty::F32, &[s, one]);
         let y = self.spv(op::F_SUB, Ty::F32, &[t, one]);
-        let fi = self.spv(op::CONVERT_F_TO_U, Ty::U32, &[face]);
+        let fi = self.f_to_int(face, false);
         let (k3, k7, k6) = (self.k32(3), self.k32(7), self.k32(6));
         let slice = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[fi, k3]);
         let f = self.spv(op::BITWISE_AND, Ty::U32, &[fi, k7]);
@@ -463,7 +524,7 @@ impl Lift<'_> {
         let u = self.spv(op::F_MUL, Ty::F32, &[u, two]);
         let v = self.spv(op::F_SUB, Ty::F32, &[t, k15]);
         let v = self.spv(op::F_MUL, Ty::F32, &[v, two]);
-        let fi = self.spv(op::CONVERT_F_TO_U, Ty::U32, &[face]);
+        let fi = self.f_to_int(face, false);
         let k7 = self.k32(7);
         let fi = self.spv(op::BITWISE_AND, Ty::U32, &[fi, k7]);
         let nu = self.spv(op::F_NEGATE, Ty::F32, &[u]);
@@ -505,6 +566,20 @@ impl Lift<'_> {
         if a16 || d16 || x.len() != if wide { 12 } else { 11 } {
             return Err(unsupported(off, "a ray/node test with 16-bit operands"));
         }
+        if !bvh_builder() {
+            // No structures: a box enters no child, anything else is missed.
+            let k6 = self.k32(6);
+            let pair = self.spv(op::BITWISE_AND, Ty::U32, &[x[0], k6]);
+            let k4 = self.k32(4);
+            let is_box = self.spv(op::I_EQUAL, Ty::BOOL, &[pair, k4]);
+            let none = self.k32(BVH_NONE);
+            for (k, miss) in BVH_MISS.into_iter().enumerate() {
+                let miss = self.k32(miss.to_bits());
+                let c = self.spv(op::SELECT, Ty::U32, &[is_box, none, miss]);
+                self.def(inst, Reg::V(reg + k as u8), R::D(c));
+            }
+            return Ok(());
+        }
         let ptr = if wide { self.u64_of(x[0], x[1]) } else { self.spv(op::U_CONVERT, Ty::U64, &[x[0]]) };
         let ray: Vec<V> = x[if wide { 2 } else { 1 }..].iter().map(|&v| self.f32v(v)).collect();
         let w: Vec<V> = (0..2).map(|k| self.opnd_dw(inst, &rsrc, k, false).map(|v| self.u32v(v))).collect::<Res<_>>()?;
@@ -534,6 +609,40 @@ impl Lift<'_> {
         }
         Ok(())
     }
+}
+
+/// A child pointer that is not there (a box the ray does not enter).
+pub(super) const BVH_NONE: u32 = 0xffff_ffff;
+
+/// What a node test that hits no triangle returns: the distance's
+/// numerator +infinity over the denominator 1.0, no weights.
+pub(super) const BVH_MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to translate with the structure builder on or off.
+    pub(crate) static TEST_BVH_BUILDER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the title's ray-tracing structure builder runs:
+/// `VICTORY_BVH_BUILDER=1`, the switch the host reads to run the builder's
+/// dispatches (`victory-gpu` `vulkan/record.rs` `bvh_builder`; off by
+/// default). While it is off nothing builds the structures the title's
+/// ray-traced passes walk, and a node test would read whatever bytes lie
+/// where a structure would be: not the scene, different from launch to
+/// launch, in a walk the title bounds at 65,535 steps a wave. So a node
+/// test then answers "no hit" and reads nothing: a box node enters no
+/// child and any other node is missed, as in a scene with nothing in it;
+/// every ray leaves at its first test and shadow rays find no occluder
+/// (origin/main `emit/intersect.rs` `no_hit`). The switch's value is part
+/// of the stage cache key (`translation_fingerprint`), so both forms are
+/// kept.
+fn bvh_builder() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BVH_BUILDER.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v != "0")
 }
 
 /// One image instruction being lowered: its fields, the address cursor and

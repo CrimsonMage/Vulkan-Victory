@@ -17,8 +17,8 @@ pub mod native;
 pub mod sampler;
 pub mod spill;
 pub mod vk;
-/// Whole-wave sections (from the removed DXIL emitter), kept for their port
-/// into `vk/`; not used by the SPIR-V path yet.
+/// Whole-wave sections (the compiler's wave reductions and prefix sums),
+/// found by simulation; `vk/lift_wave.rs` lowers what they leave.
 #[allow(dead_code)]
 pub mod wave;
 

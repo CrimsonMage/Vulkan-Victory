@@ -177,9 +177,15 @@ The shader computes the console's address
 check from the V# at run time: with stride 0, the access is in bounds when
 `offset + size <= NUM_RECORDS`; with stride > 0, when
 `index < NUM_RECORDS` (and the offset < stride for swizzled forms, not
-used by the title). An out-of-bounds access reads zeros / drops the write
-(whole access, not per dword). Typed loads and stores decode FORMAT in
-the shader. The V#'s bytes are counted up to the end of the memory map
+used by the title). The V#'s bytes are NUM_RECORDS × max(stride, 1). **A
+load or store of several dwords (`s_buffer_load_dwordx2`…`x16`,
+`buffer_load_dwordx2`…`x4`, `buffer_store_dwordx2`…`x4`) is bounded dword
+by dword**, as the console does it: the dwords inside the V#'s bytes are
+read or written, one past its end reads zero / is dropped (a `float3` at
+the end of a 340-byte constant view is read by a four-dword load at byte
+328; origin/main `emit/lower.rs` `raw_dwords`. Until 2026-11-27 the whole
+access read zeros). A typed element is bounded as a whole. Typed loads and
+stores decode FORMAT in the shader. The V#'s bytes are counted up to the end of the memory map
 range its base lies in at most (`Helper::RangeLeft`): a V# larger than
 the memory under it (NUM_RECORDS -1, as the console's BVH builder makes
 for a raw pointer) reaches all of that range, and a base in no range
@@ -286,6 +292,20 @@ console code builds from constants): the translator lists their words
 (`StaticSampler::from_words`, already in `emit/sampler.rs`) into a slot of
 the sampler heap it reserves for them, and sets the constants per stage
 at pipeline creation.
+
+**Comparison.** On the console the comparison is the instruction's
+(`image_sample_c*`), with the function every S# holds in word 0 bits
+12-14; a Vulkan sampler compares or it does not. Heap samplers compare by
+the title's own description (its comparison filter). An immediate sampler
+that a comparison instruction uses is listed with **word 0 bits 29-30 both
+set** (`victory_shader::sampler::COMPARES`; reduction 3, which the console
+never writes): `StaticSampler::from_words` then gives the comparison
+filter (`filter & 0x180 == 0x80`) and the host's sampler has
+`compareEnable` with that function. The same console words used by a plain
+sample are listed unmarked, as another immediate sampler. (Since
+2026-11-27; before it immediate samplers never compared and a comparison
+sample read the stored depth. No layout change: the host code is as it
+was.)
 
 ## 6. Stage interface
 
@@ -446,7 +466,12 @@ translation-index --pack <pack>` runs it over a whole dump and writes
 
 Known gaps (the program translates; the result differs from the console):
 
-- Ray/node tests (`image_bvh*_intersect_ray`) run in software
+- Ray/node tests (`image_bvh*_intersect_ray`): while the title's
+  structure builder does not run (the default; `VICTORY_BVH_BUILDER=1`
+  runs it, read by the host and by the translator, part of the stage cache
+  key) a node test reads nothing and answers "no hit": a box node
+  (pointer kinds 4, 5) four times `0xffffffff`, any other node the
+  triangle miss (+inf, 1.0, 0, 0). With the builder on they run in software
   (`Helper::BvhRay`, one function per module): the node is read from
   title memory at `(T# base << 8) + (pointer >> 3) * 64` through the map
   (128 bytes in one range, else the zero block); slab tests and the

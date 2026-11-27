@@ -12,7 +12,15 @@
 //!
 //! Comparison is the sampling instruction's, not the sampler's: the console
 //! encodes a comparison function in every sampler (D3D's default, less or
-//! equal, when unused).
+//! equal, when unused). A host sampler compares or it does not, so the
+//! translator lists an immediate sampler that a comparison instruction
+//! (`image_sample_c*`) uses with [`COMPARES`] set in word 0: reduction 3,
+//! which the console never writes, decoded here as D3D's comparison
+//! reduction with the word's own function.
+
+/// Word 0 of an immediate sampler a comparison instruction uses, as the
+/// translator lists it (`VkShader::samplers`): both reduction bits.
+pub const COMPARES: u32 = 3 << 29;
 
 /// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
 /// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and
@@ -44,6 +52,8 @@ impl StaticSampler {
         let reduction = match bits(w[0], 29, 2) {
             1 => 2,
             2 => 3,
+            // the translator's mark (COMPARES): D3D's comparison reduction
+            3 => 1,
             _ => 0,
         };
         let filter = if mag >= 2 || min >= 2 {

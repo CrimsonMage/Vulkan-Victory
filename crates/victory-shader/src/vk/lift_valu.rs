@@ -99,6 +99,65 @@ impl Lift<'_> {
     }
 
     /// Legacy multiply: 0 times anything (infinity, NaN) is 0.
+    /// A float to a 32-bit integer as the console converts: toward zero,
+    /// saturated at the type's ends, 0 for a NaN (origin/main
+    /// `emit/lower.rs`, `v_cvt_u32_f32`: "D3D's conversions saturate and
+    /// give 0 for NaN, as the hardware does (checked on the RX 6700 XT and
+    /// WARP)"). SPIR-V's conversions are undefined for a value the type
+    /// does not hold, so the value is clamped to what converts exactly
+    /// first and the ends are selected.
+    pub(super) fn f_to_int(&mut self, a: V, signed: bool) -> V {
+        // the least and the greatest floats that convert without overflow
+        let (lo, hi, over, most) = if signed {
+            (-2147483648.0f32, 2147483520.0f32, 2147483648.0f32, 0x7FFF_FFFFu32)
+        } else {
+            (0.0, 4294967040.0, 4294967296.0, 0xFFFF_FFFF)
+        };
+        let (klo, khi) = (self.kf(lo), self.kf(hi));
+        let c = self.gl(glsl::N_CLAMP, Ty::F32, &[a, klo, khi]);
+        let o = if signed { op::CONVERT_F_TO_S } else { op::CONVERT_F_TO_U };
+        let x = self.spv(o, Ty::U32, &[c]);
+        let kover = self.kf(over);
+        let past = self.spv(op::F_ORD_GREATER_THAN_EQUAL, Ty::BOOL, &[a, kover]);
+        let kmost = self.k32(most);
+        let x = self.spv(op::SELECT, Ty::U32, &[past, kmost, x]);
+        if !signed {
+            // (the clamp took a NaN to 0)
+            return x;
+        }
+        let nan = self.spv(op::IS_NAN, Ty::BOOL, &[a]);
+        let z = self.k32(0);
+        self.spv(op::SELECT, Ty::U32, &[nan, z, x])
+    }
+
+    /// A float with a subnormal flushed to its signed zero.
+    fn flushed(&mut self, x: V) -> V {
+        let bits = self.u32v(x);
+        let (ke, ks, z) = (self.k32(0x7F80_0000), self.k32(0x8000_0000), self.k32(0));
+        let exp = self.spv(op::BITWISE_AND, Ty::U32, &[bits, ke]);
+        let sub = self.spv(op::I_EQUAL, Ty::BOOL, &[exp, z]);
+        let zero = self.spv(op::BITWISE_AND, Ty::U32, &[bits, ks]);
+        let r = self.spv(op::SELECT, Ty::U32, &[sub, zero, bits]);
+        self.f32v(r)
+    }
+
+    /// The legacy multiply-add as RDNA 2 runs it (`v_mad_legacy_f32`
+    /// decodes as `v_fma_legacy_f32`): subnormal sources flushed, the
+    /// product fused with the add, and a zero factor makes the product +0
+    /// whatever the other factor is (origin/main `emit/lower.rs`
+    /// `legacy_fmad`, `ftz`).
+    fn fma_legacy(&mut self, a: V, b: V, c: V) -> V {
+        let (a, b, c) = (self.flushed(a), self.flushed(b), self.flushed(c));
+        let fused = self.gl(glsl::FMA, Ty::F32, &[a, b, c]);
+        let z = self.kf(0.0);
+        let az = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[a, z]);
+        let bz = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[b, z]);
+        let any = self.spv(op::LOGICAL_OR, Ty::BOOL, &[az, bz]);
+        // +0 + c: the sign of a zero addend follows the addition
+        let addend = self.spv(op::F_ADD, Ty::F32, &[z, c]);
+        self.spv(op::SELECT, Ty::F32, &[any, addend, fused])
+    }
+
     pub(super) fn mul_legacy(&mut self, a: V, b: V) -> V {
         let p = self.spv(op::F_MUL, Ty::F32, &[a, b]);
         // A constant that is not zero (and finite) leaves the product exact.
@@ -324,8 +383,7 @@ impl Lift<'_> {
                 let b = self.fsrc(inst, v, 1)?;
                 let c = self.fsrc(inst, v, 2)?;
                 let x = if name.contains("legacy") {
-                    let p = self.mul_legacy(a, b);
-                    self.spv(op::F_ADD, Ty::F32, &[p, c])
+                    self.fma_legacy(a, b, c)
                 } else {
                     self.gl(glsl::FMA, Ty::F32, &[a, b, c])
                 };
@@ -525,8 +583,7 @@ impl Lift<'_> {
                     let s = self.spv(op::F_ADD, Ty::F32, &[a, h]);
                     a = self.gl(glsl::FLOOR, Ty::F32, &[s]);
                 }
-                let o = if name == "v_cvt_u32_f32" { op::CONVERT_F_TO_U } else { op::CONVERT_F_TO_S };
-                let x = self.spv(o, Ty::U32, &[a]);
+                let x = self.f_to_int(a, name != "v_cvt_u32_f32");
                 f(self, x)
             }
             "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
@@ -861,11 +918,22 @@ impl Lift<'_> {
                 } else if self.f.as_const(a_exec) == Some(1) {
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_BROADCAST_FIRST, u32::MAX), Ty::U32, vec![x])
                 } else {
+                    // With no lane in EXEC the console reads lane 0; here the
+                    // first lane that is there (origin/main `emit/lower.rs`
+                    // `first_lane`), not lane 31 of an empty ballot.
                     let b = self.ballot(a_exec);
-                    let l = self.gl(glsl::FIND_I_LSB, Ty::U32, &[b]);
-                    let k31 = self.k32(31);
-                    let l = self.spv(op::BITWISE_AND, Ty::U32, &[l, k31]);
+                    let l = self.first_lane_of(b);
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, l])
+                };
+                // A helper lane takes its own value: in whole-quad mode the
+                // console has helper lanes in EXEC and a waterfall loop
+                // serves them too; a host may leave them out of ballots
+                // (origin/main `emit/lower.rs` `helper_reads_own`).
+                let r = if self.native.stage == HwStage::Ps && self.f.ty(x) == Ty::U32 {
+                    let h = self.f.global(Op::Builtin(Builtin::Helper), Ty::BOOL);
+                    self.spv(op::SELECT, Ty::U32, &[h, x, r])
+                } else {
+                    r
                 };
                 self.sdst(inst, &v.dst, 0, R::D(r));
                 Ok(())

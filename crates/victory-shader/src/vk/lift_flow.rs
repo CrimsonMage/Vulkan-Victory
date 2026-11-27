@@ -52,7 +52,7 @@ impl Lift<'_> {
                         _ => self.u32v(d),
                     }
                 }
-                Err(_) => self.f.global(Op::Undef, ty),
+                Err(_) => self.f.konst(ty, 0),
             };
             let phi = self.f.push(Node { op: Op::Phi, ty, args: vec![inner, outer], imm: Vec::new() });
             self.born.insert(phi, self.cur_block);
@@ -164,6 +164,11 @@ impl Lift<'_> {
             if i + 1 == n && branch {
                 break;
             }
+            // a whole-wave section ends here: what it leaves, before the
+            // restore of EXEC
+            if self.sections[b].contains_key(&i) {
+                self.section_values(b, i)?;
+            }
             self.inst(inst)?;
         }
         self.close();
@@ -256,9 +261,15 @@ impl Lift<'_> {
                 Term::Branch(c, taken, not_taken)
             }
             Exit::End => {
-                // pixels: lanes not in EXEC at the end are killed
+                // pixels: a lane outside EXEC at the end, in a block
+                // without the last export (which kills its own, `inst`),
+                // left without exporting: killed (origin/main
+                // `emit/lower.rs`, `LaneExit::End`: "A lane leaving without
+                // its final export was killed")
                 let last = p.blocks[b].insts.last();
+                let exported = p.blocks[b].insts.iter().any(|i| matches!(i.fields, Fields::Exp { done: true, .. }));
                 if self.native.stage == HwStage::Ps
+                    && !exported
                     && let Some(inst) = last.filter(|i| i.read(Reg::S(ir::EXEC)).is_some())
                 {
                     let a = self.active(inst)?;
@@ -276,7 +287,7 @@ impl Lift<'_> {
             for j in 0..self.all_phis[b].len() {
                 let node = self.all_phis[b][j];
                 let ty = self.f.ty(node);
-                let undef = self.f.global(Op::Undef, ty);
+                let undef = self.f.konst(ty, 0);
                 for a in &mut self.f.nodes[node as usize].args {
                     if *a == u32::MAX {
                         *a = undef;
@@ -342,7 +353,7 @@ impl Lift<'_> {
                         self.u32v(d)
                     }
                 },
-                Err(_) => self.f.global(Op::Undef, ty),
+                Err(_) => self.f.konst(ty, 0),
             };
             self.f.nodes[node as usize].args[k] = x;
         }
@@ -440,12 +451,24 @@ impl Lift<'_> {
                 self.guarded = false;
                 r
             }
-            Fields::Exp { .. } => {
+            Fields::Exp { done, .. } => {
+                let done = *done;
                 let g = self.guard(inst)?;
                 self.guarded = g;
                 let r = self.export(inst);
                 self.guarded = false;
-                r
+                r?;
+                // A pixel's last export hands EXEC to the pipeline as the
+                // valid mask: a lane outside it is killed (no colour, depth
+                // or stencil is written for it), which is how the console's
+                // `discard` and `clip` end (origin/main `emit/lower.rs`
+                // `export`: `discard(!guard)` at the `done` export).
+                if done && self.native.stage == HwStage::Ps {
+                    self.close();
+                    let a = self.active(inst)?;
+                    self.kill_inactive(a);
+                }
+                Ok(())
             }
         }
     }

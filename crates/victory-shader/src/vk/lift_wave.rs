@@ -288,13 +288,123 @@ impl Lift<'_> {
         self.spv(op::SELECT, Ty::U32, &[lo_set, a, b])
     }
 
+    /// The whole-wave sections of every block (`crate::wave::sections`:
+    /// the code between `s_or_saveexec -1` and the restore of EXEC, which
+    /// the console runs in every lane of the wave, the inactive ones with
+    /// an identity: the compiler's wave reductions and prefix sums), by the
+    /// index of the restore: the values written inside that turned out to
+    /// be a reduction or a prefix over the lanes. None in a wave64 whose
+    /// halves exchange (the lanes are all there, and the tree's reads
+    /// across the halves are exchanged).
+    pub(super) fn find_sections(&self) -> Vec<HashMap<usize, Vec<(Value, crate::wave::Shape)>>> {
+        use crate::wave::Shape;
+        let p = self.p;
+        (0..p.blocks.len())
+            .map(|b| {
+                if self.xwave {
+                    return HashMap::new();
+                }
+                let mut at_end = HashMap::new();
+                for (start, sec) in crate::wave::sections(p, b) {
+                    let mut vals = Vec::new();
+                    for inst in &p.blocks[b].insts[start + 1..sec.end] {
+                        for &(_, w) in &inst.writes {
+                            if let Some(&sh @ (Shape::Active(..) | Shape::Prefix(..))) = sec.shapes.get(&w) {
+                                vals.push((w, sh));
+                            }
+                        }
+                    }
+                    at_end.insert(sec.end, vals);
+                }
+                at_end
+            })
+            .collect()
+    }
+
+    /// At the end of a whole-wave section (before instruction `end`, the
+    /// restore of EXEC): each value the section's simulation found to be a
+    /// reduction or a prefix sum over the wave's lanes of `mask ? src :
+    /// identity` becomes that subgroup operation over the invocations that
+    /// are there (origin/main `emit/lower.rs` `shape`, `section_inst`).
+    /// The console's lanes all exist and run the section's tree of DPP,
+    /// `v_permlanex16` and `v_readlane` steps; a host subgroup may be
+    /// partly filled (pixels), and the tree run lane by lane through
+    /// shuffles loses whatever passed through a lane that is not there
+    /// (lanes 0-11: lane 0 ends with lanes 0-7 only). The steps themselves
+    /// stay as lifted for the values with no such form.
+    pub(super) fn section_values(&mut self, b: usize, end: usize) -> Res<()> {
+        let Some(vals) = self.sections[b].get(&end).cloned() else { return Ok(()) };
+        self.close();
+        for (w, shape) in vals {
+            if let Some(x) = self.shape(shape) {
+                self.vals.insert(w, R::D(x));
+            }
+        }
+        Ok(())
+    }
+
+    /// A reduction (`Shape::Active`) or a prefix sum (`Shape::Prefix`) as a
+    /// subgroup operation; none for a form SPIR-V has no operation for (a
+    /// 16-bit float sum, a prefix of anything but a sum).
+    fn shape(&mut self, shape: crate::wave::Shape) -> Option<V> {
+        use crate::wave::{Op as W, Shape};
+        let (o, src, mask, ident, scan) = match shape {
+            Shape::Active(o, src, mask, ident) => (o, src, mask, ident, None),
+            Shape::Prefix(o @ (W::AddU | W::AddF), src, mask, ident, inclusive) => (o, src, mask, ident, Some(inclusive)),
+            _ => return None,
+        };
+        let (opc, float) = match o {
+            W::AddU => (349, false),
+            W::AddF => (350, true),
+            W::MinI => (353, false),
+            W::MinU => (354, false),
+            W::MinF => (355, true),
+            W::MaxI => (356, false),
+            W::MaxU => (357, false),
+            W::MaxF => (358, true),
+            W::And => (359, false),
+            W::Or => (360, false),
+            W::Xor => (361, false),
+            W::AddH => return None,
+        };
+        let m = self.value(mask, 0).ok()?;
+        let on = self.mask_of(m);
+        let x = self.value(src, 0).ok()?;
+        let x = self.data(x);
+        let x = self.u32v(x);
+        let id = self.k32(ident);
+        let x = self.spv(op::SELECT, Ty::U32, &[on, x, id]);
+        let x = if float { self.f32v(x) } else { x };
+        let ty = if float { Ty::F32 } else { Ty::U32 };
+        // group operation: 0 reduce, 1 inclusive scan, 2 exclusive scan
+        let group = match scan {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        let r = self.emit(Op::Wave(opc, group), ty, vec![x]);
+        Some(self.u32v(r))
+    }
+
     /// The host subgroup's live invocations: a console wave has all its
     /// lanes, a host subgroup may be partly filled (pixels), and reading a
     /// lane that is not there gives an undefined value.
-    fn live(&mut self) -> V {
+    pub(super) fn live(&mut self) -> V {
         let t = self.kb(true);
         let v4 = self.emit(Op::Wave(op::GROUP_NON_UNIFORM_BALLOT, u32::MAX), Ty::vec(S::U32, 4), vec![t]);
         self.extract(v4, 0)
+    }
+
+    /// The first lane of the ballot `b`, or with none in it the first
+    /// lane the subgroup has.
+    pub(super) fn first_lane_of(&mut self, b: V) -> V {
+        let live = self.live();
+        let z = self.k32(0);
+        let any = self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[b, z]);
+        let m = self.spv(op::SELECT, Ty::U32, &[any, b, live]);
+        let l = self.gl(glsl::FIND_I_LSB, Ty::U32, &[m]);
+        let k31 = self.k32(31);
+        self.spv(op::BITWISE_AND, Ty::U32, &[l, k31])
     }
 
     /// Whether lane `l` (0-31) of the host subgroup is live.
