@@ -126,13 +126,28 @@ impl Walk<'_> {
         }
     }
 
+    fn one(&mut self, at: u64, want: u64, depth: u32) {
+        let Some(bytes) = self.take(at, want) else { return };
+        self.meta.push(format!("mem {at:x} {:x}", bytes.len()));
+        if depth < 3 {
+            self.scan(&bytes, depth);
+        }
+    }
+
+    /// Small blocks first (tables, constant buffers), so the large ranges
+    /// cannot use the capture's room up before them.
     fn run(&mut self) {
-        while let Some((at, want, depth)) = self.todo.pop_front() {
-            let Some(bytes) = self.take(at, want) else { continue };
-            self.meta.push(format!("mem {at:x} {:x}", bytes.len()));
-            if depth < 3 {
-                self.scan(&bytes, depth);
+        let mut large = VecDeque::new();
+        loop {
+            while let Some((at, want, depth)) = self.todo.pop_front() {
+                if want > VIEW {
+                    large.push_back((at, want, depth));
+                } else {
+                    self.one(at, want, depth);
+                }
             }
+            let Some((at, want, depth)) = large.pop_front() else { break };
+            self.one(at, want, depth);
         }
     }
 }
