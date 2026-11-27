@@ -388,3 +388,59 @@ fn a_register_nothing_wrote_reads_zero() {
         assert_eq!(out(&m.mem, 0), want, "s0 {s0}, s1 {s1}");
     }
 }
+
+/// `v_readfirstlane_b32` with no lane in EXEC reads lane 0 on the console
+/// (origin/main `emit/lower.rs` `first_lane`: "With none, `x` of the
+/// wave's first lane here"): the first lane that is there, not lane 31 of
+/// an empty ballot.
+#[test]
+fn a_first_lane_read_with_no_lane_in_exec_reads_the_first_lane() {
+    let shader = build_cs(
+        &[
+            vop2(0x25, 7, 128 + 50, 0), // v_add_nc_u32 v7, 50, v0
+            0xBE8C_037E,                // s_mov_b32 s12, exec_lo
+            0x7DA8_0000,                // v_cmpx_gt_u32 exec, s0, v0
+            vop1(0x002, 7, vgpr(7)),    // v_readfirstlane_b32 s7, v7
+            0xBEFE_030C,                // s_mov_b32 exec_lo, s12
+            vop1(0x001, 0, sgpr(7)),    // v_mov_b32 v0, s7
+        ],
+        32,
+        0,
+    );
+    let (f, _) = crate::vk::thread_ir_native(&shader.native).expect("translation");
+    // (lanes below s0 in EXEC, the lanes there, the lane read)
+    for (below, live, lane) in [(32u32, u32::MAX, 0u32), (0, u32::MAX, 0), (0, !1u32, 1), (0, 0x0000_0F00, 8), (5, !1u32, 1)] {
+        let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+        mem.put(0x1000, &[0x2000, 0, 0x1_0000, 0x3000_0FAC]);
+        let mut m = Machine::new(&f, 32, mem);
+        m.live = (0..32).map(|l| live >> l & 1 != 0).collect();
+        m.push[4] = below;
+        m.push[8] = 0x1000;
+        assert_eq!(m.run(), Stop::Returned);
+        assert_eq!(out(&m.mem, 0), 50 + lane, "{below} lanes in EXEC, lanes there {live:#010x}");
+    }
+}
+
+/// origin/main `emit/valu_tests.rs`
+/// `legacy_mad_fuses_its_product_and_flushes_its_sources`, as written:
+/// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
+/// flushed subnormal sources and the legacy zero-factor rule.
+#[test]
+fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
+        // rounding, lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor triggers the legacy zero-factor rule with +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
+    run_cases(&mad, &cases, |backend, i, _, got| {
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
+}

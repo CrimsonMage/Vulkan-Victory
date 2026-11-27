@@ -130,6 +130,34 @@ impl Lift<'_> {
         self.spv(op::SELECT, Ty::U32, &[nan, z, x])
     }
 
+    /// A float with a subnormal flushed to its signed zero.
+    fn flushed(&mut self, x: V) -> V {
+        let bits = self.u32v(x);
+        let (ke, ks, z) = (self.k32(0x7F80_0000), self.k32(0x8000_0000), self.k32(0));
+        let exp = self.spv(op::BITWISE_AND, Ty::U32, &[bits, ke]);
+        let sub = self.spv(op::I_EQUAL, Ty::BOOL, &[exp, z]);
+        let zero = self.spv(op::BITWISE_AND, Ty::U32, &[bits, ks]);
+        let r = self.spv(op::SELECT, Ty::U32, &[sub, zero, bits]);
+        self.f32v(r)
+    }
+
+    /// The legacy multiply-add as RDNA 2 runs it (`v_mad_legacy_f32`
+    /// decodes as `v_fma_legacy_f32`): subnormal sources flushed, the
+    /// product fused with the add, and a zero factor makes the product +0
+    /// whatever the other factor is (origin/main `emit/lower.rs`
+    /// `legacy_fmad`, `ftz`).
+    fn fma_legacy(&mut self, a: V, b: V, c: V) -> V {
+        let (a, b, c) = (self.flushed(a), self.flushed(b), self.flushed(c));
+        let fused = self.gl(glsl::FMA, Ty::F32, &[a, b, c]);
+        let z = self.kf(0.0);
+        let az = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[a, z]);
+        let bz = self.spv(op::F_ORD_EQUAL, Ty::BOOL, &[b, z]);
+        let any = self.spv(op::LOGICAL_OR, Ty::BOOL, &[az, bz]);
+        // +0 + c: the sign of a zero addend follows the addition
+        let addend = self.spv(op::F_ADD, Ty::F32, &[z, c]);
+        self.spv(op::SELECT, Ty::F32, &[any, addend, fused])
+    }
+
     pub(super) fn mul_legacy(&mut self, a: V, b: V) -> V {
         let p = self.spv(op::F_MUL, Ty::F32, &[a, b]);
         // A constant that is not zero (and finite) leaves the product exact.
@@ -355,8 +383,7 @@ impl Lift<'_> {
                 let b = self.fsrc(inst, v, 1)?;
                 let c = self.fsrc(inst, v, 2)?;
                 let x = if name.contains("legacy") {
-                    let p = self.mul_legacy(a, b);
-                    self.spv(op::F_ADD, Ty::F32, &[p, c])
+                    self.fma_legacy(a, b, c)
                 } else {
                     self.gl(glsl::FMA, Ty::F32, &[a, b, c])
                 };
