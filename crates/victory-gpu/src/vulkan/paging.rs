@@ -238,7 +238,11 @@ pub(super) fn report_written(frames: u64) {
     let (faults, flush_ns) = (since(FAULTS), since(FLUSH_NS));
     // What a fault costs now (the store into a protected page of our own,
     // through the system's exception dispatch), measured with each line.
-    let cost = cfg!(feature = "diagnostics").then(crate::track::fault_cost).flatten();
+    // (only once a real store has faulted: that proves the title's fault
+    // handler is there; a bake has none, and the probe's own fault ended
+    // the process, run of 2026-11-27)
+    let handled = COUNT[FAULTS].load(Ordering::Relaxed) != 0;
+    let cost = (cfg!(feature = "diagnostics") && handled).then(crate::track::fault_cost).flatten();
     let (fault_ns, change_ns) = cost.unwrap_or((0, 0));
     tracing::info!(
         faults = COUNT[FAULTS].load(Ordering::Relaxed),
