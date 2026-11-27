@@ -265,7 +265,7 @@ pub(crate) fn depth_format(dxgi: u32) -> Option<vk::Format> {
 
 /// Whether a view format of a depth family reads stencil.
 pub(crate) fn reads_stencil(dxgi: u32) -> bool {
-    matches!(dxgi, 21 | 47 | 120)
+    matches!(dxgi, 22 | 47 | 120)
 }
 
 /// The Vulkan format of a title (colour) format; for textures the card
