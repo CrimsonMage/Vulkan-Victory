@@ -66,6 +66,10 @@ fn configure(m: &mut interp::Machine, f: &tir::Func) {
                 println!("output slot {slot} comp {comp}: %{v} of {:?}", n.args);
                 m.watch.extend(n.args.iter().copied());
             }
+            if let tir::Op::Image { kind: tir::ImageKind::Store { .. }, .. } = n.op {
+                println!("image store %{v} of {:?}", n.args);
+                m.watch.extend(n.args.iter().copied());
+            }
         }
     }
     if let Some(x) = var("UNDEF") {
