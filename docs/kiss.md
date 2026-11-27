@@ -198,7 +198,8 @@ driver errors and no new crash, and the captures look no worse.
     new texture drops its neighbours (log: `new_at=0x59c268000+0xab000
     old_at=0x59c264000+0xab000`). Which ones are alive when a material is
     drawn is a matter of order: the run-to-run picture.
-  - **Tried, not merged** (commit after this entry's, see the branch): a
+  - **Tried, not merged** (local branch `sh-texture-own-trial`, one commit
+    on this one, d860421): a
     texture owns the bytes through the most detailed level a view has
     named (`Image::own`), and only those count for `drop_overlaid` and for
     remapped pages. Overlaid drops 100,000 -> 64,000 (most views name
