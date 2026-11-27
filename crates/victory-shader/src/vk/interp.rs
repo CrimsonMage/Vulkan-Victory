@@ -131,6 +131,9 @@ pub struct Machine<'a> {
     pub image_texel: W,
     /// What an undefined value reads (a poison to find uses of them).
     pub undef: u64,
+    /// Images read texels that differ by lane: each float channel scaled
+    /// by 1, 1.5, 2, 2.5 or 3 (lane mod 5), so branches on them diverge.
+    pub image_vary: bool,
 }
 
 fn width(s: S) -> u32 {
@@ -259,6 +262,7 @@ impl<'a> Machine<'a> {
             image_levels: 1,
             image_texel: [0; 4],
             undef: 0,
+            image_vary: false,
         }
     }
 
@@ -436,10 +440,19 @@ impl<'a> Machine<'a> {
                 ImageKind::Size => self.image_size,
                 ImageKind::Levels => s(u64::from(self.image_levels)),
                 ImageKind::Store { .. } => [0; 4],
-                _ => self.image_texel,
+                _ => self.texel(l),
             },
             Op::Input { loc, comp, .. } | Op::PerVertex { loc, comp, .. } => s(input(*loc, *comp, l, n.ty)),
         })
+    }
+
+    /// What an image read gives lane `l`.
+    fn texel(&self, l: usize) -> W {
+        if !self.image_vary {
+            return self.image_texel;
+        }
+        let k = 1.0 + 0.5 * (l % 5) as f32;
+        self.image_texel.map(|x| u64::from((f32::from_bits(x as u32) * k).to_bits()))
     }
 
     fn builtin(&self, b: Builtin, l: usize) -> Result<u32, String> {

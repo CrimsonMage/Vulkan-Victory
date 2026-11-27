@@ -11,7 +11,8 @@
 //! `IMAGE=size,levels,texel[,g,b,a]` (hexadecimal) what every image reads,
 //! `UNDEF=bits` what undefined values read (default 0), `FILL=dword` what
 //! memory the file leaves out reads (default 0), `OUT=1` prints the values
-//! a pixel or vertex program outputs (watched).
+//! a pixel or vertex program outputs and what image stores write
+//! (watched), `VARY=1` image texels that differ by lane.
 use victory_shader::vk::{interp, thread_ir, tir};
 
 fn hex(s: &str) -> u64 {
@@ -57,6 +58,7 @@ fn configure(m: &mut interp::Machine, f: &tir::Func) {
         m.image_levels = v[1] as u32;
         m.image_texel = if v.len() >= 6 { [v[2], v[3], v[4], v[5]] } else { [v[2]; 4] };
     }
+    m.image_vary = var("VARY").is_some();
     if let Some(x) = var("FILL") {
         m.mem.fill = hex(&x) as u32;
     }
