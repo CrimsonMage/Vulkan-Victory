@@ -164,6 +164,12 @@ impl Image {
         self.card_written.load(Ordering::Relaxed)
     }
 
+    /// An unordered view of the image was made: the card writes it from
+    /// now on, whatever its resource said.
+    pub(crate) fn written_by_card(&self) {
+        self.card_written.store(true, Ordering::Relaxed);
+    }
+
     pub(crate) fn depth(&self) -> bool {
         self.key.depth
     }
@@ -609,6 +615,21 @@ pub(crate) fn at(b: &Backend, address: u64, desc: &ResourceDesc, by_view: bool) 
     }
 }
 
+/// The format of the colour image of a resource.
+fn made_format(desc: &ResourceDesc, card_written: bool) -> Option<vk::Format> {
+    // DXGI_FORMAT_R9G9B9E5_SHAREDEXP that is no render target: the card
+    // can neither store to nor render to that format, and the title writes
+    // such textures as packed words through 32_UINT views (the screen
+    // probes' ray radiance, the final gather's output), whether or not the
+    // resource says it takes unordered access. A 32_UINT image takes the
+    // stores; its sampled views read the words as what they are
+    // (`views::view_format`).
+    if crate::resource::pc_format(desc.format) == 67 && desc.flags & RENDER_TARGET == 0 {
+        return Some(vk::Format::R32_UINT);
+    }
+    color_format(desc.format, card_written)
+}
+
 fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Option<&Arc<Image>>) -> Option<Image> {
     let depth = key.depth;
     let card_written = desc.flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) != 0
@@ -616,7 +637,7 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
     let format = if depth {
         depth_format(desc.format)?
     } else {
-        color_format(desc.format, card_written)?
+        made_format(desc, card_written)?
     };
     let (kind, extent, layers) = match desc.dimension {
         TEXTURE_1D => (vk::ImageType::TYPE_1D, vk::Extent3D { width: key.width, height: 1, depth: 1 }, u32::from(key.depth_or_array)),
@@ -642,7 +663,14 @@ fn make(b: &Backend, r: &mut Registry, key: Key, desc: &ResourceDesc, alias: Opt
         if desc.flags & RENDER_TARGET != 0 {
             usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
         }
-        if desc.flags & UNORDERED != 0 {
+        // Storage for every colour image the driver gives it to (it is
+        // dropped below where it does not): the console takes an unordered
+        // view of a resource made without the flag, and an image without
+        // the usage has no storage view, so the stores went to the null
+        // descriptor (CS_ScreenProbes_Inject's ray radiance, runs gi5 to
+        // gi8: the probes' radiance was all zeros and no indirect light
+        // reached the lighting).
+        if key.samples == 1 {
             usage |= vk::ImageUsageFlags::STORAGE;
         }
     }

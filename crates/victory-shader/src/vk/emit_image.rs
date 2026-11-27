@@ -65,7 +65,52 @@ impl Emit<'_> {
         }
     }
 
+    /// A gather of an image whose view is of floats or of integers, as its
+    /// T# says (bit 24): the integer view is read through the uint image
+    /// of its slot and its texels' bits are the result (the float image of
+    /// an integer view reads nothing on the card: every tile of
+    /// CS_Tiling_Generate_Opaque had stencil 0 and no class).
+    fn img_gather(&mut self, kind: ImageKind, class: ImageClass, sampler: Sampler, a: ImgArgs, comp: u8) -> Id {
+        let (u, f, b) = (self.t.u32_, self.t.f32_, self.t.bool_);
+        let (v4u, v4f) = (self.m.t_vec(u, 4), self.m.t_vec(f, 4));
+        let class = ImageClass { dynamic: false, ..class };
+        let s = self.load_sampler(sampler, a.sw);
+        let (k24, z) = (self.c32(1 << 24), self.c32(0));
+        let ibit = self.m.op(op::BITWISE_AND, u, &[a.tw, k24]);
+        let is_int = self.m.op(op::I_NOT_EQUAL, b, &[ibit, z]);
+        let comp = self.c32(u32::from(comp));
+        let (mask, _) = self.sample_operands(kind, a);
+        let gm = mask & !(en::IMG_LOD | en::IMG_GRAD | en::IMG_BIAS | en::IMG_MIN_LOD);
+        let (merge, li, lf) = (self.m.id(), self.m.id(), self.m.id());
+        self.m.op_void(op::SELECTION_MERGE, &[merge, 0]);
+        self.m.op_void(op::BRANCH_CONDITIONAL, &[is_int, li, lf]);
+        let mut incoming = Vec::new();
+        for (label, int) in [(li, true), (lf, false)] {
+            self.m.label(label);
+            self.block = label;
+            let (im, _) = self.load_image(class, int, false, false, a.tw);
+            let ity = self.m.t_image_d(if int { u } else { f }, u32::from(class.dim), false, class.arrayed, class.ms, 1);
+            let sity = self.m.t_sampled_image(ity);
+            let si = self.m.op(op::SAMPLED_IMAGE, sity, &[im, s]);
+            let mut o = vec![si, a.coord, comp];
+            if gm != 0 {
+                o.push(gm);
+                o.extend(a.offset);
+            }
+            let r = self.m.op(op::IMAGE_GATHER, if int { v4u } else { v4f }, &o);
+            let r = if int { self.m.op(op::BITCAST, v4f, &[r]) } else { r };
+            incoming.extend([r, label]);
+            self.m.op_void(op::BRANCH, &[merge]);
+        }
+        self.m.label(merge);
+        self.block = merge;
+        self.m.op(op::PHI, v4f, &incoming)
+    }
+
     fn img_sample(&mut self, kind: ImageKind, class: ImageClass, sampler: Sampler, a: ImgArgs, tid: Id) -> Id {
+        if let (ImageKind::Gather { comp, dref: false, .. }, true) = (kind, class.dynamic) {
+            return self.img_gather(kind, class, sampler, a, comp);
+        }
         let f = self.t.f32_;
         let v4f = self.m.t_vec(f, 4);
         let depth = a.dref.is_some();

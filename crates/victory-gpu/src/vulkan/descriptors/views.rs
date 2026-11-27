@@ -387,6 +387,11 @@ fn texture_words(
     } else {
         comps
     };
+    // A stencil view holds the stencil in every channel, as the console's
+    // does (the title's programs load it from the first and gather it from
+    // the second: CS_Tiling_Generate_Opaque's gather of the material
+    // classes read the second channel of the card's view, which is 0).
+    let comps = if stencil && !unordered { [vk::ComponentSwizzle::R; 4] } else { comps };
     let key = ViewKey {
         format,
         kind: shape.kind,

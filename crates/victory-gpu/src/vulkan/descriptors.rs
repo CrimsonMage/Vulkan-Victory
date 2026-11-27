@@ -405,6 +405,13 @@ impl Heaps {
         }
         let sampled = image.view(b, ViewKey { storage: false, ..key });
         let storage = if key.storage { image.view(b, key) } else { None };
+        if key.storage {
+            match storage {
+                Some(_) => image.written_by_card(),
+                // (never silently: the program's stores would go to the null descriptor)
+                None => super::images::once_warn(format!("Vulkan: an unordered view without a storage view: {:?} of an image of {:?} at {:#x}, usage {:?}", key.format, image.format, image.key.address, image.usage)),
+            }
+        }
         let sampled = sampled.or(storage)?;
         let completed = b.timeline.completed(&b.host);
         let mut i = 0;
