@@ -801,6 +801,11 @@ driver errors and no new crash, and the captures look no worse.
     17 modules change (-333 to +114 words; the largest ones not), the
     golden file's 1,527 behaviours not. `docs/translation-index.md` (the
     whole pack) still has the old notes: `cargo xtask translation-index`.
+- 2026-11-27 (decision, the user's): the card ceiling is raised from
+  4,608 to 5,504 MiB now, and is to come down again as room is found (the
+  ~2.2 GiB of card-written images; the seven 3840x2160 interface
+  targets). At 4,608 the pool's GPU view was starved and parts of the
+  scene came and went.
 - 2026-11-27 (12:30): run vk106 (exe int58 = integrate 7c6e839, host
   changes only on the `batch-2026-11-27d` cache; switches
   `VICTORY_AMBIENT=constant:0.5 VICTORY_VK_CEILING_MB=5312`; frame

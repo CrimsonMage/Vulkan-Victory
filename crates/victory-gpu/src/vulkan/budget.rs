@@ -29,8 +29,13 @@ use victory_vk::pool::LEAST;
 
 use super::{Backend, images, memory};
 
-/// Ours on the card at most.
-pub(super) const CEILING: u64 = 4608 << 20;
+/// Ours on the card at most. Raised from 4,608 MiB on 2026-11-27 (the
+/// user's decision, to be lowered again as room is found): at 4,608 the
+/// pool's GPU view got ~0.4 of the ~1.05 GiB the title shows through it,
+/// and the character's head, the window mesh and the far buildings came
+/// and went with eviction. The room to win back is in the ~2.2 GiB of
+/// card-written images (among them seven 3840x2160 interface targets).
+pub(super) const CEILING: u64 = 5504 << 20;
 /// The card's budget we never grow into.
 const ROOM: u64 = 1 << 30;
 /// A move of this much prints the card-memory line.
