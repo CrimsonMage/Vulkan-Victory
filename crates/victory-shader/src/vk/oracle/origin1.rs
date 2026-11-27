@@ -188,3 +188,58 @@ fn an_immediate_sampler_of_a_comparison_sample_compares() {
     assert_eq!(iface.samplers, vec![COMPARE_WORDS]);
     assert_eq!(StaticSampler::from_words(COMPARE_WORDS).filter, 0x14);
 }
+
+/// A pixel program of 32 lanes whose only input is the pixel's x (v0: the
+/// interpreter gives lane l the centre 0.5 + l % 8).
+fn pixel(body: &[u32]) -> NativeProgram {
+    let mut words = body.to_vec();
+    words.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        // SPI_PS_INPUT_ADDR: POS_X_FLOAT_ENA
+        io: StageIo::Ps { inputs: Vec::new(), input_addr: 1 << 8, db_shader_control: 0, patches: Vec::new() },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A pixel's last export (`done`) hands EXEC to the pipeline as the valid
+/// mask: the lanes outside it are killed, which is how the console's
+/// `discard` and `clip` end (origin/main `emit/lower.rs` `export`:
+/// `discard(!guard)` at the `done` export; ACO ends a discard the same
+/// way). Here the lanes at x < 4 leave EXEC before `exp mrt0 ... done vm`:
+/// they must be demoted, the others must write the colour.
+#[test]
+fn a_pixel_outside_exec_at_the_last_export_is_killed() {
+    use crate::vk::tir::{Item, Op};
+    let native = pixel(&[
+        vop1(0x001, 1, 242),  // v_mov_b32 v1, 1.0
+        0x7C22_00F6,          // v_cmpx_lt_f32 exec, 4.0, v0
+        0xF800_180F,
+        0x0101_0101,          // exp mrt0, v1, v1, v1, v1 done vm
+    ]);
+    let (f, iface) = crate::vk::thread_ir_native(&native).expect("translation");
+    assert!(iface.demotes);
+    // the demotion's guard: a condition per lane
+    let kills: Vec<u32> = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.body)
+        .filter_map(|it| match it {
+            Item::Guard { cond, body, .. } if body.iter().any(|x| matches!(x, Item::N(v) if f.node(*v).op == Op::Demote)) => Some(*cond),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kills.len(), 1, "one demotion, at the last export");
+    let mut m = Machine::new(&f, 32, Memory::default());
+    assert_eq!(m.run(), Stop::Returned);
+    for l in 0..32usize {
+        let inside = l % 8 >= 4;
+        assert_eq!(m.value(kills[0], l)[0] != 0, !inside, "lane {l} killed");
+        let wrote = m.outputs.keys().any(|k| k.0 == 0 && k.3 == l);
+        assert_eq!(wrote, inside, "lane {l} writes mrt0");
+    }
+}

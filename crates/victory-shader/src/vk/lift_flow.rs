@@ -440,12 +440,24 @@ impl Lift<'_> {
                 self.guarded = false;
                 r
             }
-            Fields::Exp { .. } => {
+            Fields::Exp { done, .. } => {
+                let done = *done;
                 let g = self.guard(inst)?;
                 self.guarded = g;
                 let r = self.export(inst);
                 self.guarded = false;
-                r
+                r?;
+                // A pixel's last export hands EXEC to the pipeline as the
+                // valid mask: a lane outside it is killed (no colour, depth
+                // or stencil is written for it), which is how the console's
+                // `discard` and `clip` end (origin/main `emit/lower.rs`
+                // `export`: `discard(!guard)` at the `done` export).
+                if done && self.native.stage == HwStage::Ps {
+                    self.close();
+                    let a = self.active(inst)?;
+                    self.kill_inactive(a);
+                }
+                Ok(())
             }
         }
     }
