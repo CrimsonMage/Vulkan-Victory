@@ -1,0 +1,221 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+// The estimate of indirect diffuse light (`ambient.rs`), three parts run
+// one after another. Compiled offline and kept as words in
+// `ambient/words.rs` (twelve a line):
+//   glslangValidator -V --target-env vulkan1.3 ambient.comp -o a.spv
+//   spirv-opt -O --strip-debug a.spv -o ambient.spv
+//
+// The method is VIctory-NVIDIA's (`crates/victory-gpu/src/ambient.rs`,
+// GPL-3.0-or-later; the constant it grew from is beloooo's,
+// VIctory-Belobug-AMD): the light visible surfaces send out, as the title
+// keeps it from the frame before, averaged in 32x18 cells; at 160x90
+// points the mean of the cells by the share of the surroundings each
+// covers, with its first moments (a direction per colour); each texel takes
+// the points around it at its own depth, along its normal, shaded in
+// creases. Unlike there, the cells hold one bounce: what the lighting added
+// for the stand-in the frame before is taken out of the kept light.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int CX = 32, CY = 18, CELLS = CX * CY;
+const int PX = 160, PY = 90;
+// The kept values: the cells' light, the slow mean of all of them, where
+// the cells are (w: the square of the distance), three values a point
+// (red, green, blue: xyz the first moment, w the mean).
+const int MEAN = CELLS, PLACES = CELLS + 1, POINTS = 2 * CELLS + 1;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Kept { vec4 v[]; };
+
+layout(push_constant, std430) uniform Push {
+    Kept kept;
+    uint part;
+    uint depth;
+    uint radiance;
+    uint light;
+    uint albedo;
+    uint before;
+    float level;
+    float strength;
+    float radius;
+    float near;
+    float tan_y;
+    float follow;
+    float most;
+    float back;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D sampled[1048576];
+layout(set = 0, binding = 1, r32ui) uniform uimage2D stored[1048576];
+
+// The point seen at a texel, in metres from the eye (x right, y up, z away).
+vec3 seen(ivec2 p, ivec2 size) {
+    float d = texelFetch(sampled[pc.depth], clamp(p, ivec2(0), size - 1), 0).r;
+    float z = min(pc.near / max(d, 1e-7), 1000.0);
+    vec2 ndc = (vec2(p) + 0.5) / vec2(size) * 2.0 - 1.0;
+    return vec3(ndc.x * pc.tan_y * float(size.x) / float(size.y) * z, -ndc.y * pc.tan_y * z, z);
+}
+
+vec3 sound(vec3 c) {
+    return any(isnan(c)) || any(isinf(c)) ? vec3(0.0) : max(c, vec3(0.0));
+}
+
+// The texel of image `slot` at a place of the picture (0 to 1).
+ivec2 texel(uint slot, vec2 place) {
+    return ivec2(place * vec2(textureSize(sampled[slot], 0)));
+}
+
+// Part 0, a cell an invocation: its light and its place.
+void keep(ivec2 at) {
+    if (at.x >= CX || at.y >= CY) return;
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 5; y++) for (int x = 0; x < 5; x++) {
+        vec2 place = (vec2(at) + (vec2(x, y) + 0.5) / 5.0) / vec2(CX, CY);
+        vec3 c = sound(texelFetch(sampled[pc.radiance], texel(pc.radiance, place), 0).rgb);
+        // Not the stand-in's own light, reflected: what the lighting added
+        // for it the frame before (the sky took none).
+        if (texelFetch(sampled[pc.depth], texel(pc.depth, place), 0).r > 0.0) {
+            vec3 albedo = texelFetch(sampled[pc.albedo], texel(pc.albedo, place), 0).rgb;
+            vec3 given = texelFetch(sampled[pc.before], texel(pc.before, place), 0).rgb;
+            c = max(c - pc.back * sound(albedo) * sound(given), vec3(0.0));
+        }
+        // Lamps and glints count, but not for everything.
+        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+    }
+    int i = at.y * CX + at.x;
+    pc.kept.v[i] = vec4(sum / 25.0, 1.0);
+    ivec2 size = textureSize(sampled[pc.depth], 0);
+    vec3 p = seen(ivec2((vec2(at) + 0.5) * vec2(size) / vec2(CX, CY)), size);
+    pc.kept.v[PLACES + i] = vec4(p, p.z * p.z);
+}
+
+// Part 1, a point an invocation: what its surroundings send it.
+void gather(ivec2 at) {
+    if (at.x >= PX || at.y >= PY) return;
+    ivec2 size = textureSize(sampled[pc.depth], 0);
+    vec3 p = seen(ivec2((vec2(at) + 0.5) * vec2(size) / vec2(PX, PY)), size);
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float whole = 0.0;
+    vec3 toward = vec3(0.0), light = vec3(0.0), red = vec3(0.0), green = vec3(0.0), blue = vec3(0.0), all = vec3(0.0);
+    for (int i = 0; i < CELLS; i++) {
+        vec4 c = pc.kept.v[PLACES + i];
+        vec3 l = pc.kept.v[i].rgb;
+        vec3 d = c.xyz - p;
+        float dd = dot(d, d);
+        float w = c.w / (dd + r2);
+        vec3 dir = d / sqrt(dd + 0.25 * r2);
+        whole += w;
+        toward += w * dir;
+        light += w * l;
+        red += w * l.r * dir;
+        green += w * l.g * dir;
+        blue += w * l.b * dir;
+        all += l;
+    }
+    whole = max(whole, 1e-6);
+    light /= whole;
+    toward /= whole;
+    int at0 = POINTS + (at.y * PX + at.x) * 3;
+    pc.kept.v[at0] = vec4(red / whole - light.r * toward, light.r);
+    pc.kept.v[at0 + 1] = vec4(green / whole - light.g * toward, light.g);
+    pc.kept.v[at0 + 2] = vec4(blue / whole - light.b * toward, light.b);
+    if (at == ivec2(0)) {
+        // The slow mean of the last seconds: what is not on screen.
+        vec4 was = pc.kept.v[MEAN];
+        vec3 now = all / float(CELLS);
+        pc.kept.v[MEAN] = vec4(was.a > 0.0 ? mix(sound(was.rgb), now, pc.follow) : now, 1.0);
+    }
+}
+
+vec3 unpack(uint v) {
+    return vec3(v & 511u, (v >> 9) & 511u, (v >> 18) & 511u) * exp2(float(v >> 27) - 24.0);
+}
+
+uint pack(vec3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) {
+        e = min(e + 1, 31);
+        scale = exp2(float(24 - e));
+    }
+    uvec3 m = min(uvec3(c * scale + 0.5), uvec3(511u));
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+
+// Part 2, a texel of the diffuse light an invocation.
+void raise(ivec2 p) {
+    ivec2 size = imageSize(stored[pc.light]);
+    if (p.x >= size.x || p.y >= size.y) return;
+    ivec2 ds = textureSize(sampled[pc.depth], 0);
+    vec3 c = seen(p, ds);
+    // The sky takes no light.
+    if (c.z >= 999.0) return;
+    vec3 l = seen(p + ivec2(-1, 0), ds), r = seen(p + ivec2(1, 0), ds);
+    vec3 u = seen(p + ivec2(0, -1), ds), d = seen(p + ivec2(0, 1), ds);
+    vec3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    vec3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    vec3 n = normalize(cross(dy, dx) + vec3(0.0, 0.0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    // How open it is (as in beloooo's cd9f78ce).
+    float open = 1.0;
+    float px = min(pc.radius * float(ds.y) / (2.0 * pc.tan_y * c.z), 128.0);
+    float noise = fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))));
+    if (pc.strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+        float sum = 0.0;
+        const int N = 12;
+        for (int i = 0; i < N; i++) {
+            float a = float(i) * 2.399963 + noise * 6.2831853;
+            vec2 o = vec2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / float(N)) * px);
+            vec3 v = seen(p + ivec2(round(o)), ds) - c;
+            float vv = dot(v, v);
+            float over = dot(v, n) - 0.004 * c.z - 0.005;
+            sum += max(over, 0.0) / sqrt(vv + 1e-6) * clamp(1.0 - vv / (pc.radius * pc.radius), 0.0, 1.0);
+        }
+        open = clamp(1.0 - pc.strength * 2.0 * sum / float(N), 0.0, 1.0);
+    }
+    // Between the four points around, those at its own depth first; which
+    // four is dithered a little.
+    vec2 g = (vec2(p) + 0.5) / vec2(size) * vec2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    ivec2 g0 = ivec2(floor(g));
+    vec2 f = g - vec2(g0);
+    vec4 sr = vec4(0.0), sg = vec4(0.0), sb = vec4(0.0);
+    float sum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = clamp(g0 + ivec2(k & 1, k >> 1), ivec2(0), ivec2(PX, PY) - 1);
+        float z = seen(ivec2((vec2(q) + 0.5) * vec2(ds) / vec2(PX, PY)), ds).z;
+        vec2 b = vec2((k & 1) != 0 ? f.x : 1.0 - f.x, (k >> 1) != 0 ? f.y : 1.0 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        int at0 = POINTS + (q.y * PX + q.x) * 3;
+        sr += w * pc.kept.v[at0];
+        sg += w * pc.kept.v[at0 + 1];
+        sb += w * pc.kept.v[at0 + 2];
+        sum += w;
+    }
+    vec3 all = vec3(sr.w, sg.w, sb.w) / sum;
+    vec3 found = all + 1.2 * vec3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = sound(mix(found, pc.kept.v[MEAN].rgb, 0.2) * pc.level * open);
+    vec3 was = unpack(imageLoad(stored[pc.light], p).r);
+    // Magenta and violet leftovers of the probes' memory (green far under
+    // red and blue; blue far over green and over red): dropped. The sky's
+    // light keeps green above 0.4 of blue, sunsets keep blue low.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = vec3(0.0);
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = vec3(0.0);
+    // What the title left counts as far as it can be true: no more than a
+    // multiple of the estimate.
+    float top = max(dot(found, LUMA) * pc.most, 1e-6);
+    was *= min(1.0, top / max(dot(was, LUMA), 1e-6));
+    imageStore(stored[pc.light], p, uvec4(pack(max(was, found)), 0u, 0u, 0u));
+}
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (pc.part == 0u) keep(at);
+    else if (pc.part == 1u) gather(at);
+    else raise(at);
+}

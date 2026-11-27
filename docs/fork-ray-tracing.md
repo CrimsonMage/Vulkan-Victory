@@ -74,10 +74,11 @@ shaders and emulates the one instruction.
    after its root node, whatever lies where the structures would be:
    indirect-light and reflection rays take the title's own miss path (sky
    probe), shadow rays are unoccluded. It also stops the title's loops from
-   walking up to 65,535 steps a wave through garbage. With it the
-   constant ambient light (`ambient.rs`) defaults to off, so that the title's
-   own probe resolve shows; `VICTORY_AMBIENT=<level>` still sets one. Do not
-   combine it with `VICTORY_BVH_BUILDER=1`.
+   walking up to 65,535 steps a wave through garbage. While the
+   builder is off the host stands in for the indirect diffuse light with an
+   estimate from the frame (`vulkan/ambient.rs`, `VICTORY_AMBIENT`); with
+   `VICTORY_BVH_BUILDER=1` it does nothing, so that the title's own probe
+   resolve shows.
 7. **Device-coherent memory for programs that sync across groups.** The
    builder's bottom-up pass reads child bounds other groups wrote (XCL: child
    pointers come out wrong unless title memory is globally coherent in compute;

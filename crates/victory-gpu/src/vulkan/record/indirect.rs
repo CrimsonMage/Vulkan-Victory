@@ -518,6 +518,7 @@ impl Rec {
                     .cmd_dispatch_indirect(cmd, buffer, at + 12 * k)
             };
         }
+        self.ambient(b, cmd);
         super::STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
