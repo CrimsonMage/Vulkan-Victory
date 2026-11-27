@@ -658,7 +658,10 @@ impl Rec {
         }
         self.refresh_map(b, cmd);
         self.last_inputs = (0, 0);
-        let (formats, count, depth) = self.begin_pass(b, cmd)?;
+        let Some((formats, count, depth)) = self.begin_pass(b, cmd) else {
+            self.no_pass(b, shaders);
+            return None;
+        };
         if let Some(name) = told {
             self.tell_draw(name, gs);
         }
@@ -1018,6 +1021,9 @@ fn draw_stages(b: &'static Backend, shaders: &[Arc<crate::pipeline::Shader>], me
 }
 
 /// The recording's part of the 10 s line.
+/// Draws left out because no target of theirs has an image.
+static NO_PASS: AtomicU64 = AtomicU64::new(0);
+
 /// Diagnostics: programs (stage, guard id) pushed a root view whose range
 /// is short -> times.
 static SHORT_ROOTS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
@@ -1026,7 +1032,7 @@ static SHORT_ROOTS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(
 pub(crate) fn short_root_programs() -> String {
     let mut all: Vec<(String, u64)> = lock(&SHORT_ROOTS).iter().map(|(k, &v)| (k.clone(), v)).collect();
     all.sort_by_key(|p| std::cmp::Reverse(p.1));
-    format!("{} programs; {}", all.len(), all.iter().take(10).map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", "))
+    format!("draws without a pass {}; {} programs; {}", NO_PASS.load(Ordering::Relaxed), all.len(), all.iter().take(10).map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", "))
 }
 
 pub(crate) fn report() {

@@ -233,6 +233,47 @@ impl Rec {
         }
     }
 
+    /// A draw is left out because none of its targets has an image: counted,
+    /// and told once a pipeline (which targets the title set, and what
+    /// each one's resource is).
+    pub(super) fn no_pass(&self, b: &Backend, shaders: &[std::sync::Arc<crate::pipeline::Shader>]) {
+        static TOLD: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        super::NO_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut told = super::lock(&TOLD);
+        if told.len() >= 64 || told.contains(&(self.pipeline as usize)) {
+            return;
+        }
+        told.push(self.pipeline as usize);
+        let one = |r: &Option<crate::descriptor::RtvRecord>| match r {
+            None => "none".to_string(),
+            Some(r) => match crate::resource::texture_memory(r.resource) {
+                None => format!("resource {:#x}: no texture memory, view {:?}", r.resource as usize, r.words()),
+                Some((data, d)) => format!(
+                    "resource {:#x} at {:#x} dim {} {}x{}x{} mips {} format {} samples {} flags {:#x}: image {}, view {:?}",
+                    r.resource as usize,
+                    data as usize,
+                    d.dimension,
+                    d.width,
+                    d.height,
+                    d.depth_or_array_size,
+                    d.mip_levels,
+                    d.format,
+                    d.sample_count,
+                    d.flags,
+                    super::super::images::of_resource(b, r.resource).is_some(),
+                    r.words()
+                ),
+            },
+        };
+        let colors: Vec<String> = self.colors[..self.color_count as usize].iter().map(one).collect();
+        tracing::warn!(
+            programs = %crate::pipeline::names(shaders),
+            colors = %colors.join(" | "),
+            depth = %one(&self.depth),
+            "Vulkan: a draw is left out: none of its targets has an image (once a pipeline)"
+        );
+    }
+
     /// Diagnostics: the state of the first draw of a program dumped before
     /// (targets, depth and stencil tests, the first target's blend).
     pub(super) fn tell_draw(&self, program: &str, gs: &GraphicsState) {
