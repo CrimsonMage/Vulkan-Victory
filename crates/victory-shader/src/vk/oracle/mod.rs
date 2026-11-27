@@ -176,6 +176,24 @@ fn run_cases_on(shader: &HostShader, cases: &[[u32; 4]], _devices: &[(&str, bool
     assert!(failed.is_empty(), "{} of {} cases failed:\n{}", failed.len(), cases.len(), failed.join("\n"));
 }
 
+/// Ours (not theirs): `v_cvt_pkrtz_f16_f32 v0, v1, v2` rounds toward zero,
+/// past the largest half too (±65504, not infinity), whatever the host's
+/// own conversion rounds by.
+#[test]
+fn pkrtz_rounds_toward_zero() {
+    let shader = build_valu_cs(&[0x2F << 25 | 2 << 9 | 257]);
+    let cases = [
+        ([1.0f32.to_bits(), 2.0f32.to_bits(), 0, 0], 0x4000_3C00),
+        ([70000.0f32.to_bits(), (-70000.0f32).to_bits(), 0, 0], 0xFBFF_7BFF),
+        // 1 + 2^-10 - 2^-23: nearer 0x3C01, toward zero 0x3C00
+        ([0x3F80_1FFF, 0xBF80_1FFF, 0, 0], 0xBC00_3C00),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(got, cases[i].1, "{backend}: v_cvt_pkrtz_f16_f32 {inp:x?} = {got:#010x}");
+    });
+}
+
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [

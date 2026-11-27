@@ -32,6 +32,24 @@ impl Lift<'_> {
         }
     }
 
+    /// `f` as f16 bits (low 16 of a u32) rounded toward zero, as
+    /// `v_cvt_pkrtz_f16_f32` rounds whatever the host's conversion does:
+    /// the host's half, one step back toward zero where it lies farther
+    /// out than `f` (an overflow to infinity becomes ±65504, not ±inf).
+    pub(super) fn f16_toward_zero(&mut self, f: V) -> V {
+        let h = self.spv(op::F_CONVERT, Ty::F16, &[f]);
+        let back = self.spv(op::F_CONVERT, Ty::F32, &[h]);
+        let fa = self.gl(glsl::F_ABS, Ty::F32, &[f]);
+        let ba = self.gl(glsl::F_ABS, Ty::F32, &[back]);
+        // ordered: never for NaN
+        let away = self.spv(op::F_ORD_GREATER_THAN, Ty::BOOL, &[ba, fa]);
+        let hb = self.spv(op::BITCAST, Ty::U16, &[h]);
+        let hb = self.spv(op::U_CONVERT, Ty::U32, &[hb]);
+        let one = self.k32(1);
+        let stepped = self.spv(op::I_SUB, Ty::U32, &[hb, one]);
+        self.spv(op::SELECT, Ty::U32, &[away, stepped, hb])
+    }
+
     /// `v_fract`: below 1.0 always (a tiny negative's x - floor(x) rounds
     /// to 1.0; RDNA gives the largest float below it); NaN stays.
     pub(super) fn below_one(&mut self, x: V, ty: Ty) -> V {
@@ -535,8 +553,11 @@ impl Lift<'_> {
                 if name != "v_cvt_pkrtz_f16_f32" {
                     return Err(unsupported(off, name));
                 }
-                let v2 = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::F32, 2), &[a, b]);
-                let x = self.gl(glsl::PACK_HALF_2X16, Ty::U32, &[v2]);
+                let lo = self.f16_toward_zero(a);
+                let hi = self.f16_toward_zero(b);
+                let k16 = self.k32(16);
+                let hi = self.spv(op::SHIFT_LEFT_LOGICAL, Ty::U32, &[hi, k16]);
+                let x = self.spv(op::BITWISE_OR, Ty::U32, &[lo, hi]);
                 f(self, x)
             }
             _ => Err(unsupported(off, name)),
