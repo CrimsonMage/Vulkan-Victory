@@ -77,6 +77,8 @@ struct Walk<'a> {
     slots: BTreeSet<u32>,
     todo: VecDeque<(u64, u64, u32)>,
     meta: Vec<String>,
+    /// Small blocks, written after the walk by a thread of their own.
+    later: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Walk<'_> {
@@ -89,7 +91,16 @@ impl Walk<'_> {
         // hundred bytes is a whole allocation's tail)
         let left = super::title_left(self.b, at);
         let bytes = [want, VIEW.min(want), TABLE.min(want)].into_iter().map(|len| len.min(left)).filter(|&len| len != 0).find_map(|len| read_title(self.b, at, len).ok())?;
-        if std::fs::write(self.dir.join(format!("mem/{at:x}.bin")), &bytes).is_err() {
+        // A file made in a folder of thousands costs the more the fuller
+        // the folder is (Wine looks through it for the name in another
+        // case): the 13,000 tables and constant buffers of a post-process
+        // pass held their recording threads for half a minute and the
+        // title gave up (run vk100). The small blocks are written by a
+        // thread of their own; the few large ranges at once, as before.
+        let file = self.dir.join(format!("mem/{at:x}.bin"));
+        if bytes.len() as u64 <= VIEW {
+            self.later.push((file, bytes.clone()));
+        } else if std::fs::write(file, &bytes).is_err() {
             return None;
         }
         self.total += bytes.len() as u64;
@@ -188,7 +199,7 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
     for r in super::memory(b).map.ranges() {
         meta.push(format!("maprange {:x} {:x} {:x}", r.title_start, r.title_size, r.device_base));
     }
-    let mut walk = Walk { b, dir: &dir, have: BTreeMap::new(), total: 0, slots: BTreeSet::new(), todo: VecDeque::new(), meta: Vec::new() };
+    let mut walk = Walk { b, dir: &dir, have: BTreeMap::new(), total: 0, slots: BTreeSet::new(), todo: VecDeque::new(), meta: Vec::new(), later: Vec::new() };
     for (param, r) in roots.iter().enumerate() {
         meta.push(format!("root {param} {}", r.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")));
         for p in r.chunks_exact(2) {
@@ -197,6 +208,12 @@ pub(super) unsafe fn before(b: &Backend, cmd: vk::CommandBuffer, programs: &[(St
     }
     walk.run();
     meta.append(&mut walk.meta);
+    let later = std::mem::take(&mut walk.later);
+    std::thread::spawn(move || {
+        for (file, bytes) in later {
+            let _ = std::fs::write(file, bytes);
+        }
+    });
     // the images its T#s name
     let (mut items, mut at, mut seen) = (Vec::new(), 0u64, BTreeSet::new());
     for &slot in &walk.slots {
