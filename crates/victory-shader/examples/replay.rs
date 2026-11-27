@@ -11,7 +11,9 @@
 //! channel), `missing.txt` (memory read that the capture lacks, as
 //! ranges), `notes.txt` (what replay assumed) and `reads.txt` (each image
 //! slot the program read: how often, and the range of what came back);
-//! `stores.txt` the title memory it stored to;
+//! `stores.txt` the title memory it stored to, and which of it lies
+//! outside the capture's memory map (`maprange` lines: the card drops
+//! those stores, and reads zeros there);
 //! `images.txt` is what every image of the capture holds, read or not
 //! (`SHOW=<slot>,...` writes some of them as tone-mapped pictures).
 //!
@@ -80,6 +82,9 @@ struct Capture {
     roots: HashMap<u8, Vec<u32>>,
     slots: HashMap<u32, Slot>,
     lines: Vec<String>,
+    /// `maprange <title start> <bytes> <device base>`: the memory map the
+    /// card had when the pass was recorded.
+    map: Vec<(u64, u64)>,
 }
 
 fn hex(s: &str) -> u64 {
@@ -149,6 +154,7 @@ fn read_capture(dir: &Path) -> Capture {
             Some("push") if c.dispatch.is_none() && c.viewport.is_none() && !c.sealed && !c.push.is_empty() => c.sealed = true,
             Some("push") if c.dispatch.is_none() && c.viewport.is_none() && !c.sealed => c.push = w[1..].iter().map(|x| hex(x) as u32).collect(),
             Some("mem") => c.mem.push((hex(w[1]), dir.join(format!("mem/{}.bin", w[1])))),
+            Some("maprange") if w.len() >= 3 => c.map.push((hex(w[1]), hex(w[2]))),
             Some("root") if w.len() >= 2 => {
                 c.roots.insert(w[1].parse().unwrap_or(0), w[2..].iter().map(|x| hex(x) as u32).collect());
             }
@@ -776,14 +782,17 @@ struct Run<'a> {
 /// `stores.txt`: the runs of title memory the program stored to (dwords
 /// no more than 64 bytes apart are one run), with how many dwords were
 /// stored, how many of them not zero, and the first few.
-fn stores_text(stored: &BTreeMap<u64, u32>) -> String {
+fn stores_text(stored: &BTreeMap<u64, u32>, map: &[(u64, u64)]) -> String {
     let mut out = String::new();
     let mut run: Vec<(u64, u32)> = Vec::new();
+    let mapped = |a: u64| map.is_empty() || map.iter().any(|&(s, n)| a >= s && a < s + n);
     let mut flush = |run: &mut Vec<(u64, u32)>| {
         if let (Some(first), Some(last)) = (run.first(), run.last()) {
             let nonzero = run.iter().filter(|(_, v)| *v != 0).count();
             let head: Vec<String> = run.iter().take(8).map(|(_, v)| format!("{v:08x}")).collect();
-            let _ = writeln!(out, "{:x}..{:x}: {} dwords stored, {nonzero} not zero: {}", first.0, last.0 + 4, run.len(), head.join(" "));
+            let outside = run.iter().filter(|(a, _)| !mapped(*a)).count();
+            let lost = if outside == 0 { String::new() } else { format!(" ({outside} of them OUTSIDE THE MEMORY MAP: dropped on the card)") };
+            let _ = writeln!(out, "{:x}..{:x}: {} dwords stored{lost}, {nonzero} not zero: {}", first.0, last.0 + 4, run.len(), head.join(" "));
         }
         run.clear();
     };
@@ -922,7 +931,7 @@ fn main() {
     let _ = std::fs::write(out.join("missing.txt"), missing_ranges(&run.missing));
     let _ = std::fs::write(out.join("notes.txt"), notes.join("\n") + "\n");
     let _ = std::fs::write(out.join("reads.txt"), st.reads_text());
-    let _ = std::fs::write(out.join("stores.txt"), stores_text(&run.stored));
+    let _ = std::fs::write(out.join("stores.txt"), stores_text(&run.stored, &run.cap.map));
     print!("{census}");
     println!("{} missing ranges; notes: {}", missing_ranges(&run.missing).lines().count(), notes.join("; "));
 }
