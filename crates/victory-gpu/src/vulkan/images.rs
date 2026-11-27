@@ -308,6 +308,9 @@ struct Registry {
 impl Registry {
     /// Puts `img` into, or takes it out of, the pages it lies over.
     fn page(&mut self, img: &Arc<Image>, add: bool) {
+        // (the pool's view keeps card pages for what programs read by
+        // address before it keeps them for a texture's memory)
+        super::paging::texture_over(img.key.address, img.bytes.max(1), add);
         for page in img.key.address >> 16..=(img.key.address + img.bytes.max(1) - 1) >> 16 {
             let there = self.over.entry(page).or_default();
             there.retain(|i| !Arc::ptr_eq(i, img));

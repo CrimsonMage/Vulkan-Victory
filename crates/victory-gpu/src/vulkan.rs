@@ -778,7 +778,12 @@ pub(crate) fn touch_range(at: u64, len: u64) {
     if let Some(b) = backend() {
         let mut m = memory(b);
         m.want_range(at, len);
-        paging::ensure(b, &mut m, at, 1);
+        if len > 1 {
+            // a buffer view: programs read all of it by address
+            paging::heat(b, &mut m, at, len);
+        } else {
+            paging::ensure(b, &mut m, at, 1);
+        }
     }
 }
 
@@ -1073,8 +1078,10 @@ fn report(b: &Backend, frame: u64) {
             a.evicted += p.stats.evicted;
             a.refilled += p.stats.refilled;
             a.binds += p.stats.binds;
+            a.hot_evicted += p.stats.hot_evicted;
             a
         });
+    let cold = m.pools.iter().map(|p| p.cold_pages()).fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
     tracing::info!(
         frame,
         timeline = b.timeline.last(),
@@ -1095,6 +1102,9 @@ fn report(b: &Backend, frame: u64) {
         pool_blocks = pool.blocks,
         pool_filled = pool.filled,
         pool_evicted = pool.evicted,
+        pool_evicted_read_by_programs = pool.hot_evicted,
+        pool_texture_mb = (cold.0 * PAGE) >> 20,
+        pool_texture_card_mb = (cold.1 * PAGE) >> 20,
         pool_refilled = pool.refilled,
         pool_binds = pool.binds,
         "Vulkan: queues, timeline and title memory"

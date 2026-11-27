@@ -118,6 +118,7 @@ pub(super) fn follow_budget(b: &Backend) {
             tracing::warn!(error = %format!("{e:#}"), "Vulkan: the pool view could not give card memory back");
         }
     }
+    super::paging::settle(b, &mut m);
 }
 
 /// All the card memory we allocated, by kind, against the driver's own

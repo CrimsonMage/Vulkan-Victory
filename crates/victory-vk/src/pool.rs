@@ -83,6 +83,21 @@ struct Page {
     /// Title pages (indices in the view) showing it.
     shown: Vec<u64>,
     touched: u64,
+    /// A filled texture lies over it whole and no buffer view names it
+    /// ([`PoolView::cool`]): programs read the texture's image, never the
+    /// page, so it is the first to lose its card page.
+    cold: bool,
+}
+
+/// Above every tick: in the LRU a page programs may read by address sorts
+/// after every cold one.
+const HOT: u64 = 1 << 62;
+
+impl Page {
+    /// Its place in the LRU: cold pages first, then by the last touch.
+    fn rank(&self) -> u64 {
+        if self.cold { self.touched } else { self.touched | HOT }
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -93,6 +108,9 @@ pub struct Stats {
     pub evicted: u64,
     pub refilled: u64,
     pub binds: u64,
+    /// Evictions of pages programs may read by address (they read zeros
+    /// there until the page is named again or comes back).
+    pub hot_evicted: u64,
 }
 
 pub struct PoolView {
@@ -117,6 +135,10 @@ pub struct PoolView {
     /// [`PoolView::ensure`] brought back: copies made with their CPU views
     /// not yet write-protected, for the caller to take and have tracked.
     pub back: Vec<u64>,
+    /// Pages programs may read by address that [`PoolView::shrink`] took
+    /// the card page of with their block: [`PoolView::recover`] gives
+    /// them one again, a cold page's.
+    lost: Vec<PageKey>,
 }
 
 /// What a refresh of pages is for.
@@ -187,6 +209,7 @@ impl PoolView {
             stats: Stats::default(),
             retired: Vec::new(),
             back: Vec::new(),
+            lost: Vec::new(),
         };
         let _ = timeline;
         view.grow(host)?;
@@ -354,7 +377,10 @@ impl PoolView {
             for (key, p) in &mut self.pages {
                 if p.slot.is_some_and(|s| s.block as usize == i) {
                     p.slot = None;
-                    lru.remove(&(p.touched, *key));
+                    lru.remove(&(p.rank(), *key));
+                    if !p.cold {
+                        self.lost.push(*key);
+                    }
                     binds.extend(p.shown.iter().map(|&t| (t, None)));
                     self.stats.evicted += 1;
                     self.stats.pages_in_card -= 1;
@@ -433,7 +459,15 @@ impl PoolView {
         if room && self.grow(host).is_ok() {
             return self.take();
         }
-        let (_, victim) = self.lru.pop_first()?;
+        let (rank, victim) = self.lru.pop_first()?;
+        if rank >= HOT {
+            // No cold page had a card page: one programs may read goes,
+            // and comes back when a cold page has one ([`PoolView::recover`]).
+            self.stats.hot_evicted += 1;
+            if self.lost.len() < 1 << 16 {
+                self.lost.push(victim);
+            }
+        }
         let page = self.pages.get_mut(&victim).expect("a page in the LRU");
         let slot = page.slot.take().expect("a page in the LRU has a card page");
         binds.extend(page.shown.iter().map(|&t| (t, None)));
@@ -446,10 +480,12 @@ impl PoolView {
     fn touch(&mut self, key: PageKey, tick: u64) {
         let Some(p) = self.pages.get_mut(&key) else { return };
         if p.slot.is_some() {
-            self.lru.remove(&(p.touched, key));
-            self.lru.insert((tick, key));
+            self.lru.remove(&(p.rank(), key));
         }
         p.touched = tick;
+        if p.slot.is_some() {
+            self.lru.insert((p.rank(), key));
+        }
     }
 
     /// Gives `key` (evicted, or new) card page `s`: every title page
@@ -458,7 +494,7 @@ impl PoolView {
         let p = self.pages.get_mut(&key).expect("a page to place");
         p.slot = Some(s);
         binds.extend(p.shown.iter().map(|&t| (t, Some(s))));
-        self.lru.insert((p.touched, key));
+        self.lru.insert((p.rank(), key));
         self.stats.pages_in_card += 1;
     }
 
@@ -496,6 +532,7 @@ impl PoolView {
                 slot: None,
                 shown: Vec::new(),
                 touched: tick,
+                cold: false,
             });
             p.shown.push(t);
             self.bound.insert(t, *key);
@@ -528,7 +565,7 @@ impl PoolView {
         if p.shown.is_empty() {
             let gone = self.pages.remove(&old).expect("page");
             if let Some(s) = gone.slot {
-                self.lru.remove(&(gone.touched, old));
+                self.lru.remove(&(gone.rank(), old));
                 self.free(s);
                 self.stats.pages_in_card -= 1;
             }
@@ -616,6 +653,63 @@ impl PoolView {
         keys.sort_unstable();
         keys.dedup();
         self.refresh(host, timeline, keys, (0, Why::Stored), source)
+    }
+
+    /// The pages shown in `[at, at + len)` are cold (`cold`: a filled
+    /// texture lies over them: only the title pages wholly inside count)
+    /// or not (a buffer view names the range: every page it reaches).
+    pub fn cool(&mut self, (at, len): (u64, u64), cold: bool) {
+        let end = at.saturating_add(len);
+        let (lo, hi) = if cold { (at.next_multiple_of(PAGE), end / PAGE * PAGE) } else { (at, end) };
+        if lo >= hi {
+            return;
+        }
+        for key in self.keys_in((lo, hi - lo)) {
+            let Some(p) = self.pages.get_mut(&key) else { continue };
+            if p.cold == cold {
+                continue;
+            }
+            if p.slot.is_some() {
+                self.lru.remove(&(p.rank(), key));
+            }
+            p.cold = cold;
+            if p.slot.is_some() {
+                self.lru.insert((p.rank(), key));
+            }
+        }
+    }
+
+    /// The pages [`PoolView::shrink`] took from programs come back, each
+    /// to a free card page or the coldest page's.
+    pub fn recover(
+        &mut self,
+        host: &Host,
+        timeline: &Timeline,
+        tick: u64,
+        source: impl Fn(PageKey) -> Option<Source>,
+    ) -> Result<()> {
+        if self.lost.is_empty() {
+            return Ok(());
+        }
+        self.free_retired(host, timeline);
+        let mut keys: Vec<PageKey> = std::mem::take(&mut self.lost).into_iter().filter(|k| self.pages.get(k).is_some_and(|p| !p.cold && p.slot.is_none())).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        // As many as there are free card pages and cold pages to take one
+        // from: a page programs read never takes another such page's (the
+        // two would change places every frame); the rest wait.
+        let free: usize = self.blocks.iter().filter(|b| !b.dead).map(|b| b.free.len()).sum();
+        let room = free + self.lru.iter().take_while(|(rank, _)| *rank < HOT).count();
+        if keys.len() > room {
+            self.lost = keys.split_off(room);
+        }
+        self.refresh(host, timeline, keys, (tick, Why::Named), source).map(drop)
+    }
+
+    /// Pages that are cold, and of them those on the card (diagnostics).
+    pub fn cold_pages(&self) -> (u64, u64) {
+        let cold = self.pages.values().filter(|p| p.cold);
+        (cold.clone().count() as u64, cold.filter(|p| p.slot.is_some()).count() as u64)
     }
 
     /// Whether the page shown at title address `title` is on the card now.

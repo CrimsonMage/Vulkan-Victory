@@ -280,3 +280,50 @@ pub(super) fn ensure(b: &super::Backend, m: &mut Memory, at: u64, len: u64) {
     }
     came_back(view);
 }
+
+/// Title memory a filled texture came to lie over (`true`) or left: asked
+/// under the images' lock, done at the next frame under the memory lock
+/// ([`settle`]).
+static TEXTURES: std::sync::Mutex<Vec<(u64, u64, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// A filled texture lies over `[at, at + len)` now (`over`), or no longer:
+/// programs read a texture's image, never its memory, so the pool pages
+/// wholly under one are the first to lose their card pages
+/// (`PoolView::cool`); the pages of everything else (geometry, tables
+/// programs read by address through views made once) keep theirs while a
+/// cold page has one. Before, the page touched least recently went,
+/// whatever it held, and only a recording that named a page brought it
+/// back: three quarters of the pool's view read zeros in the world (372 of
+/// 1,767 MB on the card, run ch3) and what was drawn changed from run to
+/// run (buildings, the window's mesh, hair).
+pub(super) fn texture_over(at: u64, len: u64, over: bool) {
+    super::lock(&TEXTURES).push((at, len, over));
+}
+
+/// A buffer view names `[at, at + len)`: its pool pages are read by
+/// address (not cold, whatever texture lay there), and come back.
+pub(super) fn heat(b: &super::Backend, m: &mut Memory, at: u64, len: u64) {
+    if let Some(view) = m.pools.iter_mut().find(|p| p.contains(at)) {
+        view.cool((at, len.max(1)), false);
+    }
+    ensure(b, m, at, len);
+}
+
+/// Every frame, after the pool's views gave card memory back: what the
+/// textures made or dropped since cools or warms, and the pages programs
+/// read that lost their card page with a block take a cold page's.
+pub(super) fn settle(b: &super::Backend, m: &mut Memory) {
+    let Memory { pools, sections, tick, .. } = m;
+    let asked = std::mem::take(&mut *super::lock(&TEXTURES));
+    for view in pools.iter_mut() {
+        for &(at, len, over) in &asked {
+            if view.contains(at) {
+                view.cool((at, len), over);
+            }
+        }
+        if let Err(e) = view.recover(&b.host, &b.timeline, *tick, |key| source_in(sections, key)) {
+            tracing::error!(error = %format!("{e:#}"), "Vulkan: pages of the pool's GPU view that programs read were not brought back");
+        }
+        came_back(view);
+    }
+}
