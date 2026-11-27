@@ -140,6 +140,11 @@ pub(crate) struct Rec {
     /// Rendering is open with these attachments, and their formats.
     pass: Option<(PassKey, [vk::Format; 8], vk::Format)>,
     targets_changed: bool,
+    /// Depth images whose stored planes were copied in since the last
+    /// dispatch or copy of this list (`copy_planes`).
+    planes_synced: Vec<u64>,
+    /// A draw of the open pass writes depth or stencil.
+    pass_wrote_depth: bool,
     bound: vk::Pipeline,
     bound_compute: vk::Pipeline,
     /// Images the recording names (kept alive until the list is reset).
@@ -200,6 +205,8 @@ impl Default for Rec {
             depth: None,
             pass: None,
             targets_changed: true,
+            planes_synced: Vec::new(),
+            pass_wrote_depth: false,
             bound: vk::Pipeline::null(),
             bound_compute: vk::Pipeline::null(),
             keep: Vec::new(),
@@ -320,6 +327,7 @@ impl Rec {
             self.state_set = None;
             self.pushed = false;
             self.indirect.clear();
+            self.planes_synced.clear();
         }
         self.cmd.as_ref().map(|r| r.cmd)
     }
@@ -342,10 +350,18 @@ impl Rec {
 
     fn end_pass(&mut self, b: &Backend) {
         if self.pass.take().is_some()
-            && let Some(r) = &self.cmd
+            && let Some(cmd) = self.cmd.as_ref().map(|r| r.cmd)
         {
             // SAFETY: rendering is open in our command buffer.
-            unsafe { b.host.device.cmd_end_rendering(r.cmd) };
+            unsafe { b.host.device.cmd_end_rendering(cmd) };
+            // What its draws wrote to depth or stencil goes to the planes
+            // compute reads and stores.
+            if std::mem::take(&mut self.pass_wrote_depth)
+                && let Some(depth) = self.attached.iter().find(|i| i.depth()).cloned()
+            {
+                // SAFETY: outside rendering now, in our command buffer.
+                unsafe { self.copy_planes(b, cmd, &depth, false) };
+            }
         }
     }
 
@@ -530,27 +546,14 @@ impl Rec {
             return Some((formats, key.count, depth_format));
         }
         self.end_pass(b);
-        // What compute stored into the depth buffer's memory goes into its
-        // depth plane first.
+        // What compute stored into the depth buffer's memory since goes
+        // into its planes first.
         if let Some(depth) = self.attached.iter().find(|i| i.depth()).cloned()
-            && b.host.caps.maintenance8
+            && !self.planes_synced.contains(&depth.id)
         {
-            for (plane, aspect) in depth.planes().into_iter().zip([vk::ImageAspectFlags::DEPTH, vk::ImageAspectFlags::STENCIL]) {
-                let Some(plane) = plane.filter(|_| depth.aspect().contains(aspect)) else { continue };
-                let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
-                let region = vk::ImageCopy::default()
-                    .src_subresource(layers(vk::ImageAspectFlags::COLOR))
-                    .dst_subresource(layers(aspect))
-                    .extent(vk::Extent3D { width: depth.extent.width.min(plane.extent.width), height: depth.extent.height.min(plane.extent.height), depth: 1 });
-                // SAFETY: outside rendering in our command buffer; live images in GENERAL.
-                unsafe {
-                    images::full_barrier(&b.host.device, cmd);
-                    b.host.device.cmd_copy_image(cmd, plane.image, vk::ImageLayout::GENERAL, depth.image, vk::ImageLayout::GENERAL, &[region]);
-                    images::full_barrier(&b.host.device, cmd);
-                }
-                PLANE_COPIES.fetch_add(1, Ordering::Relaxed);
-                self.keep.push(plane.clone());
-            }
+            self.planes_synced.push(depth.id);
+            // SAFETY: outside rendering, in our command buffer.
+            unsafe { self.copy_planes(b, cmd, &depth, true) };
         }
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()
@@ -714,6 +717,8 @@ impl Rec {
                 list.push(p);
             }
             self.push(b, cmd, &list, false);
+            let z = &gs.depth;
+            self.pass_wrote_depth |= (z.DepthEnable.as_bool() && z.DepthWriteMask.0 == 1) || (z.StencilEnable.as_bool() && z.StencilWriteMask != 0);
             let state = self.state_key(gs, topology, count);
             if self.state_set != Some(state) {
                 self.dynamic(b, cmd, gs, topology, count);
@@ -948,6 +953,7 @@ impl Rec {
         }
         lap.next();
         self.indirect.clear();
+        self.planes_synced.clear();
         if let Some(h) = super::descriptors::heaps(b) {
             h.immediates(b);
         }

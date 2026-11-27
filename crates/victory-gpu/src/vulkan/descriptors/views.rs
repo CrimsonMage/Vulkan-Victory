@@ -334,22 +334,29 @@ fn texture_words(
     // A storage view of a depth buffer: the stores go to the colour image
     // over its memory (`images::written_plane`).
     let (image, title_format) = if unordered && image.depth() && image.samples == 1 {
-        let stencil = images::reads_stencil(title_format);
+        // The stencil plane by its format, or as plane slice 1 of a 2D
+        // storage view (D3D12_TEX2D_UAV: mip slice, plane slice).
+        let stencil = images::reads_stencil(title_format) || desc.is_some_and(|d| d[1] == 4 && d[3] == 1);
         static TOLD: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
         let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
-        if told.len() < 16 && !told.contains(&(address, title_format)) {
-            told.push((address, title_format));
+        let what = (address, title_format | u32::from(stencil) << 31);
+        if told.len() < 64 && !told.contains(&what) {
+            told.push(what);
             tracing::warn!(
                 at = format_args!("{address:#x}"),
                 resource_format = rdesc.format,
                 view_format = title_format,
                 plane = if stencil { "stencil" } else { "depth" },
+                view = ?desc.map(|d| [d[1], d[2], d[3]]),
                 "Vulkan: a storage view of a depth buffer: its stores go to a colour image, copied in before the buffer is attached"
             );
         }
         drop(told);
         match images::written_plane(b, &image, address, rdesc, stencil) {
-            Some(p) => (p, if stencil { 62 } else { 41 }),
+            Some(p) => {
+                let format = p.desc.format;
+                (p, format)
+            }
             None => (image, title_format),
         }
     } else {

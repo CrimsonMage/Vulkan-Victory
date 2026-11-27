@@ -516,8 +516,13 @@ pub(crate) fn written_plane(b: &Backend, depth: &Arc<Image>, address: u64, desc:
     if let Some(p) = cell.get() {
         return Some(p.clone());
     }
-    // DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32_FLOAT
-    let format = if stencil { 62 } else { 41 };
+    // DXGI_FORMAT_R8_UINT; DXGI_FORMAT_R16_UNORM or DXGI_FORMAT_R32_FLOAT,
+    // as the depth plane's own bits
+    let format = match (stencil, depth.format) {
+        (true, _) => 62,
+        (false, vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT) => 56,
+        (false, _) => 41,
+    };
     let plain = ResourceDesc { format, flags: (desc.flags & !DEPTH_STENCIL) | UNORDERED, sample_count: 1, mip_levels: 1, ..*desc };
     // The stencil plane's image is keyed one byte on: images over one
     // address share card memory, and the two planes are two memories.

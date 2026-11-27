@@ -22,6 +22,38 @@ fn plane_format(i: &Image) -> vk::Format {
 }
 
 impl Rec {
+    /// A depth buffer the title also stores into through storage views
+    /// has a colour image a plane for those (`images::written_plane`):
+    /// the planes are copied into the depth image before it is attached
+    /// (`into_depth`), and back once draws have written it.
+    ///
+    /// # Safety
+    /// Recording into `cmd`, outside rendering.
+    pub(super) unsafe fn copy_planes(&mut self, b: &Backend, cmd: vk::CommandBuffer, depth: &std::sync::Arc<Image>, into_depth: bool) {
+        if !b.host.caps.maintenance8 {
+            return;
+        }
+        for (plane, aspect) in depth.planes().into_iter().zip([vk::ImageAspectFlags::DEPTH, vk::ImageAspectFlags::STENCIL]) {
+            let Some(plane) = plane.filter(|_| depth.aspect().contains(aspect)) else { continue };
+            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+            let extent = vk::Extent3D { width: depth.extent.width.min(plane.extent.width), height: depth.extent.height.min(plane.extent.height), depth: 1 };
+            let (src, dst, from, to) = if into_depth {
+                (plane.image, depth.image, vk::ImageAspectFlags::COLOR, aspect)
+            } else {
+                (depth.image, plane.image, aspect, vk::ImageAspectFlags::COLOR)
+            };
+            let region = vk::ImageCopy::default().src_subresource(layers(from)).dst_subresource(layers(to)).extent(extent);
+            // SAFETY: as the caller says; live images in GENERAL.
+            unsafe {
+                images::full_barrier(&b.host.device, cmd);
+                b.host.device.cmd_copy_image(cmd, src, vk::ImageLayout::GENERAL, dst, vk::ImageLayout::GENERAL, &[region]);
+                images::full_barrier(&b.host.device, cmd);
+            }
+            super::PLANE_COPIES.fetch_add(1, Ordering::Relaxed);
+            self.keep.push(plane.clone());
+        }
+    }
+
     // ---- copies ----
 
     pub(super) fn copy_buffer(&mut self, b: &'static Backend, dst: u64, src: u64, len: u64) {
@@ -32,6 +64,7 @@ impl Rec {
         let Some(cmd) = self.cmd(b) else { return };
         // It may write indirect records: no window holds.
         self.indirect.clear();
+        self.planes_synced.clear();
         // SAFETY: outside rendering; title buffers.
         unsafe {
             images::full_barrier(&b.host.device, cmd);
