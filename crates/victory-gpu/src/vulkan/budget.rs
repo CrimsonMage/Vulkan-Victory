@@ -41,7 +41,7 @@ use account::card_heap as heap;
 /// Bytes of card memory ours may take now: the ceiling, less what the
 /// budget leaves past the others' use and the room.
 pub(super) fn limit(host: &Host) -> u64 {
-    let ceiling = ceiling();
+    let (ceiling, room) = rule();
     let Some((budget, usage)) = heap(host) else {
         return ceiling;
     };
@@ -49,22 +49,21 @@ pub(super) fn limit(host: &Host) -> u64 {
     // the ceiling too: the process's whole use stays under it (vk40: ours
     // 5,318 MiB, the process 5,609).
     let others = usage.saturating_sub(account::card_total());
-    ceiling.saturating_sub(others).min(budget.saturating_sub(others).saturating_sub(ROOM))
+    ceiling.saturating_sub(others).min(budget.saturating_sub(others).saturating_sub(room))
 }
 
-/// [`CEILING`]; diagnostics builds take `VICTORY_VK_CEILING_MB` instead
-/// (to see what a run shows when no image is refused).
-fn ceiling() -> u64 {
-    static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *C.get_or_init(|| {
-        let asked = cfg!(feature = "diagnostics").then(|| std::env::var("VICTORY_VK_CEILING_MB").ok()?.trim().parse::<u64>().ok()).flatten();
-        match asked {
-            Some(mb) => {
-                tracing::warn!(mb, "Vulkan: the card-memory ceiling is VICTORY_VK_CEILING_MB (diagnostics)");
-                mb << 20
-            }
-            None => CEILING,
+/// [`CEILING`] and [`ROOM`]; diagnostics builds take
+/// `VICTORY_VK_CEILING_MB` and `VICTORY_VK_ROOM_MB` instead (to see what a
+/// run shows when no image is refused and no pool page evicted).
+fn rule() -> (u64, u64) {
+    static R: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let asked = |name: &str| cfg!(feature = "diagnostics").then(|| std::env::var(name).ok()?.trim().parse::<u64>().ok()).flatten().map(|mb| mb << 20);
+        let (ceiling, room) = (asked("VICTORY_VK_CEILING_MB"), asked("VICTORY_VK_ROOM_MB"));
+        if ceiling.is_some() || room.is_some() {
+            tracing::warn!(ceiling_mb = ceiling.unwrap_or(CEILING) >> 20, room_mb = room.unwrap_or(ROOM) >> 20, "Vulkan: the card-memory rule is the environment's (diagnostics)");
         }
+        (ceiling.unwrap_or(CEILING), room.unwrap_or(ROOM))
     })
 }
 
