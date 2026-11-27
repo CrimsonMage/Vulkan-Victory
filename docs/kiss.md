@@ -151,6 +151,30 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (evening): **where the card's 395 ms a frame go** (run gt1,
+  `VICTORY_VK_GPU_TIME=1900,6`, now a window of presents told as time a
+  frame, by program and by family; one present alone had covered 107 ms).
+  Of the 60 largest programs (328 ms): **tiled lighting pixel programs
+  205 ms** (25 of about 40 pipelines `VS_TiledLighting+TL_PS_*`, one per
+  material, each bound once a frame, 3 to 28 ms each), compute 88 ms
+  (`CS_Primary_GatherCopy` 18.7, screen-probe ray binning 9.9, cloth and
+  skinning 5 to 7 each), mesh draws 34 ms, our present 2.4 ms.
+  - **Reading, not yet proven**: each lighting pass is a full-screen draw
+    the console rejects per pixel by an early stencil/depth test on the
+    material; our SPIR-V never asks for early tests (and its stores and
+    kills stop the driver doing it unasked), so every pass shades every
+    pixel. The early-depth change (from trustno1-coder/VIctory-NVIDIA,
+    `DB_SHADER_CONTROL` bit 12; branch `tr-batch`, in work) is the test of
+    this: a translator change, so one bake.
+  - Also from that fork's comparison (2026-11-27): it leaves out
+    `CS_RaytracingResolve*` and `CS_ScreenProbes_ActivateRays*` while the
+    builder is off; the title's upscaler (29 `FSPX` programs) translates
+    there and is a stand-in here (branch `fspx`, in work); ordered pixel
+    sections and fewer half-wave meetings are in `tr-batch` too.
+  - Pull request #1 (tbarnavon: regions imported in pieces no larger than
+    the driver's largest buffer, for AMD's 2 GiB limit) merged and run
+    here (pr1): 59 regions, one piece each, picture and time unchanged.
+
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
   its latest view names; a slot stays its texture's** (runs tx0 to tx7 on
