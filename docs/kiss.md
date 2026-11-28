@@ -157,13 +157,15 @@ driver errors and no new crash, and the captures look no worse.
   (6.2), the direct queue 100 ms a frame (148), with the process's whole
   card use allowed 6,144 MiB (5,504) and 256 MiB of the driver's budget
   left free (1 GiB). The default is now 5,888 and 512 MiB (`int68.exe`,
-  not yet measured): bj2's peak of 7,427 MiB is 270 under where this
-  card's driver has corrupted its state.** `homes` is merged;
+  run bk1: the same 9.4 to 9.5 fps with the driver's own use at its
+  usual 1,063 MiB, the card's peak 7,218 MiB): bj2's peak of 7,427 MiB
+  is 270 under where this card's driver has corrupted its state.** `homes` is merged;
   `int67.exe` is its build.
   | run (`int67.exe`, the test scene, `VICTORY_VK_GPU_TIME=1900,6`) | frames in 10 s | direct queue busy, ms a frame | homes | the pool's view on the card | the driver's own | card peak, RSS peak |
   |---|---|---|---|---|---|---|
   | bj1 (the rule as it was: 5,504 and 1 GiB) | 59 to 61 | 154.4 | none held (two made in the world's load, both gone under the pool's pressure, none asked again) | 832 MiB, 195 MiB of pages programs read off the card | 1,382 MiB | |
   | bj2 (`VICTORY_VK_CEILING_MB=6144 VICTORY_VK_ROOM_MB=256`) | 93 to 96 | 99.7 | 20, 281 MiB (the 79 MiB skinning cluster among them, held) | 1,221 MiB, none off the card | 1,446 MiB | 7,427 of 8,151 MiB, 15.6 GiB |
+  | bk1 (`int68.exe`, the default rule: 5,888 and 512 MiB) | 94 to 95 | 99.7 | 20, 310 MiB, none gone | 1,472 MiB, none off the card | 1,063 MiB | 7,218 of 8,151 MiB |
   - **The driver's own card use is not one number.** 1,062 MiB in 20 of
     the last 23 runs, 1,380 to 1,450 in three (bj1, bj2 and one of
     2026-11-27), from the first second on: its three first steps are
