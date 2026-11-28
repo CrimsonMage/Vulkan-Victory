@@ -73,7 +73,7 @@ const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
 }
 
 /// `v<regs>` stored as each thread's dwords of the UAV, the thread's index (v0) times 16 on.
-fn stores(regs: [u32; 4]) -> Vec<u32> {
+pub(super) fn stores(regs: [u32; 4]) -> Vec<u32> {
     let mut w = vec![vop2(0x1A, 15, k(4), 0)]; // v_lshlrev_b32 v15, 4, v0
     for (n, r) in regs.into_iter().enumerate() {
         w.extend(store(r, 15, 4 * n as u32));
@@ -86,12 +86,12 @@ const STORE_V0: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16];
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
 /// root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
-fn native(body: &[u32]) -> NativeProgram {
+pub(super) fn native(body: &[u32]) -> NativeProgram {
     native_of(body, true, 64)
 }
 
 /// The same for a console of 32-lane waves when `wave64` is not set, with `threads` threads.
-fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
@@ -147,7 +147,7 @@ fn run_way(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32, wa
 
 /// [`run_way`] in every way; they must agree (the halves the card runs
 /// with the wave stepped as one).
-fn run_group(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32) -> Result<Vec<u32>, String> {
+pub(super) fn run_group(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32) -> Result<Vec<u32>, String> {
     let wave = run_way(native, consts, dwords, group, WAYS[0]);
     for way in &WAYS[1..] {
         let halves = run_way(native, consts, dwords, group, *way);
@@ -181,7 +181,7 @@ fn execute(native: &NativeProgram, cases: &[(u32, u32)], expected: impl Fn(u32, 
 }
 
 /// Dword 0 of the UAV.
-fn dword0(native: &NativeProgram, s0: u32, s1: u32) -> Result<u32, String> {
+pub(super) fn dword0(native: &NativeProgram, s0: u32, s1: u32) -> Result<u32, String> {
     run_group(native, [s0, s1, 0, 0], 1, 0).map(|o| o[0])
 }
 

@@ -187,6 +187,9 @@ pub mod op {
     pub const DEMOTE_TO_HELPER_INVOCATION: u16 = 5380;
     pub const IS_HELPER_INVOCATION: u16 = 5381;
     pub const SET_MESH_OUTPUTS: u16 = 5295;
+    pub const FUNCTION_CALL: u16 = 57;
+    pub const BEGIN_INVOCATION_INTERLOCK_EXT: u16 = 5364;
+    pub const END_INVOCATION_INTERLOCK_EXT: u16 = 5365;
 }
 
 /// Capabilities, storage classes, decorations, built-ins and the other
@@ -232,6 +235,7 @@ pub mod en {
     pub const CAP_INT64_ATOMICS: u32 = 12;
     pub const CAP_SAMPLE_RATE_SHADING: u32 = 35;
     pub const CAP_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4466;
+    pub const CAP_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT: u32 = 5378;
 
     pub const SC_UNIFORM_CONSTANT: u32 = 0;
     pub const SC_INPUT: u32 = 1;
@@ -297,6 +301,7 @@ pub mod en {
     pub const EM_OUTPUT_TRIANGLES_EXT: u32 = 5298;
     pub const EM_STENCIL_REF_REPLACING: u32 = 5027;
     pub const EM_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4461;
+    pub const EM_PIXEL_INTERLOCK_ORDERED_EXT: u32 = 5366;
 
     pub const EXEC_VERTEX: u32 = 0;
     pub const EXEC_FRAGMENT: u32 = 4;

@@ -529,10 +529,14 @@ impl Lift<'_> {
         })
     }
 
-    /// A load in the V#'s format, decoded by a helper; bounds by the stride.
+    /// A load in the V#'s format, decoded by a helper; bounds by the
+    /// stride, which is the element (the console's test is the index
+    /// against NUM_RECORDS): the last element of a view of 1- or 2-byte
+    /// elements is in it. A view without a stride: 4 bytes.
     fn buffer_vformat(&mut self, inst: &Inst, vs: &VSharp, o: V, reg: u8, ch: u32, d16: bool) -> Res<()> {
-        let four = self.k32(4);
-        let bytes = self.gl(glsl::U_MAX, Ty::U32, &[vs.stride, four]);
+        let (four, z) = (self.k32(4), self.k32(0));
+        let raw = self.spv(op::I_EQUAL, Ty::BOOL, &[vs.stride, z]);
+        let bytes = self.spv(op::SELECT, Ty::U32, &[raw, four, vs.stride]);
         let a = self.access_addr(vs, o, bytes, false);
         let r = self.emit(Op::Call(Helper::Typed), Ty::vec(S::U32, 4), vec![a, vs.shape]);
         let vals: Vec<V> = (0..ch).map(|i| self.extract(r, i)).collect();

@@ -153,10 +153,8 @@ impl Lift<'_> {
                 r?;
             }
         }
-        // values exchanged at the end of a source stay there; the halves may
-        // arrive from different LDS accesses
+        // values exchanged at the end of a source stay there
         self.words.clear();
-        self.lds_dirty = b != 0;
         let n = p.blocks[b].insts.len();
         let branch = matches!(p.blocks[b].exit, Exit::Branch { .. });
         for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -390,7 +388,6 @@ impl Lift<'_> {
             Fields::Sopp { .. } => match name {
                 "s_barrier" => {
                     self.close();
-                    self.lds_dirty = false;
                     self.emit(Op::Barrier, Ty::VOID, vec![]);
                     Ok(())
                 }
@@ -429,12 +426,11 @@ impl Lift<'_> {
                     self.need(inst);
                     return self.ds_cross(inst, name);
                 }
-                self.lds_meet();
+                self.lds_meet(crate::vk::meetings::access(name));
                 let g = self.guard(inst)?;
                 self.guarded = g;
                 let r = self.ds(inst, name);
                 self.guarded = false;
-                self.lds_dirty = self.xwave;
                 r
             }
             Fields::Image { .. } => {

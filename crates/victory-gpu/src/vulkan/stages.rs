@@ -638,7 +638,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         return fail(format!("over the device: {why}"));
     }
     let t = Instant::now();
-    let fitted = victory_vk::limits::fit_float_controls(&vs.spirv, b.host.caps.signed_zero_inf_nan);
+    let fitted = victory_vk::limits::fit(&vs.spirv, &b.host.caps);
     let code = fitted.as_deref().unwrap_or(&vs.spirv);
     // SAFETY: the translator's words, a SPIR-V module.
     let module = victory_vk::account::traced(&b.host, "shader module", || unsafe {

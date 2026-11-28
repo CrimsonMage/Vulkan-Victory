@@ -4,6 +4,20 @@ use super::*;
 
 /// The `src_pops_exiting_wave_id` operand.
 const POPS_EXITING_WAVE_ID: u8 = 239;
+/// The hardware register (of `s_setreg_b32`) a pixel wave names its packer
+/// in before it waits for the waves it overlaps.
+const POPS_PACKER: u16 = 25;
+
+/// Whether a pixel program has an ordered section (primitive-ordered pixel
+/// shading, which the console compiler makes of an interlock or of
+/// rasterizer ordered views): it writes `HW_REG_POPS_PACKER`, then waits
+/// until the waves holding earlier primitives' samples of its pixels have
+/// left their sections (`pops_distance`), and ends the section with
+/// `s_sendmsg(MSG_ORDERED_PS_DONE)`.
+pub(super) fn ordered_section(p: &Program) -> bool {
+    let starts = |i: &Inst| i.name() == "s_setreg_b32" && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == POPS_PACKER);
+    p.blocks.iter().flat_map(|b| &b.insts).any(starts)
+}
 
 impl Lift<'_> {
     pub(super) fn sop(&mut self, inst: &Inst, name: &'static str, dst: &Option<Operand>, src: &[Operand], imm: Option<u16>) -> Res<()> {
@@ -507,11 +521,18 @@ impl Lift<'_> {
     /// The pixel-ordering wait of an ordered pixel program (POPS):
     /// `src_pops_exiting_wave_id + x` is how far the waves ahead of this
     /// one have got, which the program compares with the wave it overlaps
-    /// and sleeps on. The PC runs overlapping pixels of a draw in no fixed
-    /// order, so every earlier wave counts as exited: the largest distance,
-    /// and the wait ends at once.
+    /// and sleeps on. Here nothing is left to wait for: every earlier wave
+    /// counts as exited (the largest distance), and the wait ends at once.
+    /// The order is the host's to keep: the whole program runs inside the
+    /// fragment shader interlock (`Interface::ordered`, emit.rs
+    /// `interlocked`), which lets the pixels of one place in one at a
+    /// time, in the order of their primitives. A wait without the
+    /// section's start (no write of `HW_REG_POPS_PACKER`) is no section
+    /// we know: the order is then not kept, and that is said.
     fn pops_distance(&mut self, s: &Sop) -> Res<()> {
-        self.approx("pixel ordering (POPS) is not kept: overlapping pixels of one draw run in any order");
+        if !self.iface.ordered {
+            self.approx("pixel ordering (POPS) is not kept: overlapping pixels of one draw run in any order");
+        }
         let (r, no) = (self.k32(u32::MAX), self.f.konst(Ty::BOOL, 0));
         self.sdst(s.inst, s.dst, 0, R::D(r));
         self.def(s.inst, Reg::Scc, R::B(no));

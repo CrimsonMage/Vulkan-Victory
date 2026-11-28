@@ -366,6 +366,11 @@ impl Lift<'_> {
 
     fn image_store(&mut self, m: &mut Mimg) -> Res<()> {
         let mip = self.image_texel(m)?;
+        let integer = m.d16.then(|| {
+            let (bit, z) = (self.k32(1 << 24), self.k32(0));
+            let x = self.spv(op::BITWISE_AND, Ty::U32, &[m.tw, bit]);
+            self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[x, z])
+        });
         let mut vals = Vec::new();
         let mut j = 0u8;
         for c in 0..4 {
