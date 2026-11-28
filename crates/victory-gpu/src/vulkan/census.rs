@@ -15,8 +15,13 @@
 //! beforehand ([`host_reads`]). A page that changed over a frame without a
 //! CPU write is one the card stored into. `touch-census.txt` lists each
 //! probed page (`<range start> <page> <read faults> <write faults> <of
-//! them victory's> <frames changed> <frames changed with no CPU write>`),
-//! and a line a range is logged. Faults between a page's hash and its
+//! them victory's> <frames changed> <frames changed with no CPU write>
+//! <read faults at a byte under an unordered-access view of 1 MiB or more>
+//! <write faults there>`), and a line a range is logged. Buffer memory
+//! that holds an unordered-access view of 1 MiB or more is probed whole,
+//! changed or not (`buffer-resources.txt`: `<first address> <bytes>
+//! <its largest such view>`): what a card home for it would have to
+//! follow. Faults between a page's hash and its
 //! re-arming at a present are missed, and a page whose protection write
 //! tracking changes meanwhile may be given back writable once: the frames
 //! of the probe are not to be judged as pictures.
@@ -69,7 +74,41 @@ pub(super) fn view(kind: u8, at: u64, len: u64) {
     }
 }
 
-fn hash(page: &[u8]) -> u64 {
+/// Buffer memory the title made unordered-access views of: (first
+/// address, bytes) of the resource (or of a placed view's memory) -> the
+/// bytes of its largest such view.
+static RESOURCES: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+
+/// The title made an unordered-access view of `view` bytes in the buffer
+/// memory `[base, base + len)`.
+pub(super) fn resource(base: u64, len: u64, view: u64) {
+    if cfg!(feature = "diagnostics") && window().is_some() {
+        let mut r = lock(&RESOURCES);
+        let e = r.entry((base, len)).or_insert(0);
+        *e = (*e).max(view);
+    }
+}
+
+/// Sorted spans joined where they touch.
+fn merged(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in spans {
+        match out.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// Whether one of the sorted, disjoint `spans` holds a byte of `[at, at + len)`.
+fn within(spans: &[(u64, u64)], at: u64, len: u64) -> bool {
+    let i = spans.partition_point(|m| m.0 < at + len);
+    i > 0 && spans[i - 1].1 > at
+}
+
+pub(super) fn hash(page: &[u8]) -> u64 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64;
     for c in page.chunks_exact(8) {
         let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
@@ -139,7 +178,7 @@ pub(super) fn frame(b: &Backend, frame: u64) {
             }
         }
     }
-    tracing::info!(frame, mb = bytes >> 20, ms = t.elapsed().as_millis() as u64, "Vulkan: write census, a present hashed");
+    tracing::info!(frame, mb = bytes >> 20, ms = t.elapsed().as_millis() as u64, recordings_open = b.timeline.open(), "Vulkan: write census, a present hashed");
     if frame < first + frames {
         return;
     }
@@ -157,13 +196,23 @@ pub(super) fn frame(b: &Backend, frame: u64) {
     }
     if let Some(folder) = crate::capture::folder() {
         let _ = std::fs::write(folder.join("write-census.txt"), text);
-        let mut text = Vec::new();
-        for ((kind, at, len), n) in lock(&VIEWS).iter() {
-            let _ = writeln!(text, "{kind} {at:x} {len:x} {n}");
-        }
-        let _ = std::fs::write(folder.join("buffer-views.txt"), text);
+        write_views(&folder);
     }
     *guard = None;
+}
+
+/// `buffer-views.txt` and `buffer-resources.txt` into the capture folder.
+fn write_views(folder: &std::path::Path) {
+    let mut text = Vec::new();
+    for ((kind, at, len), n) in lock(&VIEWS).iter() {
+        let _ = writeln!(text, "{kind} {at:x} {len:x} {n}");
+    }
+    let _ = std::fs::write(folder.join("buffer-views.txt"), text);
+    let mut text = Vec::new();
+    for ((at, len), view) in lock(&RESOURCES).iter() {
+        let _ = writeln!(text, "{at:x} {len:x} {view:x}");
+    }
+    let _ = std::fs::write(folder.join("buffer-resources.txt"), text);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +230,12 @@ struct Probe {
     /// Faults whose instruction lies in victory's image, and pages the
     /// host's guarded reads let go.
     ours: Vec<AtomicU32>,
+    /// Of the first touches, those at a byte under an unordered-access
+    /// view of 1 MiB or more: reads, writes.
+    view_reads: Vec<AtomicU32>,
+    view_writes: Vec<AtomicU32>,
+    /// The bytes of those views, joined.
+    large: Vec<(u64, u64)>,
     /// The CPU wrote the page since the last present.
     wrote: Vec<AtomicBool>,
     /// Presents at which the page had changed; of those, without a CPU
@@ -258,23 +313,18 @@ fn let_go(p: &Probe, i: usize) -> bool {
 fn probe_start(st: &State) {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    // the views' spans, merged
-    let mut spans: Vec<(u64, u64)> = lock(&VIEWS).keys().filter(|k| k.0 == 2).map(|k| (k.1, k.1 + k.2)).collect();
-    spans.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::new();
-    for (a, b) in spans {
-        match merged.last_mut() {
-            Some(m) if a <= m.1 => m.1 = m.1.max(b),
-            _ => merged.push((a, b)),
-        }
-    }
-    let under = |page: u64| {
-        let i = merged.partition_point(|m| m.0 < page + SMALL as u64);
-        i > 0 && merged[i - 1].1 > page
-    };
+    // the views' spans, joined; those of 1 MiB or more; and the buffer
+    // memory that holds such a view, whole
+    let merged = merged(lock(&VIEWS).keys().filter(|k| k.0 == 2).map(|k| (k.1, k.1 + k.2)).collect());
+    let large = self::merged(lock(&VIEWS).keys().filter(|k| k.0 == 2 && k.2 >= 1 << 20).map(|k| (k.1, k.1 + k.2)).collect());
+    let whole = self::merged(lock(&RESOURCES).iter().filter(|(_, view)| **view >= 1 << 20).map(|(k, _)| (k.0, k.0 + k.1)).collect());
     let mut pages: Vec<(u64, u64)> = Vec::new();
     for (at, (_, _, masks)) in &st.ranges {
-        pages.extend(masks.iter().enumerate().filter(|(_, m)| **m != 0).map(|(i, _)| (at + (i * SMALL) as u64, *at)).filter(|p| under(p.0)));
+        let probed = |i: usize, m: u32| {
+            let page = at + (i * SMALL) as u64;
+            (m != 0 && within(&merged, page, SMALL as u64)) || within(&whole, page, SMALL as u64)
+        };
+        pages.extend(masks.iter().enumerate().filter(|(i, m)| probed(*i, **m)).map(|(i, _)| (at + (i * SMALL) as u64, *at)));
     }
     pages.sort_unstable();
     let n = pages.len();
@@ -285,6 +335,9 @@ fn probe_start(st: &State) {
         reads: counters(n),
         writes: counters(n),
         ours: counters(n),
+        view_reads: counters(n),
+        view_writes: counters(n),
+        large,
         wrote: (0..n).map(|_| AtomicBool::new(false)).collect(),
         changed: counters(n),
         card: counters(n),
@@ -361,7 +414,7 @@ fn probe_tell(p: &Probe, frames: u64) {
         s.card_read += u64::from(k != 0 && r != 0);
         s.card_untouched += u64::from(k != 0 && r == 0 && w == 0);
         s.card_frames += k;
-        let _ = writeln!(text, "{range:x} {page:x} {r} {w} {o} {c} {k}");
+        let _ = writeln!(text, "{range:x} {page:x} {r} {w} {o} {c} {k} {} {}", get(&p.view_reads, i), get(&p.view_writes, i));
     }
     for (range, s) in &by {
         tracing::info!(
@@ -415,12 +468,15 @@ fn takes(page: u64, write: bool) -> bool {
 
 /// The first touch of probed page `i` since the last present, by the
 /// instruction at `ip`.
-fn touched(p: &Probe, i: usize, write: bool, ip: usize) {
+fn touched(p: &Probe, i: usize, write: bool, ip: usize, at: u64) {
+    let under = within(&p.large, at, 1);
     if write {
         p.writes[i].fetch_add(1, Ordering::Relaxed);
+        p.view_writes[i].fetch_add(u32::from(under), Ordering::Relaxed);
         p.wrote[i].store(true, Ordering::Relaxed);
     } else {
         p.reads[i].fetch_add(1, Ordering::Relaxed);
+        p.view_reads[i].fetch_add(u32::from(under), Ordering::Relaxed);
     }
     if ip >= p.image.0 && ip < p.image.1 {
         p.ours[i].fetch_add(1, Ordering::Relaxed);
@@ -443,7 +499,7 @@ unsafe extern "system" fn on_touch(info: *mut windows_sys::Win32::System::Diagno
     let Ok(i) = p.pages.binary_search_by_key(&page, |q| q.0) else { return EXCEPTION_CONTINUE_SEARCH };
     let s = p.state[i].fetch_and(!ARMED, Ordering::SeqCst);
     if s & ARMED != 0 {
-        touched(p, i, write, r.ExceptionAddress as usize);
+        touched(p, i, write, r.ExceptionAddress as usize, at);
         protect(page, s & 0xfff);
         return EXCEPTION_CONTINUE_EXECUTION;
     }

@@ -203,6 +203,7 @@ pub(super) fn flush_written(b: &super::Backend, frame_end: bool) {
         return;
     }
     let start = std::time::Instant::now();
+    super::homes::flush(b);
     let copy = crate::track::flush(frame_end, &mut |shown, fill| {
         let mut held: Vec<Held> = {
             let m = memory(b);

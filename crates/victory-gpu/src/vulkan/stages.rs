@@ -335,8 +335,11 @@ impl Stage {
     /// eighth a dispatch. The records are read while the card may be
     /// writing them (cleared, counted up again): one reading in five of
     /// the heaviest pass was too low to stage it (runs ss3 and ss5).
-    pub(crate) fn indirect_groups(&self, now: u64) -> u64 {
+    /// `None`: the records are not read (their home is the card): what
+    /// was last read stays.
+    pub(crate) fn indirect_groups(&self, now: Option<u64>) -> u64 {
         let held = self.held_groups.load(Ordering::Relaxed);
+        let Some(now) = now else { return held };
         let groups = now.max(held - held / 8);
         self.held_groups.store(groups, Ordering::Relaxed);
         groups

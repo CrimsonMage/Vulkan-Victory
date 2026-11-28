@@ -533,7 +533,8 @@ impl Rec {
         let Some((cmd, stage)) = self.prepare_dispatch(b) else {
             return;
         };
-        let staged = self.stage_stores(b, cmd, &stage, stage.indirect_groups(groups_now(spec)));
+        let now = (!super::super::homed(b, spec.src, 12)).then(|| groups_now(spec));
+        let staged = self.stage_stores(b, cmd, &stage, stage.indirect_groups(now));
         // SAFETY: outside rendering, in our command buffer.
         let watched = if super::super::watch::on() { unsafe { super::super::watch::read(b, cmd, None) } } else { Vec::new() };
         // SAFETY: outside rendering; no statistics query of the list's is

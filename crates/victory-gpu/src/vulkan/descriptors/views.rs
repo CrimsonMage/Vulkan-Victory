@@ -207,7 +207,14 @@ fn buffer_words(base: u64, len: u64, desc: Option<&[u32; 10]>, unordered: bool) 
         }
     }
     ;
-    super::super::census::view(1 + u8::from(unordered), out.address, u64::from(out.stride.max(1)) * u64::from(out.records));
+    let bytes = u64::from(out.stride.max(1)) * u64::from(out.records);
+    super::super::census::view(1 + u8::from(unordered), out.address, bytes);
+    if unordered {
+        super::super::census::resource(base, len, bytes);
+        if let Some(b) = super::super::backend() {
+            super::super::homes::view(b, base, len, bytes);
+        }
+    }
     let mut out = out.encode().to_vec();
     out.resize(8, 0);
     out

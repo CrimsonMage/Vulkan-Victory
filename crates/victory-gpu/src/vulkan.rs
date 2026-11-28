@@ -48,6 +48,7 @@ mod engine;
 mod gpu_stats;
 mod gputime;
 mod guard;
+pub(crate) mod homes;
 mod loose;
 mod paging;
 mod probe;
@@ -140,6 +141,9 @@ struct Region {
     /// Loose memory (no `XMemVirtualAlloc` region): joined with loose
     /// neighbours when the pages between are committed.
     loose: bool,
+    /// The title asked for it write-combined (memory it does not read
+    /// back: `homes.rs`).
+    combined: bool,
 }
 
 struct Section {
@@ -167,6 +171,8 @@ struct Memory {
     reservations: BTreeMap<usize, usize>,
     pools: Vec<PoolView>,
     map: MemoryMap,
+    /// Card homes of the buffers programs store into (`homes.rs`).
+    homes: homes::Homes,
     /// Imports replaced by larger ones: kept for the run (recorded command
     /// buffers not yet submitted may bind maps that name them).
     retired: Vec<Imported>,
@@ -281,8 +287,14 @@ impl Memory {
     }
 
     /// The buffer and offset of a title address, for copies, index and
-    /// vertex buffers.
+    /// vertex buffers: its home on the card, or where it is imported.
     fn buffer_of(&self, title: u64) -> Option<(vk::Buffer, u64)> {
+        self.homes.of(title).or_else(|| self.imported_of(title))
+    }
+
+    /// The buffer and offset of a title address in the pool's GPU view or
+    /// an import (under a home: the system RAM the home was copied from).
+    fn imported_of(&self, title: u64) -> Option<(vk::Buffer, u64)> {
         for p in &self.pools {
             if p.contains(title) {
                 return Some((p.buffer, title - p.title_start));
@@ -333,7 +345,7 @@ impl Memory {
             }
         }
         let mut map = MemoryMap::default();
-        for r in MemoryMap::coalesce(ranges) {
+        for r in self.homes.cut(MemoryMap::coalesce(ranges), victory_vk::map::MAX_RANGES) {
             if let Err(e) = map.insert(r) {
                 // Shaders reading there read zeros (and writes are lost).
                 if MAP_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -396,8 +408,9 @@ fn memory(b: &Backend) -> MutexGuard<'_, Memory> {
 }
 
 /// `xmem` reserved a region for the title at `at`, `len` bytes (a multiple
-/// of 64 KiB): imported when the card first needs it.
-pub fn title_region(at: usize, len: usize) {
+/// of 64 KiB): imported when the card first needs it. `combined`: the
+/// title asked for write-combined memory.
+pub fn title_region(at: usize, len: usize, combined: bool) {
     if let Some(b) = backend() {
         memory(b).regions.insert(
             at,
@@ -407,6 +420,7 @@ pub fn title_region(at: usize, len: usize) {
                 refused: false,
                 wanted: false,
                 loose: false,
+                combined,
             },
         );
     }
@@ -469,7 +483,7 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
     let end = at + len;
     let before = m.views.len();
     m.views.retain(|&a, &mut (l, ..)| a + l <= at || a >= end);
-    let remapped = m.drop_stale_loose(b, at, end);
+    let remapped = m.drop_stale_loose(b, at, end) | m.homes_freed(b, at as u64, len as u64);
     let gone: Vec<usize> = m.regions.range(..end).filter(|&(&a, r)| a + r.len > at && a >= at && a + r.len <= end).map(|(&a, _)| a).collect();
     let mut imports = Vec::new();
     for a in gone {
@@ -552,7 +566,7 @@ pub fn title_memory_released(at: usize, len: usize) {
         .filter(|&(&a, r)| a >= at && a + r.len <= at + len)
         .map(|(&a, _)| a)
         .collect();
-    let mut dropped = m.drop_stale_loose(b, at, at + len);
+    let mut dropped = m.drop_stale_loose(b, at, at + len) | m.homes_freed(b, at as u64, len as u64);
     for a in gone {
         if let Some(r) = m.regions.remove(&a) {
             // The card, or a command buffer not yet submitted, may still
@@ -724,11 +738,17 @@ fn map_now(b: &Backend) -> MemoryMap {
 /// card memory).
 fn imported_over(b: &Backend, title: u64, len: u64) -> Option<(vk::Buffer, u64)> {
     let m = memory(b);
-    if len == 0 || m.pools.iter().any(|p| p.contains(title)) {
+    if len == 0 || m.pools.iter().any(|p| p.contains(title)) || m.homes.over(title, len).0 {
         return None;
     }
-    let (buffer, offset) = m.buffer_of(title)?;
-    (m.buffer_of(title + len - 1) == Some((buffer, offset + len - 1))).then_some((buffer, offset))
+    let (buffer, offset) = m.imported_of(title)?;
+    (m.imported_of(title + len - 1) == Some((buffer, offset + len - 1))).then_some((buffer, offset))
+}
+
+/// Whether title memory `[title, title + len)` has its home on the card
+/// (`homes.rs`): all of it.
+fn homed(b: &Backend, title: u64, len: u64) -> bool {
+    memory(b).homes.over(title, len).1
 }
 
 /// The map's generation now (regions wanted imported first).
@@ -795,6 +815,14 @@ fn buffer_of(b: &Backend, title: u64) -> Option<(vk::Buffer, u64)> {
 /// first.
 fn buffer_over(b: &Backend, title: u64, len: u64) -> Option<(vk::Buffer, u64)> {
     let mut m = memory(b);
+    // No one buffer holds a range that reaches into a home from outside.
+    if m.homes.over(title, len) == (true, false) {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::warn!(at = format_args!("{title:#x}"), len, "Vulkan: a recording names memory that reaches into a home from outside; it is left out");
+        }
+        return None;
+    }
     paging::ensure(b, &mut m, title, len);
     if let Some(found) = m.buffer_of(title) {
         return Some(found);
@@ -991,6 +1019,7 @@ impl Memory {
                     refused: false,
                     wanted: true,
                     loose: true,
+                    combined: false,
                 },
             );
         }
@@ -1195,6 +1224,7 @@ fn report(b: &Backend, frame: u64) {
     record::report();
     images::report();
     paging::report_written(frames);
+    homes::report(b);
     card_memory(b);
 }
 

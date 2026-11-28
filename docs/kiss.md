@@ -67,7 +67,7 @@ exactly one home, the one a PC game would give it:
 |---|---|---|
 | CPU writes often, GPU reads (constants, dynamic vertices, command data) | system RAM, read in place by the GPU (upload heap) | open the title's memory as a heap; nothing copied, nothing tracked |
 | Streamed once, GPU reads (textures, static geometry) | video memory (default heap) | upload once when the title says it arrived; free when it unloads |
-| GPU writes, GPU reads (render targets, scratch) | video memory only | never copied back |
+| GPU writes, GPU reads (render targets, scratch, the buffers programs store into) | video memory only | never copied back; a buffer the title makes an unordered-access view of 1 MiB or more in, in memory it asked for write-combined, gets a home on the card once the card is seen to store into it (`vulkan/homes.rs`) |
 | GPU writes, CPU reads (queries, read-backs) | system RAM (read-back heap) | the GPU writes into title memory in place |
 
 No class is mirrored in both places and kept in sync by watching or
@@ -79,7 +79,9 @@ NVIDIA) and textures (the console's tiled layouts are not the card's).
 They are kept exact by write tracking, not by comparing: such a page is
 write-protected, the first store into it faults once, and its copies are
 made again before the next submission (`victory-gpu/src/track.rs`,
-`docs/vulkan-host.md` "Write tracking").
+`docs/vulkan-host.md` "Write tracking"). A home is no copy: the card is
+where its bytes live, and a CPU store into them is sent after
+(`docs/vulkan-host.md` "Homes").
 
 ## Rules
 
@@ -150,6 +152,81 @@ driver errors and no new crash, and the captures look no worse.
 | 8 | HLSL backend replaces the DXIL encoder | — | after 5 and 6 |
 
 ## Decisions log
+
+- 2026-11-28 (homes): **the buffers programs store into live on the
+  card: 7.4 fps (6.2), the direct queue 130 ms a frame (148). Cloth and
+  hair strands, 24 ms a frame in the list, are gone from it; skinning
+  and store staging's copies are not touched: their buffers lie in loose
+  memory, which the CPU sees at two addresses.** Branch `homes`; no
+  translator change (the key is `085b3a007cf1bafe` as before, nothing
+  baked). How it works: `docs/vulkan-host.md`, "Homes".
+  | run (the test scene, `VICTORY_VK_GPU_TIME=1900,6`) | frames in 10 s | direct queue busy, ms a frame | card by the marks | homes | card peak, RSS peak |
+  |---|---|---|---|---|---|
+  | ss6 (the baseline) | 61 to 63 | 147.9 | 156.5 | | 6,798 MiB, 16.5 GiB |
+  | hs2 (the homes went under the pool's pressure of the world's load and did not come back in time) | 61 to 63 | 151.2 | | none in the window | |
+  | **hs3 (they ask again)** | **72 to 76** | **130.0** | **131.7** | 2: 50.15 and 1.34 MiB | 6,781 MiB, 16.6 GiB |
+  No hang, no guard hit, no error in hs2 and hs3; the picture as bh1's
+  (capture hs3 frames 3210 and 3900 beside bh1 frame 3210, by eye: the
+  hair and the jumpsuit move from frame to frame).
+  - **By family** (ms a frame among the 40 largest, ss6 against hs3; a
+    family that left the list is under 0.9):
+    | family | ss6 | hs3 |
+    |---|---|---|
+    | `CS_SolvePerVertConstraint` and what follows it | 8.12 + 3.83 | not listed |
+    | `CS_WavePerSplineConstraint_32` and what follows it | 4.96 + 2.96 | not listed |
+    | `CS_InterpolateStrands` | 3.41 | not listed |
+    | `CS_CachePrevPosition` | 2.12 | not listed |
+    | `CS_PedStandardSkinning_8`, `_5`, `_11` | 6.52 | 7.04 |
+    | `CSComputeSkinningDefaultVelocity` and what follows it | 5.26 | 5.17 |
+    | store staging's copies | 13.13 | 14.45 |
+    | the 40 largest together | 93.5 | 75.4 |
+  - **Measured first** (run hm0, `VICTORY_VK_WRITE_CENSUS=1900,6`, whose
+    touch probe now takes every page of buffer memory with an
+    unordered-access view of 1 MiB or more, changed or not: 168,973
+    pages, 660 MiB).
+    | memory | clusters of such buffers | MiB | pages the card stored into (a frame) | pages the CPU read | CPU write faults in six frames (at a byte under a view) |
+    |---|---|---|---|---|---|
+    | the write-combined region (0x2404, 1,277 MiB) | 21 | 177.4 | 4,643 (3,950) | 0 | 42 (36, all in one 3.3 MiB cluster) |
+    | the loose 79 MiB range | 1 (three buffers end to start) | 79.0 | 2,935 (2,622) | 0 at this address | 0 at this address |
+    | the loose 348 MiB arena | 23 | 195.9 | 2,626 (2,249) | 0 at this address | 0 at this address |
+    | the 32-bit arena (185 MiB) | 1 (one 174 MiB buffer, 241 views of 1 MiB in it) | 174.0 | 1,072 (400) | 4,044 | 9,123 (all) |
+    Where the families store (the captures of cm-a and cb1 replayed in
+    the interpreter, and hs3's times): strands, cloth and
+    `CS_CachePrevPosition` into the 50.15 MiB cluster of the
+    write-combined region (a 45 MiB and a 5.15 MiB buffer) and a 1.34 MiB
+    one; `CS_PedStandardSkinning_8` into the loose 79 MiB range;
+    `CSComputeSkinningDefaultVelocity` and `CS_GatherOperation` into a
+    53.25 MiB cluster of the arena (six buffers). In those three kinds
+    of memory every buffer with such a view is the view (no larger
+    buffer around it), and no two overlap.
+  - **The card has no headroom of its own** (fact c): ours stands at the
+    card-memory limit (4,290 to 4,480 of 4,380 to 4,440 MiB; the limit
+    is the driver's budget of 6,470 MiB less its own 1,062 and the 1 GiB
+    never grown into), because the pool's GPU view takes what is left.
+    Of the view's 1,090 to 1,340 MiB about 1,050 are pages programs read;
+    the rest, and what the scratch gives back, is the room homes have:
+    about 200 MiB. hs3's two homes are 52 MiB; the pool's view kept
+    every page programs read (0 MiB off the card in the scene).
+  - **Which clusters** (step 0 has the map's 64 ranges: 43 to 47 in use,
+    12 kept for store staging, so three or four homes): the ones the card
+    is seen to store into, the one that changed most first. By size the
+    34 and the two 15.5 MiB clusters would have come before the cloth's
+    1.34 MiB, and the card stores a page a frame into them or nothing.
+    In hs3 the map turned further clusters down 44 times.
+  - **CPU stores** (hs3, 400 s with homes): 1,283 write faults on the
+    homes' pages, none at a byte of a cluster (all in the pages at a
+    cluster's ends, whose other bytes are someone else's); nothing had
+    to go up.
+  - **Not explained**: why `CS_PedStandardSkinning_*` is 0.5 ms higher
+    in hs3 (within what the families move between runs).
+  - **Next**: (1) the map's limit to 256 ranges, so that every cluster
+    the card stores into gets its home; (2) loose memory: its pages
+    protected at every address the CPU sees them at, for the skinning
+    families' 12 ms and store staging's 14 ms of copies (its views lie in
+    the arena; with homes there the scratch gives 126 MiB back).
+  - Scratch: `scratch-agent/homes/` (the logs `hm0.log`, `hs1.log` to
+    `hs3.log`, `hm0-clusters.txt`, the executables `hm0.exe`, `hs1.exe`
+    to `hs3.exe`, `pics/`), the captures `capture/hm0`, `hs1` to `hs3`.
 
 - 2026-11-28 (store staging in the host): **the store views a dispatch
   scatters over run on the card: 6.2 fps (5.2), card 156 ms a frame

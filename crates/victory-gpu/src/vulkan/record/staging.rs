@@ -36,6 +36,8 @@
 //! - A program whose stores or views are found only at run time (a
 //!   descriptor index from memory, a computed address) is left in place,
 //!   counted, and named once.
+//! - A view that has its home on the card (`vulkan/homes.rs`) needs
+//!   nothing.
 //!
 //! Between the copies the view's home is stale; nothing else of the
 //! command buffer runs there, and what another queue does at that time
@@ -49,7 +51,7 @@ use victory_vk::ash::vk;
 use victory_vk::map::MAX_RANGES;
 
 use super::super::stages::{Stage, Stores};
-use super::super::{Backend, descriptors, gputime, images, imported_over, lock, map_block, map_now, tables};
+use super::super::{Backend, descriptors, gputime, homed, images, imported_over, lock, map_block, map_now, tables};
 use super::Rec;
 
 /// What a scattering invocation costs in place (ns; the pass bench),
@@ -68,14 +70,16 @@ const PAD: u64 = 16;
 /// bytes; and dispatches or views left in place: the program's stores are
 /// not found, a V# was not read, below the floor, another view reaches
 /// into the view, the map has no ranges left (or none holds the view),
-/// the view has no home in one imported buffer (or no scratch).
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// the view has no home in one imported buffer (or no scratch); views on
+/// the card as it is.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const NOT_FOUND: usize = 3;
 const UNREAD: usize = 4;
 const FLOOR: usize = 5;
 const REACHED: usize = 6;
 const NO_RANGE: usize = 7;
 const NO_HOME: usize = 8;
+const ON_CARD: usize = 9;
 
 fn count(what: usize) {
     STATS[what].fetch_add(1, Ordering::Relaxed);
@@ -117,6 +121,7 @@ pub(super) fn report() {
         reached_by_another_view = n(REACHED),
         no_range = n(NO_RANGE),
         no_home = n(NO_HOME),
+        on_the_card = n(ON_CARD),
         programs_read_now = super::super::stages::VIEWS_READ.load(Ordering::Relaxed),
         "Vulkan: store staging (dispatches whose store views ran on the card; left in place by reason; programs whose views no file held)"
     );
@@ -259,6 +264,10 @@ impl Rec {
             }
             if !worth(bytes) {
                 count(FLOOR);
+                continue;
+            }
+            if homed(b, base, bytes) {
+                count(ON_CARD);
                 continue;
             }
             let reaches = |v: &(u64, u64, bool)| v.1 != 0 && v.0 < base + bytes && v.0 + v.1 > base && !(v.0 >= base && v.0 + v.1 <= base + bytes);

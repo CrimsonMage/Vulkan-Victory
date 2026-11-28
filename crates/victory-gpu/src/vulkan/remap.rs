@@ -81,7 +81,7 @@ impl Memory {
         for (base, bytes, since) in std::mem::take(&mut self.rejoin) {
             let free = self.regions.range(..base + bytes).all(|(&a, r)| a + r.len <= base);
             if near(base, bytes) && free && super::loose::all_usable(base, base + bytes) {
-                self.regions.insert(base, Region { len: bytes, import: Vec::new(), refused: false, wanted: true, loose: true });
+                self.regions.insert(base, Region { len: bytes, import: Vec::new(), refused: false, wanted: true, loose: true, combined: false });
             } else if tick.saturating_sub(since) < PATIENCE {
                 left.push((base, bytes, since));
             }

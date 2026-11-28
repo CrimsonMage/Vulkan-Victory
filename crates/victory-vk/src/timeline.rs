@@ -438,6 +438,12 @@ impl Timeline {
         self.lost() || self.completed(host) >= mark.ticket.unwrap_or(0)
     }
 
+    /// Recordings begun and not yet submitted or abandoned: what may
+    /// still run with what was bound when each began.
+    pub fn open(&self) -> usize {
+        self.state().recorders.iter().filter(|r| r.done_at == u64::MAX).count()
+    }
+
     /// The value `line` has reached on the card.
     pub fn line_completed(&self, host: &Host, line: Line) -> u64 {
         let sem = self.state().lines[line].semaphore;

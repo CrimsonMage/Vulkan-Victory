@@ -110,7 +110,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // (the title's 23 calls never do); replace that part of the
     // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
-    asked(base, size, kind, flags, protect);
+    let combined = asked(base, size, kind, flags, protect);
     if placeholder && kind & MEM_REPLACE_PLACEHOLDER != 0 {
         // Part of a placeholder the title split: it stays one.
         return base;
@@ -160,18 +160,17 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
         if !at.is_null() {
-            reserved(at as usize, size, placeholder, region);
+            reserved(at as usize, size, placeholder, region, combined);
         }
     }
     at
 }
 
-/// Diagnostics: what the title asked a virtual allocation with, before
-/// the console's bits are dropped (the first 4,096 calls; a title makes a
-/// few hundred): the protection with its write-combine (0x400), no-cache
-/// (0x200) and GPU bits, the XMem flags, and whether the address is its
-/// choice.
-fn asked(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32) {
+/// Diagnostics: logs what the title asked a virtual allocation with before
+/// the console's bits are dropped (the first 4,096 calls): protection,
+/// XMem flags, whose the address is. Returns whether the protection has
+/// the write-combine bit (0x400: memory the CPU does not read back).
+fn asked(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32) -> bool {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     if cfg!(feature = "diagnostics") && CALLS.fetch_add(1, Ordering::Relaxed) < 4096 {
         tracing::info!(
@@ -185,6 +184,7 @@ fn asked(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32) {
             "XMemVirtualAlloc: as the title asked"
         );
     }
+    protect & 0x400 != 0
 }
 
 /// How memory is reserved, as (kind, bytes); always at an address of our
@@ -200,7 +200,7 @@ fn reservation(kind: u32, size: usize, constrained: bool, region: bool) -> (u32,
 /// A reservation made at an address of our choice: noted for the fault
 /// handler, and for the GPU side a reservation physical pages are mapped
 /// into page by page (the pool's GPU view), or a region.
-fn reserved(at: usize, size: usize, placeholder: bool, region: bool) {
+fn reserved(at: usize, size: usize, placeholder: bool, region: bool, combined: bool) {
     RESERVED.write().unwrap_or_else(|e| e.into_inner()).insert(at, size);
     install_fault_handler();
     let title_bytes = size.next_multiple_of(PAGE);
@@ -208,7 +208,7 @@ fn reserved(at: usize, size: usize, placeholder: bool, region: bool) {
         victory_gpu::title_page_reservation(at, title_bytes);
     }
     if region {
-        victory_gpu::title_region(at, title_bytes);
+        victory_gpu::title_region(at, title_bytes, combined);
     }
 }
 

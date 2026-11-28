@@ -114,14 +114,22 @@ fn set(page: usize, protection: u32) -> bool {
     let mut old = 0;
     COUNT[CHANGES].fetch_add(1, Ordering::Relaxed);
     // SAFETY: a page of title memory; a page not there fails the call.
-    unsafe { VirtualProtect(page as *const _, PAGE, protection, &mut old) != 0 }
+    let done = unsafe { VirtualProtect(page as *const _, PAGE, protection, &mut old) != 0 };
+    // The 4 KiB pages a card home keeps read-only stay so.
+    if protection == PAGE_READWRITE {
+        crate::vulkan::homes::opened(page, PAGE);
+    }
+    done
 }
 
 /// A store faulted at `at`: if the page is one we protected, it is noted
 /// written and opened, and the store goes on (true). Takes no lock a
 /// writer of title memory may hold: victory's own writers fault here too.
 pub fn write_fault(at: usize) -> bool {
-    let Some(m) = mark(at) else { return false };
+    // A page of a card home's cluster first (its own 4 KiB tracking); the
+    // 64 KiB page around it may be tracked here as well.
+    let home = crate::vulkan::homes::write_fault(at);
+    let Some(m) = mark(at) else { return home };
     let page = at & !(PAGE - 1);
     let taken = m.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & PROTECTED != 0).then_some(v & !PROTECTED | WRITTEN));
     match taken {
@@ -132,7 +140,7 @@ pub fn write_fault(at: usize) -> bool {
             lock(&LIST).push(page);
             COUNT[FAULTS].fetch_add(1, Ordering::Relaxed);
             COUNT[IMAGE_FAULTS].fetch_add(u64::from(v & IMAGE != 0), Ordering::Relaxed);
-            open
+            open || home
         }
         // Open by its mark (another thread's fault is opening it, or a
         // flush protected it between that thread's two steps): opened,
@@ -140,9 +148,9 @@ pub fn write_fault(at: usize) -> bool {
         Err(v) if v & (WRITTEN | HOT) != 0 => {
             let open = set(page, PAGE_READWRITE);
             lock(&LIST).push(page);
-            open
+            open || home
         }
-        Err(_) => false,
+        Err(_) => home,
     }
 }
 
@@ -190,6 +198,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     }
     let mut host = lock(&HOST);
     host.push((at, len));
+    crate::vulkan::homes::host_writes(at, len);
     for (page, m) in marked(at, len) {
         let was = m.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & PROTECTED != 0).then_some(v & !PROTECTED | WRITTEN));
         match was {
@@ -252,6 +261,7 @@ pub fn released(at: usize, len: usize) {
         return;
     }
     let _host = lock(&HOST);
+    crate::vulkan::homes::host_writes(at, len);
     for (page, m) in marked(at, len) {
         if m.swap(0, Ordering::AcqRel) & PROTECTED != 0 {
             set(page, PAGE_READWRITE);
@@ -263,7 +273,13 @@ pub fn released(at: usize, len: usize) {
 /// Whether we keep `page` read-only now (a page found read-only is
 /// title memory all the same: `vulkan/loose.rs`).
 pub(crate) fn protected(page: usize) -> bool {
-    mark(page).is_some_and(|m| m.load(Ordering::Acquire) & PROTECTED != 0)
+    mark(page).is_some_and(|m| m.load(Ordering::Acquire) & PROTECTED != 0) || crate::vulkan::homes::tracks(page)
+}
+
+/// Whether a host call is writing a byte of `[at, at + len)` now
+/// ([`writing`]): its pages stay open.
+pub(crate) fn host_holds(at: usize, len: usize) -> bool {
+    lock(&HOST).iter().any(|&(h, n)| at < h.saturating_add(n) && h < at + len)
 }
 
 /// The memory a page address shows: every address that shows it now, and
@@ -289,6 +305,19 @@ static VIEWS: OnceLock<Views> = OnceLock::new();
 /// `xmem` gives its page table's answers; tracking starts.
 pub fn views_with(views: Views) {
     let _ = VIEWS.set(views);
+}
+
+/// The pages of `[at, at + len)` whose memory the CPU sees at another
+/// address too (a store there is no store here: `vulkan/homes.rs`).
+pub(crate) fn aliased(at: u64, len: u64) -> usize {
+    let Some(views) = VIEWS.get() else { return 0 };
+    if at as usize >= TOP {
+        return 0;
+    }
+    let all: Vec<usize> = pages(at as usize, len as usize).collect();
+    let mut n = 0;
+    views(&all, &mut |shown| n += shown.iter().filter(|s| s.cpu().count() > 1).count());
+    n
 }
 
 /// The card is about to copy `[at, at + len)` (a fill of the pool's GPU
