@@ -10,13 +10,16 @@
 //! - **What gets one.** Buffer memory the title makes an unordered-access
 //!   view of [`LEAST`] bytes or more in, where it lies in a region the
 //!   title asked for write-combined: the title does not read such memory
-//!   back (run hm0: no CPU read of 45,000 probed pages there). Buffers
-//!   that touch are one cluster with one home ([`Homes::want`]). A
+//!   back (run hm0: no CPU read of 45,000 probed pages there); or in
+//!   loose memory (its own allocator's blocks) every page of which its
+//!   CPU has at another address too: the card's side of physical pages
+//!   mapped twice ([`view`]). Buffers that touch are one cluster with
+//!   one home ([`Homes::want`]). A
 //!   cluster gets its home once it is seen to change ([`Asking`]: a few
 //!   of its pages are looked at every [`ROUND`] presents; the card stores
-//!   into some clusters every frame and into others never), the one that
-//!   changed most first, while the memory map and the card have room
-//!   ([`each_frame`]).
+//!   into some clusters every frame and into others never) or store
+//!   staging stages a view in it ([`staged`]), the one that changed most
+//!   first, while the memory map and the card have room ([`each_frame`]).
 //! - **The home is the cluster's bytes, exactly.** The memory map shows
 //!   them at the home's device address in every generation
 //!   ([`Homes::cut`]), so every access by address goes there, and the
@@ -27,7 +30,8 @@
 //!   page is copied as it was and opened. Before the next submission
 //!   ([`flush`]) the page is protected again, and the bytes of the
 //!   cluster that differ from the copy go to the home; bytes the CPU did
-//!   not change stay the card's.
+//!   not change stay the card's. A page is read-only at every address
+//!   the CPU sees it at ([`Span::others`]).
 //! - **A home goes** when the title frees its memory (nothing copied), and
 //!   under pressure (the pool's GPU view cannot keep the pages programs
 //!   read on the card: it asks again; the map has no ranges left for
@@ -78,8 +82,9 @@ const PATIENCE: u64 = 2_000_000_000;
 
 /// Homes made, homes gone (pressure or no range; the memory freed),
 /// clusters turned down for the map, for the card; write faults, those
-/// at a byte of the cluster, pages gone up, runs, bytes.
-static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// at a byte of the cluster, pages gone up, runs, bytes; write faults
+/// through another address of a page.
+static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 const MADE: usize = 0;
 const LEFT: usize = 1;
 const FREED: usize = 2;
@@ -90,6 +95,7 @@ const INSIDE: usize = 6;
 const PAGES: usize = 7;
 const RUNS: usize = 8;
 const BYTES: usize = 9;
+const ELSEWHERE: usize = 10;
 
 /// Counts; the count before.
 fn count(what: usize, n: u64) -> u64 {
@@ -114,11 +120,75 @@ struct Span {
     at: usize,
     end: usize,
     state: Box<[AtomicU8]>,
+    /// The other addresses the CPU sees the cluster's 64 KiB pages at
+    /// (loose memory is views of physical pages, and the title maps them
+    /// twice): (the other address, the page here), by address. `xmem`
+    /// tells of every view that comes or goes ([`mapped`], [`unmapped`]).
+    others: Mutex<Vec<(usize, usize)>>,
 }
 
 impl Span {
     fn pages(&self) -> usize {
         self.state.len() * SMALL
+    }
+
+    /// The index of the 4 KiB page at `page`: the cluster's own address
+    /// or another address of it.
+    fn index(&self, page: usize) -> Option<usize> {
+        let here = if page >= self.first && page < self.first + self.pages() {
+            page
+        } else {
+            let others = lock(&self.others);
+            let &(other, here) = others.get(others.partition_point(|o| o.0 <= page).checked_sub(1)?)?;
+            if page >= other + crate::track::PAGE {
+                return None;
+            }
+            here + (page - other)
+        };
+        (here >= self.first && here < self.first + self.pages()).then(|| (here - self.first) / SMALL)
+    }
+
+    /// Every address the CPU sees page `i` at, its own first.
+    fn places(&self, i: usize) -> Vec<usize> {
+        let here = self.first + i * SMALL;
+        let page = here & !(crate::track::PAGE - 1);
+        std::iter::once(here).chain(lock(&self.others).iter().filter(|o| o.1 == page).map(|o| o.0 + (here - page))).collect()
+    }
+
+    /// Protects page `i` at every address the CPU sees it at.
+    fn protect(&self, i: usize, protection: u32) {
+        for place in self.places(i) {
+            protect(place, SMALL, protection);
+        }
+    }
+
+    /// Protects the cluster's pages at the other address `other` of the
+    /// 64 KiB page `here`.
+    fn protect_other(&self, (other, here): (usize, usize), protection: u32) {
+        let lo = here.max(self.first);
+        let hi = (here + crate::track::PAGE).min(self.first + self.pages());
+        if lo < hi {
+            protect(other + (lo - here), hi - lo, protection);
+        }
+    }
+
+    /// The indices of the cluster's pages `[at, at + len)` shows, with
+    /// the address each is shown at there (its own or another).
+    fn shown_in(&self, at: usize, len: usize) -> Vec<(usize, usize)> {
+        let end = at.saturating_add(len);
+        let mut runs = vec![(self.first, self.first)];
+        runs.extend(lock(&self.others).iter().filter(|o| o.0 < end && at < o.0 + crate::track::PAGE).copied());
+        let mut out = Vec::new();
+        for (shown, here) in runs {
+            let whole = if shown == self.first { self.pages() } else { crate::track::PAGE };
+            for page in (at.max(shown) & !(SMALL - 1)..end.min(shown + whole)).step_by(SMALL) {
+                let i = (here + (page - shown)).wrapping_sub(self.first) / SMALL;
+                if here + (page - shown) >= self.first && i < self.state.len() {
+                    out.push((i, page));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -146,17 +216,18 @@ fn read(page: usize) -> Option<[u8; SMALL]> {
     (unsafe { ReadProcessMemory(GetCurrentProcess(), page as *const _, now.as_mut_ptr().cast(), SMALL, &mut done) } != 0).then_some(now)
 }
 
-/// The span holding page `page` and the page's index in it.
+/// The span holding the page at `page` (its own address or another)
+/// and the page's index in it.
 fn span_of(page: usize) -> Option<(Arc<Span>, usize)> {
     let spans = SPANS.read().unwrap_or_else(|e| e.into_inner());
-    let s = spans.iter().find(|s| page >= s.first && page < s.first + s.pages())?;
-    Some((s.clone(), (page - s.first) / SMALL))
+    spans.iter().find_map(|s| s.index(page).map(|i| (s.clone(), i)))
 }
 
 /// Page `i` of `span`, armed until now (the caller's exchange made it
-/// busy): copied as it is, listed and opened.
-fn open(span: &Span, i: usize) {
-    let page = span.first + i * SMALL;
+/// busy): copied as it is, listed, and opened at `page`, the address the
+/// store goes through (another address stays read-only until a store
+/// comes through it).
+fn open(span: &Span, i: usize, page: usize) {
     let mut before = Box::new([0u8; SMALL]);
     // SAFETY: a page of title memory we keep read-only.
     unsafe { std::ptr::copy_nonoverlapping(page as *const u8, before.as_mut_ptr(), SMALL) };
@@ -164,21 +235,24 @@ fn open(span: &Span, i: usize) {
     span.state[i].store(OPEN, Ordering::Release);
     // Listed once open: a flush that takes the list has the page, or the
     // next one has.
-    lock(&WRITTEN).push((page, before));
+    lock(&WRITTEN).push((span.first + i * SMALL, before));
 }
 
 /// A store faulted at `at`: if the page is a cluster's, it is copied as
 /// it was (the first store since the last flush) and opened, and the
 /// store goes on (true). Takes no lock a writer of title memory may hold.
 pub(crate) fn write_fault(at: usize) -> bool {
-    let Some((span, i)) = span_of(at & !(SMALL - 1)) else { return false };
+    let page = at & !(SMALL - 1);
+    let Some((span, i)) = span_of(page) else { return false };
+    let here = span.first + i * SMALL + (at - page);
     count(FAULTS, 1);
-    count(INSIDE, u64::from(at >= span.at && at < span.end));
+    count(INSIDE, u64::from(here >= span.at && here < span.end));
+    count(ELSEWHERE, u64::from(page != span.first + i * SMALL));
     loop {
         match span.state[i].load(Ordering::Acquire) {
             ARMED => {
                 if span.state[i].compare_exchange(ARMED, BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    open(&span, i);
+                    open(&span, i, page);
                     return true;
                 }
             }
@@ -187,9 +261,10 @@ pub(crate) fn write_fault(at: usize) -> bool {
             // Its home is going: the store waits until title memory holds
             // the home's bytes.
             HELD => std::thread::yield_now(),
-            // Open by its state, read-only by someone else's doing.
+            // Open by its state: read-only at this address still, or by
+            // someone else's doing.
             _ => {
-                protect(at & !(SMALL - 1), SMALL, PAGE_READWRITE);
+                protect(page, SMALL, PAGE_READWRITE);
                 return true;
             }
         }
@@ -201,13 +276,13 @@ pub(crate) fn write_fault(at: usize) -> bool {
 /// (`crate::track::released`): the armed pages there are opened as a
 /// fault opens them.
 pub(crate) fn host_writes(at: usize, len: usize) {
-    let spans: Vec<Arc<Span>> = SPANS.read().unwrap_or_else(|e| e.into_inner()).iter().filter(|s| at < s.first + s.pages() && s.first < at.saturating_add(len)).cloned().collect();
+    let spans: Vec<Arc<Span>> = SPANS.read().unwrap_or_else(|e| e.into_inner()).to_vec();
     for s in spans {
-        let lo = (at.max(s.first) - s.first) / SMALL;
-        let hi = (at.saturating_add(len).min(s.first + s.pages()) - s.first).div_ceil(SMALL);
-        for i in lo..hi {
+        for (i, page) in s.shown_in(at, len) {
             if s.state[i].compare_exchange(ARMED, BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                open(&s, i);
+                open(&s, i, page);
+            } else if s.state[i].load(Ordering::Acquire) == OPEN {
+                protect(page, SMALL, PAGE_READWRITE);
             }
         }
     }
@@ -217,14 +292,41 @@ pub(crate) fn host_writes(at: usize, len: usize) {
 /// armed pages there are read-only again.
 pub(crate) fn opened(at: usize, len: usize) {
     let spans = SPANS.read().unwrap_or_else(|e| e.into_inner());
-    for s in spans.iter().filter(|s| at < s.first + s.pages() && s.first < at + len) {
-        let lo = (at.max(s.first) - s.first) / SMALL;
-        let hi = ((at + len).min(s.first + s.pages()) - s.first).div_ceil(SMALL);
-        for i in lo..hi {
+    for s in spans.iter() {
+        for (i, page) in s.shown_in(at, len) {
             if s.state[i].load(Ordering::Acquire) == ARMED {
-                protect(s.first + i * SMALL, SMALL, PAGE_READONLY);
+                protect(page, SMALL, PAGE_READONLY);
             }
         }
+    }
+}
+
+/// `xmem` mapped a view page at `at` over memory `others` show too: if a
+/// cluster's page is among them, `at` is another address of it from here
+/// on, read-only where the page is armed (told before the title has the
+/// address, so no store through it is missed).
+pub(crate) fn mapped(at: usize, others: &[usize]) {
+    let spans = SPANS.read().unwrap_or_else(|e| e.into_inner());
+    for s in spans.iter() {
+        let Some(here) = others.iter().find_map(|&o| s.index(o).map(|i| (s.first + i * SMALL) & !(crate::track::PAGE - 1))) else { continue };
+        let mut all = lock(&s.others);
+        all.retain(|o| o.0 != at);
+        let k = all.partition_point(|o| o.0 < at);
+        all.insert(k, (at, here));
+        drop(all);
+        for (i, page) in s.shown_in(at, crate::track::PAGE) {
+            if page >= at && s.state[i].load(Ordering::Acquire) != OPEN {
+                protect(page, SMALL, PAGE_READONLY);
+            }
+        }
+    }
+}
+
+/// `xmem` takes the view page at `at` away: no cluster's other address
+/// any more.
+pub(crate) fn unmapped(at: usize) {
+    for s in SPANS.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        lock(&s.others).retain(|o| o.0 != at);
     }
 }
 
@@ -234,14 +336,19 @@ pub(crate) fn tracks(page: usize) -> bool {
     span_of(page & !(SMALL - 1)).is_some()
 }
 
-/// The pages of `[at, at + len)` are tracked from here: read-only.
-fn track(at: u64, len: u64) -> Arc<Span> {
+/// The pages of `[at, at + len)` are tracked from here: read-only, at
+/// `others` (the other address, the page here) too.
+fn track(at: u64, len: u64, mut others: Vec<(usize, usize)>) -> Arc<Span> {
     let first = at as usize & !(SMALL - 1);
     let pages = ((at + len) as usize - first).div_ceil(SMALL);
-    let span = Arc::new(Span { first, at: at as usize, end: (at + len) as usize, state: (0..pages).map(|_| AtomicU8::new(ARMED)).collect() });
+    others.sort_unstable();
+    let span = Arc::new(Span { first, at: at as usize, end: (at + len) as usize, state: (0..pages).map(|_| AtomicU8::new(ARMED)).collect(), others: Mutex::new(others.clone()) });
     SPANS.write().unwrap_or_else(|e| e.into_inner()).push(span.clone());
     if !protect(first, pages * SMALL, PAGE_READONLY) {
         tracing::warn!(at = format_args!("{at:#x}"), mb = len >> 20, "Vulkan: pages of a home's cluster took no protection; CPU stores into them do not reach the home");
+    }
+    for o in others {
+        span.protect_other(o, PAGE_READONLY);
     }
     span
 }
@@ -255,7 +362,7 @@ fn hold(span: &Span) -> Vec<(usize, Box<[u8; SMALL]>)> {
                 BUSY => std::hint::spin_loop(),
                 OPEN => {
                     if state.compare_exchange(OPEN, HELD, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                        protect(span.first + i * SMALL, SMALL, PAGE_READONLY);
+                        span.protect(i, PAGE_READONLY);
                         break;
                     }
                 }
@@ -278,6 +385,9 @@ fn untrack(span: &Arc<Span>) {
     SPANS.write().unwrap_or_else(|e| e.into_inner()).retain(|s| !Arc::ptr_eq(s, span));
     lock(&WRITTEN).retain(|(page, _)| *page < span.first || *page >= span.first + span.pages());
     protect(span.first, span.pages(), PAGE_READWRITE);
+    for o in std::mem::take(&mut *lock(&span.others)) {
+        span.protect_other(o, PAGE_READWRITE);
+    }
     for state in span.state.iter() {
         state.store(OPEN, Ordering::Release);
     }
@@ -296,15 +406,21 @@ pub(super) struct Home {
     shown: bool,
     /// Its turn among the homes made.
     turn: u64,
+    /// The changes that made its cluster ripe ([`Asking`]).
+    needs: u32,
 }
 
 /// A cluster that asks for a home: its bytes, what [`SAMPLES`] of its
-/// pages held when last looked at, and how often one had changed.
+/// pages held when last looked at, how often one had changed, and the
+/// changes that make it ripe ([`RIPE`]; twice as many each time its home
+/// went under the pool's pressure, so that a home the card has no room
+/// for is tried ever more rarely).
 #[derive(Default)]
 struct Asking {
     len: u64,
     held: [u64; SAMPLES],
     changes: u32,
+    needs: u32,
 }
 
 impl Asking {
@@ -398,7 +514,7 @@ impl Homes {
                 hi = hi.max(a + w.len);
             }
         }
-        self.wanted.insert(lo, Asking { len: hi - lo, ..Asking::default() });
+        self.wanted.insert(lo, Asking { len: hi - lo, needs: RIPE, ..Asking::default() });
     }
 
     /// The home at `at` leaves the map; `back`: its bytes go back to
@@ -446,7 +562,7 @@ impl Homes {
 
     /// Makes the home of the cluster `[at, at + len)`: card memory, the
     /// pages tracked, the bytes copied in behind everything given so far.
-    fn make(m: &mut Memory, b: &Backend, at: u64, len: u64) -> bool {
+    fn make(m: &mut Memory, b: &Backend, (at, len, needs): (u64, u64, u32), others: Vec<(usize, usize)>) -> bool {
         if m.want_range(at, len) && m.import_regions(&b.host) {
             m.rebuild_map();
         }
@@ -460,7 +576,7 @@ impl Homes {
         };
         // Tracked before the copy is given: a store from here on goes up
         // behind it.
-        let span = track(at, len);
+        let span = track(at, len, others);
         let whole = [vk::BufferCopy { src_offset: offset, dst_offset: 0, size: len }];
         // SAFETY: a command buffer of ours; the import and the home hold
         // the region.
@@ -481,7 +597,7 @@ impl Homes {
             "Vulkan: a home on the card for buffers programs store into"
         );
         let turn = m.homes.turns;
-        m.homes.live.insert(at, Home { at, len, buffer, span, shown: true, turn });
+        m.homes.live.insert(at, Home { at, len, buffer, span, shown: true, turn, needs });
         true
     }
 }
@@ -518,20 +634,45 @@ impl Memory {
     }
 
     /// Whether `[at, at + len)` lies in memory whose buffers get homes: a
-    /// region the title asked for write-combined.
-    fn takes_homes(&self, at: u64, len: u64) -> bool {
-        self.regions.range(..=at as usize).next_back().is_some_and(|(&a, r)| r.combined && at + len <= (a + r.len) as u64)
+    /// region the title asked for write-combined (true), or loose memory
+    /// (false: only where the CPU sees every page of it at another
+    /// address too, [`view`]).
+    fn takes_homes(&self, at: u64, len: u64) -> Option<bool> {
+        let (&a, r) = self.regions.range(..=at as usize).next_back()?;
+        (at + len <= (a + r.len) as u64 && (r.combined || r.loose)).then_some(r.combined)
     }
 
-    /// The homes that hold a byte of `[at, at + len)` go, nothing copied
-    /// (the title freed or unmapped the memory); whether any did.
-    pub(super) fn homes_freed(&mut self, b: &Backend, at: u64, len: u64) -> bool {
+    /// Diagnostics: the loose regions, as (first address, end).
+    pub(super) fn loose_spans(&self) -> Vec<(u64, u64)> {
+        self.regions.iter().filter(|(_, r)| r.loose).map(|(&a, r)| (a as u64, (a + r.len) as u64)).collect()
+    }
+
+    /// The homes that hold a byte of `[at, at + len)` go: the title frees
+    /// the memory (nothing copied), or `xmem` is about to take a view of
+    /// physical pages away (`back`: the pages stay, and what the card
+    /// stored goes back into them first). Whether any went.
+    pub(super) fn homes_freed(&mut self, b: &Backend, at: u64, len: u64, back: bool) -> bool {
         self.homes.wanted.retain(|&a, w| a + w.len <= at || a >= at + len);
         let gone: Vec<u64> = self.homes.live.values().filter(|h| h.at < at + len && at < h.at + h.len).map(|h| h.at).collect();
         for &a in &gone {
-            Homes::leave(self, b, a, false);
+            Homes::leave(self, b, a, back);
         }
         !gone.is_empty()
+    }
+
+    /// An announced write of `[at, at + len)` (DirectStorage, a file read:
+    /// through views of our own or from the kernel, no fault to see):
+    /// what of it lies in a home goes up.
+    pub(super) fn homes_written(&self, b: &Backend, at: u64, len: u64) {
+        let over = self.homes.live.values().filter(|h| h.at < at + len && at < h.at + h.len);
+        let copies: Vec<_> = over
+            .filter_map(|h| {
+                let (lo, hi) = (at.max(h.at), (at + len).min(h.at + h.len));
+                let (ram, offset) = self.imported_whole(lo, hi - lo)?;
+                Some((ram, h.buffer.buffer, vk::BufferCopy { src_offset: offset, dst_offset: lo - h.at, size: hi - lo }))
+            })
+            .collect();
+        upload(b, &copies);
     }
 }
 
@@ -541,24 +682,31 @@ pub(super) fn view(b: &Backend, base: u64, len: u64, view: u64) {
     if view < LEAST || len == 0 {
         return;
     }
-    {
+    let combined = {
         let m = memory(b);
-        if !m.takes_homes(base, len) || m.homes.known(base, len) {
-            return;
+        match m.takes_homes(base, len) {
+            Some(combined) if !m.homes.known(base, len) => combined,
+            _ => return,
         }
-    }
-    // Memory the CPU sees at another address too (physical pages mapped
-    // twice) takes stores we would not see. Asked before the memory
-    // lock: `xmem` answers under its own.
-    let aliased = crate::track::aliased(base, len);
-    if aliased != 0 {
-        static SAID: AtomicU64 = AtomicU64::new(0);
-        if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
-            tracing::info!(at = format_args!("{base:#x}"), kb = len >> 10, pages = aliased, "Vulkan: no home for buffer memory the CPU sees at another address too");
-        }
+    };
+    // Loose memory: only the card's side of physical pages the title's
+    // CPU sees at an address of its own (its 32-bit arena is loose
+    // memory too, shown once, and the CPU reads and writes it all the
+    // time). Asked before the memory lock: `xmem` answers under its own.
+    if !combined && crate::track::elsewhere(base, len).iter().any(|p| p.1.is_empty()) {
         return;
     }
     memory(b).homes.want(base, len);
+}
+
+/// Store staging staged the view `[at, at + len)`: the card stores into
+/// it, whatever its pages look like (a program that stores the bytes
+/// already there changes none), so the cluster it lies in is ripe.
+pub(super) fn staged(b: &Backend, at: u64, len: u64) {
+    let mut m = memory(b);
+    if let Some((_, w)) = m.homes.wanted.range_mut(..=at).next_back().filter(|(a, w)| at + len <= **a + w.len) {
+        w.changes = w.changes.max(w.needs);
+    }
 }
 
 /// Before work is given to the card: a home the map does not show goes
@@ -576,14 +724,19 @@ pub(super) fn flush(b: &Backend) {
     if !hidden.is_empty() {
         m.rebuild_map();
     }
-    let copies = m.stored();
+    upload(b, &m.stored());
+}
+
+/// Copies what the CPU stored to the homes (the import, the home, the
+/// bytes), on the host line: behind everything given before.
+fn upload(b: &Backend, copies: &[(vk::Buffer, vk::Buffer, vk::BufferCopy)]) {
     if copies.is_empty() {
         return;
     }
     // SAFETY: a command buffer of ours; imports and homes that hold the
     // regions.
     let given = b.timeline.record(&b.host, |d, cmd| unsafe {
-        for (ram, home, region) in &copies {
+        for (ram, home, region) in copies {
             d.cmd_copy_buffer(cmd, *ram, *home, std::slice::from_ref(region));
         }
     });
@@ -605,10 +758,10 @@ impl Memory {
             let Some(home) = self.homes.live.get(&(span.at as u64)) else { continue };
             // Protected again first: a store from here on is the next
             // flush's.
-            let held = crate::track::host_holds(page, SMALL);
+            let held = span.places(i).iter().any(|&place| crate::track::host_holds(place, SMALL));
             if !held {
                 span.state[i].store(ARMED, Ordering::Release);
-                protect(page, SMALL, PAGE_READONLY);
+                span.protect(i, PAGE_READONLY);
             }
             let mut missed = false;
             changed(home, page, &before, |from, n| match self.imported_of(from) {
@@ -632,27 +785,34 @@ impl Memory {
     fn homes_yield(&mut self, b: &Backend) -> bool {
         let zeros: u64 = self.pools.iter().map(|p| p.cold_pages().2).sum();
         self.homes.short = if zeros == 0 { 0 } else { self.homes.short + 1 };
-        let last = self.homes.live.values().max_by_key(|h| h.turn).map(|h| (h.at, h.len));
-        if let Some((at, len)) = last.filter(|_| self.homes.short >= 2) {
+        let last = self.homes.live.values().max_by_key(|h| h.turn).map(|h| (h.at, h.len, h.needs));
+        if let Some((at, len, needs)) = last.filter(|_| self.homes.short >= 2) {
             tracing::info!(pages_off_the_card = zeros, "Vulkan: the pool's GPU view has no room for the pages programs read; a home goes");
             Homes::leave(self, b, at, true);
             self.rebuild_map();
             self.homes.want(at, len);
+            if let Some(w) = self.homes.wanted.get_mut(&at) {
+                w.needs = needs.saturating_mul(2);
+            }
         }
         zeros != 0
     }
 
     /// Why the cluster `[at, at + len)` gets no home now: the memory map
-    /// has no ranges for it, or the card no room. What the pool's view
-    /// holds beyond the pages programs read is room (it gives blocks back
-    /// as ours passes the limit).
+    /// has no ranges for it, or the card no room. Of what the pool's view
+    /// holds beyond the pages programs read, half is room (it gives blocks
+    /// back as ours passes the limit).
     fn no_home(&self, b: &Backend, at: u64, len: u64) -> Option<usize> {
         if self.map.ranges().len() + 2 + SPARE > MAX_RANGES {
             return Some(NO_RANGE);
         }
         let spare: u64 = self.pools.iter().map(|p| p.card_bytes().saturating_sub(p.stats.pages_in_card.saturating_sub(p.cold_pages().1) * PAGE)).sum();
         let (ours, limit) = (account::card_total(), budget::limit(&b.host));
-        if ours + len + MARGIN <= limit + spare {
+        // Half of it: the view gives whole blocks back, and the pages
+        // programs read lie in all of them (run hs6: a 79 MiB home made on
+        // all of it left pages off the card within seconds, twice, and the
+        // frames after showed dark spots on the character's suit).
+        if ours + len + MARGIN <= limit + spare / 2 {
             return None;
         }
         if STATS[NO_ROOM].load(Ordering::Relaxed) < 16 {
@@ -661,15 +821,14 @@ impl Memory {
         Some(NO_ROOM)
     }
 
-    /// The asking clusters are looked at, and the ripe one that changed
-    /// most gets its home, if the map and the card have room (else it
-    /// asks again from the start).
-    fn homes_ripen(&mut self, b: &Backend) {
+    /// The asking clusters are looked at; the ripe one that changed most,
+    /// if the map and the card have room for its home (else it asks again
+    /// from the start).
+    fn homes_ripe(&mut self, b: &Backend) -> Option<(u64, u64)> {
         for (&at, w) in self.homes.wanted.iter_mut() {
             w.look(at);
         }
-        let ripe = self.homes.wanted.iter().filter(|(_, w)| w.changes >= RIPE).max_by_key(|(_, w)| w.changes).map(|(&at, w)| (at, w.len));
-        let Some((at, len)) = ripe else { return };
+        let (at, len) = self.homes.wanted.iter().filter(|(_, w)| w.changes >= w.needs).max_by_key(|(_, w)| w.changes).map(|(&at, w)| (at, w.len))?;
         // Its bytes must not straddle a home made before (a buffer that
         // reaches into one): that one goes first.
         let over: Vec<u64> = self.homes.live.values().filter(|h| h.at < at + len && at < h.at + h.len).map(|h| h.at).collect();
@@ -679,17 +838,12 @@ impl Memory {
         if !over.is_empty() {
             self.rebuild_map();
         }
-        if let Some(why) = self.no_home(b, at, len) {
-            count(why, 1);
-            if let Some(w) = self.homes.wanted.get_mut(&at) {
-                w.changes = 0;
-            }
-            return;
+        let Some(why) = self.no_home(b, at, len) else { return Some((at, len)) };
+        count(why, 1);
+        if let Some(w) = self.homes.wanted.get_mut(&at) {
+            w.changes = 0;
         }
-        self.homes.wanted.remove(&at);
-        if Homes::make(self, b, at, len) {
-            self.rebuild_map();
-        }
+        None
     }
 }
 
@@ -697,9 +851,24 @@ impl Memory {
 /// [`ROUND`] presents: under pressure the home made last goes; else the
 /// asking clusters are looked at and the ripest gets its home.
 pub(super) fn each_frame(b: &Backend) {
+    let Some((at, len)) = ripe(b) else { return };
+    // The other addresses the CPU sees its pages at: asked before the
+    // memory lock (`xmem` answers under its own). A view mapped between
+    // this and the tracking below is not seen as one.
+    let others = crate::track::elsewhere(at, len).into_iter().flat_map(|(page, others)| others.into_iter().map(move |o| (o, page))).collect();
+    let mut m = memory(b);
+    if let Some(w) = m.homes.wanted.remove(&at).filter(|w| w.len == len)
+        && Homes::make(&mut m, b, (at, len, w.needs), others)
+    {
+        m.rebuild_map();
+    }
+}
+
+/// [`each_frame`] under the memory lock: the cluster to make a home for.
+fn ripe(b: &Backend) -> Option<(u64, u64)> {
     let mut m = memory(b);
     if m.homes.live.is_empty() && m.homes.wanted.is_empty() && m.homes.dying.is_empty() {
-        return;
+        return None;
     }
     for (mut mark, buffer) in std::mem::take(&mut m.homes.dying) {
         if b.timeline.passed(&b.host, &mut mark) {
@@ -710,9 +879,7 @@ pub(super) fn each_frame(b: &Backend) {
             m.homes.dying.push((mark, buffer));
         }
     }
-    if m.tick.is_multiple_of(ROUND) && !m.homes_yield(b) {
-        m.homes_ripen(b);
-    }
+    if m.tick.is_multiple_of(ROUND) && !m.homes_yield(b) { m.homes_ripe(b) } else { None }
 }
 
 /// The 10 s line.
@@ -736,6 +903,7 @@ pub(super) fn report(b: &Backend) {
         no_room = n(NO_ROOM),
         cpu_write_faults = n(FAULTS),
         at_a_byte_of_the_cluster = n(INSIDE),
+        through_another_address = n(ELSEWHERE),
         pages_gone_up = n(PAGES),
         runs = n(RUNS),
         bytes = n(BYTES),

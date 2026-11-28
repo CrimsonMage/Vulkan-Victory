@@ -2148,22 +2148,34 @@ asked for write-combined memory). `vulkan/homes.rs`; the numbers are in
   does not read such memory back: run hm0's touch probe (every 4 KiB page
   of every such buffer inaccessible for six presents) saw no CPU read of
   45,000 pages there.
+- And in **loose memory** (the title's own allocator's blocks: views of
+  physical pages side by side) where the CPU sees every page of the
+  buffer at another address too: the card's side of pages the title's
+  CPU has at an address of its own (its 79 and 348 MiB arenas, where the
+  skinning programs and most of store staging's views store). Loose
+  memory shown once is not taken: the title's 32-bit arena is that, and
+  the CPU reads and writes it all the time (run hs1 gave its 174 MiB
+  buffer a home: 965,000 write faults and 1.2 GB sent up in three
+  minutes, submissions stopped finishing, the title crashed).
 - Buffers that touch are one **cluster** with one home (the title's
   45 MiB and 5 MiB buffers lie end to start). A home is the cluster's
   bytes, exactly: a V# must lie whole in one range of the map.
 - **A cluster gets its home once the card is seen to store into it.**
   Eight of its pages are looked at every 16 presents; eight changes make
-  it ripe, and the ripe cluster that changed most is made first. Of the
+  it ripe, and the ripe cluster that changed most is made first. A view
+  store staging stages makes its cluster ripe at once (a program that
+  stores the bytes already there changes no page). Of the
   21 clusters of the test scene (177 MiB) the card stored into twelve in
   six frames, into three of them one page. A cluster that never changes costs
-  nothing (a program that stores the bytes already there is not seen
-  either: its views stay with store staging).
+  nothing.
 - While the memory map has ranges (a home takes up to two; twelve stay
-  free for store staging's cuts) and the card has room (ours with the
-  home under the card-memory limit, counting what the pool's GPU view
-  holds beyond the pages programs read). **The pool's view comes first**:
-  while pages programs read by address have no card page no home is made,
-  and after two rounds of it the home made last goes and asks again (the
+  free for store staging's cuts; 256 since ABI v6, of which the scene
+  uses 84 with 19 homes) and the card has room (ours with the home under
+  the card-memory limit, counting half of what the pool's GPU view holds
+  beyond the pages programs read: it gives whole blocks back). **The
+  pool's view comes first**: while pages programs read by address have no
+  card page no home is made, and after two rounds of it the home made
+  last goes and asks again, needing twice the changes each time (the
   world's load is such a time, with or without homes).
 
 **How it holds.**
@@ -2188,7 +2200,16 @@ asked for write-combined memory). `vulkan/homes.rs`; the numbers are in
   tracking's own protection changes leave these pages read-only
   (`homes::opened`); host calls that write from the kernel, and the
   title's own protection changes, open them as a fault does
-  (`homes::host_writes`).
+  (`homes::host_writes`); an announced write (DirectStorage, a file
+  read: through views of our own) sends its bytes up as they are
+  (`Memory::homes_written`).
+- **At every address.** A cluster's pages are read-only at each address
+  the CPU sees them at (`track::elsewhere`, asked of `xmem` when the
+  home is made), a store through any of them is the page's store
+  (`Span::index`), and `xmem` tells of every view that comes or goes
+  (`track::mapped`, before the title has the new address;
+  `track::forget`). A view of the cluster's own address taken away sends
+  the home's bytes back into the pages first (`homes_freed`).
 - **A home goes** with its memory (the title frees or unmaps it: nothing
   is copied), under the pool's pressure, when the map has no ranges left
   for it, and when a larger cluster reaches into it. Its bytes go back to
@@ -2211,25 +2232,25 @@ asked for write-combined memory). `vulkan/homes.rs`; the numbers are in
   command buffers have bound.
 - shortcut: the CPU reads a cluster as it was when its home was made. A
   CPU store of the value title memory already holds is not seen.
-- **Loose memory has no homes**, and that is where the skinning families
-  and store staging's views lie (the title's 79 and 348 MiB arenas): the
-  CPU sees every page of them at a second address (views of physical
-  pages mapped twice; run hs1: 800 of 800 pages of the 50 MiB buffer), so
-  a store through the other address would not fault here. Tracking them
-  needs the pages protected at every address `xmem` shows them at, as
-  `track.rs` does for its 64 KiB pages. Run hs1 also gave the 174 MiB
-  buffer in the title's 32-bit arena a home (loose memory took homes
-  then): the CPU reads and writes it all the time (965,000 write faults,
-  1.2 GB sent up in three minutes), submissions stopped finishing and the
-  title crashed.
+- **Whether the CPU reads loose buffers through its own address is not
+  measured.** The touch probe took the other addresses too (runs hm1 and
+  hs6) and the title crashed at the probe's first present both times
+  (450,000 pages inaccessible). What is known: no CPU store came through
+  another address in runs hs5 to hs7 (the `homes` line), and the picture
+  holds. A read there would see the bytes as they were when the home was
+  made.
+- A view mapped between `track::elsewhere` and the tracking of a new
+  home is not seen as one of its addresses.
 
 **Diagnostics.** The 10 s line `homes` (homes and their bytes, clusters
-asking, made, gone, turned down for the map or the card, CPU write faults
-and those at a byte of a cluster, pages and bytes gone up); a line a home
-made or gone. `VICTORY_VK_WRITE_CENSUS`'s touch probe now probes every
+asking, made, gone, turned down for the map or the card, CPU write faults,
+those at a byte of a cluster and those through another address, pages
+and bytes gone up); a line a home made or gone. `VICTORY_VK_WRITE_CENSUS`'s touch probe now probes every
 page of buffer memory with an unordered-access view of 1 MiB or more,
 changed or not, tells which faults fell on a byte under such a view, and
-writes `buffer-resources.txt`.
+writes `buffer-resources.txt`; for buffers in loose memory it takes the
+other addresses of their pages too (and the title has not survived
+that).
 
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 

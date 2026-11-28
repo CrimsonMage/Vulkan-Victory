@@ -163,6 +163,7 @@ pub(crate) fn title_memory_written(at: usize, len: usize) {
     // Card images over the memory are filled again.
     images::written(at as u64, len as u64);
     let mut guard = memory(b);
+    guard.homes_written(b, at as u64, len as u64);
     let Memory {
         pools,
         sections,

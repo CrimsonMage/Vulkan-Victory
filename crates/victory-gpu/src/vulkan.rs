@@ -483,7 +483,9 @@ pub fn title_memory_unmapped(at: usize, len: usize) {
     let end = at + len;
     let before = m.views.len();
     m.views.retain(|&a, &mut (l, ..)| a + l <= at || a >= end);
-    let remapped = m.drop_stale_loose(b, at, end) | m.homes_freed(b, at as u64, len as u64);
+    // (the homes first: their bytes go back into the pages while the
+    // import still holds them)
+    let remapped = m.homes_freed(b, at as u64, len as u64, true) | m.drop_stale_loose(b, at, end);
     let gone: Vec<usize> = m.regions.range(..end).filter(|&(&a, r)| a + r.len > at && a >= at && a + r.len <= end).map(|(&a, _)| a).collect();
     let mut imports = Vec::new();
     for a in gone {
@@ -566,7 +568,7 @@ pub fn title_memory_released(at: usize, len: usize) {
         .filter(|&(&a, r)| a >= at && a + r.len <= at + len)
         .map(|(&a, _)| a)
         .collect();
-    let mut dropped = m.drop_stale_loose(b, at, at + len) | m.homes_freed(b, at as u64, len as u64);
+    let mut dropped = m.drop_stale_loose(b, at, at + len) | m.homes_freed(b, at as u64, len as u64, false);
     for a in gone {
         if let Some(r) = m.regions.remove(&a) {
             // The card, or a command buffer not yet submitted, may still

@@ -67,7 +67,7 @@ exactly one home, the one a PC game would give it:
 |---|---|---|
 | CPU writes often, GPU reads (constants, dynamic vertices, command data) | system RAM, read in place by the GPU (upload heap) | open the title's memory as a heap; nothing copied, nothing tracked |
 | Streamed once, GPU reads (textures, static geometry) | video memory (default heap) | upload once when the title says it arrived; free when it unloads |
-| GPU writes, GPU reads (render targets, scratch, the buffers programs store into) | video memory only | never copied back; a buffer the title makes an unordered-access view of 1 MiB or more in, in memory it asked for write-combined, gets a home on the card once the card is seen to store into it (`vulkan/homes.rs`) |
+| GPU writes, GPU reads (render targets, scratch, the buffers programs store into) | video memory only | never copied back; a buffer the title makes an unordered-access view of 1 MiB or more in, in memory it asked for write-combined or in loose memory its CPU has at another address, gets a home on the card once the card is seen to store into it (`vulkan/homes.rs`) |
 | GPU writes, CPU reads (queries, read-backs) | system RAM (read-back heap) | the GPU writes into title memory in place |
 
 No class is mirrored in both places and kept in sync by watching or
@@ -154,20 +154,53 @@ driver errors and no new crash, and the captures look no worse.
 ## Decisions log
 
 - 2026-11-28 (homes): **the buffers programs store into live on the
-  card: 7.4 fps (6.2), the direct queue 130 ms a frame (148). Cloth and
-  hair strands, 24 ms a frame in the list, are gone from it; skinning
-  and store staging's copies are not touched: their buffers lie in loose
-  memory, which the CPU sees at two addresses.** Branch `homes`; no
-  translator change (the key is `085b3a007cf1bafe` as before, nothing
-  baked). How it works: `docs/vulkan-host.md`, "Homes".
+  card: 8.5 to 8.8 fps (6.2), the direct queue 110 ms a frame (148).
+  Cloth, hair strands and the default skinning velocity, 30 ms a frame in
+  the list, are gone from it. The skinning programs' 79 MiB cluster has
+  no room on the card (with it: 9.0 to 9.5 fps for the minutes it held),
+  and 9 ms of store staging's copies are left.** Branch `homes`; tag
+  `batch-2026-11-28a` (ABI v6: the map's 256 ranges, the views in the
+  kept translation; baked in 4,193 s, key `811f405c63812693`). How it
+  works: `docs/vulkan-host.md`, "Homes".
   | run (the test scene, `VICTORY_VK_GPU_TIME=1900,6`) | frames in 10 s | direct queue busy, ms a frame | card by the marks | homes | card peak, RSS peak |
   |---|---|---|---|---|---|
   | ss6 (the baseline) | 61 to 63 | 147.9 | 156.5 | | 6,798 MiB, 16.5 GiB |
   | hs2 (the homes went under the pool's pressure of the world's load and did not come back in time) | 61 to 63 | 151.2 | | none in the window | |
-  | **hs3 (they ask again)** | **72 to 76** | **130.0** | **131.7** | 2: 50.15 and 1.34 MiB | 6,781 MiB, 16.6 GiB |
-  No hang, no guard hit, no error in hs2 and hs3; the picture as bh1's
-  (capture hs3 frames 3210 and 3900 beside bh1 frame 3210, by eye: the
-  hair and the jumpsuit move from frame to frame).
+  | hs3 (step 0: the write-combined region, the map's 64 ranges; they ask again) | 72 to 76 | 130.0 | 131.7 | 2: 50.15 and 1.34 MiB | 6,781 MiB, 16.6 GiB |
+  | hs4 (step 1: the batch baked, 256 ranges, a staged view makes its cluster ripe) | 72 to 76, then 75 | 130.2 | 132.7 | 8, 103 MiB | 6,799 MiB, 17.3 GiB |
+  | hs5 (loose memory too) | 83 to 95 | 104.3 at the end | 118.1 | 20, 281 MiB with the 79 MiB cluster, which came and went five times | 6,780 MiB, 16.8 GiB |
+  | hs6 (a home that went asks ever more rarely) | 82 to 86 | 111.1 | 122.8 | 19, 202 MiB; the 79 MiB cluster twice for 4 s | 6,767 MiB, 17.7 GiB |
+  | **hs7 (half of the pool's spare is room; as committed)** | **82 to 88, at the end 85 to 88** | **109.5** | **118.9** | 20, 236 MiB; none went after the world's load | 6,763 MiB, 17.5 GiB |
+  No hang, no guard hit, no error in hs2 to hs7; the picture as bh1's
+  (captures hs3, hs4, hs5 and hs7, frame 3210 each, beside bh1 frame
+  3210, by eye: the hair and the jumpsuit move from frame to frame). In
+  hs6, frame 2910, 16 s after the 79 MiB home had come and gone for the
+  second time, the suit has three dark spots; hs7 does not make that
+  home and has none. Frame times step by the display's: 130 ms of card
+  work is 8 refreshes (75 frames in 10 s), 110 is 7 (86).
+  - **Step 1 alone moved nothing** (hs4 against hs3): every cluster of
+    the write-combined region the card stores into has its home (8;
+    `CS_Primary_GatherCopy`'s view among them, so it is staged no more:
+    44 MiB copied a frame against 51), and what is left of compute lies
+    in loose memory. The eight-step search costs nothing that shows
+    (130.2 against 130.0 ms). Offline before the bake: `cargo test -p
+    victory-shader` (190) and `-p victory-vk` (17, one of them a full
+    map's first, middle and last range), golden 1,527 programs with no
+    change of behaviour, twelve modules valid (`spirv-val`), and the
+    pass bench with the map filled to 256 ranges below, above and on
+    both sides of the capture's (ray binning, strands,
+    `CS_Primary_GatherCopy`, a tiled lighting draw: the same memory
+    hash and targets each time).
+  - **Loose memory** (hs5 to hs7). The CPU sees every page of the
+    arenas' buffers at a second address (views of physical pages mapped
+    twice; hs1: 800 of 800 pages of the 50 MiB buffer), so a cluster's
+    pages are read-only at every address and `xmem` tells of views that
+    come and go. In hs5 to hs7 no CPU store came through another
+    address, and none hit a byte of a cluster at all (1,391 write
+    faults in hs7, all in the pages at the clusters' ends). **Whether
+    the CPU reads there is not measured**: the touch probe on the other
+    addresses (hm1, and hs6 at frame 3,000) ended the title at its first
+    present both times.
   - **By family** (ms a frame among the 40 largest, ss6 against hs3; a
     family that left the list is under 0.9):
     | family | ss6 | hs3 |
@@ -180,6 +213,8 @@ driver errors and no new crash, and the captures look no worse.
     | `CSComputeSkinningDefaultVelocity` and what follows it | 5.26 | 5.17 |
     | store staging's copies | 13.13 | 14.45 |
     | the 40 largest together | 93.5 | 75.4 |
+    In hs7: `CSComputeSkinningDefaultVelocity` not listed, the skinning
+    families 8.98, store staging's copies 8.89, the 40 largest 69.5.
   - **Measured first** (run hm0, `VICTORY_VK_WRITE_CENSUS=1900,6`, whose
     touch probe now takes every page of buffer memory with an
     unordered-access view of 1 MiB or more, changed or not: 168,973
@@ -207,26 +242,39 @@ driver errors and no new crash, and the captures look no worse.
     the rest, and what the scratch gives back, is the room homes have:
     about 200 MiB. hs3's two homes are 52 MiB; the pool's view kept
     every page programs read (0 MiB off the card in the scene).
-  - **Which clusters** (step 0 has the map's 64 ranges: 43 to 47 in use,
-    12 kept for store staging, so three or four homes): the ones the card
-    is seen to store into, the one that changed most first. By size the
-    34 and the two 15.5 MiB clusters would have come before the cloth's
-    1.34 MiB, and the card stores a page a frame into them or nothing.
-    In hs3 the map turned further clusters down 44 times.
+  - **Which clusters**: the ones the card is seen to store into (eight
+    pages of each looked at every 16 presents), the one that changed
+    most first; a view store staging stages makes its cluster ripe. By
+    size the 34 and the two 15.5 MiB clusters of the region would have
+    come before the cloth's 1.34 MiB, and the card stores a page a frame
+    into them or nothing. Step 0 had the map's 64 ranges (43 to 47 in
+    use, 12 kept for store staging: three or four homes; hs3 turned
+    clusters down 44 times); with 256, hs7 uses 86.
+  - **The card is what limits now.** hs7 turned clusters down for room
+    22 times; 225 MiB ask (the 79 MiB cluster of the skinning programs
+    and the staged views' clusters among them: 9 ms of skinning and 9 ms
+    of copies). Homes take 237 MiB, the scratch 79 (167 before), the
+    pool's view 1,024.
   - **CPU stores** (hs3, 400 s with homes): 1,283 write faults on the
-    homes' pages, none at a byte of a cluster (all in the pages at a
-    cluster's ends, whose other bytes are someone else's); nothing had
-    to go up.
-  - **Not explained**: why `CS_PedStandardSkinning_*` is 0.5 ms higher
-    in hs3 (within what the families move between runs).
-  - **Next**: (1) the map's limit to 256 ranges, so that every cluster
-    the card stores into gets its home; (2) loose memory: its pages
-    protected at every address the CPU sees them at, for the skinning
-    families' 12 ms and store staging's 14 ms of copies (its views lie in
-    the arena; with homes there the scratch gives 126 MiB back).
-  - Scratch: `scratch-agent/homes/` (the logs `hm0.log`, `hs1.log` to
-    `hs3.log`, `hm0-clusters.txt`, the executables `hm0.exe`, `hs1.exe`
-    to `hs3.exe`, `pics/`), the captures `capture/hm0`, `hs1` to `hs3`.
+    homes' pages, none at a byte of a cluster; nothing had to go up.
+    The same in hs7.
+  - **Not explained**: `CS_GenerateShadowMasks_Checkerboard_NoHair` is
+    4.0 ms a frame in hs5 to hs7 (1.2 staged in ss6, 2.2 in place in
+    bh2); the skinning families are 1.3 ms higher in hs7 than in ss6;
+    what the title did when the probe made the other addresses
+    inaccessible; hs6's dark spots are put down to the pool's pages off
+    the card while the 79 MiB home held, not shown.
+  - **Next**: (1) room on the card: the limit leaves 1 GiB of the
+    driver's budget alone and the process peaks at 6.8 of 8.15 GiB; the
+    79 MiB cluster alone is worth a refresh (hs5). (2) The probe on the
+    other addresses made to work, for the CPU's reads there. (3) The
+    cut written into the map blocks of command buffers already begun
+    when a home is made or goes.
+  - Scratch: `scratch-agent/homes/` (the logs `hm0.log`, `hm1.log`,
+    `hs1.log` to `hs7.log`, `hm0-clusters.txt`, `bench-fakes-1.txt` to
+    `-3.txt`, the executables beside them, `passbench/` with `FAKES=`,
+    `spvdump/`, `pics/`), `scratch-agent/bake-28a.out`, the captures
+    `capture/hm0`, `hm1`, `hs1` to `hs7`.
 
 - 2026-11-28 (store staging in the host): **the store views a dispatch
   scatters over run on the card: 6.2 fps (5.2), card 156 ms a frame

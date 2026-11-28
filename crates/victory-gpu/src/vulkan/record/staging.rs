@@ -291,6 +291,7 @@ impl Rec {
                 continue;
             };
             let at = chosen.last().map_or(0, |c| (c.at + c.bytes + c.pad + 16).next_multiple_of(16));
+            super::super::homes::staged(b, base, bytes);
             chosen.push(Chosen { base, bytes, home, pad, at });
         }
         chosen

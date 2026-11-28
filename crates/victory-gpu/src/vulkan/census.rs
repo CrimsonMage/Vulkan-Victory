@@ -21,7 +21,11 @@
 //! that holds an unordered-access view of 1 MiB or more is probed whole,
 //! changed or not (`buffer-resources.txt`: `<first address> <bytes>
 //! <its largest such view>`): what a card home for it would have to
-//! follow. Faults between a page's hash and its
+//! follow. So is every other address the CPU sees such a buffer's pages
+//! at (loose memory is views of physical pages, and the title maps them
+//! twice): a line `<range start> <address> <read faults> <write faults>
+//! <of them victory's> alias <the buffer's page> <read faults at a byte
+//! under a large view> <write faults there>`. Faults between a page's hash and its
 //! re-arming at a present are missed, and a page whose protection write
 //! tracking changes meanwhile may be given back writable once: the frames
 //! of the probe are not to be judged as pictures.
@@ -152,6 +156,7 @@ pub(super) fn frame(b: &Backend, frame: u64) {
     }
     let t = std::time::Instant::now();
     let k = (frame - first) as u32;
+    let loose = memory(b).loose_spans();
     let imported: Vec<(u64, u64)> = {
         let m = memory(b);
         let pools: Vec<(u64, u64)> = m.pools.iter().map(|p| (p.title_start, p.len)).collect();
@@ -182,7 +187,7 @@ pub(super) fn frame(b: &Backend, frame: u64) {
     if frame < first + frames {
         return;
     }
-    probe_start(st);
+    probe_start(st, &loose);
     let all = (1u32 << frames) - 1;
     let mut text = Vec::new();
     for (at, (len, _, masks)) in &st.ranges {
@@ -219,6 +224,9 @@ fn write_views(folder: &std::path::Path) {
 // The touch probe
 
 const ARMED: u32 = 1 << 31;
+/// In a probed page's second field: the page is another address of the
+/// buffer page in the low bits.
+const ALIAS: u64 = 1 << 63;
 
 struct Probe {
     /// (page, the start of its range), by page.
@@ -310,7 +318,7 @@ fn let_go(p: &Probe, i: usize) -> bool {
 
 /// The census is over: the pages it saw change under unordered-access
 /// views are probed from here.
-fn probe_start(st: &State) {
+fn probe_start(st: &State, loose: &[(u64, u64)]) {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     // the views' spans, joined; those of 1 MiB or more; and the buffer
@@ -326,7 +334,20 @@ fn probe_start(st: &State) {
         };
         pages.extend(masks.iter().enumerate().filter(|(i, m)| probed(*i, **m)).map(|(i, _)| (at + (i * SMALL) as u64, *at)));
     }
+    // the other addresses the CPU sees those buffers' pages at, for the
+    // buffers in loose memory that homes take (run hm1 probed every
+    // buffer's: 456,000 pages, and the title crashed at once)
+    let mut aliases = 0usize;
+    for &(lo, hi) in whole.iter().filter(|w| loose.iter().any(|l| l.0 <= w.0 && w.1 <= l.1)) {
+        for (page, others) in crate::track::elsewhere(lo, hi - lo) {
+            for (other, k) in others.iter().flat_map(|&o| (0..crate::track::PAGE / SMALL).map(move |k| (o, k * SMALL))) {
+                pages.push(((other + k) as u64, ALIAS | (page + k) as u64));
+                aliases += 1;
+            }
+        }
+    }
     pages.sort_unstable();
+    pages.dedup_by_key(|p| p.0);
     let n = pages.len();
     let last: Vec<u64> = pages.iter().map(|p| hash_at(p.0).unwrap_or(0)).collect();
     let probe = Probe {
@@ -353,7 +374,7 @@ fn probe_start(st: &State) {
     for i in 0..n {
         arm(p, i);
     }
-    tracing::info!(pages = n, mb = (n * SMALL) >> 20, views = merged.len(), "Vulkan: touch probe, the pages that changed under unordered-access views are inaccessible until touched");
+    tracing::info!(pages = n, mb = (n * SMALL) >> 20, views = merged.len(), other_addresses = aliases, "Vulkan: touch probe, the pages that changed under unordered-access views are inaccessible until touched");
 }
 
 /// At a present of the probe: each page's change is noted and the page
@@ -397,12 +418,25 @@ fn probe_tell(p: &Probe, frames: u64) {
         card_read: u64,
         card_untouched: u64,
         card_frames: u64,
+        /// Other addresses of its buffers' pages: pages, read faults,
+        /// write faults, and of those at a byte under a large view.
+        alias: [u64; 4],
     }
     let get = |v: &[AtomicU32], i: usize| u64::from(v[i].load(Ordering::Relaxed));
     let mut by: BTreeMap<u64, Sum> = BTreeMap::new();
     let mut text = Vec::new();
     for (i, &(page, range)) in p.pages.iter().enumerate() {
         let (r, w, o, c, k) = (get(&p.reads, i), get(&p.writes, i), get(&p.ours, i), get(&p.changed, i), get(&p.card, i));
+        if range & ALIAS != 0 {
+            // counted with the range of the buffer page it is another address of
+            let of = range & !ALIAS;
+            let range = p.pages.binary_search_by_key(&of, |q| q.0).map_or(0, |j| p.pages[j].1);
+            let s = by.entry(range).or_default();
+            let under = get(&p.view_writes, i);
+            s.alias = [s.alias[0] + 1, s.alias[1] + r, s.alias[2] + w, s.alias[3] + under];
+            let _ = writeln!(text, "{range:x} {page:x} {r} {w} {o} alias {of:x} {} {under}", get(&p.view_reads, i));
+            continue;
+        }
         let s = by.entry(range).or_default();
         s.pages += 1;
         s.read += u64::from(r != 0);
@@ -429,6 +463,10 @@ fn probe_tell(p: &Probe, frames: u64) {
             card_stored_a_frame = format_args!("{:.0}", s.card_frames as f64 / frames as f64),
             card_stored_and_cpu_read = s.card_read,
             card_stored_cpu_never_touched = s.card_untouched,
+            other_address_pages = s.alias[0],
+            read_faults_there = s.alias[1],
+            write_faults_there = s.alias[2],
+            of_them_under_a_large_view = s.alias[3],
             "Vulkan: touch probe, a range"
         );
     }
@@ -469,6 +507,8 @@ fn takes(page: u64, write: bool) -> bool {
 /// The first touch of probed page `i` since the last present, by the
 /// instruction at `ip`.
 fn touched(p: &Probe, i: usize, write: bool, ip: usize, at: u64) {
+    // another address of a buffer page: the byte it is in the buffer
+    let at = if p.pages[i].1 & ALIAS != 0 { (p.pages[i].1 & !ALIAS) + at % SMALL as u64 } else { at };
     let under = within(&p.large, at, 1);
     if write {
         p.writes[i].fetch_add(1, Ordering::Relaxed);

@@ -237,6 +237,14 @@ pub fn written(page: usize) {
     }
 }
 
+/// A view page was mapped at `page` over memory `others` show too: a
+/// card home's cluster follows it there (`vulkan/homes.rs`), and it is
+/// open ([`written`]).
+pub fn mapped(page: usize, others: &[usize]) {
+    crate::vulkan::homes::mapped(page, others);
+    written(page);
+}
+
 /// The pool page shown at `page` was copied to the card with its CPU
 /// views open: the next flush protects them and has that copy made again
 /// (images over it were filled under protection: they stay).
@@ -250,6 +258,7 @@ pub(crate) fn copied(page: usize) {
 /// it are not yet flushed (the caller lists another place that shows the
 /// same memory, [`written`]).
 pub fn forget(page: usize) -> bool {
+    crate::vulkan::homes::unmapped(page);
     mark(page).is_some_and(|m| m.swap(0, Ordering::AcqRel) & (WRITTEN | HOT) != 0)
 }
 
@@ -307,17 +316,15 @@ pub fn views_with(views: Views) {
     let _ = VIEWS.set(views);
 }
 
-/// The pages of `[at, at + len)` whose memory the CPU sees at another
-/// address too (a store there is no store here: `vulkan/homes.rs`).
-pub(crate) fn aliased(at: u64, len: u64) -> usize {
-    let Some(views) = VIEWS.get() else { return 0 };
-    if at as usize >= TOP {
-        return 0;
-    }
+/// The pages of `[at, at + len)`, each with the other addresses the CPU
+/// sees its memory at (a store there is no store here:
+/// `vulkan/homes.rs`).
+pub(crate) fn elsewhere(at: u64, len: u64) -> Vec<(usize, Vec<usize>)> {
+    let Some(views) = VIEWS.get().filter(|_| (at as usize) < TOP) else { return Vec::new() };
     let all: Vec<usize> = pages(at as usize, len as usize).collect();
-    let mut n = 0;
-    views(&all, &mut |shown| n += shown.iter().filter(|s| s.cpu().count() > 1).count());
-    n
+    let mut out = Vec::new();
+    views(&all, &mut |shown| out = shown.iter().map(|s| (s.page, s.cpu().filter(|&c| c != s.page).collect())).collect());
+    out
 }
 
 /// The card is about to copy `[at, at + len)` (a fill of the pool's GPU

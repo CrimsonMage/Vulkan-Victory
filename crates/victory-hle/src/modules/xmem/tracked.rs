@@ -63,6 +63,6 @@ pub(super) fn unmapped(at: usize, others: Option<&Vec<usize>>) {
 /// protects it.
 pub(super) fn mapped(at: usize, others: &[usize]) {
     if !others.is_empty() {
-        track::written(at);
+        track::mapped(at, others);
     }
 }
