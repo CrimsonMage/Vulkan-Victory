@@ -112,7 +112,7 @@ driver errors and no new crash, and the captures look no worse.
 | | Start (2026-11-25) | Now |
 |---|---|---|
 | Rust lines | 128,292 | 100,007 on 2026-11-27, about 10,000 of them tests and tools (78,027 right after the D3D12 back end went; 154,557 just before) |
-| `VICTORY_*` switches | 224 | 38 |
+| `VICTORY_*` switches | 224 | 39 |
 | `diagnostics`-only blocks | 283 | 71 |
 | World frame time (Proton, 8 GB card) | 0.5–5 s | ~440 ms on the card with the whole scene lit and textured (2026-11-27, run tx7); ~295 ms on 2026-11-25 with most of the picture missing |
 
@@ -151,6 +151,93 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (late night): **title memory in system RAM is not what the
+  card waits for.** The entry below read the card's slowness from a
+  benchmark of scattered reads. Measured with the reads the heavy
+  programs really make, where the memory lives explains a few
+  milliseconds of the 286 ms frame, and the one thing built on it gave
+  nothing (branch `card-memory`, runs cm-a to cm-d on the tree of
+  `batch-2026-11-27e`; host only, nothing baked; the full account is in
+  `docs/vulkan-host.md`, "Where title memory lives: measured").
+  - **What the heavy programs read** (captures of frame 1900, run cm-a,
+    replayed with `READS=1`; "heap" is the title's shader-visible
+    descriptor heap, 38 MiB at 0x56a0000, which it lays over the head of
+    the arena it keeps its per-frame tables and constants in):
+
+    | Program (card ms a frame) | Reads | Where | Stores |
+    |---|---|---|---|
+    | `TL_PS_PBR_MATERIAL_STANDARD` (22) | 663 dwords a pixel, 465 lines | 71% heap (50 lines on 5 pages of 64 KiB: its two root tables); 25% the 1.28 GiB region (per-frame constants and light lists, 16 pages); 4% the rest of the arena | none |
+    | `TL_PS_NoDir_PBR_MATERIAL_STANDARD` (27) | 552 a pixel, 227 lines | 71% heap; 27% the region | none |
+    | `PS_DeferredPedTexturedNC` (mesh draws) | 82 lines | 68% heap; 15% the rest of the arena; 15% the region; 2% the sampler heap | none |
+    | `CS_Primary_GatherCopy` (18) | 171 line accesses a wave, 18,600 lines on 599 pages (a quarter of its groups) | 23% heap; 69% the region; 8% a 348 MiB arena at 0xaf27c0000 | into the region |
+    | `CS_ScreenProbes_TraceRays_RayBinning...` (10) | 107 a wave, 28,900 lines on 2,759 pages | 32% heap; 21% that arena; 14% the region; 7% the pool's view; 23% addresses in no range (zeros) | into that arena |
+    | `CSComputeSkinningDefaultVelocity` (5) | 134 a wave | 22% heap; 67% the rest of the arena; geometry in the pool's view (card) | skinned vertices into the 348 MiB arena |
+
+    No program stored into the heap. The cloth solvers' replays stop
+    early (their captures lack memory).
+  - **Who writes it** (`VICTORY_VK_WRITE_CENSUS`, eight presents): of the
+    heap's 608 pages of 64 KiB about 116 change a frame (8 in every
+    frame), the CPU's work; the 1.28 GiB region changes in 4,600 pages
+    of 4 KiB a frame and the title has made unordered-access views over
+    197 MB of it, the 348 MiB arena 3,200 pages a frame and 211 MB: CPU
+    constants and card scratch share pages there. Whether the CPU reads
+    back what the card wrote was not measured.
+  - **What those reads cost** (scratch `tracebench` and `wavebench`: the
+    same lines, read as often, from memory laid out as the title's
+    ranges, native Vulkan on this card): `TL_PS_PBR_MATERIAL_STANDARD`
+    **6.6 ms from card memory, 13.1 ms imported**; its heap's lines on
+    the card and the rest imported 12.5 ms. `TL_PS_NoDir_...` 2.2 against
+    3.1 ms. The ped pixel program 3.0 against 3.2. `CS_Primary_GatherCopy`
+    about 0.1 against 1.1 ms, the ray binning 0.1 against 0.5. So with
+    every byte of title memory on the card the first lighting pass could
+    lose 6.5 of its 22 ms (the 22 scattered reads a pixel of its light
+    lists), the others a millisecond or less. Two of about 25 lighting
+    programs and three compute programs were measured; taken as typical,
+    that is some 10 to 15 ms of the frame, not the bulk of it. The
+    benchmark of the entry below picked each read at random among 512
+    lines on 512 pages; the passes read 91 lines on 21 pages at every
+    pixel, and those cost the same wherever they lie.
+  - **Built, measured, not kept: the descriptor heap on the card.** A
+    copy of the heap's pages in card memory the CPU writes through a
+    mapping (the driver has such memory, type `DEVICE_LOCAL |
+    HOST_VISIBLE`), kept current by write tracking (CPU copies at each
+    flush, no submission), a range of the memory map at an alias address,
+    and the alias handed to programs for descriptor tables and heap
+    bases (push constants). Run cm-c: the picture right; the card
+    compared with title memory at frame 2350, 607 of 608 pages equal and
+    one differing (not explained: a flush between its two steps, or a
+    store missed); **card time unchanged** (`TL_PS_PBR_MATERIAL_STANDARD`
+    22.5 ms against 22.1, `..._NoDir_...` 27.8 against 26.9, 30 to 31
+    frames in 10 s, 40 W), for 38 MiB of card memory, 130 pages copied a
+    frame (1.4 ms), 125 more faults a frame and 2.6 ms more in the
+    flushes. Patch in scratch `card/heap-copies-with-census.patch`.
+  - **A range of the memory map cannot be cut.** The first build (run
+    cm-b) put the copy in the heap's own place in the map, cutting the
+    import around it: 6 frames a second, and a picture of hair and sky.
+    A program translates a base once and adds offsets; the title
+    addresses a 174 MiB buffer from 0x61a0000, inside the heap's 38 MiB,
+    and everything read past the copy's end read nothing. What the map
+    holds as one range (a region, joined loose memory) is one thing to
+    programs.
+  - **Also not it: victory's own buffers in system RAM.** The descriptor
+    buffers, the memory map's blocks and the code tables moved to
+    mappable card memory (run cm-d): card time unchanged (27.9 and 21.3
+    ms, 32 frames in 10 s, 41 W), and the driver took 512 MiB more of
+    the card for it (the pool's view fell from 1,216 to 832 MiB). Not
+    kept; patch `card/own-buffers-on-card.patch`.
+  - **So** the card's 286 ms are not explained: not by loops, the map's
+    search or the program's size (entry below), not by where title
+    memory or our own buffers lie. The card's power is no measure
+    either: it drew 40 W in run cm-b too, at twice the frame rate. Next
+    to try is what the entry below planned and did not do: run one
+    captured lighting pass natively (its SPIR-V, its images, its memory)
+    and take things away until its 22 ms move.
+  - Kept: `VICTORY_VK_WRITE_CENSUS` (`vulkan/census.rs`). In scratch
+    `card/`: `readtool` (the replay with `lines.txt`, and `waves.bin`
+    with `WAVES=1`), `tracebench`, `wavebench`, `membench` (now with
+    mappable card memory: as fast as card memory but for lines spread
+    one a page over 64 MiB, 11.8 against 4.1 ms).
+
 - 2026-11-27 (night): **why the card is slow: it reads title memory out
   of system RAM.** After the early depth test (card time 395 -> 286 ms a
   frame, 2.2 -> 3.1 fps; tiled lighting 205 -> 104 ms; bake 201 s) the
@@ -178,6 +265,8 @@ driver errors and no new crash, and the captures look no worse.
     not in a small window. What programs read often has to be on the
     card (as the pool's view already is); which ranges, and how they are
     kept current, is the next work (branch `card-memory`).
+    **Corrected by the entry above**: the passes' own reads stay in a
+    small window, and moving them changes nothing.
   - Tools kept: `replay` writes `visits.txt` (a wave's work by block) and,
     with `READS=1`, `pages.txt` (title memory read and written, by map
     range).

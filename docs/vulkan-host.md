@@ -1940,6 +1940,100 @@ texture. The 10 s line counts the texture descriptors in the title's
 heaps whose slot reads the null image (0 of 74,000 when the test scene
 stands).
 
+### Where title memory lives: measured (2026-11-27, branch `card-memory`)
+
+Question (coordinator): programs read title memory imported in place, so
+out of system RAM; put what they read on the card. Answer: for this title
+and this card it is not worth doing. What was measured, what was built and
+taken out again, and what holds for whoever tries next. Runs cm-a to cm-d
+are on the tree of `batch-2026-11-27e`; the numbers are in
+`docs/kiss.md` (decisions log, 2026-11-27 late night).
+
+**How it was measured.**
+
+- *What a program reads*: a pass captured at a frame
+  (`VICTORY_VK_DUMP_AT`) and replayed with `READS=1`. The copy of the
+  replay in scratch (`card/readtool`) also writes `lines.txt` (each
+  64-byte line read or stored, how often) and, with `WAVES=1`,
+  `waves.bin` (each wave's line accesses in order).
+- *Who writes it*: `VICTORY_VK_WRITE_CENSUS=<frame>,<frames>`
+  (`vulkan/census.rs`, diagnostics builds). At each present of the window
+  every 4 KiB page of the imported ranges of the memory map is hashed;
+  the pages that changed are written to `write-census.txt` in the capture
+  folder (range, page, a bit a present) and counted a range in the log.
+  `buffer-views.txt` beside it lists the buffer views the title made
+  (kind 0 constant, 1 shader resource, 2 unordered access; address,
+  bytes, how often): unordered-access views from the start of the run,
+  the others in the window. It hashes 8 GiB in 1.5 s a present; it cannot
+  tell a CPU store from a card store.
+- *What the reads cost*: `card/tracebench` (a pixel pass: the lines every
+  pixel reads in one order for all, then the scattered ones picked by
+  weight) and `card/wavebench` (a compute pass: one invocation a wave
+  makes that wave's line accesses), native Vulkan, the memory under test
+  laid out as the title's ranges are (1.5 to 1.8 GiB), as card memory,
+  mappable card memory, the driver's host memory, imported private pages
+  and imported shared pages.
+
+**What holds.**
+
+- **The passes' reads are few lines read often.** A lighting pass reads
+  about 90 lines on 21 pages of 4 KiB at every pixel (descriptor tables,
+  constants) and 7 to 22 scattered ones (light lists). The first kind
+  costs the same from any memory; only the second pays for lying in
+  system RAM. The benchmark that started this (`card/membench`) read
+  each time at random among 512 lines on 512 pages: the worst case, and
+  not the title's.
+- **A range of the memory map is one thing.** A translated program
+  translates a base address once and adds offsets (ABI section 3), so
+  whatever a title addresses from one base must stay in one range. The
+  tested title lays its descriptor heap (38 MiB at 0x56a0000) over the
+  head of an arena and addresses a 174 MiB buffer from inside it; a
+  range cut at the heap's end broke every mesh that buffer holds. A
+  copy of part of a range can only be reached through addresses the
+  host itself hands out (below).
+- **Mappable card memory exists** on this driver (memory type
+  `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` on the card's heap): the
+  CPU fills 64 MiB of it in 11 ms, and programs read it as fast as plain
+  card memory except when the lines lie one a page over tens of MiB
+  (11.8 against 4.1 ms in `membench`). Descriptor buffers put there cost
+  512 MiB of the card in the driver's own use.
+- **The card writes into the same pages the CPU writes.** In the title's
+  1.28 GiB region and its 348 MiB arena the per-frame constants the CPU
+  stores and the buffers programs store into (unordered-access views:
+  197 and 211 MB) share 64 KiB pages. A copy of such a page kept current
+  by write tracking would be overwritten with stale bytes at the CPU's
+  next store. Only memory the card never writes can be copied this way.
+
+**Built and taken out: card copies of descriptor heaps.**
+
+- A shader-visible heap's pages got a copy in mappable card memory at
+  `CreateDescriptorHeap`, kept by write tracking as the pool's GPU view
+  is (protected, then copied; a stored page protected again and copied
+  again at the next flush), but by a CPU copy into the mapping: no
+  submission.
+- The copy was a range of the map at an **alias** (address space below
+  4 GiB, reserved and never committed), and the host pushed the alias
+  for `Table`, `ResourceHeap` and `SamplerHeap` user data
+  (`record.rs`, `push`); root views, V# bases and pointers in data kept
+  the title's addresses. An alias was handed out only to command buffers
+  whose bound map held it.
+- Result (run cm-c): picture right, card time unchanged, 38 MiB of card
+  memory and about 4.5 ms of CPU a frame (130 pages copied, 125 more
+  faults, the flushes). `VICTORY_VK_COPY_CHECK` (in the patch) compared
+  the copy with title memory at a frame: 607 of 608 pages equal, one
+  differing and not explained (a flush caught between protecting and
+  copying it; or a store missed: stores announced through victory's own
+  views were not forwarded to the copies).
+- Heaps victory allocates itself (not placed by the title) had no copy:
+  write tracking follows only memory `xmem` maps.
+- The patch is `card/heap-copies-with-census.patch` in scratch; that
+  programs read the copy was not shown apart from the pushed aliases
+  (the 10 s line counted one heap read there).
+
+**Open.** What the card spends its 286 ms on. The reads of title memory
+are 3 to 13 ms of a 22 to 27 ms lighting pass in `tracebench`; the rest is
+not found.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the
