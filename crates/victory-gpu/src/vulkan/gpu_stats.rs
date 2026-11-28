@@ -42,7 +42,9 @@ fn flags() -> vk::QueryPipelineStatisticFlags {
 /// # Safety
 /// Recording into `cmd`, outside rendering.
 pub(crate) unsafe fn begin(b: &Backend, cmd: vk::CommandBuffer) -> Option<u32> {
-    if !on() || b.host.caps.core.pipeline_statistics_query != vk::TRUE {
+    // In the frames `VICTORY_VK_GPU_TIME` counts, each dispatch has a
+    // statistics query of its own (one at a time in a command buffer).
+    if !on() || b.host.caps.core.pipeline_statistics_query != vk::TRUE || super::gputime::counting() {
         return None;
     }
     let mut guard = lock(&POOL);

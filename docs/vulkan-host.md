@@ -2030,7 +2030,18 @@ are on the tree of `batch-2026-11-27e`; the numbers are in
   programs read the copy was not shown apart from the pushed aliases
   (the 10 s line counted one heap read there).
 
-**Open.** What the card spends its 286 ms on. The reads of title memory
+**Stores are what costs (2026-11-28, branch `computebench`).** The
+above measured reads. A compute pass's scattered stores into title memory
+are another matter: replayed natively (`card/passbench`, `MEM=`),
+`CS_Primary_GatherCopy` takes 0.10 ms a dispatch with the region it
+stores into on the card, 1.85 ms with it in the driver's write-combined
+host memory, and 21 to 42 ms with it in cached system RAM, whether the
+driver's own or pages imported in place (the game: 18.3 ms); with its
+stores left out, 0.03 ms. A bulk copy between the card and either kind of
+system RAM runs at 12 GiB/s. The numbers and the other passes are in
+`docs/kiss.md` (decisions log, 2026-11-28).
+
+**Open (as of 2026-11-27).** What the card spends its 286 ms on. The reads of title memory
 are 3 to 13 ms of a 22 to 27 ms lighting pass in `tracebench`; the rest is
 not found.
 

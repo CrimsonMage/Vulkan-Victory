@@ -57,6 +57,8 @@ impl Rec {
     fn clear_view(&mut self, b: &'static Backend, view: vk::ImageView, extent: (u32, u32), depth: Option<vk::ImageAspectFlags>, clear: vk::ClearAttachment, rects: &[Rect]) {
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a clear".into()) };
         let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: extent.0, height: extent.1 } };
         let rects: Vec<vk::ClearRect> = if rects.is_empty() {
             vec![vk::ClearRect { rect: area, base_array_layer: 0, layer_count: 1 }]

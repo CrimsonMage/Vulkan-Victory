@@ -511,6 +511,9 @@ impl Rec {
         };
         // SAFETY: outside rendering, in our command buffer.
         let watched = if super::super::watch::on() { unsafe { super::super::watch::read(b, cmd, None) } } else { Vec::new() };
+        // SAFETY: outside rendering; no statistics query of the list's is
+        // active where one is begun.
+        let counted = if self.query.is_none() { unsafe { super::super::gputime::dispatching(b, cmd) } } else { None };
         for k in 0..u64::from(max) {
             // SAFETY: outside rendering, the title's compute pipeline bound;
             // our scratch.
@@ -520,6 +523,8 @@ impl Rec {
                     .cmd_dispatch_indirect(cmd, buffer, at + 12 * k)
             };
         }
+        // SAFETY: as above.
+        unsafe { super::super::gputime::dispatched(b, cmd, counted) };
         self.watched_dispatch(b, cmd, &watched, "dispatch indirect");
         self.ambient(b, cmd);
         super::STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

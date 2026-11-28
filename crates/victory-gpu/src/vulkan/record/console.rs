@@ -164,6 +164,8 @@ impl Rec {
         let bits = if float && victory_vk::gfx10::is_integer(image.format) { values.map(|v| f32::from_bits(v) as u32) } else { values };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a clear of a view".into()) };
         // SAFETY: outside rendering; a live image in GENERAL.
         unsafe {
             images::full_barrier(&b.host.device, cmd);
@@ -191,6 +193,8 @@ impl Rec {
         let words: [u32; 4] = std::array::from_fn(|k| u32::from_le_bytes(std::array::from_fn(|i| pattern[k * 4 + i])));
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a fill".into()) };
         let d = &b.host.device;
         // SAFETY: outside rendering; title memory through its buffer.
         unsafe {
@@ -288,6 +292,8 @@ impl Rec {
         }
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a value write".into()) };
         let d = &b.host.device;
         // SAFETY: outside rendering; title memory through its buffer.
         unsafe {

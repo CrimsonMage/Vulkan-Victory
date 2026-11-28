@@ -1,8 +1,20 @@
-//! Diagnostics (`VICTORY_VK_GPU_TIME=<frame>[,<frames>]`): the card's time by
-//! program over a few frames (four unless said), told as time a frame.
-//! Every time a recording binds another pipeline in those frames a
-//! timestamp is written; the time to the next timestamp (all lists
-//! together, in the order the card ran them) is the bound program's. Two
+//! Diagnostics (`VICTORY_VK_GPU_TIME=<frame>[,<frames>[,counted]]`): the
+//! card's time by program over a few frames (four unless said), told as
+//! time a frame.
+//! Every time a recording binds another pipeline for a draw, and before
+//! every dispatch, a timestamp is written; the time to the next timestamp
+//! (all lists together, in the order the card ran them) is the bound
+//! program's. A dispatch ends with a timestamp too: what the list does
+//! from there to the next program (`after: <program>`: the title's copies
+//! and clears, the host's own passes, the next program's preparation) is
+//! not the dispatch's; the title's copies, clears and fills are marked
+//! themselves (`title: a buffer copy`, ...). With `counted` each
+//! dispatch's invocations are counted too (a pipeline statistics query
+//! around it; the lists' own statistics, `gpu_stats.rs`, stand back in
+//! those frames), so that a program's time can be held against its work
+//! and a replay of a captured dispatch against the game's; the query
+//! costs 30 to 100 us a dispatch on the test card, so the times of a
+//! counted run are not the game's (run cb1 against bh1). Two
 //! presents after the last frame the sums are told, the largest first, by
 //! program and by family (the name without its variant hashes). A list's
 //! end is a timestamp too (`host: between lists`): what follows it until
@@ -28,13 +40,32 @@ const MOST: u32 = 1 << 19;
 static POOL: OnceLock<Option<vk::QueryPool>> = OnceLock::new();
 static NEXT: AtomicU32 = AtomicU32::new(0);
 static MARKS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+/// Dispatches counted at most.
+const COUNTED: u32 = 1 << 16;
+static COUNT_POOL: OnceLock<Option<vk::QueryPool>> = OnceLock::new();
+static COUNT_NEXT: AtomicU32 = AtomicU32::new(0);
+static COUNTS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+// The program the recording thread marked last (lists are recorded side
+// by side, each by one thread).
+thread_local! {
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static STRAYED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the recording thread's last mark was not a program's (a copy
+/// or a clear of the title's, a dispatch's end): a draw with the pipeline
+/// still bound marks its program again.
+pub(super) fn strayed() -> bool {
+    STRAYED.with(std::cell::Cell::get)
+}
 
 /// The first frame timed and how many frames, if any.
 fn timed() -> Option<(u64, u64)> {
     static FRAME: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *FRAME.get_or_init(|| {
         let v = std::env::var("VICTORY_VK_GPU_TIME").ok()?;
-        let (first, frames) = v.split_once(',').unwrap_or((&v, "4"));
+        let mut fields = v.split(',');
+        let (first, frames) = (fields.next().unwrap_or(""), fields.next().unwrap_or("4"));
         cfg!(feature = "diagnostics").then(|| (first.trim().parse().unwrap_or(0), frames.trim().parse().unwrap_or(4).max(1)))
     })
 }
@@ -52,6 +83,59 @@ fn pool(b: &Backend) -> Option<vk::QueryPool> {
     })
 }
 
+fn count_pool(b: &Backend) -> Option<vk::QueryPool> {
+    *COUNT_POOL.get_or_init(|| {
+        if b.host.caps.core.pipeline_statistics_query != vk::TRUE {
+            return None;
+        }
+        let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::PIPELINE_STATISTICS).query_count(COUNTED).pipeline_statistics(vk::QueryPipelineStatisticFlags::COMPUTE_SHADER_INVOCATIONS);
+        // SAFETY: a plain query pool of the device.
+        unsafe { b.host.device.create_query_pool(&info, None) }.ok()
+    })
+}
+
+/// Whether the frame being recorded is timed and its dispatches counted
+/// (the lists' own statistics queries stand back: one statistics query at
+/// a time in a list).
+pub(super) fn counting() -> bool {
+    static COUNTED_RUN: OnceLock<bool> = OnceLock::new();
+    *COUNTED_RUN.get_or_init(|| std::env::var("VICTORY_VK_GPU_TIME").is_ok_and(|v| v.split(',').nth(2).is_some_and(|w| w.trim() == "counted")))
+        && within(super::present::FRAME.load(Ordering::Relaxed))
+}
+
+/// Before a dispatch of the program marked last: its invocations are
+/// counted from here (the slot to end with, [`dispatched`]).
+///
+/// # Safety
+/// Recording into `cmd`, outside rendering, no statistics query active.
+pub(super) unsafe fn dispatching(b: &Backend, cmd: vk::CommandBuffer) -> Option<u32> {
+    if !counting() {
+        return None;
+    }
+    let pool = count_pool(b)?;
+    let n = COUNT_NEXT.fetch_add(1, Ordering::Relaxed);
+    if n >= COUNTED {
+        return None;
+    }
+    // SAFETY: as the caller says; the query was reset a present ago.
+    unsafe { b.host.device.cmd_begin_query(cmd, pool, n, vk::QueryControlFlags::empty()) };
+    lock(&COUNTS).push((n, LAST.with(|l| l.borrow().clone())));
+    Some(n)
+}
+
+/// After the dispatch: its count ends, and what follows is not its time.
+///
+/// # Safety
+/// Recording into `cmd`, outside rendering; `slot` from [`dispatching`].
+pub(super) unsafe fn dispatched(b: &Backend, cmd: vk::CommandBuffer, slot: Option<u32>) {
+    if let (Some(n), Some(pool)) = (slot, count_pool(b)) {
+        // SAFETY: as the caller says.
+        unsafe { b.host.device.cmd_end_query(cmd, pool, n) };
+    }
+    // SAFETY: as the caller says.
+    unsafe { mark(b, cmd, || format!("after: {}", LAST.with(|l| l.borrow().clone()))) };
+}
+
 /// In the present before the first timed frame: the pool is reset. In a
 /// present of the window: a mark, so that the time to the next list is
 /// not the last program's of the frame before.
@@ -64,12 +148,17 @@ pub(super) unsafe fn arm(b: &Backend, cmd: vk::CommandBuffer, frame: u64) {
     {
         // SAFETY: as the caller says.
         unsafe { b.host.device.cmd_reset_query_pool(cmd, pool, 0, MOST) };
+        if let Some(counts) = count_pool(b) {
+            // SAFETY: as the caller says.
+            unsafe { b.host.device.cmd_reset_query_pool(cmd, counts, 0, COUNTED) };
+        }
     }
     // SAFETY: as the caller says.
     unsafe { mark(b, cmd, || "host: present".into()) };
 }
 
-/// A recording binds the pipeline of `name` (its programs' names).
+/// A recording binds the pipeline of `name` (its programs' names), or
+/// dispatches with it.
 ///
 /// # Safety
 /// Recording into `cmd`.
@@ -84,7 +173,13 @@ pub(super) unsafe fn mark(b: &Backend, cmd: vk::CommandBuffer, name: impl FnOnce
     }
     // SAFETY: as the caller says; the query was reset a present ago.
     unsafe { b.host.device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, n) };
-    lock(&MARKS).push((n, name()));
+    let name = name();
+    let stray = ["after: ", "title: ", "host: "].iter().any(|p| name.starts_with(p));
+    STRAYED.with(|s| s.set(stray));
+    if !stray {
+        LAST.with(|l| l.borrow_mut().clone_from(&name));
+    }
+    lock(&MARKS).push((n, name));
 }
 
 /// A program's name without its variant hashes: `CS_Name_0123abcd` and
@@ -109,6 +204,22 @@ fn sums(at: &[(f64, &str)], key: impl Fn(&str) -> String) -> Vec<(String, f64, u
     let mut top: Vec<(String, f64, u32)> = by.into_iter().map(|(k, (t, n))| (k, t, n)).collect();
     top.sort_by(|a, b| b.1.total_cmp(&a.1));
     top
+}
+
+/// The counted dispatches' invocations and their number, by program.
+fn work(b: &Backend) -> HashMap<String, (u64, u32)> {
+    let mut work: HashMap<String, (u64, u32)> = HashMap::new();
+    let counts = std::mem::take(&mut *lock(&COUNTS));
+    let Some(pool) = count_pool(b).filter(|_| !counts.is_empty()) else { return work };
+    let mut got = vec![[0u64; 2]; COUNT_NEXT.load(Ordering::Relaxed).min(COUNTED) as usize];
+    // SAFETY: that many queries of a 64-bit value and availability each.
+    let _ = unsafe { b.host.device.get_query_pool_results(pool, 0, &mut got, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY) };
+    for (i, name) in counts.iter().filter(|(i, _)| got[*i as usize][1] != 0) {
+        let e = work.entry(name.clone()).or_default();
+        e.0 += got[*i as usize][0];
+        e.1 += 1;
+    }
+    work
 }
 
 /// Two presents after the last timed frame: the sums are told, a frame.
@@ -142,10 +253,21 @@ pub(super) fn tell(b: &Backend, frame: u64) {
         ms_a_frame = format_args!("{:.1}", total / a_frame),
         "Vulkan: the card's time by program follows (ms a frame over the frames timed)"
     );
+    let work = work(b);
+    let worked = |name: &str| work.get(name).copied().unwrap_or_default();
     for (name, t, binds) in sums(&at, family).into_iter().take(40) {
         tracing::info!(ms = format_args!("{:.2}", t / a_frame), share = format_args!("{:.1}%", 100.0 * t / total.max(1.0)), binds, family = name, "Vulkan: card time by family");
     }
-    for (name, t, binds) in sums(&at, str::to_owned).into_iter().take(60) {
-        tracing::info!(ms = format_args!("{:.2}", t / a_frame), share = format_args!("{:.1}%", 100.0 * t / total.max(1.0)), binds, program = name, "Vulkan: card time");
+    for (name, t, binds) in sums(&at, str::to_owned).into_iter().take(80) {
+        let (invocations, dispatches) = worked(&name);
+        tracing::info!(
+            ms = format_args!("{:.2}", t / a_frame),
+            share = format_args!("{:.1}%", 100.0 * t / total.max(1.0)),
+            binds,
+            dispatches,
+            invocations_a_frame = invocations / frames,
+            program = name,
+            "Vulkan: card time"
+        );
     }
 }

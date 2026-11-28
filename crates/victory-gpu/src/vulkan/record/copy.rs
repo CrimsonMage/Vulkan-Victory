@@ -62,6 +62,8 @@ impl Rec {
         };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a buffer copy".into()) };
         // It may write indirect records: no window holds.
         self.indirect.clear();
         self.planes_synced.clear();
@@ -152,6 +154,8 @@ impl Rec {
         };
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: an image copy".into()) };
         // SAFETY: outside rendering; images in GENERAL.
         unsafe {
             images::full_barrier(&b.host.device, cmd);
@@ -198,6 +202,8 @@ impl Rec {
                     .image_extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
                 self.end_pass(b);
                 let Some(cmd) = self.cmd(b) else { return };
+                // SAFETY: recording into our command buffer.
+                unsafe { super::super::gputime::mark(b, cmd, || "title: a texture copy".into()) };
                 // SAFETY: outside rendering; a title buffer and an image in GENERAL.
                 unsafe {
                     images::full_barrier(&b.host.device, cmd);
@@ -223,6 +229,8 @@ impl Rec {
                     .image_extent(vk::Extent3D { width: r.saturating_sub(l).max(1), height: bt.saturating_sub(t).max(1), depth: k.saturating_sub(f).max(1) });
                 self.end_pass(b);
                 let Some(cmd) = self.cmd(b) else { return };
+                // SAFETY: recording into our command buffer.
+                unsafe { super::super::gputime::mark(b, cmd, || "title: a texture copy".into()) };
                 // SAFETY: outside rendering; an image in GENERAL and a title buffer.
                 unsafe {
                     images::full_barrier(&b.host.device, cmd);
@@ -242,6 +250,8 @@ impl Rec {
         }
         self.end_pass(b);
         let Some(cmd) = self.cmd(b) else { return };
+        // SAFETY: recording into our command buffer.
+        unsafe { super::super::gputime::mark(b, cmd, || "title: a resolve".into()) };
         let layers = |i: &Image, s: u32| vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: s % i.mips,

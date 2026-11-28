@@ -151,6 +151,95 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-28 (compute bench): **compute's time is the programs' stores
+  into title memory: it is cached system RAM, and a scattered store of
+  the card into such memory costs about 20 times one into write-combined
+  system RAM and 250 times one into card memory.** Found by replaying
+  captured dispatches natively (the pass bench, now with dispatches).
+  Branch `computebench`; no translator change, nothing baked.
+  - **The game's numbers first** (run cb1, the timing switch extended,
+    below): a dispatch's time is in the dispatch (what follows it to the
+    next program is small: the largest tail is 2.5 ms a frame after
+    3,576 empty `CS_RaytracingResolve` dispatches), and the game runs the
+    invocations the captures hold (`CS_Primary_GatherCopy` 189,141 a
+    frame in one dispatch, the capture's dispatch 195,072; the ray
+    binning 161,114 against 161,152).
+  - **The bench** (scratch `card/passbench <capture> <compute
+    container>`): the capture's images and title memory as for a pixel
+    pass, the compute pipeline as `stages.rs` makes it, the capture's
+    push constants and groups (an indirect dispatch's from the captured
+    memory); the first dispatch timed by timestamps, then ten more; what
+    it left (a hash of title memory and of the storage images) held
+    against the other variants'. `MEM=` puts the ranges of the map that
+    hold given addresses whole into system RAM: `host` (the driver's
+    host memory, the type the CPU does not cache: write-combined),
+    `hostcached` (the driver's, cached), `import` (pages of the process
+    imported in place, as the game's title memory is), `huge` (the same
+    on huge pages). ms a dispatch:
+    | pass (invocations) | card | imported | imported, stores left out | game |
+    |---|---|---|---|---|
+    | `CS_Primary_GatherCopy` (195,072) | 0.10 | 21 to 42 | 0.02 to 0.04 | 18.3 (21.5 counted) |
+    | ray binning `..._WithFar` (161,152) | 0.25 | 5 to 17, mostly 15 | 0.39 | 10.2 (13.4 counted) |
+    | `CSComputeSkinningDefaultVelocity` (1,440) | 0.02 to 0.04 | 0.08 to 0.21 | 0.01 to 0.03 | 0.12 on average |
+    | `CS_InterpolateStrands` (3,104) | 0.06 | 0.81 to 0.88 | 0.05 | (a dispatch of the game's has 114 on average) |
+    | `CS_PedStandardSkinning_8` (544) | 0.02 | 0.04 | 0.02 | |
+    | `CS_GatherOperation` (448) | 0.01 | 0.01 | 0.01 | 0.09 on average: not reproduced |
+    The two heaviest are reproduced and explained whole: 28.5 of
+    compute's 92 ms a frame. `CS_SolvePerVertConstraint` and
+    `CS_WavePerSplineConstraint_32` are not replayed: their captures
+    lack a range (4 bytes at 0x705810054 the capture's scan did not
+    reach), so the programs leave at once.
+  - **Which memory** (`CS_Primary_GatherCopy`, only the 1.28 GiB region
+    it stores into moved, ms): card 0.10; the driver's host memory,
+    write-combined (memory type 2) **1.85**; the driver's host memory,
+    cached (type 3) 28 to 41; imported 21 to 42; imported on huge pages
+    27 to 47 (the plain import was on huge pages already). With only the
+    region of the descriptor tables and constants imported: 0.10 (the
+    reads cost nothing, as found before). So it is not the import and
+    not the page size: it is that the CPU caches the pages.
+  - **A copy is cheap**: 8 MiB between a card buffer and system RAM of
+    either kind 0.63 to 0.68 ms each way (12 GiB/s), card to card 0.03.
+    The pass stores 1.2 MB, 192 bytes a wave over a span of 9.3 MB, and
+    takes 20 to 40 ms for it in cached RAM: 300 times a copy's rate.
+  - **What did not matter** (card memory; the same output each time, no
+    guard hit): the loop guard at 256 (ray binning 0.25, skinning 0.02,
+    strands 0.06, ped skinning 0.02: unchanged), the memory map as one
+    range (ray binning 0.17, strands 0.06), votes and shuffles per lane
+    (0.23), no bounds selects (0.23). The compute analogue of the helper
+    lanes does not exist: of the 800 used compute programs 514 have
+    loops, with 12,237 exits by a vote, 2,508 by a scalar condition fed
+    by wave reads (310 programs) and 1,534 by other scalar conditions; 55
+    programs have lanes that are no threads of their group. A lane of a
+    compute wave reads the wave's value at a first-lane read, so none is
+    left alone in a loop (scratch `card/sweep`, `out/sweep.txt`).
+  - **Whether the work is real**: all of it is the title's. The ray
+    binning with the structure builder off still stores its result (two
+    pages changed in the replay); leaving it out is not shown to be the
+    same.
+  - **`VICTORY_VK_GPU_TIME`** (diagnostics) now marks every dispatch and
+    its end, so the time after a dispatch is told apart
+    (`after: <program>`), and the title's copies, clears and fills are
+    marked themselves (`title: ...`); before, all that was charged to the
+    program bound last. A third field `counted` counts each dispatch's
+    invocations (a statistics query a dispatch: 30 to 100 us each on the
+    test card, so a counted run's times are high: run cb1 against bh1).
+  - **What follows for the host** (not built; the user's and the
+    coordinator's decision): the memory programs store into must not be
+    cached system RAM. Measured choices: write-combined system RAM (20
+    times less; it would have to be the driver's own memory mapped as the
+    title's, since a process cannot make its own pages write-combined;
+    the title asks for write-combined heaps itself, protection 0x2404,
+    and `xmem.rs` drops that), or card memory with what the CPU must see
+    copied back in bulk (250 times less for the stores, 0.08 ms a MiB
+    for a copy). The finding of 2026-11-27 ("title memory in system RAM
+    is not what the card waits for") holds for reads only: it did not
+    measure stores.
+  - Scratch `card/`: `passbench` (run files `out/run20.sh` to
+    `run31.sh`, results beside them), `sweep`, the captures of run cb1
+    (`CS_InterpolateStrands`, `CS_GatherOperation`,
+    `CS_PedStandardSkinning_8`), `passbench/translator-probes.patch`
+    (now with `nostore`).
+
 - 2026-11-27 (night): **the helper-lane fix in the game: 3.1 to 5.2 fps,
   card 289 to 180 ms a frame.** Tag `batch-2026-11-27g` (the entry below),
   baked in 239 s (216 pixel programs), run bh1 on the test scene with

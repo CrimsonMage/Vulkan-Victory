@@ -356,6 +356,22 @@ impl Rec {
         STATS[7].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Binds a draw's pipeline unless it is bound; whether the draw's
+    /// program is to be marked for the timing (a bind, or the thread's
+    /// last mark was not a program's: `gputime::strayed`).
+    ///
+    /// # Safety
+    /// Recording into `cmd`.
+    unsafe fn bind_draw(&mut self, b: &Backend, cmd: vk::CommandBuffer, pipeline: vk::Pipeline) -> bool {
+        let rebound = self.bound != pipeline;
+        if rebound {
+            // SAFETY: as the caller says.
+            unsafe { b.host.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline) };
+            self.bound = pipeline;
+        }
+        rebound || super::gputime::strayed()
+    }
+
     fn end_pass(&mut self, b: &Backend) {
         if self.pass.take().is_some()
             && let Some(cmd) = self.cmd.as_ref().map(|r| r.cmd)
@@ -739,12 +755,9 @@ impl Rec {
                 l
             }
         };
-        let d = &b.host.device;
         // SAFETY: recording into our command buffer, rendering open.
         unsafe {
-            if self.bound != made.pipeline {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, made.pipeline);
-                self.bound = made.pipeline;
+            if self.bind_draw(b, cmd, made.pipeline) {
                 super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             }
             let mut list: Vec<&Stage> = vec![&pre];
@@ -993,8 +1006,13 @@ impl Rec {
             lap.next();
             // SAFETY: outside rendering, in our command buffer.
             let watched = if super::watch::on() { unsafe { super::watch::read(b, cmd, None) } } else { Vec::new() };
-            // SAFETY: outside rendering, the pipeline bound.
-            unsafe { b.host.device.cmd_dispatch(cmd, x, y, z) };
+            // SAFETY: outside rendering, the pipeline bound; no statistics
+            // query of the list's is active where one is begun.
+            unsafe {
+                let counted = if self.query.is_none() { super::gputime::dispatching(b, cmd) } else { None };
+                b.host.device.cmd_dispatch(cmd, x, y, z);
+                super::gputime::dispatched(b, cmd, counted);
+            }
             self.watched_dispatch(b, cmd, &watched, &format!("dispatch {x}x{y}x{z}"));
             self.ambient(b, cmd);
             lap.next();
@@ -1111,8 +1129,10 @@ impl Rec {
             if self.bound_compute != pipeline {
                 b.host.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.bound_compute = pipeline;
-                super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             }
+            // Every dispatch is marked, not only a bind: the dispatch
+            // before this one ended its own time (`gputime::dispatched`).
+            super::gputime::mark(b, cmd, || shaders.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("+"));
             lap.next();
             self.push(b, cmd, &[&stage], true);
             lap.next();
