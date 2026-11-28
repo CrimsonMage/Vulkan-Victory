@@ -5,13 +5,12 @@
 // left out too (build.rs `without_tests`). Included by build.rs and by
 // lib.rs's test that every entry exists.
 
-/// The interpreter (offline checks: tests, examples, xtask), the oracle
-/// tests, and the views a program reaches memory through (read from the
-/// thread program for the host; no module depends on it).
-pub const FINGERPRINT_EXCLUDE: &[&str] = &["vk/interp.rs", "vk/oracle", "vk/views.rs"];
+/// The interpreter (offline checks: tests, examples, xtask) and the
+/// oracle tests.
+pub const FINGERPRINT_EXCLUDE: &[&str] = &["vk/interp.rs", "vk/oracle"];
 
 /// Lines of fingerprinted files left out with a left-out file: its
 /// declaration (file, line), so that adding the file keeps the cache.
 /// (`pub mod interp;` is older than this list and stays in the
 /// fingerprint: taking it out would change every key once.)
-pub const FINGERPRINT_EXCLUDE_LINES: &[(&str, &str)] = &[("vk/mod.rs", "pub mod views;")];
+pub const FINGERPRINT_EXCLUDE_LINES: &[(&str, &str)] = &[];

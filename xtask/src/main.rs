@@ -106,9 +106,7 @@ enum Cmd {
         /// with a program's hash first on each line.
         #[arg(long)]
         golden: Option<PathBuf>,
-        /// Also write the lines as the host keeps them beside its
-        /// translations: `views-<key>.txt` in the stage cache's folder
-        /// (the game's log names the folder and the key).
+        /// Also write the lines (hash, the views' line) to this file.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Worker threads.

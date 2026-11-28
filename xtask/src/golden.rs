@@ -201,8 +201,7 @@ fn views_text(container: &[u8]) -> String {
 /// Prints, for each compute program of the golden file, the views it
 /// stores and loads through (`victory_shader::vk::views`: hash, the
 /// views' line, name), and how many programs the host can stage. With
-/// `out`: the lines as the host keeps them beside its translations
-/// (`views-<key>.txt`; the game's log names the folder and the key).
+/// `out`: the lines without the names, into that file.
 pub fn views(pack: &Path, golden: &Path, out: Option<&Path>, jobs: usize) -> Result<()> {
     let list = std::fs::read_to_string(golden).with_context(|| format!("reading {}", golden.display()))?;
     let hashes = list.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_whitespace().next());

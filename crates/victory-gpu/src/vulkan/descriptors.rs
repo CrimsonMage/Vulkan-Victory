@@ -61,7 +61,9 @@ const MAPS: u64 = 256;
 /// staging, `record/staging.rs`), reused round: a command buffer has long
 /// run when its block comes up again (a frame stages a few dispatches).
 const STAGED_MAPS: u64 = 1024;
-const MAP_BLOCK: u64 = 4096;
+/// A block's bytes in the maps buffer: [`victory_vk::map::BLOCK_BYTES`]
+/// (8,224) on a uniform buffer's offset alignment.
+const MAP_BLOCK: u64 = 8448;
 
 pub(crate) struct Heaps {
     resource: Buffer,

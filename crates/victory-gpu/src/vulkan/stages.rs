@@ -25,7 +25,7 @@ use super::Backend;
 use crate::pipeline::Shader;
 
 /// The ABI version the host binds for (`docs/vulkan-abi.md`).
-pub(crate) const HOST_ABI: u32 = 5;
+pub(crate) const HOST_ABI: u32 = 6;
 
 /// Stage workers: half the logical processors, 4 to 8, below the title's
 /// threads (`SetThreadPriority` below normal): draws wait for their stages.
@@ -272,28 +272,17 @@ pub(crate) enum Stores {
     Unfound(&'static str),
 }
 
-/// [`Stores`] of a compute program: its views as kept beside the
-/// translations (`stage_cache::views`), else read from its container now
-/// (the thread program made again) and kept.
-fn stores_of(shader: &Shader) -> Stores {
-    let views = super::stage_cache::views(&shader.full).or_else(|| {
-        VIEWS_READ.fetch_add(1, Ordering::Relaxed);
-        let views = std::panic::catch_unwind(|| victory_shader::vk::views::of(shader.container())).ok()?.ok()?;
-        super::stage_cache::note_views(&shader.full, &views);
-        Some(views)
-    });
+/// [`Stores`] of a program by its views (`VkShader::views`, kept with its
+/// translation; a compute program has them).
+fn stores_of(views: Option<&victory_shader::vk::views::Views>) -> Stores {
     match views {
+        None => Stores::None,
         Some(v) if v.other_stores => Stores::Unfound("it stores through a view or an address found at run time"),
         Some(v) if v.stores().next().is_none() => Stores::None,
         Some(v) if v.other_views => Stores::Unfound("it loads through a view found at run time"),
-        Some(v) => Stores::Views(v),
-        None => Stores::Unfound("its views were not read"),
+        Some(v) => Stores::Views(v.clone()),
     }
 }
-
-/// Compute programs whose views no file held: read from their containers
-/// by the stage workers in this run.
-pub(crate) static VIEWS_READ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Stage {
     pub(crate) stage: HwStage,
@@ -798,7 +787,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         guard_id: vs.guard_id,
         mesh_parts: vs.mesh_parts.max(1),
         threads: vs.local_size.iter().product(),
-        stores: if vs.stage == HwStage::Cs { stores_of(shader) } else { Stores::None },
+        stores: stores_of(vs.views.as_ref()),
         held_groups: AtomicU64::new(0),
     }))
 }

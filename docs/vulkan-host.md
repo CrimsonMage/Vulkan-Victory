@@ -287,7 +287,8 @@ The unified table of `docs/kiss.md` holds; only the mechanism changes.
 **Fallback, if the driver refuses sparse binds of imported memory.**
 
 - Each import has the device address the driver chose. The memory map
-  holds one range per import (up to 64, sorted; ABI proposal below).
+  holds one range per import (up to 64, sorted; ABI proposal below; 256
+  since ABI v6).
 - The pool's GPU view then needs CPU views of its pages so they can be
   imported. That costs one wineserver map per page change, ~17 maps/s
   after workstream 11.
@@ -2070,19 +2071,19 @@ or stores through, where the V# lies (a descriptor table's address in the
 push constants plus a constant), whether its stores are scattered, and
 whether the program reaches memory in a way that is not found (a
 descriptor index it reads from memory, a store at a computed address).
-The module is not touched and the translation key does not change (the
-file is left out of the fingerprint). The kept translation holds only
-the module, so the views are kept beside it, a line a container
-(`views-<key>.txt`), written by `cargo xtask shader-views --pack <pack>
---golden <cache>/stage-names.txt --out <cache>/views-<key>.txt` or by the
-stage worker that first misses a container.
+They are part of what the translator returns (`VkShader::views`) and of
+the kept translation since ABI v6. (Before, `views.rs` lay outside the
+translation key and the views in a file beside the translations,
+`views-<key>.txt`, written by `cargo xtask shader-views --out` or by the
+stage worker that first missed a container.)
 
-- **Not in the game process, if it can be helped.** Run ss1 made the
+- **Not read again in the game process.** Run ss1 made the
   thread program again for every compute stage as it was made (about a
   thousand, while the title loaded): the title's own blocks ended up in
   121 imports instead of 41, the map was full (64 ranges, 4,846 ranges
   refused), and two thirds of the indirect executions found their
-  records in no range. With the file, a run reads no container.
+  records in no range. With the views in the kept translation, a run
+  makes no thread program for them.
 
 **What is staged** (a dispatch at a time; everything else stays in place
 as before):

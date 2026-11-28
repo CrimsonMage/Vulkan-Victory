@@ -26,7 +26,7 @@ impl Emit<'_> {
             for (k, o) in [0u32, 8, 16, 24].iter().enumerate() {
                 self.m.member_decorate(range, k as u32, en::DEC_OFFSET, &[*o]);
             }
-            let arr = self.m.t_array(range, 64);
+            let arr = self.m.t_array(range, crate::vk::MAP_RANGES);
             self.m.decorate(arr, en::DEC_ARRAY_STRIDE, &[32]);
             // A program with code tables reads the tables buffer's address
             // too: member 3, at byte 24, the ranges then member 4 (other
@@ -548,13 +548,13 @@ impl Emit<'_> {
             let k2 = self.c32(2);
             let count = self.map_load_at(map, u, &[k2]);
             let mut lo = self.c32(0);
-            for step in [32u32, 16, 8, 4, 2, 1] {
+            for step in (0..crate::vk::MAP_RANGES.trailing_zeros()).rev().map(|k| 1u32 << k) {
                 let ks = self.c32(step);
                 let mid = self.m.op(op::I_ADD, u, &[lo, ks]);
                 let inside = self.m.op(op::U_LESS_THAN, b, &[mid, count]);
                 let k3 = self.c32(self.map_ranges());
-                let k63 = self.c32(63);
-                let midc = self.m.ext(glsl::U_MIN, u, &[mid, k63]);
+                let most = self.c32(crate::vk::MAP_RANGES - 1);
+                let midc = self.m.ext(glsl::U_MIN, u, &[mid, most]);
                 let start = self.map_load_at(map, q, &[k3, midc, z]);
                 let le = self.m.op(op::U_LESS_THAN_EQUAL, b, &[start, ps[0]]);
                 let ok = self.m.op(op::LOGICAL_AND, b, &[inside, le]);

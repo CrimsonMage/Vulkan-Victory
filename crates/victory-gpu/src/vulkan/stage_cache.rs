@@ -17,7 +17,7 @@ use victory_shader::{HwStage, RootType};
 /// The file encoding's version: bump it when `encode`/`decode` change.
 /// (The key used to hash this whole file, so any edit here, even one that
 /// left the encoding alone, threw every kept translation away.)
-const MAGIC: &[u8; 8] = b"vkstage5";
+const MAGIC: &[u8; 8] = b"vkstage6";
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -313,43 +313,6 @@ pub(crate) fn forget_code_tables() {
     }
 }
 
-/// The views of compute programs (`victory_shader::vk::views`) of this
-/// translator key, kept beside the translations, a line a container
-/// (hash, 32 hex digits, then `Views::line`): read from the container's
-/// thread program, which the kept translation does not hold. Making that
-/// program again for every compute stage of a run cost the run its memory
-/// map (run ss1: a thousand of them while the title loaded left the
-/// title's own blocks in 121 pieces instead of 41, more than the map's 64
-/// ranges), so it is done once a container: by `cargo xtask shader-views
-/// --out`, else by the stage worker that first misses it.
-fn views_file() -> String {
-    format!("views-{}.txt", key())
-}
-
-fn views_kept() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, victory_shader::vk::views::Views>> {
-    static KEPT: OnceLock<std::sync::Mutex<std::collections::HashMap<String, victory_shader::vk::views::Views>>> = OnceLock::new();
-    let kept = KEPT.get_or_init(|| {
-        let lines = lines_of(&views_file());
-        let views = lines.iter().filter_map(|l| l.split_once(' ')).filter_map(|(h, v)| Some((h.to_string(), victory_shader::vk::views::Views::parse(v)?)));
-        std::sync::Mutex::new(views.collect())
-    });
-    kept.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The kept views of the container `full`.
-pub(crate) fn views(full: &[u8; 32]) -> Option<victory_shader::vk::views::Views> {
-    let hash: String = full[..16].iter().map(|b| format!("{b:02x}")).collect();
-    views_kept().get(&hash).cloned()
-}
-
-/// Keeps the views of the container `full`.
-pub(crate) fn note_views(full: &[u8; 32], views: &victory_shader::vk::views::Views) {
-    let hash: String = full[..16].iter().map(|b| format!("{b:02x}")).collect();
-    if views_kept().insert(hash.clone(), views.clone()).is_none() {
-        append_line(&views_file(), &format!("{hash} {}", views.line()));
-    }
-}
-
 /// Keeps `vs`, the translation of the container `full`.
 pub(crate) fn write(full: &[u8; 32], vs: &VkShader) {
     let Some(p) = path(full) else { return };
@@ -433,6 +396,14 @@ fn encode(vs: &VkShader) -> Vec<u8> {
     w.extend(&vs.spirv);
     w.push(vs.tables.len() as u32);
     w.extend(&vs.tables);
+    // a compute program's views, as their line of text (0 bytes: none)
+    let views = vs.views.as_ref().map_or(String::new(), |v| v.line());
+    w.push(views.len() as u32);
+    w.extend(views.as_bytes().chunks(4).map(|c| {
+        let mut b = [0u8; 4];
+        b[..c.len()].copy_from_slice(c);
+        u32::from_le_bytes(b)
+    }));
     let mut out = MAGIC.to_vec();
     out.extend(w.iter().flat_map(|x| x.to_le_bytes()));
     out
@@ -487,5 +458,8 @@ fn decode(bytes: &[u8]) -> Option<VkShader> {
     let spirv = r.take(n)?.to_vec();
     let n = r.next()? as usize;
     let tables = r.take(n)?.to_vec();
-    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id, mesh_parts, tables })
+    let n = r.next()? as usize;
+    let line: Vec<u8> = r.take(n.div_ceil(4))?.iter().flat_map(|x| x.to_le_bytes()).take(n).collect();
+    let views = if n == 0 { None } else { Some(victory_shader::vk::views::Views::parse(std::str::from_utf8(&line).ok()?)?) };
+    Some(VkShader { stage, spirv, user_data, samplers, interface, local_size, approximate: Vec::new(), ir_insts: 0, guard_id, mesh_parts, tables, views })
 }

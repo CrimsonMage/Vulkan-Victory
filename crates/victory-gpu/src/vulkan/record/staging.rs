@@ -16,9 +16,9 @@
 //!    again.
 //!
 //! What a dispatch may stage is told by the program's views
-//! ([`victory_shader::vk::views`], kept beside the translations:
-//! `stage_cache::views`) and their V#s as the title's tables hold them
-//! at record time:
+//! ([`victory_shader::vk::views`], kept with its translation:
+//! `VkShader::views`) and their V#s as the title's tables hold them at
+//! record time:
 //!
 //! - **A cut is a whole view, to the byte**: a V# must lie whole in one
 //!   range of the map, or it reads zeros and its stores are dropped. So
@@ -122,8 +122,7 @@ pub(super) fn report() {
         no_range = n(NO_RANGE),
         no_home = n(NO_HOME),
         on_the_card = n(ON_CARD),
-        programs_read_now = super::super::stages::VIEWS_READ.load(Ordering::Relaxed),
-        "Vulkan: store staging (dispatches whose store views ran on the card; left in place by reason; programs whose views no file held)"
+        "Vulkan: store staging (dispatches whose store views ran on the card; left in place by reason)"
     );
     if cfg!(feature = "diagnostics") {
         let mut all = lock(&PROGRAMS).clone();

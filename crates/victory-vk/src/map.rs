@@ -1,13 +1,13 @@
 //! The memory map of `docs/vulkan-abi.md` section 3 (ABI v1): title
 //! address ranges and the device addresses they start at, sorted and
-//! disjoint, at most 64, written as the block translated programs read.
+//! disjoint, at most 256, written as the block translated programs read.
 
 use anyhow::{Result, bail, ensure};
 
 /// Ranges a map holds at most.
-pub const MAX_RANGES: usize = 64;
+pub const MAX_RANGES: usize = victory_shader::vk::MAP_RANGES as usize;
 /// Bytes of a map block: the header (zero, sink, count, padding, the
-/// tables buffer) and 64 ranges of 32 bytes.
+/// tables buffer) and 256 ranges of 32 bytes.
 pub const BLOCK_BYTES: usize = 32 + MAX_RANGES * 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +209,29 @@ mod tests {
         assert_eq!(full.device(0x10), Some(0x10));
         full.cut(0, 0x1000, 0x70_0000).unwrap();
         assert_eq!(full.device(0x10), Some(0x70_0010));
+    }
+
+    /// More ranges than the six search steps of the first maps reached
+    /// (64): the first, the middle and the last resolve, and what lies
+    /// between ranges does not.
+    #[test]
+    fn a_full_map_resolves_first_middle_and_last() {
+        let mut m = MemoryMap::default();
+        for k in 0..MAX_RANGES as u64 {
+            m.insert(r(0x1_0000 + (k << 16), 0x8000, 0x9_0000_0000 + (k << 20))).unwrap();
+        }
+        assert!(m.insert(r(0, 0x100, 0)).is_err());
+        for k in [0, 63, 64, 65, MAX_RANGES as u64 / 2, MAX_RANGES as u64 - 1] {
+            let start = 0x1_0000 + (k << 16);
+            assert_eq!(m.device(start), Some(0x9_0000_0000 + (k << 20)));
+            assert_eq!(m.device(start + 0x7fff), Some(0x9_0000_0000 + (k << 20) + 0x7fff));
+            assert_eq!(m.device(start + 0x8000), None);
+        }
+        let b = m.block(0, 0, 0);
+        assert_eq!(b.len(), BLOCK_BYTES);
+        assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), MAX_RANGES as u32);
+        let last = 32 + 32 * (MAX_RANGES - 1);
+        assert_eq!(u64::from_le_bytes(b[last..last + 8].try_into().unwrap()), 0x1_0000 + ((MAX_RANGES as u64 - 1) << 16));
     }
 
     #[test]

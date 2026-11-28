@@ -1,7 +1,11 @@
 # Vulkan shader ABI (translator ↔ Vulkan host)
 
-Status: **v5** (2026-11-26: 64-bit image atomics on R64_UINT views of
-two-dword images, set 0 binding 3; v4 2026-11-26: mesh output memory
+Status: **v6** (2026-11-28: the memory map holds 256 ranges, searched in
+eight steps, so that the buffers programs store into can have homes on
+the card, each a range of its own; a compute program's views are part of
+`VkShader` and of the kept translation. v5 2026-11-26: 64-bit image
+atomics on R64_UINT views of two-dword images, set 0 binding 3; v4
+2026-11-26: mesh output memory
 within 32 KiB, a mesh program over it split into `VkShader::mesh_parts`
 host groups in y; v3 2026-11-26: the loop guard buffer in push dwords 2–3; v2
 2026-11-26: semantic registry, six-layer 2D-array views of cubes on set 0
@@ -37,7 +41,7 @@ reads it:
 
 Nothing is traced, guessed or looked up per access beyond that.
 
-`ABI_VERSION = 5`
+`ABI_VERSION = 6`
 
 ## 1. Vulkan requirements
 
@@ -135,7 +139,7 @@ one subtract and add over the host's imports of title memory:
 struct MemoryMap {            // uniform buffer, set 3 binding 0 (std140; offsets as written)
     u64 zero;                 // device address of >= 256 bytes of zeros (never written)
     u64 sink;                 // device address of >= 256 writable bytes nobody reads (dropped stores)
-    u32 count;                // ranges in use, 1..=64
+    u32 count;                // ranges in use, 1..=256
     u32 pad;
     u64 tables;               // device address of the tables buffer (section 3.1; byte 24)
     struct {
@@ -143,7 +147,7 @@ struct MemoryMap {            // uniform buffer, set 3 binding 0 (std140; offset
         u64 title_size;       // bytes
         u64 device_base;      // device address that title_start maps to
         u64 pad;
-    } range[64];              // sorted by title_start, disjoint
+    } range[256];             // sorted by title_start, disjoint (`vk::MAP_RANGES`)
 };
 ```
 
@@ -153,7 +157,10 @@ constant 0** (bool, default true) says the map has one range (the host's
 title window: `title_start` 0, `device_base` the window): the translator
 then does exactly that with `range[0]`, one compare and add. A host that
 writes several ranges sets it false at pipeline creation; the module then
-does a binary search over the sorted ranges (6 steps). (`count` is read
+does a binary search over the sorted ranges (8 steps; 6 over 64 ranges
+until v6: the pass bench's ray binning takes 0.30 ms a dispatch with a
+map of 256 ranges, whether its own are the first, the middle or the last
+of them, against 0.31 with the capture's 42). (`count` is read
 only then.) An address in no range reads
 zeros from `zero` and writes into `sink`; so does any access that is out
 of bounds of its V# (section 4). The map must stay valid and unchanged
@@ -553,10 +560,10 @@ reaches title memory: the buffer views it loads and stores through, each
 by the place of its V# (a push dword's address plus a constant), whether
 its stores through a view are scattered, and whether it stores or loads
 in a way that is not found. The host stages stores by it
-(`docs/vulkan-host.md`, "Store staging") and keeps it beside the
-translations; it is no part of `VkShader`, the kept translation or the
-translation key. `cargo xtask shader-views --pack <pack>` prints it for
-the used compute programs.
+(`docs/vulkan-host.md`, "Store staging"). A compute program's views are
+`VkShader::views`, kept with its translation (until v6 a file beside the
+translations, with `views.rs` outside the translation key). `cargo xtask
+shader-views --pack <pack>` prints them for the used compute programs.
 
 `vk::report` (an opt-in for tools) translates a container and adds the
 opcodes its code uses and the opcode a refusal stops at. `cargo xtask

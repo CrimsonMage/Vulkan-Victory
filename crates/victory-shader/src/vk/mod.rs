@@ -37,7 +37,10 @@ pub use report::{Report, report};
 pub use semantics::Semantics;
 
 /// Version of the interface in `docs/vulkan-abi.md`.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
+/// Ranges of the memory map at most (`docs/vulkan-abi.md` section 3): a
+/// power of two, searched in one step a bit (eight).
+pub const MAP_RANGES: u32 = 256;
 
 /// (row, channel) -> (location, component) for the user-semantic rows of
 /// a signature part (`locs`: each row's location, from the registry).
@@ -94,6 +97,9 @@ pub struct VkShader {
     /// gives the module their place in it, specialization constant
     /// [`SPEC_CODE_TABLES`] (`docs/vulkan-abi.md` section 3.1).
     pub tables: Vec<u32>,
+    /// A compute program's views: how it reaches title memory ([`views`];
+    /// what the host stages stores by).
+    pub views: Option<views::Views>,
 }
 
 struct SigRow {
@@ -259,6 +265,7 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         ir_insts,
         guard_id: guard_id(container),
         mesh_parts,
+        views: (native.stage == HwStage::Cs).then(|| views::views(&f)),
         tables: f.tables.words,
     })
 }
