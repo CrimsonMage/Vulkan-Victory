@@ -66,6 +66,7 @@ pub(crate) fn present(frame: u64, size: Option<(u32, u32)>, planes: &[compose::S
     drop(sc);
     split(Split::Present, presented);
     FRAME.store(frame, Ordering::Relaxed);
+    super::census::frame(b, frame);
 }
 
 /// A swapchain on the title's window (or one of ours, at the planes' size).

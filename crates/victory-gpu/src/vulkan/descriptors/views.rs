@@ -64,7 +64,10 @@ pub(crate) fn write(handle: u64, view: &View) {
     // may begin anywhere in it).
     super::super::touch(handle);
     match view {
-        View::Constant(address, size) => super::super::touch_range(*address, u64::from(*size)),
+        View::Constant(address, size) => {
+            super::super::census::view(0, *address, u64::from(*size));
+            super::super::touch_range(*address, u64::from(*size))
+        }
         View::Shader(r, _) | View::Unordered(r, _, _) => {
             if let Some((data, len)) = crate::resource::buffer_bytes(*r as crate::object::This) {
                 super::super::touch_range(data as u64, len);
@@ -166,7 +169,7 @@ fn census(b: &Backend, handle: u64, view: &View) {
 
 /// A V# for a buffer view of `len` bytes at `base` (SRV or UAV words).
 fn buffer_words(base: u64, len: u64, desc: Option<&[u32; 10]>, unordered: bool) -> Vec<u32> {
-    let mut out = match desc {
+    let out = match desc {
         None => gfx10::Buffer::raw(base, len.min(u64::from(u32::MAX)) as u32),
         Some(d) => {
             // SRV: format, dimension, mapping, pad, first (2), count, stride, flags.
@@ -203,8 +206,9 @@ fn buffer_words(base: u64, len: u64, desc: Option<&[u32; 10]>, unordered: bool) 
             }
         }
     }
-    .encode()
-    .to_vec();
+    ;
+    super::super::census::view(1 + u8::from(unordered), out.address, u64::from(out.stride.max(1)) * u64::from(out.records));
+    let mut out = out.encode().to_vec();
     out.resize(8, 0);
     out
 }

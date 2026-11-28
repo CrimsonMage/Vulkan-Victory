@@ -41,6 +41,7 @@ mod passes;
 mod targets;
 mod watch;
 mod budget;
+mod census;
 mod compose;
 mod descriptors;
 mod engine;
