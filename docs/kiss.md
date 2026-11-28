@@ -151,6 +151,21 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (night): **the helper-lane fix in the game: 3.1 to 5.2 fps,
+  card 289 to 180 ms a frame.** Tag `batch-2026-11-27g` (the entry below),
+  baked in 239 s (216 pixel programs), run bh1 on the test scene with
+  `VICTORY_VK_GPU_TIME=1900,6`: 52 to 53 frames in 10 s (31 before), the
+  direct queue busy 183 ms a frame (309), no hang, no guard hit, no
+  error; the picture as before (capture bh1, frame 3210, beside bg2 frame
+  2340; compared by eye, the character moves between them). No tiled
+  lighting family is left among the 40 largest (each under 1.4 ms; 104 ms
+  together before). What the 40 largest hold now: compute 92 ms
+  (`CS_Primary_GatherCopy` 18.3, the screen-probe ray binning 10.2,
+  `CS_SolvePerVertConstraint` 7.4, skinning and strands), draws 23 ms,
+  between lists 5.8 ms; 57 ms are in families under 1.4 ms each. Card
+  peak 6,728 MiB, RSS peak 15.7 GB. Next: the same bench for the compute
+  programs.
+
 - 2026-11-27 (bench): **where a lighting pass's time went: helper pixels
   spinning to the loop guard. One condition in the translator; 26.6 ms a
   draw become 0.74.** Found with a native pass bench, after three
