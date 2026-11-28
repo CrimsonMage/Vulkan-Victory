@@ -427,6 +427,34 @@ impl Emit<'_> {
         id
     }
 
+    /// `Helper::Dot4` (addend, a, b): the addend plus the four products of
+    /// the signed bytes of `a` and `b`. Marked for inlining.
+    fn write_dot4(&mut self, fid: Id) {
+        let u = self.t.u32_;
+        let fty = self.m.global_fn_type(u, &[u, u, u]);
+        self.m.op_to(op::FUNCTION, u, fid, &[1, fty]);
+        let ps: Vec<Id> = (0..3)
+            .map(|_| {
+                let id = self.m.id();
+                self.m.op_to(55, u, id, &[]); // OpFunctionParameter
+                id
+            })
+            .collect();
+        let entry = self.m.id();
+        self.m.label(entry);
+        let k8 = self.c32(8);
+        let mut sum = ps[0];
+        for byte in 0..4 {
+            let at = self.c32(8 * byte);
+            let x = self.m.op(op::BIT_FIELD_S_EXTRACT, u, &[ps[1], at, k8]);
+            let y = self.m.op(op::BIT_FIELD_S_EXTRACT, u, &[ps[2], at, k8]);
+            let p = self.m.op(op::I_MUL, u, &[x, y]);
+            sum = self.m.op(op::I_ADD, u, &[sum, p]);
+        }
+        self.m.op_void(254, &[sum]); // OpReturnValue
+        self.m.op_void(op::FUNCTION_END, &[]);
+    }
+
     /// Writes the helper functions' bodies (after main).
     pub(super) fn write_helpers(&mut self) {
         let mut helpers: Vec<(Helper, Id)> = self.helpers.iter().map(|(h, i)| (*h, *i)).collect();
@@ -447,6 +475,10 @@ impl Emit<'_> {
         if let Some(k) = helpers.iter().position(|h| h.0 == Helper::BvhRay) {
             let (_, fid) = helpers.remove(k);
             self.write_bvh(fid);
+        }
+        if let Some(k) = helpers.iter().position(|h| h.0 == Helper::Dot4) {
+            let (_, fid) = helpers.remove(k);
+            self.write_dot4(fid);
         }
         while let Some(k) = helpers.iter().position(|h| matches!(h.0, Helper::CodeTable(_))) {
             let (Helper::CodeTable(t), fid) = helpers.remove(k) else { unreachable!() };

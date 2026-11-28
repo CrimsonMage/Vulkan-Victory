@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// [`program_name`]); empty otherwise. Logged beside the hash so a log
     /// says which pass a failure is without the title's shader archive.
     pub(crate) name: String,
+    /// A pass of the title's upscaler ([`is_pass`]).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) pass: bool,
     container: Vec<u8>,
 }
 
@@ -80,11 +83,14 @@ impl std::fmt::Debug for Shader {
 /// archive names the record (`<entry>_<8 hex>_Wrapped`; the archive's
 /// record adds `<family>:` before it, the container does not): the
 /// printable run that ends at `_Wrapped`, without the 8-digit suffix and
-/// `_Wrapped`. Empty if the container has no such string.
+/// `_Wrapped`. A container of another compiler's code (a pass of the
+/// title's upscaler: an `ACCC` part) has no such string and names its
+/// entry function in its `PSV0` part. Empty if the container has neither.
 pub(crate) fn program_name(container: &[u8]) -> String {
     const END: &[u8] = b"_Wrapped";
     let Some(at) = container.windows(END.len()).position(|w| w == END) else {
-        return String::new();
+        let entry = || victory_shader::Container::parse(container).ok()?.entry_name().map(str::to_owned);
+        return if is_pass(container) { entry().unwrap_or_default() } else { String::new() };
     };
     let begin = container[..at]
         .iter()
@@ -96,6 +102,13 @@ pub(crate) fn program_name(container: &[u8]) -> String {
         Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => head.to_owned(),
         _ => name,
     }
+}
+
+/// Whether `container` is a pass of the title's upscaler: console code of
+/// another compiler, in an `ACCC` part (`victory_shader::native`).
+pub(crate) fn is_pass(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    Container::parse(container).is_ok_and(|c| c.part(FourCC::ACCC).is_some())
 }
 
 /// The names of `shaders`, for logs (`?` for a nameless one).
@@ -129,6 +142,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 full: *full.as_bytes(),
                 name: program_name(bytes),
+                pass: is_pass(bytes),
                 container: bytes.to_vec(),
             })
         })
@@ -508,7 +522,7 @@ mod tests {
 
 #[cfg(test)]
 mod name_tests {
-    use super::program_name;
+    use super::{is_pass, program_name};
 
     #[test]
     fn names_come_from_the_wrapped_entry() {
@@ -516,6 +530,46 @@ mod name_tests {
         assert_eq!(program_name(c), "CS_Visibility");
         assert_eq!(program_name(b"\x00PS_FogColor_Wrapped\x00"), "PS_FogColor");
         assert_eq!(program_name(b"DXBC no name here"), "");
+    }
+
+    /// A pass of the upscaler (an `ACCC` part) is named by its `PSV0`
+    /// entry; a container of the title's compiler without `_Wrapped` (the
+    /// ray-tracing structure builder's) stays nameless, PSV0 or not: the
+    /// recorder knows the builder's programs by that.
+    #[test]
+    fn a_pass_of_the_upscaler_is_named_by_its_entry() {
+        // PSV0: 52 bytes of runtime information (the name at 1 of the
+        // string table), no resources, the table
+        let mut psv = 52u32.to_le_bytes().to_vec();
+        psv.resize(4 + 48, 0);
+        psv.extend_from_slice(&1u32.to_le_bytes());
+        psv.extend_from_slice(&0u32.to_le_bytes());
+        psv.extend_from_slice(&12u32.to_le_bytes());
+        psv.extend_from_slice(b"\0some_pass\0\0");
+        let container = |code: &[u8; 4]| {
+            let parts: [(&[u8; 4], &[u8]); 2] = [(b"PSV0", &psv), (code, b"FSPX")];
+            let table = 0x20 + 4 * parts.len();
+            let total = table + parts.iter().map(|p| 8 + p.1.len()).sum::<usize>();
+            let mut c = b"DXBC".to_vec();
+            c.extend_from_slice(&[0; 16]);
+            c.extend_from_slice(&[1, 0, 0, 0]);
+            c.extend_from_slice(&(total as u32).to_le_bytes());
+            c.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+            let mut at = table;
+            for p in &parts {
+                c.extend_from_slice(&(at as u32).to_le_bytes());
+                at += 8 + p.1.len();
+            }
+            for p in &parts {
+                c.extend_from_slice(p.0);
+                c.extend_from_slice(&(p.1.len() as u32).to_le_bytes());
+                c.extend_from_slice(p.1);
+            }
+            c
+        };
+        assert_eq!(program_name(&container(b"ACCC")), "some_pass");
+        assert_eq!(program_name(&container(b"DXIL")), "");
+        assert!(is_pass(&container(b"ACCC")) && !is_pass(&container(b"DXIL")) && !is_pass(b"DXBC"));
     }
 }
 

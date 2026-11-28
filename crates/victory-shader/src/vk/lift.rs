@@ -1041,6 +1041,8 @@ mod scalar;
 mod valu;
 #[path = "lift_vops.rs"]
 mod vops;
+#[path = "lift_pk.rs"]
+mod pk;
 #[path = "lift_flow.rs"]
 mod flow;
 #[path = "lift_wave.rs"]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use victory_game::sgd5;
 use victory_shader::gfx10::{self, Instruction};
-use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
+use victory_shader::{Container, DxilProgram, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
@@ -101,7 +101,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.code_part();
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();

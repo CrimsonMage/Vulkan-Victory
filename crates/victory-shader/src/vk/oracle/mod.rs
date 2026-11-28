@@ -29,6 +29,7 @@ mod waterfall;
 mod upper;
 
 mod nvidia;
+mod packed;
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 

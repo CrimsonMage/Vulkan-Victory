@@ -4,7 +4,7 @@
 //! beyond naming the opcode of each approximation it takes.
 
 use super::VkShader;
-use crate::dxbc::{Container, FourCC};
+use crate::dxbc::Container;
 use crate::native::{HwStage, NativeProgram};
 use crate::{ShaderError, gfx10};
 
@@ -35,6 +35,26 @@ pub fn report(container: &[u8]) -> Report {
     Report { stage, opcodes, result, refused_at }
 }
 
+/// How many containers of another compiler's code (an `ACCC` part,
+/// `native/fspx.rs`) `file` holds as they are, if every one translates:
+/// the passes of a title's upscaler in its DLL. Else the first that does
+/// not and why (or that there is none).
+pub fn accc_passes(file: &[u8]) -> Result<usize, String> {
+    let other = |c: &&[u8]| Container::parse(c).is_ok_and(|c| c.part(crate::FourCC::ACCC).is_some());
+    let passes: Vec<&[u8]> = crate::containers(file).into_iter().filter(other).collect();
+    if passes.is_empty() {
+        return Err("no pass found in the file".into());
+    }
+    for (n, pass) in passes.iter().enumerate() {
+        match std::panic::catch_unwind(|| super::translate(pass)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("pass {n} of {}: {e}", passes.len())),
+            Err(_) => return Err(format!("pass {n} of {}: the translator panicked", passes.len())),
+        }
+    }
+    Ok(passes.len())
+}
+
 /// The stage of [`program`].
 pub fn stage(container: &[u8]) -> Option<HwStage> {
     program(container).map(|p| p.stage)
@@ -47,7 +67,7 @@ fn program(container: &[u8]) -> Option<NativeProgram> {
         return Some(n);
     }
     let c = Container::parse(container).ok()?;
-    crate::native_programs(c.part(FourCC::DXIL)?.data).ok()?.into_iter().next()
+    crate::native_programs(c.code_part()?.data).ok()?.into_iter().next()
 }
 
 /// The opcode at a refusal's offset. Offset 0 is also where refusals of

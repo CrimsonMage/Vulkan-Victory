@@ -114,7 +114,14 @@ impl Lift<'_> {
             self.sdst(inst, s.dst, 0, R::D(x));
             return Ok(());
         }
-        if s.b64 && (self.mask_like(inst, &s.src[0]) || s.dst_exec) && cond.is_none() {
+        // A lane mask moves as one, and so does anything moved into EXEC.
+        // Into VCC a pair of numbers moves as the two numbers: AMD's
+        // compute compiler keeps data in vcc_lo and vcc_hi (two words of a
+        // V#, weights) and puts it there with `s_mov_b64`, in waves of 32
+        // too, where the mask move left vcc_hi without a value.
+        let into_vcc = matches!(s.dst, Some(Operand::Scalar { code, .. }) if *code == ir::VCC);
+        let mask = self.mask_like(inst, &s.src[0]) || (s.dst_exec && !(into_vcc && self.number_pair(inst, &s.src[0])));
+        if s.b64 && mask && cond.is_none() {
             let m = self.opnd_mask(inst, &s.src[0])?;
             self.mask_def(inst, s.dst, m);
             return Ok(());
@@ -135,6 +142,12 @@ impl Lift<'_> {
             self.sdst(inst, s.dst, k, r);
         }
         Ok(())
+    }
+
+    /// Whether both dwords of a scalar pair hold numbers (not lane masks).
+    fn number_pair(&mut self, inst: &Inst, o: &Operand) -> bool {
+        let Operand::Scalar { code, .. } = *o else { return false };
+        code != crate::gfx10::NULL && (0..2).all(|k| matches!(self.val(inst, Reg::S(code + k)), Ok(R::D(_))))
     }
 
     /// `x`, or under a false condition the destination's old dword `k`.

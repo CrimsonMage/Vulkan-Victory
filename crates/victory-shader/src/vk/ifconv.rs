@@ -61,7 +61,7 @@ fn size(f: &Func, items: &[Item]) -> Option<usize> {
 /// translation (no memory, no lanes, no images).
 fn speculable(op: &Op) -> bool {
     match op {
-        Op::Call(h) => matches!(h, Helper::Translate | Helper::TranslateRange | Helper::RangeLeft),
+        Op::Call(h) => matches!(h, Helper::Translate | Helper::TranslateRange | Helper::RangeLeft | Helper::Dot4),
         Op::Wave(..) | Op::Pick => false,
         o => o.pure(),
     }

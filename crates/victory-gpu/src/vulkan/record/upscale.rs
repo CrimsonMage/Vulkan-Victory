@@ -1,7 +1,8 @@
-//! The title's upscale (AMD FidelityFX `ffxDispatch`, `crate::upscale`) on
-//! the Vulkan backend: the render-resolution colour scaled into the output
-//! with a linear filter (`vkCmdBlitImage`), recorded into the title's list
-//! where it asked for the upscale.
+//! The stand-in for the title's upscale (AMD FidelityFX `ffxDispatch`,
+//! `crate::upscale`: used while a pass of the upscaler has no translation)
+//! on the Vulkan backend: the render-resolution colour scaled into the
+//! output with a linear filter (`vkCmdBlitImage`), recorded into the
+//! title's list where it asked for the upscale.
 //!
 //! shortcut: as on the D3D12 path, no temporal accumulation and no
 //! sharpening; and the filter at the rendered rectangle's edge may read the

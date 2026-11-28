@@ -112,6 +112,12 @@ pub enum Helper {
     /// `Func::tables`, 0 past its end: a constant table in the program's
     /// own code, read through `s_getpc_b64` (lift_mem.rs `code_table`).
     CodeTable(u16),
+    /// (addend u32, a u32, b u32) -> u32: the addend plus the products of
+    /// the four signed bytes of `a` and `b`, modulo 2^32
+    /// (`v_dot4c_i32_i8`, `v_dot4_i32_i8`; lift_pk.rs). A function, so
+    /// that a program of thousands of them (a network pass of the
+    /// FidelityFX upscaler) is a module of a size drivers compile.
+    Dot4,
 }
 
 /// The most dwords of code a constant table read through `s_getpc_b64`

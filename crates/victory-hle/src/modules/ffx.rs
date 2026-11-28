@@ -1,18 +1,23 @@
 //! `amd_fidelityfx_loader_xbox.dll`, the title's AMD FidelityFX loader
 //! (Series S), stays the title's: mapped and bound as its other DLLs. Only
-//! its `ffxDispatch` is ours, for the upscale: that runs the PC way, as a
-//! linear scale (`victory_gpu::upscale`, recorded into Vulkan), because
-//! the upscaler's programs ship only as ACO-compiled console code that
-//! does not translate. Every other dispatch, and an upscale the scale
-//! cannot take, goes to the title's own `ffxDispatch`.
+//! its `ffxDispatch` is ours, for the upscale. The upscaler's passes are
+//! console compute programs of another compiler (`ACCC` containers in its
+//! DLL); **when every one of them translates, the upscale is the title's
+//! own**: its `ffxDispatch` runs and the passes go the way of every compute
+//! stage. While one does not (or one failed on the card,
+//! `victory_gpu::upscale::pass_failed`), the upscale runs the PC way as a
+//! linear scale (`victory_gpu::upscale`, recorded into Vulkan). Every other
+//! dispatch, and an upscale the scale cannot take, goes to the title's own
+//! `ffxDispatch`.
 //!
-//! What it rests on is the FidelityFX API, not one title: the dispatch
-//! type `FFX_API_DISPATCH_DESC_TYPE_UPSCALE` and `ffxDispatchDescUpscale`
-//! as the API's header lays it out (`victory_gpu::upscale`). That layout is
-//! the same in every upscaler the FidelityFX API carries (FSR 3.1 on, the
-//! API's start, through FSR 4), so the gate is the upscaler DLL beside the
-//! loader and its version (`VS_FIXEDFILEINFO`): another major version, or
-//! no upscaler DLL, leaves the upscale to the title, loudly.
+//! What the stand-in rests on is the FidelityFX API, not one title: the
+//! dispatch type `FFX_API_DISPATCH_DESC_TYPE_UPSCALE` and
+//! `ffxDispatchDescUpscale` as the API's header lays it out
+//! (`victory_gpu::upscale`). That layout is the same in every upscaler the
+//! FidelityFX API carries (FSR 3.1 on, the API's start, through FSR 4), so
+//! its gate is the upscaler DLL beside the loader and its version
+//! (`VS_FIXEDFILEINFO`): another major version, or no upscaler DLL, leaves
+//! the upscale to the title, loudly.
 
 use std::ffi::c_void;
 
@@ -42,7 +47,7 @@ extern "system" fn ffxDispatch(context: *mut c_void, desc: *const c_void) -> u32
         let kind = unsafe { desc.cast::<u64>().as_ref() }.copied();
         // SAFETY: an upscale description, as the title passes it.
         if kind == Some(victory_gpu::upscale::UPSCALE)
-            && upscaler_known()
+            && stands_in(upscaler(), victory_gpu::upscale::pass_failed())
             && unsafe { victory_gpu::upscale::dispatch(desc.cast()) }
         {
             return OK;
@@ -85,34 +90,68 @@ fn file_version(bytes: &[u8]) -> Option<Version> {
     Some(((ms >> 16) as u16, ms as u16, (ls >> 16) as u16))
 }
 
-/// Whether the title's upscaler is one whose upscale description has the
-/// layout read (decided once, logged once).
+/// Who runs the title's upscales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Upscaler {
+    /// The title's own upscaler: every pass of it translates.
+    Own,
+    /// The linear scale: a pass does not translate, and the upscale
+    /// description has the layout read.
+    Scale,
+    /// The title, for want of anything else: an upscaler of no known API
+    /// version (or none).
+    Unknown,
+}
+
+/// Whether the linear scale takes an upscale: the upscaler's passes do not
+/// all translate, or one of them failed on the card (`pass_failed`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stands_in(upscaler: Upscaler, pass_failed: bool) -> bool {
+    match upscaler {
+        Upscaler::Own => pass_failed,
+        Upscaler::Scale => true,
+        Upscaler::Unknown => false,
+    }
+}
+
+/// Who runs the upscales of the upscaler whose file holds `bytes`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decide(bytes: Option<&[u8]>) -> (Upscaler, String) {
+    let Some(v) = bytes.and_then(file_version).filter(|&v| layout_known(v)) else {
+        return (Upscaler::Unknown, format!("version {:?}", bytes.and_then(file_version)));
+    };
+    let version = format!("{}.{}.{}", v.0, v.1, v.2);
+    match victory_gpu::upscale::passes_translate(bytes.unwrap_or_default()) {
+        Ok(passes) => (Upscaler::Own, format!("version {version}, {passes} passes")),
+        Err(why) => (Upscaler::Scale, format!("version {version}; {why}")),
+    }
+}
+
+/// Who runs the title's upscales (decided once, logged once).
 #[cfg(windows)]
-fn upscaler_known() -> bool {
+fn upscaler() -> Upscaler {
     use std::sync::OnceLock;
-    static KNOWN: OnceLock<bool> = OnceLock::new();
+    static KNOWN: OnceLock<Upscaler> = OnceLock::new();
     *KNOWN.get_or_init(|| {
         let path = crate::runtime::image_named(DLL)
             .and_then(crate::runtime::image_path)
             .and_then(|p| p.parent().map(|d| d.join(UPSCALER)));
-        let version = path.as_ref().and_then(|p| std::fs::read(p).ok()).as_deref().and_then(file_version);
-        match version {
-            Some(v) if layout_known(v) => {
-                tracing::info!(
-                    version = format_args!("{}.{}.{}", v.0, v.1, v.2),
-                    "FidelityFX upscaler: its upscales run as a linear scale (ffxDispatchDescUpscale as the FidelityFX API lays it out)"
-                );
-                true
-            }
-            other => {
-                tracing::error!(
-                    upscaler = ?path,
-                    version = ?other,
-                    "FidelityFX upscaler of no known API version (FSR 3.1 to 4 are): its upscales are left to it, and its console-only programs do not run (the upscaled image stays black)"
-                );
-                false
-            }
+        let bytes = path.as_ref().and_then(|p| std::fs::read(p).ok());
+        let (who, what) = decide(bytes.as_deref());
+        match who {
+            Upscaler::Own => tracing::info!(what, "FidelityFX upscaler: every pass translates, its upscales are its own"),
+            Upscaler::Scale => tracing::warn!(
+                what,
+                "FidelityFX upscaler: a pass does not translate, its upscales run as a linear scale (ffxDispatchDescUpscale as the FidelityFX API lays it out)"
+            ),
+            Upscaler::Unknown => tracing::error!(
+                upscaler = ?path,
+                what,
+                "FidelityFX upscaler of no known API version (FSR 3.1 to 4 are): its upscales are left to it"
+            ),
         }
+        who
     })
 }
 
@@ -160,6 +199,27 @@ mod tests {
         file.extend_from_slice(&(5u32 << 16).to_le_bytes());
         assert_eq!(file_version(&file), Some((3, 1, 5)));
         assert_eq!(file_version(&file[..70]), None);
+    }
+
+    /// The scale stands in while a pass has no translation or failed on
+    /// the card, never for an upscaler whose description is not known.
+    #[test]
+    fn the_scale_stands_in_only_without_the_upscalers_own_passes() {
+        assert!(!stands_in(Upscaler::Own, false));
+        assert!(stands_in(Upscaler::Own, true));
+        assert!(stands_in(Upscaler::Scale, false));
+        assert!(!stands_in(Upscaler::Unknown, true));
+        // no file, a file of no version, a file of a known version without passes
+        assert_eq!(decide(None).0, Upscaler::Unknown);
+        assert_eq!(decide(Some(&[0; 64])).0, Upscaler::Unknown);
+        let mut file = vec![0u8; 64];
+        file.extend_from_slice(&0xFEEF_04BDu32.to_le_bytes());
+        file.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        file.extend_from_slice(&(4u32 << 16).to_le_bytes());
+        file.extend_from_slice(&(2u32 << 16).to_le_bytes());
+        let (who, what) = decide(Some(&file));
+        assert_eq!(who, Upscaler::Scale);
+        assert!(what.contains("no pass found"), "{what}");
     }
 
     #[test]
