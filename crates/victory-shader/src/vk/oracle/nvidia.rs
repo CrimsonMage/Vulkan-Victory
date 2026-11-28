@@ -441,6 +441,40 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
     }
 }
 
+/// Theirs: `typed_non_d16_table_load_preserves_integer_bits`. Non-`d16`
+/// typed loads (`buffer_load_format_x`) are used by
+/// `CS_BlendshapeTranslationsHSSGraphOutputExtract` (reading `HSSGraphOut`
+/// `R16_UINT`) and `CS_PedStandardSkinning_*` (reading bone indices): exact
+/// integer bits for `R16_UINT`, `R16_SINT` and `R32_UINT`.
+#[test]
+fn typed_non_d16_table_load_preserves_integer_bits() {
+    let mut body = Vec::new();
+    // s[8:11] = table[0] (src typed SRV), s[12:15] = table[1] (raw UAV out)
+    body.extend_from_slice(&s_load_dwordx4_off(8, 4, 0));
+    body.extend_from_slice(&s_load_dwordx4_off(12, 4, 32));
+    // buffer_load_format_x v2, v0, s[8:11], 0 idxen (op 0x00)
+    body.extend_from_slice(&mubuf_idxen(0x00, 2, 0, 8));
+    // v4 = v0 << 2 (byte offset = thread * 4)
+    body.push(0x3408_0082); // v_lshlrev_b32 v4, 2, v0
+    // buffer_store_dword v2, v4, s[12:15], 0 offen (op 0x1C, offen bit 12)
+    body.extend_from_slice(&[0x38 << 26 | 0x1C << 18 | 1 << 12, 0x80 << 24 | (12u32 >> 2) << 16 | (2u32 << 8) | 4u32]);
+    let native = table_typed_cs(&body);
+    let r16_data = [0x3C00_0001u32, 0xFFFF_BC00u32];
+    let r32_data = [0xDEAD_BEEFu32, 0x0000_0001, 0x8000_0000, 0x7FFF_FFFF];
+    // (GFX10 buffer formats 11, 12, 20: 16 UINT, 16 SINT, 32 UINT)
+    let cases: [(&str, u32, u32, &[u32], [u32; 4]); 3] = [
+        ("R16_UINT", 11, 2, &r16_data, [0x0001, 0x3C00, 0xBC00, 0xFFFF]),
+        ("R16_SINT", 12, 2, &r16_data, [0x0001, 0x3C00, 0xFFFF_BC00, 0xFFFF_FFFF]),
+        ("R32_UINT", 20, 4, &r32_data, r32_data),
+    ];
+    let (src, raw) = (0x2000, 0x4000);
+    for (label, format, elem_bytes, input, want) in cases {
+        let views = [vsharp(src, elem_bytes, 4, format), vsharp(raw, 0, 64, 0)];
+        let mem = run_table(&native, 0, &views, input);
+        assert_eq!(dwords(&mem, raw, 4), want, "{label}");
+    }
+}
+
 /// Their size tests' program frame: the table at s[2:3], its raw UAV's
 /// descriptor (entry 2) in s[20:23]; a wave32 compute program of one thread
 /// with the table of views at s0.

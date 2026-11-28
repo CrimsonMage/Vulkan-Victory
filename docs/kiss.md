@@ -316,6 +316,20 @@ driver errors and no new crash, and the captures look no worse.
     Open; the fix is a sampler slot chosen by a phi of the immediates'
     slots. Not ported: what their tests say of their own lowering (which
     root views it asks for, the stores its tracing cannot type).
+  - **A load in a view's format is bounded by its element** (a commit of
+    its own, to take or leave: it is right, and it costs a bake of half
+    the used set). Their `typed_non_d16_table_load_preserves_integer_bits`
+    failed on the last element of an `R16_UINT` view: a load through the
+    V#'s FORMAT was bounded on max(stride, 4) bytes, so the last element
+    of a view of 2-byte elements (the last three of 1-byte ones) read 0
+    (`CS_BlendshapeTranslationsHSSGraphOutputExtract` reads `R16_UINT`
+    so, the ped skinning its bone indices). Now on the stride, as the
+    console tests the index against NUM_RECORDS (4 bytes for a view
+    without a stride); the decoder reads the element's own dword and
+    nothing past it. `shader-golden`: 0 of 1,527 changed (random views
+    seldom have a stride under 4); **11,042 modules of the pack change**
+    (every program with such a load, 4 words a load), **790 of the used
+    set**; all pass `spirv-val`.
 
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
