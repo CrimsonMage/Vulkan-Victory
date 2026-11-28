@@ -153,6 +153,45 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-28 (homes confirmed, the card-memory rule): **9.3 to 9.6 fps
+  (6.2), the direct queue 100 ms a frame (148), with the process's whole
+  card use allowed 6,144 MiB (5,504) and 256 MiB of the driver's budget
+  left free (1 GiB). The default is now 5,888 and 512 MiB (`int68.exe`,
+  not yet measured): bj2's peak of 7,427 MiB is 270 under where this
+  card's driver has corrupted its state.** `homes` is merged;
+  `int67.exe` is its build.
+  | run (`int67.exe`, the test scene, `VICTORY_VK_GPU_TIME=1900,6`) | frames in 10 s | direct queue busy, ms a frame | homes | the pool's view on the card | the driver's own | card peak, RSS peak |
+  |---|---|---|---|---|---|---|
+  | bj1 (the rule as it was: 5,504 and 1 GiB) | 59 to 61 | 154.4 | none held (two made in the world's load, both gone under the pool's pressure, none asked again) | 832 MiB, 195 MiB of pages programs read off the card | 1,382 MiB | |
+  | bj2 (`VICTORY_VK_CEILING_MB=6144 VICTORY_VK_ROOM_MB=256`) | 93 to 96 | 99.7 | 20, 281 MiB (the 79 MiB skinning cluster among them, held) | 1,221 MiB, none off the card | 1,446 MiB | 7,427 of 8,151 MiB, 15.6 GiB |
+  - **The driver's own card use is not one number.** 1,062 MiB in 20 of
+    the last 23 runs, 1,380 to 1,450 in three (bj1, bj2 and one of
+    2026-11-27), from the first second on: its three first steps are
+    336, 336 and 672 MiB instead of 256, 256 and 512 (21/16 of them).
+    The same executable, translations and driver cache give either. Not
+    explained. Under the old rule those 320 to 380 MiB came off ours, the
+    pool's view could not hold the pages programs read, and no home was
+    made: the gain of `homes` was there in some runs and not in others.
+  - **The dark patches on the character's suit are older than the homes
+    and go with pool pages off the card.** One frame each, a few
+    triangles black. bj1 (no home at all, 42,687 evictions of pages
+    programs read): 8 of the last 24 captured frames. bj2 (6,041 such
+    evictions): 3 of the last 16. hs6's three spots were the same thing.
+    What is left of them is the pool's view not holding everything the
+    title shows through it (1,221 of 1,755 MiB).
+  - **The card's time has no large family left**: of 112 ms a frame by
+    the marks the largest are store staging's copies back (7.5), a ped
+    draw (4.7), `CS_GenerateShadowMasks_Checkerboard_NoHair` (4.1),
+    between lists (3.9); the first 40 families are under 70 together.
+    4,349 dispatches a frame.
+  - **The CPU's side is the next wall**: the frame's thread spends 43 ms
+    joining the recordings, 17 flushing and 5 to 7 presenting, and the
+    recordings take 477 ms a frame summed over their threads. With the
+    card at nothing that is 14 fps.
+  - Next: the CPU's side of a frame (branch `cpu-frame`); what a dispatch
+    and a draw cost the card apart from their program, and card room
+    from the images (branch `card-tail`).
+
 - 2026-11-28 (homes): **the buffers programs store into live on the
   card: 8.5 to 8.8 fps (6.2), the direct queue 110 ms a frame (148).
   Cloth, hair strands and the default skinning velocity, 30 ms a frame in

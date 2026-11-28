@@ -1380,8 +1380,9 @@ began: the process went 3,105 → 6,442 MiB in ~3 s.
   `host_buffers_mb=32`), imports (host memory; `imports_mb` was already
   3,857 while the process showed 3,105 MiB on the card).
 - **The rule** (`vulkan/budget.rs`):
-  - everything of ours on the card stays under 4.5 GiB (`CEILING`), and
-    never grows into the last 1 GiB of the card's budget (`limit`: the
+  - the process's whole card use stays under 5,888 MiB (`CEILING`; ours
+    is that less the driver's own for us, 1,062 to 1,450 MiB), and never
+    grows into the last 512 MiB of the card's budget (`limit`: the
     budget less the others' use, driver spills included);
   - the pool's GPU view gets a fixed share: at most 1.5 GiB, less what the
     rest of ours takes past its part, at least 256 MiB. It is checked every

@@ -30,15 +30,24 @@ use victory_vk::pool::LEAST;
 
 use super::{Backend, images, memory};
 
-/// Ours on the card at most. Raised from 4,608 MiB on 2026-11-27 (the
-/// user's decision, to be lowered again as room is found): at 4,608 the
-/// pool's GPU view got ~0.4 of the ~1.05 GiB the title shows through it,
-/// and the character's head, the window mesh and the far buildings came
-/// and went with eviction. The room to win back is in the ~2.2 GiB of
-/// card-written images (among them seven 3840x2160 interface targets).
-pub(super) const CEILING: u64 = 5504 << 20;
+/// The process's whole use of the card at most (ours and the driver's
+/// own for us, see [`limit`]). Raised from 4,608 MiB to 5,504 on
+/// 2026-11-27 (the user's decision): at 4,608 the pool's GPU view got
+/// ~0.4 of the ~1.05 GiB the title shows through it, and the character's
+/// head, the window mesh and the far buildings came and went with
+/// eviction. Raised to 5,888 on 2026-11-28 with [`ROOM`] lowered from
+/// 1 GiB: the driver's own use is 1,062 MiB in most runs and 1,380 to
+/// 1,450 in some (the same executable and caches; not explained), and in
+/// those the old rule left the homes no room at all (run bj1: no home
+/// held, 195 MiB of pool pages programs read off the card, 6.0 fps
+/// against 8.6). Run bj2 at 6,144 and 256 MiB: 20 homes of 281 MiB, the
+/// pool's view 1,221 MiB, 9.5 fps, but the card's peak was 7,427 of
+/// 8,151 MiB, and this card's driver has corrupted its state at about
+/// 7,700: the rule stays 256 MiB under what bj2 ran with. The room to
+/// win back is in the ~2.9 GiB of images.
+pub(super) const CEILING: u64 = 5888 << 20;
 /// The card's budget we never grow into.
-const ROOM: u64 = 1 << 30;
+const ROOM: u64 = 512 << 20;
 /// A move of this much prints the card-memory line.
 const STEP: u64 = 256 << 20;
 
