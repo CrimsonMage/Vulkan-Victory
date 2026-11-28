@@ -151,6 +151,37 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (night): **why the card is slow: it reads title memory out
+  of system RAM.** After the early depth test (card time 395 -> 286 ms a
+  frame, 2.2 -> 3.1 fps; tiled lighting 205 -> 104 ms; bake 201 s) the
+  lighting passes that really cover the screen still took 22 to 27 ms
+  each, and the card drew 41 W of its 180 W in the scene (11 W idle,
+  memory controller 2%): it waits.
+  - **Ruled out**: loops at their guard (none fired); the memory map's
+    search (sharing the search among translations that add constants to
+    one base, 49 of 122 searches gone in `TL_PS_PBR_MATERIAL_STANDARD`:
+    104 -> 109 ms, no gain; not kept, patch in scratch `gt/near.patch`);
+    the program's size (replay of a captured pass: 10,300 thread-IR
+    instructions a wave, loops run 1.2 to 2.3 times).
+  - **What the pass reads** (replay with `READS=1`, 7,200 waves): 660
+    dword reads a pixel, all from 465 lines of 64 bytes (30 KiB) on 83
+    pages of two imported ranges, spread over 1.1 GiB of addresses.
+  - **What that costs** (scratch `membench`, native Vulkan on this card:
+    1 M invocations, dependent reads of a storage buffer): 512 lines
+    spread over 64 MiB, 640 reads each: **4.2 ms from card memory, 27 ms
+    from imported shared pages, 50 ms from imported private 4 KiB pages**
+    (huge pages: 26 ms; the driver's own host-visible memory: 5.3 ms).
+    4,096 lines: 6 ms against 143 ms. Whole 64 MiB at random: 11 ms
+    against 364 ms (about 185 M reads/s: the bus).
+  - **So**: title memory imported in place costs the CPU nothing and the
+    card six to thirty times its own memory's time on every read that is
+    not in a small window. What programs read often has to be on the
+    card (as the pool's view already is); which ranges, and how they are
+    kept current, is the next work (branch `card-memory`).
+  - Tools kept: `replay` writes `visits.txt` (a wave's work by block) and,
+    with `READS=1`, `pages.txt` (title memory read and written, by map
+    range).
+
 - 2026-11-27 (evening): **where the card's 395 ms a frame go** (run gt1,
   `VICTORY_VK_GPU_TIME=1900,6`, now a window of presents told as time a
   frame, by program and by family; one present alone had covered 107 ms).

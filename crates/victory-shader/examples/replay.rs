@@ -778,6 +778,73 @@ struct Run<'a> {
     log: Vec<String>,
     /// Title memory the program stored to: dword address -> the last value.
     stored: BTreeMap<u64, u32>,
+    /// Block visits, summed over the waves run, and how many waves.
+    visits: Vec<u64>,
+    waves: u64,
+    /// `READS=1`: title memory read and written, by 64-byte line: (reads, writes).
+    lines: BTreeMap<u64, (u64, u64)>,
+}
+
+/// `pages.txt` (`READS=1`): where in title memory the program reads and
+/// writes, by range of the capture's memory map: accesses, the distinct
+/// 64-byte lines and 4 KiB pages they touch, and the span from the first
+/// to the last. A card reads its own memory fast wherever it lies; memory
+/// imported from the host only while what it reads stays in its cache.
+fn pages_text(lines: &BTreeMap<u64, (u64, u64)>, map: &[(u64, u64)], waves: u64) -> String {
+    let mut out = format!("waves {waves}; lines of 64 bytes touched {}\n", lines.len());
+    let mut by: BTreeMap<(u64, u64), Vec<(u64, u64, u64)>> = BTreeMap::new();
+    for (&line, &(r, w)) in lines {
+        let a = line << 6;
+        let range = map.iter().copied().find(|&(s, n)| a >= s && a < s + n).unwrap_or((0, 0));
+        by.entry(range).or_default().push((a, r, w));
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.iter().map(|x| x.1).sum::<u64>()));
+    for ((start, bytes), v) in rows {
+        let (reads, writes): (u64, u64) = (v.iter().map(|x| x.1).sum(), v.iter().map(|x| x.2).sum());
+        let pages: BTreeSet<u64> = v.iter().map(|x| x.0 >> 12).collect();
+        let span = v.last().map_or(0, |l| l.0 + 64 - v[0].0);
+        let _ = writeln!(
+            out,
+            "range {start:#x}+{bytes:#x}: reads {reads} writes {writes} lines {} pages {} span {:#x} ({} KiB) from {:#x}",
+            v.len(),
+            pages.len(),
+            span,
+            span >> 10,
+            v[0].0
+        );
+    }
+    out
+}
+
+/// `visits.txt`: where a wave's work is. Per block of the thread IR: how
+/// often a wave entered it on average, its instructions, and the product
+/// (the largest first), with the sum over all blocks: the instructions a
+/// wave runs.
+fn visits_text(f: &victory_shader::vk::tir::Func, visits: &[u64], waves: u64) -> String {
+    use victory_shader::vk::tir::Item;
+    fn items(list: &[Item]) -> usize {
+        list.iter()
+            .map(|i| match i {
+                Item::N(_) => 1,
+                Item::Guard { body, phis, .. } => 1 + items(body) + phis.len(),
+            })
+            .sum()
+    }
+    let waves = waves.max(1) as f64;
+    let mut rows: Vec<(f64, usize, f64, usize)> =
+        f.blocks.iter().enumerate().map(|(b, bl)| (visits.get(b).copied().unwrap_or(0) as f64 / waves, bl.phis.len() + items(&bl.body) + 1, 0.0, b)).collect();
+    for r in &mut rows {
+        r.2 = r.0 * r.1 as f64;
+    }
+    let total: f64 = rows.iter().map(|r| r.2).sum();
+    let once: usize = rows.iter().map(|r| r.1).sum();
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let mut out = format!("waves {waves}; instructions a wave runs {total:.0}; instructions in the program {once}; blocks {}\n", rows.len());
+    for (v, n, work, b) in rows.iter().take(60) {
+        let _ = writeln!(out, "block {b:5}  visits a wave {v:9.1}  instructions {n:5}  work {work:10.0}  {:.1}%", 100.0 * work / total.max(1.0));
+    }
+    out
 }
 
 /// `stores.txt`: the runs of title memory the program stored to (dwords
@@ -809,6 +876,9 @@ fn stores_text(stored: &BTreeMap<u64, u32>, map: &[(u64, u64)]) -> String {
 
 impl<'a> Run<'a> {
     fn wave(&mut self, setup: impl FnOnce(&mut Machine<'a>)) -> Machine<'a> {
+        if std::env::var_os("READS").is_some() {
+            self.mem.log = Some(Vec::new());
+        }
         let mut m = Machine::new(self.f, self.lanes, std::mem::take(&mut self.mem));
         m.push = self.cap.push.clone();
         m.push.resize(64, 0);
@@ -836,7 +906,18 @@ impl<'a> Run<'a> {
             *self.missing.entry(a).or_default() += n;
         }
         self.stored.append(&mut m.mem.stored);
+        for (a, kind) in m.mem.log.take().unwrap_or_default() {
+            if a < victory_shader::vk::interp::LDS_LOG {
+                let e = self.lines.entry(a >> 6).or_default();
+                if kind == victory_shader::vk::interp::READ { e.0 += 1 } else { e.1 += 1 }
+            }
+        }
         self.mem = std::mem::take(&mut m.mem);
+        self.visits.resize(m.visits.len().max(self.visits.len()), 0);
+        for (sum, v) in self.visits.iter_mut().zip(&m.visits) {
+            *sum += v;
+        }
+        self.waves += 1;
         m
     }
 }
@@ -889,7 +970,7 @@ fn main() {
         images.0.borrow_mut().notes.insert("no push line: user data built from the root lines".into());
     }
     let lanes = if native.wave64 { 64 } else { 32 };
-    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new(), stored: BTreeMap::new() };
+    let mut run = Run { f: &f, cap: &cap, mem: memory(&cap), images: images.clone(), lanes, missing: BTreeMap::new(), stops: BTreeMap::new(), log: Vec::new(), stored: BTreeMap::new(), visits: Vec::new(), waves: 0, lines: BTreeMap::new() };
     if std::env::var_os("DUMP").is_some() {
         victory_shader::vk::tir::dump(&f);
     }
@@ -924,6 +1005,10 @@ fn main() {
     }
     let mut notes: Vec<String> = st.notes.iter().cloned().collect();
     notes.push(format!("stops: {:?}", run.stops));
+    let _ = std::fs::write(out.join("visits.txt"), visits_text(&f, &run.visits, run.waves));
+    if !run.lines.is_empty() {
+        let _ = std::fs::write(out.join("pages.txt"), pages_text(&run.lines, &cap.map, run.waves));
+    }
     notes.push("samplers: linear, clamp to edge (no sampler state captured); level 0 only".into());
     let _ = std::fs::write(out.join("census.txt"), &census);
     if !run.log.is_empty() {
