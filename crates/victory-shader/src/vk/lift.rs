@@ -73,6 +73,10 @@ pub struct Interface {
     /// Pixel: the console tests depth and stencil before the program runs
     /// (`vk::early_depth`: the module declares `EarlyFragmentTests`).
     pub early_depth: bool,
+    /// Pixel: the program has an ordered section (the console's
+    /// primitive-ordered pixel shading, lift_scalar.rs `ordered_section`):
+    /// it runs inside the fragment shader interlock.
+    pub ordered: bool,
     /// Reads barycentrics or per-vertex values (fragmentShaderBarycentric).
     pub per_vertex: bool,
     /// Clip and cull distances (`PA_CL_VS_OUT_CNTL`): how many of each.
@@ -245,8 +249,6 @@ pub struct Lift<'a> {
     approx_taken: u32,
     /// The exchanged dwords of masks, per block.
     words: HashMap<V, (V, V)>,
-    /// An LDS access since the halves last met (lift_wave.rs).
-    lds_dirty: bool,
     /// The block whose body `cur` is.
     cur_block: usize,
     /// The block each value made in a block body belongs to (prelude values
@@ -356,7 +358,6 @@ impl<'a> Lift<'a> {
             idle_of: HashMap::new(),
             approx_taken: 0,
             words: HashMap::new(),
-            lds_dirty: false,
             cur_block: 0,
             born: HashMap::new(),
             depth: vec![0; p.blocks.len()],
@@ -392,6 +393,7 @@ impl<'a> Lift<'a> {
             sections: Vec::new(),
         };
         l.sections = l.find_sections();
+        l.iface.ordered = native.stage == HwStage::Ps && scalar::ordered_section(p);
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
             StageIo::Ms(ms) => ms.lds_bytes / 4,
@@ -1041,6 +1043,8 @@ mod scalar;
 mod valu;
 #[path = "lift_vops.rs"]
 mod vops;
+#[path = "lift_pk.rs"]
+mod pk;
 #[path = "lift_flow.rs"]
 mod flow;
 #[path = "lift_wave.rs"]

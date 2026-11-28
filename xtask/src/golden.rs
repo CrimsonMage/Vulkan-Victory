@@ -190,7 +190,7 @@ pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, halves:
 /// console waves or as the host subgroups the card runs (`upper_first`: the
 /// upper half of each wave64 before the lower between their meetings):
 /// how it stopped, and its outputs, image stores and memory stores as text.
-fn group_run(f: &victory_shader::vk::tir::Func, native: &victory_shader::NativeProgram, seed: u64, mode: Mode, upper_first: bool) -> (interp::Stop, String, u64) {
+fn group_run(f: &victory_shader::vk::tir::Func, native: &victory_shader::NativeProgram, seed: u64, mode: Mode, upper_first: bool) -> (interp::Stop, String, [u64; 2]) {
     let mem = interp::Memory { range: (0, u64::MAX), noise: Some(seed), ..Default::default() };
     let setup = |m: &mut interp::Machine| {
         for (k, p) in m.push.iter_mut().enumerate() {
@@ -213,7 +213,7 @@ fn group_run(f: &victory_shader::vk::tir::Func, native: &victory_shader::NativeP
     }
     lines.sort();
     lines.extend(g.mem.stored.iter().map(|(a, v)| format!("m {a:x} {v:x}")));
-    (stop, lines.join("\n"), g.races)
+    (stop, lines.join("\n"), [g.races, g.lds_races])
 }
 
 /// How a wave64 compute or mesh program differs when its group runs as the
@@ -222,7 +222,8 @@ fn group_run(f: &victory_shader::vk::tir::Func, native: &victory_shader::NativeP
 /// went past the block limit: nothing to compare), "same-but-raced" (in
 /// some run the halves stored to a dword the other half accessed between
 /// two meetings, as random descriptors make them; the other runs agree), or
-/// the first difference.
+/// the first difference. Such a dword of workgroup memory is a difference
+/// too: the lift's meetings before LDS accesses (`vk::meetings`) leave none.
 /// None for the programs with nothing to tell apart (no wave64 group).
 pub fn halves(container: &[u8]) -> Option<String> {
     let (f, _, native) = thread_ir(container).ok()?;
@@ -234,10 +235,13 @@ pub fn halves(container: &[u8]) -> Option<String> {
     for seed in 1..=SEEDS {
         let (stop, wave, _) = group_run(&f, &native, seed, Mode::Waves, false);
         for upper_first in [false, true] {
-            let (hstop, halves, races) = group_run(&f, &native, seed, Mode::Halves, upper_first);
+            let (hstop, halves, [races, lds_races]) = group_run(&f, &native, seed, Mode::Halves, upper_first);
             if stop == interp::Stop::Limit || hstop == interp::Stop::Limit {
                 limit = true;
                 continue;
+            }
+            if lds_races > 0 {
+                return Some(format!("seed {seed}, upper first {upper_first}: {lds_races} LDS dwords the halves accessed with no meeting between"));
             }
             // random memory: the halves stored to one dword between two
             // meetings (descriptors that collide), in an order the card
@@ -246,18 +250,25 @@ pub fn halves(container: &[u8]) -> Option<String> {
                 raced = true;
                 continue;
             }
-            if stop != hstop {
-                return Some(format!("seed {seed}, upper first {upper_first}: the wave {}, the halves {}", unnumbered(&format!("{stop:?}")), unnumbered(&format!("{hstop:?}"))));
-            }
-            if let Some((a, b)) = wave.lines().zip(halves.lines()).find(|(a, b)| a != b) {
-                return Some(format!("seed {seed}, upper first {upper_first}: the wave `{a}`, the halves `{b}`"));
-            }
-            if wave.lines().count() != halves.lines().count() {
-                return Some(format!("seed {seed}, upper first {upper_first}: {} effects as a wave, {} as halves", wave.lines().count(), halves.lines().count()));
+            if let Some(d) = difference((&stop, &wave), (&hstop, &halves)) {
+                return Some(format!("seed {seed}, upper first {upper_first}: {d}"));
             }
         }
     }
     Some(if raced { "same-but-raced" } else if limit { "limit" } else { "same" }.to_owned())
+}
+
+/// How a group's run as halves (how it stopped, its effects) differs from
+/// its run as waves, if it does.
+fn difference(wave: (&interp::Stop, &str), halves: (&interp::Stop, &str)) -> Option<String> {
+    if wave.0 != halves.0 {
+        return Some(format!("the wave {}, the halves {}", unnumbered(&format!("{:?}", wave.0)), unnumbered(&format!("{:?}", halves.0))));
+    }
+    if let Some((a, b)) = wave.1.lines().zip(halves.1.lines()).find(|(a, b)| a != b) {
+        return Some(format!("the wave `{a}`, the halves `{b}`"));
+    }
+    let (n, m) = (wave.1.lines().count(), halves.1.lines().count());
+    (n != m).then(|| format!("{n} effects as a wave, {m} as halves"))
 }
 
 /// Every wanted wave64 compute or mesh program's group as console waves and
@@ -269,7 +280,11 @@ pub fn run_halves(pack: &Path, wanted: &HashSet<String>, jobs: usize) -> Result<
     for (hash, (b, name)) in &found {
         let kind = match b.as_str() {
             "" => "no wave64 group",
-            "same" | "limit" | "panic" | "same-but-raced" => b.as_str(),
+            "same" => "same",
+            "limit" | "panic" | "same-but-raced" => {
+                println!("{b} {hash} {name}");
+                b.as_str()
+            }
             _ => {
                 println!("differs {hash} {name}: {b}");
                 "differs"

@@ -4,6 +4,20 @@ use super::*;
 
 /// The `src_pops_exiting_wave_id` operand.
 const POPS_EXITING_WAVE_ID: u8 = 239;
+/// The hardware register (of `s_setreg_b32`) a pixel wave names its packer
+/// in before it waits for the waves it overlaps.
+const POPS_PACKER: u16 = 25;
+
+/// Whether a pixel program has an ordered section (primitive-ordered pixel
+/// shading, which the console compiler makes of an interlock or of
+/// rasterizer ordered views): it writes `HW_REG_POPS_PACKER`, then waits
+/// until the waves holding earlier primitives' samples of its pixels have
+/// left their sections (`pops_distance`), and ends the section with
+/// `s_sendmsg(MSG_ORDERED_PS_DONE)`.
+pub(super) fn ordered_section(p: &Program) -> bool {
+    let starts = |i: &Inst| i.name() == "s_setreg_b32" && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == POPS_PACKER);
+    p.blocks.iter().flat_map(|b| &b.insts).any(starts)
+}
 
 impl Lift<'_> {
     pub(super) fn sop(&mut self, inst: &Inst, name: &'static str, dst: &Option<Operand>, src: &[Operand], imm: Option<u16>) -> Res<()> {
@@ -114,7 +128,14 @@ impl Lift<'_> {
             self.sdst(inst, s.dst, 0, R::D(x));
             return Ok(());
         }
-        if s.b64 && (self.mask_like(inst, &s.src[0]) || s.dst_exec) && cond.is_none() {
+        // A lane mask moves as one, and so does anything moved into EXEC.
+        // Into VCC a pair of numbers moves as the two numbers: AMD's
+        // compute compiler keeps data in vcc_lo and vcc_hi (two words of a
+        // V#, weights) and puts it there with `s_mov_b64`, in waves of 32
+        // too, where the mask move left vcc_hi without a value.
+        let into_vcc = matches!(s.dst, Some(Operand::Scalar { code, .. }) if *code == ir::VCC);
+        let mask = self.mask_like(inst, &s.src[0]) || (s.dst_exec && !(into_vcc && self.number_pair(inst, &s.src[0])));
+        if s.b64 && mask && cond.is_none() {
             let m = self.opnd_mask(inst, &s.src[0])?;
             self.mask_def(inst, s.dst, m);
             return Ok(());
@@ -135,6 +156,12 @@ impl Lift<'_> {
             self.sdst(inst, s.dst, k, r);
         }
         Ok(())
+    }
+
+    /// Whether both dwords of a scalar pair hold numbers (not lane masks).
+    fn number_pair(&mut self, inst: &Inst, o: &Operand) -> bool {
+        let Operand::Scalar { code, .. } = *o else { return false };
+        code != crate::gfx10::NULL && (0..2).all(|k| matches!(self.val(inst, Reg::S(code + k)), Ok(R::D(_))))
     }
 
     /// `x`, or under a false condition the destination's old dword `k`.
@@ -494,11 +521,18 @@ impl Lift<'_> {
     /// The pixel-ordering wait of an ordered pixel program (POPS):
     /// `src_pops_exiting_wave_id + x` is how far the waves ahead of this
     /// one have got, which the program compares with the wave it overlaps
-    /// and sleeps on. The PC runs overlapping pixels of a draw in no fixed
-    /// order, so every earlier wave counts as exited: the largest distance,
-    /// and the wait ends at once.
+    /// and sleeps on. Here nothing is left to wait for: every earlier wave
+    /// counts as exited (the largest distance), and the wait ends at once.
+    /// The order is the host's to keep: the whole program runs inside the
+    /// fragment shader interlock (`Interface::ordered`, emit.rs
+    /// `interlocked`), which lets the pixels of one place in one at a
+    /// time, in the order of their primitives. A wait without the
+    /// section's start (no write of `HW_REG_POPS_PACKER`) is no section
+    /// we know: the order is then not kept, and that is said.
     fn pops_distance(&mut self, s: &Sop) -> Res<()> {
-        self.approx("pixel ordering (POPS) is not kept: overlapping pixels of one draw run in any order");
+        if !self.iface.ordered {
+            self.approx("pixel ordering (POPS) is not kept: overlapping pixels of one draw run in any order");
+        }
         let (r, no) = (self.k32(u32::MAX), self.f.konst(Ty::BOOL, 0));
         self.sdst(s.inst, s.dst, 0, R::D(r));
         self.def(s.inst, Reg::Scc, R::B(no));

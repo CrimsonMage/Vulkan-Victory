@@ -88,6 +88,11 @@ pub const EXTENSIONS: &[Extension] = &[
         "64-bit image atomics (the alpha prepass programs' image_atomic_umax on two-dword texels; without it those programs are refused)",
     ),
     ext(
+        ext::fragment_shader_interlock::NAME,
+        Need::Wanted,
+        "ordered pixel sections (the console's primitive-ordered pixel shading: hair cards keep their nearest layers; without it those programs run their pixels in any order)",
+    ),
+    ext(
         MAINTENANCE8,
         Need::Wanted,
         "samples with a texel offset that is not a constant (image_sample_*_o under a guard)",
@@ -277,6 +282,11 @@ pub struct Caps {
     /// `shaderImageInt64Atomics` (VK_EXT_shader_image_atomic_int64): 64-bit
     /// image atomics on R64_UINT storage views (ABI v5 section 5.1).
     pub image_int64_atomics: bool,
+    /// `fragmentShaderPixelInterlock` (VK_EXT_fragment_shader_interlock):
+    /// the translated modules of ordered pixel programs run inside the
+    /// interlock (taken out of a module where false:
+    /// `limits::fit_interlock`).
+    pub pixel_interlock: bool,
     /// `shaderSignedZeroInfNanPreserveFloat16/32/64`: the translated
     /// modules' SignedZeroInfNanPreserve execution mode per width (left
     /// out of a module where false: `limits::fit_float_controls`).
@@ -573,6 +583,7 @@ impl Host {
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut m8 = Maintenance8::default();
         let mut int64_image = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
+        let mut interlock = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
         let on = |n: &CStr| has(n);
         let mut core = {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -613,6 +624,7 @@ impl Host {
             f2 = chain_features(f2, on(ext::conditional_rendering::NAME), &mut conditional);
             f2 = chain_features(f2, on(MAINTENANCE8), &mut m8);
             f2 = chain_features(f2, on(ext::shader_image_atomic_int64::NAME), &mut int64_image);
+            f2 = chain_features(f2, on(ext::fragment_shader_interlock::NAME), &mut interlock);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             f2.features
         };
@@ -620,6 +632,9 @@ impl Host {
         m8.p_next = null;
         int64_image.p_next = null;
         int64_image.sparse_image_int64_atomics = vk::FALSE;
+        interlock.p_next = null;
+        interlock.fragment_shader_sample_interlock = vk::FALSE;
+        interlock.fragment_shader_shading_rate_interlock = vk::FALSE;
         v11.p_next = null;
         v12.p_next = null;
         v13.p_next = null;
@@ -761,6 +776,7 @@ impl Host {
             info = chain_device(info, has(ext::conditional_rendering::NAME), &mut conditional);
             info = chain_device(info, has(MAINTENANCE8), &mut m8);
             info = chain_device(info, has(ext::shader_image_atomic_int64::NAME), &mut int64_image);
+            info = chain_device(info, has(ext::fragment_shader_interlock::NAME), &mut interlock);
             unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?
         };
 
@@ -820,6 +836,7 @@ impl Host {
             timestamp_period: props.limits.timestamp_period,
             null_descriptor: null_descriptor(has(ext::robustness2::NAME), &rob2),
             image_int64_atomics: int64_image.shader_image_int64_atomics == vk::TRUE,
+            pixel_interlock: interlock.fragment_shader_pixel_interlock == vk::TRUE,
             signed_zero_inf_nan: [
                 fc_props.shader_signed_zero_inf_nan_preserve_float16,
                 fc_props.shader_signed_zero_inf_nan_preserve_float32,

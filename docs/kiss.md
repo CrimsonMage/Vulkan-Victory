@@ -130,7 +130,7 @@ driver errors and no new crash, and the captures look no worse.
 | 9 | Find the world-start card-memory spike (+1.1–1.7 GB in a second) | subagent | running |
 | 11 | Cut memory-mapping churn: stock wineserver walks every view on each map/unmap | subagent | merged (e4e2dd2): wineserver 88% → 5–7% of a core in the world; ~17 map calls/s instead of ~200; filler zero page shown by stand-ins |
 | 13 | Series S: compose the title's two display planes (compose.rs) | subagent | merged: menus, loading and credits show |
-| 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f): Series S world renders lit (run s7, frame 1890) |
+| 14 | Series S world: the title's FSR4 upscale (console-only ACO code) runs as a plain linear scale at `ffxDispatch` | subagent | merged (977868f): Series S world renders lit (run s7, frame 1890); 2026-11-27: its 29 passes translate (branch `fspx`, offline proof; the scale stands in only while one does not): not yet run |
 | 15 | Frame-time breakdown (`frame time:` line every 5 s) and removal of four needless full card drains | subagent | merged (28ccc38), built, not yet run |
 | 17 | Console CPU instructions: patch each site once | subagent | merged: 21,000 traps/s → 8 in a whole run |
 | 18 | Per-draw recording cost | subagent | merged: per-thread lookups, lock-free slot check, fast hashers, in-place constant tables, slot chunks; per-call timing in the frame line |
@@ -256,7 +256,206 @@ driver errors and no new crash, and the captures look no worse.
       the loop guard's store, all for the demote). Declaring the mode for
       them would be our choice, not the console's word: it would change
       nothing they write unless a draw uses alpha to coverage with them.
+  - **An ordered pixel section runs inside the fragment shader interlock.**
+    The console's primitive-ordered pixel shading (a pixel wave names its
+    packer in `HW_REG_POPS_PACKER`, sleeps until the waves holding earlier
+    primitives' samples of its pixels have left, `src_pops_exiting_wave_id`,
+    and ends with `s_sendmsg(MSG_ORDERED_PS_DONE)`): until now the wait was
+    skipped and nothing ordered ("overlapping pixels of one draw run in any
+    order"). Now such a program (`Interface::ordered`: it writes the packer
+    register) is a function its entry point calls between
+    `OpBeginInvocationInterlockEXT` and `OpEndInvocationInterlockEXT`,
+    execution mode `PixelInterlockOrderedEXT`
+    (`VK_EXT_fragment_shader_interlock`; theirs `ordered_section`: D3D12's
+    rasterizer ordered views, which wait at their first access).
+    - **The programs:** 10 in the pack, none in the used set, all
+      `PS_PedTexturedCutOutTint_Zero_*` (the hair cards that keep their
+      nearest layers), control word 0x10240 (bit 16, primitive ordered,
+      in these ten and no other).
+    - **The interlock's rules** (one begin and one end, in the entry
+      point, outside control flow, begin first, each on every path): all
+      ten have the same shape, one section between branches: a wave with
+      no pixel left leaves for `exp null` before the section, and one
+      does from inside it (a discard between the stores), before the
+      `done` message. A begin where the console's is would sit inside
+      those branches and its end would be skipped. So the whole program
+      is the section: the entry point is `begin; call; end; return` and
+      nothing else, in all ten. That orders more than the console does
+      (the shading before the section too) and nothing less; what it
+      costs on the card is not measured (the programs are in no scene
+      run so far).
+    - **Host:** `VK_EXT_fragment_shader_interlock` and
+      `fragmentShaderPixelInterlock` are enabled where the device has
+      them (`victory-vk/src/host.rs`, `Caps::pixel_interlock`; the RTX
+      5060 Ti does: `vulkaninfo`). Where not, the module is given
+      without its interlock (`limits::fit`, `fit_interlock`: the five
+      instructions left out), which is what every such program was
+      before. `docs/vulkan-abi.md` is not changed (its section 1 does
+      not list the extension yet).
+    - Proof: `an_ordered_section_runs_inside_the_interlock`
+      (oracle/nvidia.rs: theirs
+      `an_ordered_section_uses_rasterizer_ordered_views`, their program;
+      fails without the change), `the_interlock_goes_where_the_device_has_none`
+      (victory-vk); pack: exactly these 10 modules change (+30 words),
+      all pass `spirv-val`, their approximation is gone;
+      `shader-golden`: 0 of 1,527 changed; `cargo xwin check` of
+      `victory-vk` and `victory-gpu`. **Not run on the card.** Needs no
+      bake of a used program.
+  - **The halves of a wave64 meet before an LDS access only where the
+    meeting orders something** (`vk/meetings.rs`; theirs `LdsOrder`,
+    89cfae2, kept exact). The lift puts a meeting before every LDS access
+    and says what the access does; when the program is whole (after
+    `uniform.rs`) a pass over the block graph takes away the ones whose
+    access commutes with everything a half may have done since the halves
+    last surely met (a kept meeting, an exchange that is still there, the
+    console's barrier): a read after reads; an atomic whose result nothing
+    takes after atomics of its family (adds; each minimum, maximum and bit
+    operation). A plain write, an atomic that returns the old value, an
+    exchange and a compare-exchange keep theirs after anything.
+    - **Where it differs from theirs:** theirs cuts the program at
+      `s_barrier` and lets every read and atomic go that no plain write
+      shares a piece with, reads beside atomics too (it calls those
+      unstable: a half may read before the other half's add; the console's
+      wave never does, and `interp_group` counts it a race). Ours keeps
+      that meeting, and in return goes by what precedes an access on a
+      path, so reads after the meeting that follows a write need none.
+      `CS_DefragHeap_ComputeRelocations`: 30 meetings in our code before,
+      12 now (theirs: 138 to 50 in theirs').
+    - **Measured** (meetings in the code): used set 3,419 to 1,803 (96
+      programs had some, 90 have); pack 10,530 to 5,250 (356 to 318).
+      Most changed of the used set: `LuminanceMinMaxDownsampleFinalCS` and
+      `LuminanceMinMaxDownsampleCS` 166 to 81, `CS_IrradianceCache_
+      IntegrateIrradianceSH` 126 to 47, `LuminanceMinMaxDownsampleInitCS`
+      142 to 66, `CS_AmbientCubeIBR_Paraboloid` 115 to 42 (of the pack:
+      `GpuParticleEmit:CS_Emit_Dynamic_Model_Edge` 201 to 85). The
+      exchanges are as they were (7,599 used).
+    - **Found wrong on the way:** the lift took every exchange for a
+      meeting, and `uniform.rs` then took exchanges of uniform words
+      away. In `CS_RayBudgeting_Cull_RayBinning` (used) and
+      `CS_VolumePortalTiling_Generate` a lane's `ds_write` and the wave's
+      `ds_add_u32` after it were left with nothing between them: the half
+      that ran first could add before the other half's lane had set the
+      counter. Both have a meeting there now (1 to 2 each; the only
+      programs that gained one).
+    - Proof: `lds_accesses_that_commute_need_no_meeting` (theirs
+      `lds_accesses_after_the_last_plain_write_need_no_meeting`, their
+      program; fails without the pass), `a_read_after_the_waves_adds_sees_
+      them_all` (the case theirs gives up), the unit tests of
+      `meetings.rs`; `shader-golden`: 0 of 1,527 changed;
+      `shader-golden --halves` (now it also counts an LDS dword the halves
+      touched with no meeting between as a difference, and lists the
+      programs it cannot compare): program for program the same lines
+      before and after: 468 same, 19 same but raced over title memory, 68
+      past the block limit, 1 differs before and after alike
+      (`CS_ProjDecalReduceClassification_Vectorized`, seed 1: one LDS
+      dword both halves write in one instruction, which no meeting
+      orders). 361 modules of the pack change (97 used; 23 of them, 8
+      used, keep their count and grow by 5 to 37 words: a lane guard now
+      ends before every LDS access, also where the meeting goes); all pass
+      `spirv-val`. **Needs the bake:** the 97 used compute and mesh
+      programs.
+  - **Their tests, as oracle tests** (`vk/oracle/nvidia.rs`, through the
+    interpreter; they ran them on a D3D12 device):
+    `typed_d16_table_uav_roundtrip_uint_sint_and_float` and
+    `some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on` pass as
+    they are. `a_counter_texture_is_set_by_a_store_of_one_channel`: ours
+    refused a `d16` image store; now the 16-bit channels are widened by
+    the image's kind (the T#'s INTEGER bit: the integer as it is, else
+    the half as a float; no program of the pack has such a store, so no
+    module changes: it is the upscaler's). The interpreter ran an image
+    atomic of a lane outside its guard; no more.
+    `immediate_sampler_chosen_by_control_flow` is there and ignored: it
+    fails (also when both arms move the same sampler): an S# that is not
+    four constants where it is used is read as a heap sampler, slot 0.
+    Open; the fix is a sampler slot chosen by a phi of the immediates'
+    slots. Not ported: what their tests say of their own lowering (which
+    root views it asks for, the stores its tracing cannot type).
+  - **A load in a view's format is bounded by its element** (a commit of
+    its own, to take or leave: it is right, and it costs a bake of half
+    the used set). Their `typed_non_d16_table_load_preserves_integer_bits`
+    failed on the last element of an `R16_UINT` view: a load through the
+    V#'s FORMAT was bounded on max(stride, 4) bytes, so the last element
+    of a view of 2-byte elements (the last three of 1-byte ones) read 0
+    (`CS_BlendshapeTranslationsHSSGraphOutputExtract` reads `R16_UINT`
+    so, the ped skinning its bone indices). Now on the stride, as the
+    console tests the index against NUM_RECORDS (4 bytes for a view
+    without a stride); the decoder reads the element's own dword and
+    nothing past it. `shader-golden`: 0 of 1,527 changed (random views
+    seldom have a stride under 4); **11,042 modules of the pack change**
+    (every program with such a load, 4 words a load), **790 of the used
+    set**; all pass `spirv-val`.
 
+- 2026-11-27 (the title's upscaler): **the 29 passes of the title's
+  FidelityFX upscaler translate, and the linear scale stands in only while
+  one of them does not** (branch `fspx`; offline only: nothing baked, no
+  run, so nothing below is seen on the card yet).
+  - **What they are.** Compute programs like the title's, made by AMD's
+    compiler: a container with an `ACCC` part and no `DXIL` part, the part
+    an `FSPX` payload (a directory of dispatch state, the GFX10 code and
+    records that say where the root parameters arrive;
+    `victory-shader/src/native/fspx.rs`, read as the upscaler's own reader
+    reads it). The upscaler is a network (FSR4): a **prepass** (the colour
+    as log2(1 + 150 c) / 12.29, the history reprojected, the network's
+    first layer), **12 network passes** on tensors of signed bytes in one
+    scratch buffer with **13 passes that clear their borders**, a
+    **postpass** (the network's last layer, the output and the next
+    history), a sharpening pass that decodes that colour space again, and
+    an exposure pyramid.
+  - **What the translator lacked** (each with a case in
+    `vk/oracle/packed.rs`, the hardware's words from ProjectLeonida's
+    tests): `v_dot4c_i32_i8` and `v_dot4_i32_i8` (the dot product of four
+    signed bytes, 27,271 in the 29 programs; two registers go through one
+    function of the module, `Helper::Dot4`, so the largest pass is 275,000
+    words where written out it was 607,000), `v_pk_add_u16`,
+    `v_pk_sub_u16`, `v_pk_fmac_f16`, an image store of 16-bit data, and two
+    things it had wrong: **an image load of 16-bit data from a float view
+    took the low 16 bits of the float** (now the float as f16, as samples
+    did), and **`s_mov_b64 vcc, <two numbers>` moved a lane mask** (this
+    compiler keeps numbers in vcc_lo and vcc_hi: in waves of 32 vcc_hi had
+    no value, three passes were refused; in waves of 64 the numbers were
+    read as ballots). The loop guard of these programs is 2^18 (they bound
+    their own waits at 2^16, `docs/vulkan-abi.md` 2.1).
+  - **Proof.** `cargo test -p victory-shader` (173); every one of the 29
+    modules passes `spirv-val`; none takes an approximation. The golden
+    file: 9 of 1,527 used programs change, each of them one with an image
+    load of 16-bit data (six mesh transforms, two compute passes): the fix
+    above, meant. In the interpreter (a scratch tool on `vk::interp_group`,
+    inputs made up, the network's weights from the user's DLL): the
+    prepass's colour is the closed form to five digits; all 27 passes of a
+    frame in a row on a static 64x64 scene return and the output is the
+    input; **from a black history the output's worst pixel is 0.1615,
+    0.1975, 0.19985, 0.19999 of an input of 0.2 after one to four frames**;
+    a static ramp is met within 0.001 inside the picture after four; the
+    three passes for waves of 64 give the same bytes run as console waves
+    and as the card's halves; the sharpening pass gives the colour back
+    within 0.6% (it computes in 16 bits).
+  - **The host** (`upscale.rs`, `hle/modules/ffx.rs`, `pipeline.rs`,
+    `vulkan/record.rs`, `vulkan/stages.rs`; no change of the ABI). The
+    title's own `ffxDispatch` runs the upscale when every pass in the
+    upscaler's DLL translates (checked once, at the first upscale: about
+    0.2 s in a release build); the linear scale takes it otherwise, and from the moment a
+    pass fails to become a pipeline on the card. A pass is named by the
+    entry function its `PSV0` part names (the recorder left nameless
+    compute programs out as the structure builder's: every pass would
+    have been skipped). Before a pass's dispatch the recorder puts a
+    memory barrier: the passes are made to overlap on the console and wait
+    for one another by spinning on flags in the scratch buffer.
+  - **Not proven, most important first:** (1) nothing ran on the card: the
+    Windows side is compiled and its tests built, not run; (2) the order
+    and the group counts of the passes are read from the DLL's code, not
+    seen in a run, and in that order **pass 7's first wait is not met in
+    the interpreter** (it wants counts of 4 where pass 6 has stored 1) and
+    runs to its bound: right output, 65,536 looks; on the card that would
+    be time in every frame, and the first run should look at that pass's
+    time; (3) the driver's compile of the three largest modules (177,000
+    to 275,000 words) is not timed; (4) the exposure pyramid and the
+    sharpening pass were only run alone.
+  - **Cost, from the code** (1920x1080 out): 27 dispatches a frame (29
+    with sharpening and the exposure pyramid): the prepass 8,160 groups of
+    256, the network 12 dispatches over tensors of 960x540, 480x270 and
+    240x135 (518,400 down to 32,400 threads, about 3.1 billion byte dot
+    products a frame in all), the border passes 24 to 94 groups of 32, the
+    postpass 2,040 groups of 256.
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
   its latest view names; a slot stays its texture's** (runs tx0 to tx7 on

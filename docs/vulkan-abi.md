@@ -95,6 +95,13 @@ reads it, and when dword 0 is not 0 it logs the count and the pipeline
 whose stage has that guard id, then zeroes it. A program that hits the
 guard has a loop to fix, not a limit to raise.
 
+One kind of program has its limit at 2^18 (since 2026-11-27; no change
+for the host): a program of another compiler (an `ACCC` container: the
+passes of the title's FidelityFX upscaler, `native/fspx.rs`). Such a pass
+spins on flags the passes before it set, 2^16 looks at most by its own
+count, and then does its work whatever it saw; ended at 2^14 it would
+drop the work.
+
 User-data dword k is what the console puts in user SGPR k of the stage
 (SGPR k + 8 for mesh programs, which run as a merged stage). The
 translated module lists, per stage, which root parameter fills each dword

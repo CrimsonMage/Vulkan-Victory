@@ -454,6 +454,9 @@ pub(crate) fn created(b: &'static Backend, shaders: &[Arc<Shader>]) {
     // Diagnostics: compiled here, on the title's thread, one at a time.
     for s in mine {
         let state = make(b, &s);
+        if matches!(state, State::Failed) {
+            crate::upscale::stage_failed(s.container(), &s.hash);
+        }
         if let Some(q) = queue().as_mut() {
             q.states.insert(s.full, state);
         }
@@ -562,6 +565,9 @@ fn worker(b: &'static Backend) {
             }
         };
         let state = make(b, &shader);
+        if matches!(state, State::Failed) {
+            crate::upscale::stage_failed(shader.container(), &shader.hash);
+        }
         if let Some(q) = queue().as_mut() {
             q.states.insert(shader.full, state);
         }
@@ -632,7 +638,7 @@ fn make(b: &Backend, shader: &Shader) -> State {
         return fail(format!("over the device: {why}"));
     }
     let t = Instant::now();
-    let fitted = victory_vk::limits::fit_float_controls(&vs.spirv, b.host.caps.signed_zero_inf_nan);
+    let fitted = victory_vk::limits::fit(&vs.spirv, &b.host.caps);
     let code = fitted.as_deref().unwrap_or(&vs.spirv);
     // SAFETY: the translator's words, a SPIR-V module.
     let module = victory_vk::account::traced(&b.host, "shader module", || unsafe {

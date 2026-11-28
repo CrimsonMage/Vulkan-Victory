@@ -73,7 +73,7 @@ const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
 }
 
 /// `v<regs>` stored as each thread's dwords of the UAV, the thread's index (v0) times 16 on.
-fn stores(regs: [u32; 4]) -> Vec<u32> {
+pub(super) fn stores(regs: [u32; 4]) -> Vec<u32> {
     let mut w = vec![vop2(0x1A, 15, k(4), 0)]; // v_lshlrev_b32 v15, 4, v0
     for (n, r) in regs.into_iter().enumerate() {
         w.extend(store(r, 15, 4 * n as u32));
@@ -86,12 +86,12 @@ const STORE_V0: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16];
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
 /// root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
-fn native(body: &[u32]) -> NativeProgram {
+pub(super) fn native(body: &[u32]) -> NativeProgram {
     native_of(body, true, 64)
 }
 
 /// The same for a console of 32-lane waves when `wave64` is not set, with `threads` threads.
-fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
@@ -147,7 +147,7 @@ fn run_way(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32, wa
 
 /// [`run_way`] in every way; they must agree (the halves the card runs
 /// with the wave stepped as one).
-fn run_group(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32) -> Result<Vec<u32>, String> {
+pub(super) fn run_group(native: &NativeProgram, consts: [u32; 4], dwords: u32, group: u32) -> Result<Vec<u32>, String> {
     let wave = run_way(native, consts, dwords, group, WAYS[0]);
     for way in &WAYS[1..] {
         let halves = run_way(native, consts, dwords, group, *way);
@@ -181,11 +181,30 @@ fn execute(native: &NativeProgram, cases: &[(u32, u32)], expected: impl Fn(u32, 
 }
 
 /// Dword 0 of the UAV.
-fn dword0(native: &NativeProgram, s0: u32, s1: u32) -> Result<u32, String> {
+pub(super) fn dword0(native: &NativeProgram, s0: u32, s1: u32) -> Result<u32, String> {
     run_group(native, [s0, s1, 0, 0], 1, 0).map(|o| o[0])
 }
 
 // ---- emit/wave64_tests.rs ----
+
+/// Ours: AMD's compute compiler keeps numbers in vcc_lo and vcc_hi and
+/// moves a pair in with `s_mov_b64` (the FidelityFX upscaler's network
+/// passes: two words of a V#, weights). In a wave of 64 that is the move
+/// of a lane mask too; a pair of numbers stays the two numbers in every
+/// thread (read as a mask's dwords each half had its own ballot of them).
+#[test]
+fn a_pair_of_numbers_moved_into_vcc_stays_numbers() {
+    let mut body = vec![
+        sop1(0x04, 106, 0),    // s_mov_b64 vcc, s[0:1]
+        vop1(0x01, 0, 106),    // v_mov_b32 v0, vcc_lo
+        vop2(0x25, 0, 107, 0), // v_add_nc_u32 v0, vcc_hi, v0
+    ];
+    body.extend(STORE_V0);
+    let p = native(&body);
+    for (s0, s1) in [(5u32, 7u32), (0xFFFF_FFFF, 2), (0x8000_0001, 0x7FFF_FFFF), (0, 0)] {
+        assert_eq!(dword0(&p, s0, s1), Ok(s0.wrapping_add(s1)), "s0={s0:#x} s1={s1:#x}");
+    }
+}
 
 /// The console's 16-bit float addition on normal numbers and zero (theirs).
 fn add16(a: u16, b: u16) -> u16 {

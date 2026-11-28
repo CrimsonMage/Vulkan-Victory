@@ -1039,11 +1039,12 @@ impl Rec {
             return None;
         };
         // The ray-tracing structure builder (the GDK's XboxBvhBuilder.dll:
-        // compute programs without a program name) is not run unless asked
+        // compute programs without a program name that are no pass of the
+        // title's upscaler) is not run unless asked
         // for: partly working, it writes garbage structures into title
         // memory (wild light, and the title crashing on what it reads
         // back). Without structures every ray of the title misses.
-        if !bvh_builder() && shaders.iter().all(|s| s.name.is_empty()) {
+        if !bvh_builder() && shaders.iter().all(|s| s.name.is_empty() && !s.pass) {
             BUILDER_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -1068,6 +1069,15 @@ impl Rec {
         self.end_pass(b);
         let cmd = self.cmd(b)?;
         lap.next();
+        // The upscaler's passes run overlapped on the console and wait for
+        // one another's work themselves (each spins on flags in the
+        // upscaler's scratch buffer that the passes before it set when
+        // their part is stored). Here a pass starts when the work before
+        // it is done and seen, so its waits end at their first look.
+        if shaders.iter().any(|s| s.pass) {
+            // SAFETY: outside rendering, in our command buffer.
+            unsafe { images::full_barrier(&b.host.device, cmd) };
+        }
         for s in shaders {
             if super::targets::wants(&s.name) {
                 // SAFETY: outside rendering, in our command buffer.

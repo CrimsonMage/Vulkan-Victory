@@ -17,6 +17,8 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Console code of another compiler, in place of `DXIL` (`native/fspx.rs`).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -109,6 +111,51 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The entry function's name, where the `PSV0` part gives it (runtime
+    /// information of version 3: the name's place in the part's string
+    /// table is its last dword; the table follows the resource bindings).
+    pub fn entry_name(&self) -> Option<&'a str> {
+        const INFO3: usize = 52;
+        let d = self.part(FourCC::PSV0)?.data;
+        let info = u32_at(d, 0).ok()? as usize;
+        if info < INFO3 {
+            return None;
+        }
+        let name_at = u32_at(d, 4 + INFO3 - 4).ok()? as usize;
+        let mut at = 4 + info;
+        let resources = u32_at(d, at).ok()? as usize;
+        at += 4;
+        if resources > 0 {
+            at += 4 + resources.checked_mul(u32_at(d, at).ok()? as usize)?;
+        }
+        let table = d.get(at + 4..)?.get(..u32_at(d, at).ok()? as usize)?;
+        let name = table.get(name_at..)?.split(|&b| b == 0).next()?;
+        std::str::from_utf8(name).ok().filter(|n| !n.is_empty())
+    }
+
+    /// The part that holds the console programs: `DXIL`, or `ACCC` in a
+    /// container without one.
+    pub fn code_part(&self) -> Option<&Part<'a>> {
+        self.part(FourCC::DXIL).or(self.part(FourCC::ACCC))
+    }
+}
+
+/// The containers stored as they are in `data` (a file of any kind, such
+/// as a DLL that carries its shaders), found by the magic: each one that
+/// parses, cut to the size it states.
+pub fn containers(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = data[from..].windows(4).position(|w| w == b"DXBC").map(|i| from + i) {
+        from = at + 4;
+        let total = u32_at(data, at + 0x18).map_or(0, |n| n as usize);
+        if let Some(c) = data.get(at..at + total).filter(|c| Container::parse(c).is_ok()) {
+            out.push(c);
+            from = at + total;
+        }
+    }
+    out
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -166,6 +213,53 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    /// A `PSV0` part with runtime information of `info` bytes, `resources`
+    /// bindings of 24 bytes and the string table `table`, the entry's name
+    /// at `name_at` of it.
+    fn psv0(info: usize, resources: u32, table: &[u8], name_at: u32) -> Vec<u8> {
+        let mut d = (info as u32).to_le_bytes().to_vec();
+        d.resize(4 + info, 0);
+        if info >= 52 {
+            d[4 + 48..4 + 52].copy_from_slice(&name_at.to_le_bytes());
+        }
+        d.extend_from_slice(&resources.to_le_bytes());
+        if resources > 0 {
+            d.extend_from_slice(&24u32.to_le_bytes());
+            d.resize(d.len() + 24 * resources as usize, 0xEE);
+        }
+        d.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        d.extend_from_slice(table);
+        d
+    }
+
+    #[test]
+    fn reads_the_entry_name_of_the_pipeline_state_part() {
+        let name = |psv: &[u8]| Container::parse(&build(&[(FourCC::PSV0, psv)])).unwrap().entry_name().map(str::to_owned);
+        assert_eq!(name(&psv0(52, 2, b"\0some_pass\0\0\0\0", 1)).as_deref(), Some("some_pass"));
+        assert_eq!(name(&psv0(52, 0, b"\0main\0\0\0", 1)).as_deref(), Some("main"));
+        // older runtime information has no name; an empty or missing one is none
+        assert_eq!(name(&psv0(48, 2, b"\0some_pass\0", 1)), None);
+        assert_eq!(name(&psv0(52, 2, b"\0some_pass\0", 0)), None);
+        assert_eq!(name(&psv0(52, 2, b"\0abc", 9)), None);
+        assert_eq!(name(&psv0(52, 1, b"", 0)[..60]), None);
+        assert_eq!(Container::parse(&build(&[(FourCC::SFI0, &[0; 8])])).unwrap().entry_name(), None);
+    }
+
+    #[test]
+    fn finds_the_containers_in_a_file() {
+        let (a, b) = (build(&[(FourCC::SFI0, &[1, 2, 3, 4])]), build(&[(FourCC::ACCC, b"FSPX"), (FourCC::HASH, &[9; 20])]));
+        // a magic with nothing behind it, two containers, one cut short
+        let mut file = b"MZ..DXBC....".to_vec();
+        file.extend_from_slice(&a);
+        file.extend_from_slice(&[0; 7]);
+        file.extend_from_slice(&b);
+        file.extend_from_slice(&a[..a.len() - 1]);
+        assert_eq!(containers(&file), [&a[..], &b[..]]);
+        assert!(containers(b"DXB").is_empty());
+        let c = Container::parse(&b).unwrap();
+        assert_eq!(c.code_part().unwrap().fourcc, FourCC::ACCC);
     }
 
     #[test]

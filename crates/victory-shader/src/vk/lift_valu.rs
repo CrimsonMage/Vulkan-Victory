@@ -558,6 +558,9 @@ impl Lift<'_> {
         let _ = &f;
         match name {
             "v_lshrrev_b16" | "v_lshlrev_b16" | "v_ashrrev_i16" | "v_add_nc_u16" | "v_sub_nc_u16" | "v_mul_lo_u16" => self.op_lshrrev_b16(inst, name, v, a_exec),
+            "v_dot4c_i32_i8" | "v_dot4_i32_i8" => self.op_dot4_i8(inst, name, v),
+            "v_pk_add_u16" | "v_pk_sub_u16" => self.op_pk_add_u16(inst, name, v),
+            "v_pk_fmac_f16" => self.op_pk_fmac_f16(inst, name, v),
             _ => Err(unsupported(off, name)),
         }
     }
@@ -1015,6 +1018,7 @@ fn valu_part(name: &str) -> Option<u8> {
         "v_pk_fma_f16" | "v_pk_mul_f16" | "v_pk_add_f16" | "v_pk_max_f16" | "v_pk_min_f16" => 5,
         "v_pk_lshlrev_b16" | "v_pk_lshrrev_b16" | "v_pk_ashrrev_i16" => 5,
         "v_lshrrev_b16" | "v_lshlrev_b16" | "v_ashrrev_i16" | "v_add_nc_u16" | "v_sub_nc_u16" | "v_mul_lo_u16" => 6,
+        "v_dot4c_i32_i8" | "v_dot4_i32_i8" | "v_pk_add_u16" | "v_pk_sub_u16" | "v_pk_fmac_f16" => 6,
         "v_cvt_f32_u32" | "v_cvt_f32_i32" => 7,
         "v_cvt_u32_f32" | "v_cvt_i32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => 7,
         "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => 7,
