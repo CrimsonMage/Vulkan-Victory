@@ -20,7 +20,7 @@ draws, (b) the fog apply pass's huge R/A on sky pixels, (c) glyph boxes.
 | 1 whole-wave sections | fixed for every program but a wave64 whose halves exchange (`lift_wave.rs` `section_values`) |
 | 2 node tests with the builder off | fixed: no hit, nothing read (`VICTORY_BVH_BUILDER`, part of the stage cache key). An all-zero node was already a miss in both forms |
 | 3 pixel quad reads, `s_wqm` | open |
-| 4 first-lane reads | fixed: empty EXEC reads the first lane there; a pixel helper lane its own value |
+| 4 first-lane reads | fixed: empty EXEC reads the first lane there; a pixel helper lane in EXEC its own value, outside EXEC the wave's (its own, never written there, kept it in the wave's loops to the loop guard: `docs/kiss.md`, the pass bench) |
 | 5 unwritten registers | fixed: 0 |
 | 6 NaN tests | as before (same intent, unproven on the driver); their test not ported |
 | 7 legacy mad | fixed: fused, sources flushed |

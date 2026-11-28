@@ -928,13 +928,18 @@ impl Lift<'_> {
                     let l = self.first_lane_of(b);
                     self.emit(Op::Wave(op::GROUP_NON_UNIFORM_SHUFFLE, u32::MAX), Ty::U32, vec![x, l])
                 };
-                // A helper lane takes its own value: in whole-quad mode the
-                // console has helper lanes in EXEC and a waterfall loop
-                // serves them too; a host may leave them out of ballots
-                // (origin/main `emit/lower.rs` `helper_reads_own`).
+                // A helper lane in EXEC takes its own value: in whole-quad
+                // mode the console has helper lanes in EXEC and a waterfall
+                // loop serves them too; a host may leave them out of ballots
+                // (origin/main `emit/lower.rs` `helper_reads_own`). Outside
+                // EXEC it takes the wave's, as the console's one register
+                // holds it: with its own (which no masked write ever moves)
+                // it went another way than the wave at the next scalar
+                // branch and stayed in the wave's loops to the loop guard.
                 let r = if self.native.stage == HwStage::Ps && self.f.ty(x) == Ty::U32 {
                     let h = self.f.global(Op::Builtin(Builtin::Helper), Ty::BOOL);
-                    self.spv(op::SELECT, Ty::U32, &[h, x, r])
+                    let own = self.spv(op::LOGICAL_AND, Ty::BOOL, &[h, a_exec]);
+                    self.spv(op::SELECT, Ty::U32, &[own, x, r])
                 } else {
                     r
                 };

@@ -421,6 +421,39 @@ fn a_first_lane_read_with_no_lane_in_exec_reads_the_first_lane() {
     }
 }
 
+/// A pixel's helper lane outside EXEC reads what the wave reads. The
+/// console has one scalar register for the wave, so `v_readfirstlane`
+/// gives every lane the first EXEC lane's value; origin/main's rule
+/// (`emit/lower.rs` `first_lane`: a helper lane takes its own) is for
+/// helper lanes in EXEC (whole-quad mode). A helper lane that took its own
+/// value outside EXEC went another way than its wave at the next scalar
+/// branch: in the tiled lighting's light loops it stayed alone until the
+/// loop guard (`docs/kiss.md`, the pass bench: 26.6 ms a draw, 0.74 with
+/// this). Lanes 0 and 9 are helpers here; the first lane in EXEC is 1.
+#[test]
+fn a_pixel_helper_lane_outside_exec_reads_the_waves_first_lane() {
+    use crate::vk::spirv::op;
+    use crate::vk::tir::{Builtin, Op, V};
+    let native = pixel(&[
+        vop1(0x002, 7, vgpr(0)), // v_readfirstlane_b32 s7, v0
+        vop1(0x001, 1, sgpr(7)), // v_mov_b32 v1, s7
+        0xF800_180F,
+        0x0101_0101,             // exp mrt0, v1, v1, v1, v1 done vm
+    ]);
+    let (f, _) = crate::vk::thread_ir_native(&native).expect("translation");
+    // the read's result: the select between the lane's own value and the wave's
+    let helper = |v: V| f.node(v).op == Op::Builtin(Builtin::Helper);
+    let own = |v: V| f.node(v).args.first().is_some_and(|&c| f.node(c).op == Op::Spv(op::LOGICAL_AND) && f.node(c).args.iter().any(|&a| helper(a)));
+    let read = (0..f.nodes.len() as V).filter(|&v| f.node(v).op == Op::Spv(op::SELECT) && own(v)).last().expect("the read");
+    let mut m = Machine::new(&f, 32, Memory { range: (0, 1 << 32), ..Default::default() });
+    m.helpers[0] = true;
+    m.helpers[9] = true;
+    assert_eq!(m.run(), Stop::Returned);
+    for lane in [0, 1, 2, 9, 31] {
+        assert_eq!(m.value(read, lane)[0], u64::from(1.5f32.to_bits()), "lane {lane}");
+    }
+}
+
 /// origin/main `emit/valu_tests.rs`
 /// `legacy_mad_fuses_its_product_and_flushes_its_sources`, as written:
 /// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with

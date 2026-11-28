@@ -151,6 +151,115 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (bench): **where a lighting pass's time went: helper pixels
+  spinning to the loop guard. One condition in the translator; 26.6 ms a
+  draw become 0.74.** Found with a native pass bench, after three
+  readings of the card's time had failed (the map's search, where memory
+  lies, the card's power). Branch `passbench`; nothing baked, no game run.
+  - **The bench** (scratch `card/passbench`, native Linux Vulkan on the
+    test card, built on `victory-vk` and this tree's translator): one
+    captured pixel pass as the game runs it. The capture's vertex and
+    pixel containers translated now; the host's rectangle stage behind the
+    vertex program (the tiled lighting draws 60 rectangles of 128 x 120
+    pixels, 180 vertices); library parts and a fast link with the game's
+    dynamic state; the capture's images in their descriptor slots; its
+    title memory as sparse buffers under the game's own memory map (card
+    pages where captured blocks lie); its push constants, targets and
+    depth (test EQUAL, no write). Timed by timestamps around each of 20
+    draws; the first draw's targets compared with the capture's `after/`.
+    - `TL_PS_PBR_MATERIAL_STANDARD` (run tl2): 187,246 pixel invocations
+      (the capture's draw changed 187,384 texels); of the 182,351 texels
+      both changed, all but 57 within 2% and 92% equal to the bit.
+      **26.5 ms a draw against the game's 22.**
+    - `TL_PS_NoDir_PBR_MATERIAL_STANDARD` (run cm-a): 322,759 texels,
+      every one equal to the capture's to the bit. **34.7 ms.**
+    So the pass is as slow by itself as in the game: nothing around it.
+  - **What did not move it** (the first pass, 26.5 ms): one pipeline
+    instead of parts and a fast link 26.7; no bounds select on each loaded
+    dword 26.6; no float controls 26.5; the memory map as one range (the
+    one-compare form, title memory under one sparse window) 26.5; votes
+    of the lane's quad 28.5; helper lanes without a vote 21.4; maximal
+    reconvergence declared 26.5; `spirv-opt -O` 25.1. A flat pixel
+    program in its place: 0.01 ms (the draw itself costs nothing). The
+    legacy multiplies as plain ones: 23.6. The hit store of the loop
+    guard left out: 23.6.
+  - **What did**: the loop guard at 256 iterations instead of 16,384:
+    **1.1 ms, the same texels**. So the time was loops running to the
+    guard in lanes whose work nobody sees: no live pixel's result changed
+    and no guard hit was ever stored. With the guard's edge never taken
+    the device is lost (those loops do not end). Votes per lane: 0.51.
+    Helper invocations returning at the program's start: 0.58, the same
+    texels: the lanes are the helpers.
+  - **Why.** The tiled lighting walks the lights of the wave: the union
+    of the lanes' masks, bit by bit, each bit taken with
+    `v_readfirstlane` from the first lane in EXEC. A helper lane (a pixel
+    of a quad that failed the early depth test or lies past the
+    rectangle's edge; about 11,000 in 6,400 subgroups of this draw) is in
+    EXEC at no time in these programs: they have no `s_wqm`.
+    `lift_valu.rs` gave **every** helper lane its own value for a
+    first-lane read (taken over from origin/main, where a helper lane is
+    in EXEC in whole-quad mode and branches are per lane). Here a helper
+    lane's own copy is never written (every write is masked), so at the
+    loop's scalar branch ("was that the last bit?") it went another way
+    than the wave and stayed in the loop alone until the guard: 16,384
+    iterations a helper lane, their stores dropped by the card (the
+    guard's too: "none fired").
+  - **The change** (`lift_valu.rs` `valu_lane0`): a helper lane takes its
+    own value for a first-lane read only **where it is in EXEC**; outside
+    it takes the wave's, as the console's one register holds it.
+    Bench: `TL_PS_PBR_MATERIAL_STANDARD` **26.6 -> 0.74 ms**,
+    `TL_PS_NoDir_PBR_MATERIAL_STANDARD` **34.7 -> 0.75 ms**, the same
+    texels as before in both (the second still equal to the capture's to
+    the bit). `spirv-val` passes on both modules; `cargo test -p
+    victory-shader` 186 passed (new:
+    `a_pixel_helper_lane_outside_exec_reads_the_waves_first_lane`; the
+    interpreter has helper lanes for it, `Machine::helpers`); shader
+    golden 1,527 programs, 0 changed behaviour.
+    **Bake: 216 of the 414 used pixel programs change** (every one with a
+    first-lane read: 130 `TL_PS_*`, the deferred mesh draws' textured
+    programs, alpha prepasses, decals); no vertex, mesh or compute
+    program does.
+  - **Returning helper invocations at the start** of a pixel program
+    without `s_wqm` and without implicit derivatives was tried on top
+    and left out: 0.58 instead of 0.74 ms in the first pass, 1.12 instead
+    of 0.75 in the second.
+  - **What is left in the pass** (0.74 ms; one thing at a time, the same
+    texels each time): the memory map as one range **0.32** (the search
+    of 6 steps at each of 127 address translations is now more than half
+    of the pass); legacy multiplies plain 0.50; no bounds selects 0.51;
+    no guard store 0.54; votes per lane 0.51; guard never taken 0.72;
+    all of them 0.29. No depth test (345,586 pixels instead of 186,453)
+    1.27.
+  - **Expected in the game, not yet run**: the tiled lighting family
+    (104 ms a frame in about 40 passes) to a few milliseconds, so the
+    frame from about 286 ms toward 185: 5 fps, not 30. The mesh draws'
+    pixel programs (27 ms) have first-lane reads too and may gain. Compute
+    (97 ms) has no helper lanes: its time is not explained by this, and
+    the bench does not run compute passes yet (the next step: the same
+    table for `CS_Primary_GatherCopy`, starting with the memory map as
+    one range, which only now shows as a cost).
+  - **The other fork's translation of the same container** (VIctory-NVIDIA,
+    D3D12/DXIL; scratch `card/tn1` with its own census): 8,048
+    instructions in 193 blocks against our 14,864 in 600 blocks and 6
+    functions (the second pass: 6,860 against 11,781).
+    | | theirs | ours |
+    |---|---|---|
+    | branches | per lane (the host's own control flow); a wave vote only where every lane must act | flat guards and votes of the subgroup: 26 `Any`, 14 ballots, 28 shuffles (theirs: 31 wave operations in all) |
+    | selects, phis | 1,179 (8 of them guards), 250 | 2,438, 819 |
+    | buffers | real descriptors from the heap (`ResourceDescriptorHeap`): 97 handles, 149 buffer loads, 36 constant-buffer loads, no address translation in this program (title memory by a 64 KiB page directory only for raw pointers) | 662 loads through 127 address translations, each a 6-step search of the memory map, and a bounds select per dword |
+    | legacy multiply | at most one compare and select (none where a factor is known finite or a non-zero constant) | two compares, an or and a select each (829 compares) |
+    | loop limit | 2^20, a counter per loop (9) | 2^14, a counter per loop (9), a store on a hit |
+    | helper lanes | branch by their own conditions like any lane; own value at a first-lane read (`helper_own`) | outside EXEC, following the votes; the wave's value at a first-lane read (this entry) |
+    So theirs never had this cost: a lane there leaves a loop by its own
+    condition. What remains between the two after this change is the
+    static size (1.8 times) and the address translations.
+  - Tools in scratch `card/`: `passbench` (with `rect_gs.spv`, the host's
+    rectangle stage; `translator-probes.patch`, the switches the tables
+    above were made with, never committed; `probe/` the lane and vote
+    probes: on this card a subgroup vote gives helper lanes the live
+    lanes' answer, and helper lanes are flagged as such), `trb-new` and
+    `trb-base` (module hashes of the used set under two trees), `tn1`.
+
 - 2026-11-27 (night): **the merged translator batch holds 3.1 fps without
   the upscaler; the title's own upscaler is off by default; the card does
   not idle between lists.** Tag `batch-2026-11-27f`, baked in full

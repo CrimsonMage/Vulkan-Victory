@@ -570,6 +570,15 @@ Known gaps (the program translates; the result differs from the console):
   as the D3D12 path's tested reference did. Triangles always return the
   barycentric form (T# dword 3 bit 24; the title sets it). Not checked
   on the card yet.
+- A pixel program starts with the live lanes in EXEC; its helper
+  invocations (`gl_HelperInvocation`) run along outside EXEC, every write
+  masked, and follow the subgroup's votes at scalar branches. A
+  `v_readfirstlane` gives a helper lane its own value only where it is in
+  EXEC (after `s_wqm`: a waterfall loop serves it too, and a host may
+  leave it out of ballots); outside EXEC it reads the wave's value like
+  every lane, so that it takes the wave's way at the next scalar branch.
+  (With its own value a helper lane of the tiled lighting stayed in the
+  light loops until the loop guard: 26.6 ms a draw instead of 0.74.)
 - Wave64 compute and mesh programs run each console wave as two host
   subgroups that exchange one word where a value must be whole-wave:
   64-bit masks read as numbers (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`,

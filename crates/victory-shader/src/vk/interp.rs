@@ -217,6 +217,10 @@ pub struct Machine<'a> {
     /// computes nothing, is in no ballot or reduction, and a shuffle from
     /// it is noted and reads 0.
     pub live: Vec<bool>,
+    /// The invocations that are helpers (none, by default): pixels of a
+    /// quad the triangle does not cover or the early tests killed, run
+    /// for the others' derivatives (`gl_HelperInvocation`).
+    pub helpers: Vec<bool>,
 }
 
 fn width(s: S) -> u32 {
@@ -391,6 +395,7 @@ impl<'a> Machine<'a> {
             image_vary: false,
             watch_lanes: 4,
             live: vec![true; lanes],
+            helpers: vec![false; lanes],
         }
     }
 
@@ -699,13 +704,14 @@ impl<'a> Machine<'a> {
                 let (x, y) = (ox + q % 4 * 2 + (lane & 1), oy + q / 4 * 2 + (lane >> 1 & 1));
                 (0.5f32 + if c == 0 { x } else { y } as f32).to_bits()
             }
-            // pixels: lane l at (l % 8, l / 8) of an 8x4 tile, no helpers
+            // pixels: lane l at (l % 8, l / 8) of an 8x4 tile
             Builtin::FragCoord(0) => (0.5f32 + (lane % 8) as f32).to_bits(),
             Builtin::FragCoord(1) => (0.5f32 + (lane / 8) as f32).to_bits(),
             Builtin::FragCoord(2) => 0.5f32.to_bits(),
             Builtin::FragCoord(_) => 1.0f32.to_bits(),
             Builtin::FrontFacing | Builtin::SampleMaskIn => 1,
-            Builtin::Helper | Builtin::SampleId | Builtin::PrimitiveId => 0,
+            Builtin::Helper => u32::from(self.helpers[l]),
+            Builtin::SampleId | Builtin::PrimitiveId => 0,
             Builtin::Bary { comp, .. } => [0.25f32, 0.25, 0.5][usize::from(comp).min(2)].to_bits(),
             _ => return Err(format!("built-in {b:?}")),
         })
