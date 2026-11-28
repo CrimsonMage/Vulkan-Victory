@@ -20,38 +20,35 @@ impl Lift<'_> {
     /// half's, upper half's).
     pub(super) fn exchange(&mut self, own: V) -> (V, V) {
         let pair = self.emit(Op::Xchg, Ty::vec(S::U32, 2), vec![own]);
-        self.lds_dirty = false;
         (self.extract(pair, 0), self.extract(pair, 1))
     }
 
-    /// Before an LDS access: the halves meet when either may have made
-    /// another since they last did. The console's wave runs its LDS
-    /// accesses in program order across all 64 lanes (a lane initialises a
-    /// counter, the wave adds to it, a lane reads the total); two host
-    /// subgroups are not ordered without it.
-    pub(super) fn lds_meet(&mut self) {
-        if !self.xwave || !self.lds_dirty {
-            return;
+    /// Before an LDS access of `kind` (`meetings::access`): the halves
+    /// meet. The console's wave runs its LDS accesses in program order
+    /// across all 64 lanes (a lane initialises a counter, the wave adds to
+    /// it, a lane reads the total); two host subgroups are not ordered
+    /// without it. Every access gets its meeting here; the ones that order
+    /// nothing go once the program is whole (`meetings::drop_unneeded`).
+    pub(super) fn lds_meet(&mut self, kind: u32) {
+        if self.xwave {
+            self.meet(vec![crate::vk::uniform::MEET, kind]);
         }
-        self.meet();
     }
 
     /// At the console's memory barrier (`s_waitcnt_vscnt`): the halves meet
     /// (the meeting orders buffer and image memory too).
     pub(super) fn memory_meet(&mut self) {
-        if !self.xwave {
-            return;
+        if self.xwave {
+            self.meet(vec![crate::vk::uniform::MEET]);
         }
-        self.meet();
     }
 
     /// The halves meet, nothing exchanged (`uniform::MEET`: it goes in a
     /// program with nothing shared to order).
-    fn meet(&mut self) {
+    fn meet(&mut self, imm: Vec<u32>) {
         self.close();
         let z = self.k32(0);
-        self.emit_imm(Op::Xchg, Ty::vec(S::U32, 2), vec![z], vec![crate::vk::uniform::MEET]);
-        self.lds_dirty = false;
+        self.emit_imm(Op::Xchg, Ty::vec(S::U32, 2), vec![z], imm);
     }
 
     /// The two dwords of a wave64 mask: exchanged once per block (masks

@@ -16,6 +16,7 @@ pub mod interp_group;
 #[cfg(test)]
 mod oracle;
 pub mod lift;
+pub mod meetings;
 pub mod pack16;
 pub mod report;
 pub mod semantics;
@@ -345,6 +346,7 @@ fn thread_ir_parts(native: &NativeProgram, osg: &[SigRow], isg: &[SigRow], strid
     tir::fold_branches(&mut f);
     ifconv::if_convert(&mut f);
     tir::dce(&mut f);
+    meetings::drop_unneeded(&mut f);
     let placed = tir::placed(&f);
     // the code tables something still reads, as the bytes the host keeps
     let mut read = vec![false; f.tables.tables.len()];

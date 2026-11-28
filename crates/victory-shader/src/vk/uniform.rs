@@ -32,8 +32,9 @@ use std::collections::HashMap;
 use super::spirv::{glsl, op};
 use super::tir::{Builtin, Func, ImageKind, Item, Node, Op, S, Term, Ty, V};
 
-/// `Node::imm` of an exchange that is only a meeting of the halves (its
-/// pair unused: before an LDS access, at a memory barrier).
+/// `Node::imm[0]` of an exchange that is only a meeting of the halves (its
+/// pair unused: before an LDS access, whose kind is then `imm[1]`
+/// ([`super::meetings`]), or at a memory barrier).
 pub const MEET: u32 = 1;
 
 /// What the pass changed (statistics).

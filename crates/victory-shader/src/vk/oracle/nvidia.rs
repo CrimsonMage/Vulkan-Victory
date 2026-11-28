@@ -7,8 +7,10 @@
 
 #![allow(clippy::all)]
 
+use super::wave64::{native_of, run_group, stores};
 use super::*;
 use crate::native::NativeProgram;
+use crate::vk::meetings;
 use crate::vk::spirv::en;
 
 const TABLE: u64 = 0x1000;
@@ -199,4 +201,104 @@ fn an_ordered_section_runs_inside_the_interlock() {
     let mut unmarked = [&section[..], &end].concat();
     unmarked.remove(16);
     assert_eq!(pops(&pixel(&unmarked, 0)), (false, true));
+}
+
+/// A wave64 compute program of `threads` threads with one 512-byte LDS unit.
+fn lds_program(body: &[u32], threads: u32) -> NativeProgram {
+    let mut native = native_of(body, true, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    native
+}
+
+/// The kinds of the meetings before LDS accesses the translation keeps,
+/// in block order.
+fn meetings_of(native: &NativeProgram) -> Vec<u32> {
+    use crate::vk::tir::{Item, Op};
+    let (f, _) = crate::vk::thread_ir_native(native).expect("translation");
+    let kinds: Vec<u32> = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.body)
+        .filter_map(|it| match it {
+            Item::N(v) if f.node(*v).op == Op::Xchg && f.node(*v).imm.first() == Some(&crate::vk::uniform::MEET) => f.node(*v).imm.get(1).copied(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds.len(), meetings::count(&f));
+    kinds
+}
+
+const DS_WRITE_V1_V0: [u32; 2] = [0xD834_0000, 0x0000_0001];
+const DS_ADD_V1_V0: [u32; 2] = [0xD800_0000, 0x0000_0001];
+const WAITCNT: u32 = 0xBF8C_C07F;
+const S_BARRIER: u32 = 0xBF8A_0000;
+
+/// `ds_read_b32 v<dst>, v<addr>`.
+const fn ds_read(dst: u32, addr: u32) -> [u32; 2] {
+    [0xD8D8_0000, dst << 24 | addr]
+}
+
+/// Theirs: `lds_accesses_after_the_last_plain_write_need_no_meeting`
+/// (89cfae2 `LdsOrder`), their program: before a barrier a lane writes its
+/// dword and reads it back; after it the lanes read and add. Which
+/// accesses the halves of a wave must meet before: none before the write
+/// (nothing precedes it) nor before the read after the barrier (the
+/// barrier is a meeting); the read after the write and the add after the
+/// read keep theirs. (Theirs lets the add go too, and calls the read
+/// beside it unstable: a half may then read before the other half's add.)
+/// And the program computes the same as one wave and as two halves in
+/// either order.
+#[test]
+fn lds_accesses_that_commute_need_no_meeting() {
+    let body = |tail: &[u32]| {
+        let mut w = vec![0x3402_0082]; // v_lshlrev_b32 v1, 2, v0
+        w.extend(DS_WRITE_V1_V0);
+        w.extend(ds_read(4, 1));
+        w.extend([WAITCNT, S_BARRIER]);
+        w.extend(ds_read(5, 1));
+        w.extend(DS_ADD_V1_V0);
+        w.extend_from_slice(tail);
+        w
+    };
+    let theirs = lds_program(&body(&[]), 128);
+    assert_eq!(meetings_of(&theirs), [meetings::READ, meetings::ADD]);
+    // ... then each lane reads its dword twice more: one meeting for both
+    // reads (they follow the add), and every thread finds t, t, 2t, 2t.
+    let mut tail = ds_read(6, 1).to_vec();
+    tail.extend(ds_read(7, 1));
+    tail.push(WAITCNT);
+    tail.extend(stores([4, 5, 6, 7]));
+    let native = lds_program(&body(&tail), 128);
+    assert_eq!(meetings_of(&native), [meetings::READ, meetings::ADD, meetings::READ]);
+    let want: Vec<u32> = (0..128).flat_map(|t| [t, t, 2 * t, 2 * t]).collect();
+    assert_eq!(run_group(&native, [0; 4], 4 * 128, 0), Ok(want));
+}
+
+/// Ours: why a read beside an atomic keeps its meeting. Every lane of a
+/// wave adds 1 to one counter, then reads it: the console's wave has made
+/// all 64 adds before any lane reads, so every lane reads 64. Two halves
+/// that did not meet between would read 32 in the half that ran first
+/// (`run_group` runs both orders and counts LDS dwords the halves accessed
+/// with no meeting between).
+#[test]
+fn a_read_after_the_waves_adds_sees_them_all() {
+    let mut body = vec![
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xD800_0000,
+        0x0000_0201, // ds_add_u32 v1, v2
+        0xD800_0000,
+        0x0000_0201, // ds_add_u32 v1, v2
+    ];
+    body.extend(ds_read(4, 1));
+    body.extend(ds_read(5, 1));
+    body.push(WAITCNT);
+    body.extend(stores([4, 5, 4, 5]));
+    let native = lds_program(&body, 64);
+    // the two adds commute, the two reads commute; the read after the adds
+    // does not
+    assert_eq!(meetings_of(&native), [meetings::READ]);
+    assert_eq!(run_group(&native, [0; 4], 4 * 64, 0), Ok(vec![128; 4 * 64]));
 }

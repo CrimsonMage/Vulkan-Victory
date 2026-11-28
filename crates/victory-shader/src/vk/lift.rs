@@ -249,8 +249,6 @@ pub struct Lift<'a> {
     approx_taken: u32,
     /// The exchanged dwords of masks, per block.
     words: HashMap<V, (V, V)>,
-    /// An LDS access since the halves last met (lift_wave.rs).
-    lds_dirty: bool,
     /// The block whose body `cur` is.
     cur_block: usize,
     /// The block each value made in a block body belongs to (prelude values
@@ -360,7 +358,6 @@ impl<'a> Lift<'a> {
             idle_of: HashMap::new(),
             approx_taken: 0,
             words: HashMap::new(),
-            lds_dirty: false,
             cur_block: 0,
             born: HashMap::new(),
             depth: vec![0; p.blocks.len()],

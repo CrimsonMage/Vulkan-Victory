@@ -247,6 +247,59 @@ driver errors and no new crash, and the captures look no worse.
       `shader-golden`: 0 of 1,527 changed; `cargo xwin check` of
       `victory-vk` and `victory-gpu`. **Not run on the card.** Needs no
       bake of a used program.
+  - **The halves of a wave64 meet before an LDS access only where the
+    meeting orders something** (`vk/meetings.rs`; theirs `LdsOrder`,
+    89cfae2, kept exact). The lift puts a meeting before every LDS access
+    and says what the access does; when the program is whole (after
+    `uniform.rs`) a pass over the block graph takes away the ones whose
+    access commutes with everything a half may have done since the halves
+    last surely met (a kept meeting, an exchange that is still there, the
+    console's barrier): a read after reads; an atomic whose result nothing
+    takes after atomics of its family (adds; each minimum, maximum and bit
+    operation). A plain write, an atomic that returns the old value, an
+    exchange and a compare-exchange keep theirs after anything.
+    - **Where it differs from theirs:** theirs cuts the program at
+      `s_barrier` and lets every read and atomic go that no plain write
+      shares a piece with, reads beside atomics too (it calls those
+      unstable: a half may read before the other half's add; the console's
+      wave never does, and `interp_group` counts it a race). Ours keeps
+      that meeting, and in return goes by what precedes an access on a
+      path, so reads after the meeting that follows a write need none.
+      `CS_DefragHeap_ComputeRelocations`: 30 meetings in our code before,
+      12 now (theirs: 138 to 50 in theirs').
+    - **Measured** (meetings in the code): used set 3,419 to 1,803 (96
+      programs had some, 90 have); pack 10,530 to 5,250 (356 to 318).
+      Most changed of the used set: `LuminanceMinMaxDownsampleFinalCS` and
+      `LuminanceMinMaxDownsampleCS` 166 to 81, `CS_IrradianceCache_
+      IntegrateIrradianceSH` 126 to 47, `LuminanceMinMaxDownsampleInitCS`
+      142 to 66, `CS_AmbientCubeIBR_Paraboloid` 115 to 42 (of the pack:
+      `GpuParticleEmit:CS_Emit_Dynamic_Model_Edge` 201 to 85). The
+      exchanges are as they were (7,599 used).
+    - **Found wrong on the way:** the lift took every exchange for a
+      meeting, and `uniform.rs` then took exchanges of uniform words
+      away. In `CS_RayBudgeting_Cull_RayBinning` (used) and
+      `CS_VolumePortalTiling_Generate` a lane's `ds_write` and the wave's
+      `ds_add_u32` after it were left with nothing between them: the half
+      that ran first could add before the other half's lane had set the
+      counter. Both have a meeting there now (1 to 2 each; the only
+      programs that gained one).
+    - Proof: `lds_accesses_that_commute_need_no_meeting` (theirs
+      `lds_accesses_after_the_last_plain_write_need_no_meeting`, their
+      program; fails without the pass), `a_read_after_the_waves_adds_sees_
+      them_all` (the case theirs gives up), the unit tests of
+      `meetings.rs`; `shader-golden`: 0 of 1,527 changed;
+      `shader-golden --halves` (now it also counts an LDS dword the halves
+      touched with no meeting between as a difference, and lists the
+      programs it cannot compare): program for program the same lines
+      before and after: 468 same, 19 same but raced over title memory, 68
+      past the block limit, 1 differs before and after alike
+      (`CS_ProjDecalReduceClassification_Vectorized`, seed 1: one LDS
+      dword both halves write in one instruction, which no meeting
+      orders). 361 modules of the pack change (97 used; 23 of them, 8
+      used, keep their count and grow by 5 to 37 words: a lane guard now
+      ends before every LDS access, also where the meeting goes); all pass
+      `spirv-val`. **Needs the bake:** the 97 used compute and mesh
+      programs.
 
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
