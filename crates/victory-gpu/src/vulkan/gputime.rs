@@ -4,7 +4,10 @@
 //! timestamp is written; the time to the next timestamp (all lists
 //! together, in the order the card ran them) is the bound program's. Two
 //! presents after the last frame the sums are told, the largest first, by
-//! program and by family (the name without its variant hashes). One frame
+//! program and by family (the name without its variant hashes). A list's
+//! end is a timestamp too (`host: between lists`): what follows it until
+//! the next list's first program, the card waiting for a list included, is
+//! not charged to a program. One frame
 //! alone is not a whole frame of the title's: its lists are recorded while
 //! the frame before is still on the card (run am1: 107 of 410 ms), so the
 //! window is several presents and the sums are divided by their number.

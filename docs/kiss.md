@@ -151,6 +151,39 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-27 (night): **the merged translator batch holds 3.1 fps without
+  the upscaler; the title's own upscaler is off by default; the card does
+  not idle between lists.** Tag `batch-2026-11-27f`, baked in full
+  (3,215 s), then runs bf1, bf2 (upscaler on) and bg2 (upscaler off).
+  - *The title's upscaler* (FSR 4: 29 translated compute passes, a neural
+    model): 0.2 fps, the direct queue busy 3 to 9 s a frame, the picture
+    black, `fsr4_model_v07_fp8_no_scale_pass9` at its loop guard every
+    frame (count 226,944), 153 "submission has not finished" reports in
+    one run. The offline checks could not see this: they prove an
+    instruction's result, not a pass's time on the card nor that its waits
+    end. The linear scale is the default again; `VICTORY_FFX_OWN=1` runs
+    the passes (`modules/ffx.rs`, `docs/switches-hle.md`).
+  - *The rest of the batch* (fewer LDS meetings, ordered pixel sections,
+    typed-load bounds, the 16-bit image store), run bg2: 31 frames in
+    10 s as before, card 289 ms a frame (286 before), no hang, no guard
+    hit, no error, the picture right (capture bg2, frame 2340). Correct,
+    and no faster.
+  - *Is the card computing or waiting for us?* An outside review asked
+    whether the frame is card time or the card idle between submissions
+    (158 a frame on the direct queue) while the CPU faults, copies and
+    serialises. `VICTORY_VK_GPU_TIME` charged the time between two
+    timestamps to the earlier program, so idle time between lists would
+    have been charged to a program. A list's end is now a timestamp too
+    (`host: between lists`): 5.85 ms of 289 ms a frame over six frames
+    (909 list ends). The card is inside the programs for the rest. The
+    CPU side of the same run: about 280 write faults a frame (0.9 ms in
+    our handler), 5.6 ms refreshing, 18 ms in submits, 42 ms joining the
+    recording threads, no forced wait.
+  - Still not isolated: what in a translated program costs the time. The
+    loop guard's own cost was never taken out and timed; the single-pass
+    bench (scratch `card/passbench`) is where that and the other pieces
+    are removed one at a time.
+
 - 2026-11-27 (late night): **title memory in system RAM is not what the
   card waits for.** The entry below read the card's slowness from a
   benchmark of scattered reads. Measured with the reads the heavy

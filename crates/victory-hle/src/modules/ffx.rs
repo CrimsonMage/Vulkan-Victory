@@ -2,11 +2,13 @@
 //! (Series S), stays the title's: mapped and bound as its other DLLs. Only
 //! its `ffxDispatch` is ours, for the upscale. The upscaler's passes are
 //! console compute programs of another compiler (`ACCC` containers in its
-//! DLL); **when every one of them translates, the upscale is the title's
-//! own**: its `ffxDispatch` runs and the passes go the way of every compute
-//! stage. While one does not (or one failed on the card,
-//! `victory_gpu::upscale::pass_failed`), the upscale runs the PC way as a
-//! linear scale (`victory_gpu::upscale`, recorded into Vulkan). Every other
+//! DLL). The upscale runs the PC way as a linear scale
+//! (`victory_gpu::upscale`, recorded into Vulkan). With `VICTORY_FFX_OWN=1`
+//! and every pass translating (and none failed on the card,
+//! `victory_gpu::upscale::pass_failed`), the upscale is the title's own
+//! instead: its `ffxDispatch` runs and the passes go the way of every
+//! compute stage. That is not the default while they are too slow and come
+//! out black (see `decide`). Every other
 //! dispatch, and an upscale the scale cannot take, goes to the title's own
 //! `ffxDispatch`.
 //!
@@ -117,13 +119,23 @@ fn stands_in(upscaler: Upscaler, pass_failed: bool) -> bool {
 
 /// Who runs the upscales of the upscaler whose file holds `bytes`.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn decide(bytes: Option<&[u8]>) -> (Upscaler, String) {
+///
+/// `own` is the switch `VICTORY_FFX_OWN`: without it the linear scale runs
+/// even when every pass translates. Measured 2026-11-27 (FSR 4, 29 passes,
+/// RTX 5060 Ti): the translated passes take 3 to 9 s a frame, one of them
+/// runs into its loop guard, and the picture comes out black.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decide(bytes: Option<&[u8]>, own: bool) -> (Upscaler, String) {
     let Some(v) = bytes.and_then(file_version).filter(|&v| layout_known(v)) else {
         return (Upscaler::Unknown, format!("version {:?}", bytes.and_then(file_version)));
     };
     let version = format!("{}.{}.{}", v.0, v.1, v.2);
     match victory_gpu::upscale::passes_translate(bytes.unwrap_or_default()) {
-        Ok(passes) => (Upscaler::Own, format!("version {version}, {passes} passes")),
+        Ok(passes) if own => (Upscaler::Own, format!("version {version}, {passes} passes")),
+        Ok(passes) => (
+            Upscaler::Scale,
+            format!("version {version}; its {passes} passes translate but are not run (VICTORY_FFX_OWN=1 runs them)"),
+        ),
         Err(why) => (Upscaler::Scale, format!("version {version}; {why}")),
     }
 }
@@ -138,12 +150,12 @@ fn upscaler() -> Upscaler {
             .and_then(crate::runtime::image_path)
             .and_then(|p| p.parent().map(|d| d.join(UPSCALER)));
         let bytes = path.as_ref().and_then(|p| std::fs::read(p).ok());
-        let (who, what) = decide(bytes.as_deref());
+        let (who, what) = decide(bytes.as_deref(), std::env::var_os("VICTORY_FFX_OWN").is_some_and(|v| v == "1"));
         match who {
             Upscaler::Own => tracing::info!(what, "FidelityFX upscaler: every pass translates, its upscales are its own"),
             Upscaler::Scale => tracing::warn!(
                 what,
-                "FidelityFX upscaler: a pass does not translate, its upscales run as a linear scale (ffxDispatchDescUpscale as the FidelityFX API lays it out)"
+                "FidelityFX upscaler: its upscales run as a linear scale (ffxDispatchDescUpscale as the FidelityFX API lays it out)"
             ),
             Upscaler::Unknown => tracing::error!(
                 upscaler = ?path,
@@ -210,14 +222,14 @@ mod tests {
         assert!(stands_in(Upscaler::Scale, false));
         assert!(!stands_in(Upscaler::Unknown, true));
         // no file, a file of no version, a file of a known version without passes
-        assert_eq!(decide(None).0, Upscaler::Unknown);
-        assert_eq!(decide(Some(&[0; 64])).0, Upscaler::Unknown);
+        assert_eq!(decide(None, true).0, Upscaler::Unknown);
+        assert_eq!(decide(Some(&[0; 64]), true).0, Upscaler::Unknown);
         let mut file = vec![0u8; 64];
         file.extend_from_slice(&0xFEEF_04BDu32.to_le_bytes());
         file.extend_from_slice(&0x0001_0000u32.to_le_bytes());
         file.extend_from_slice(&(4u32 << 16).to_le_bytes());
         file.extend_from_slice(&(2u32 << 16).to_le_bytes());
-        let (who, what) = decide(Some(&file));
+        let (who, what) = decide(Some(&file), true);
         assert_eq!(who, Upscaler::Scale);
         assert!(what.contains("no pass found"), "{what}");
     }

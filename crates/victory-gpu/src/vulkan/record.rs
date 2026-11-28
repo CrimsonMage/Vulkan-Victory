@@ -383,6 +383,10 @@ impl Rec {
                 // SAFETY: outside rendering, before the buffer ends.
                 unsafe { super::gpu_stats::end(b, rec.cmd, slot, true) };
             }
+            // The time from here to the next list's first program is not
+            // the last program's: the card waiting for a list counts here.
+            // SAFETY: outside rendering, before the buffer ends.
+            unsafe { super::gputime::mark(b, rec.cmd, || "host: between lists".into()) };
             super::part_commands(list, rec);
         }
     }

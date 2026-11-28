@@ -18,6 +18,7 @@ what remains after a switch is removed.
 | `VICTORY_CACHE_DIR` | core `config.rs` | derived data (else `[paths].cache_dir`, else `%LOCALAPPDATA%\victory\cache`) |
 | `VICTORY_DATA_DIR` | core `config.rs` | saves and title storage (else `[paths].data_dir`, else `%LOCALAPPDATA%\victory\data`) |
 | `VICTORY_KEYS` | hle `gameinput.rs` (`diagnostics` builds) | scripted key presses `<seconds>:<key>,...`, used by the test harness |
+| `VICTORY_FFX_OWN` | hle `modules/ffx.rs` | `1`: the title's FidelityFX upscales run as the upscaler's own translated passes instead of the linear scale. Off by default: measured 2026-11-27 (FSR 4, RTX 5060 Ti) the passes take 3 to 9 s a frame, one runs into its loop guard and the picture is black |
 | `VICTORY_RELAUNCHED_FROM` | hle `lifecycle.rs` | not a user switch: the inherited handle a relaunched `victory` waits on when the title relaunches itself (`XLaunchNewGame`); part of the default path |
 
 The `--console series-x|series-s` option of `victory run` is unchanged.
