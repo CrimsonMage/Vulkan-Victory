@@ -52,9 +52,9 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Where it stands (2026-11-27)
+## Where it stands (2026-11-28)
 
-**Not playable: about 2 frames a second.** Tested with one title, on one
+**Not playable: about 9 frames a second.** Tested with one title, on one
 machine: Linux (stock Proton), an Intel CPU, NVIDIA RTX 5060 Ti 8 GB, 31 GB
 RAM; the Series S profile.
 
@@ -63,9 +63,9 @@ RAM; the Series S profile.
 | Boot, menus, opening | reached by scripted input in every test run |
 | The world | the opening scene matches the console's picture: geometry, characters with their materials and lettering, hair, the sky, direct sun, fog; surface colours are the same every run |
 | Indirect light | an estimate from the frame before stands in for it: the title's ray tracing does not run (its structure builder is left out), so there is no ray-traced bounce light, reflection or shadow |
-| Known to be wrong | over-exposed sky; flat interior light; lettering and hair less sharp than the console's; the title sometimes crashes during the load |
-| Frame rate | about 2 frames a second in the world: the card needs about 440 ms a frame |
-| Memory | about 16.5 GB of RAM and 6.7 GB on the card at peak (the aim is a Series S's amounts) |
+| Known to be wrong | over-exposed sky; flat interior light; lettering and hair less sharp than the console's; a few triangles of a character's clothing go dark for a frame now and then; the title sometimes crashes during the load |
+| Frame rate | about 9 frames a second in the world (the aim is 30): the card needs about 100 ms a frame, spread over thousands of small dispatches and draws, and the CPU's side of a frame about 65 ms |
+| Memory | about 17.3 GB of RAM and 7.2 GB on the card at peak (the aim is a Series S's amounts) |
 | Shaders | 25,694 of 25,889 console programs translate (the rest are unused geometry programs); the used set is compiled ahead of time by `victory bake` |
 
 `docs/kiss.md` is the working record: the principle, the Xbox → PC map,
