@@ -158,33 +158,73 @@ impl Limits {
 const CAP_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4466;
 const EM_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4461;
 
+/// The instructions of a module (each with its first word).
+fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
+    let mut i = 5;
+    std::iter::from_fn(move || {
+        let n = ((*words.get(i)? >> 16) as usize).max(1);
+        let ins = words.get(i..i + n)?;
+        i += n;
+        Some(ins)
+    })
+}
+
+/// The module the device takes ([`fit_float_controls`], [`fit_interlock`]).
+/// `None`: the module as it is.
+pub fn fit(words: &[u32], caps: &crate::host::Caps) -> Option<Vec<u32>> {
+    let floats = fit_float_controls(words, caps.signed_zero_inf_nan);
+    let unlocked = fit_interlock(floats.as_deref().unwrap_or(words), caps.pixel_interlock);
+    unlocked.or(floats)
+}
+
 /// The module the device takes: the translator declares
 /// SignedZeroInfNanPreserve for each float width a module uses; the
 /// execution modes of widths the device does not preserve (`preserve`:
 /// 16, 32 and 64 bits) are left out, and the capability with the last of
 /// them. `None`: the module as it is.
 pub fn fit_float_controls(words: &[u32], preserve: [bool; 3]) -> Option<Vec<u32>> {
-    let instructions = || {
-        let mut i = 5;
-        std::iter::from_fn(move || {
-            let n = ((*words.get(i)? >> 16) as usize).max(1);
-            let ins = words.get(i..i + n)?;
-            i += n;
-            Some(ins)
-        })
-    };
     // an execution mode of this kind: Some(whether the device keeps it)
     let mode = |ins: &[u32]| match (ins[0] & 0xFFFF, ins.get(2), ins.get(3)) {
         (16, Some(&EM_SIGNED_ZERO_INF_NAN_PRESERVE), Some(&w)) => Some(matches!((w, preserve), (16, [true, _, _]) | (32, [_, true, _]) | (64, [_, _, true]))),
         _ => None,
     };
-    if words.len() < 5 || !instructions().any(|ins| mode(ins) == Some(false)) {
+    if words.len() < 5 || !instructions(words).any(|ins| mode(ins) == Some(false)) {
         return None;
     }
-    let kept = instructions().any(|ins| mode(ins) == Some(true));
+    let kept = instructions(words).any(|ins| mode(ins) == Some(true));
     let capability = |ins: &[u32]| ins[0] & 0xFFFF == 17 && ins.get(1) == Some(&CAP_SIGNED_ZERO_INF_NAN_PRESERVE);
     let mut out = words[..5].to_vec();
-    for ins in instructions().filter(|&ins| mode(ins) != Some(false) && (kept || !capability(ins))) {
+    for ins in instructions(words).filter(|&ins| mode(ins) != Some(false) && (kept || !capability(ins))) {
+        out.extend_from_slice(ins);
+    }
+    Some(out)
+}
+
+/// The fragment shader interlock of an ordered pixel program: the
+/// extension, the capability, the execution mode and the two instructions.
+const EXT_INTERLOCK: &[u8] = b"SPV_EXT_fragment_shader_interlock\0";
+const CAP_PIXEL_INTERLOCK: u32 = 5378;
+const EM_PIXEL_INTERLOCK_ORDERED: u32 = 5366;
+const OP_BEGIN_INTERLOCK: u32 = 5364;
+const OP_END_INTERLOCK: u32 = 5365;
+
+/// The module a device without `fragmentShaderPixelInterlock` takes: an
+/// ordered pixel program (`victory_shader::vk` `Interface::ordered`) with
+/// its interlock left out, so the pixels of one place run in any order
+/// (what every such program did before the interlock). `None`: the module
+/// as it is.
+pub fn fit_interlock(words: &[u32], interlock: bool) -> Option<Vec<u32>> {
+    let named = |ins: &[u32]| ins[1..].iter().flat_map(|w| w.to_le_bytes()).take(EXT_INTERLOCK.len()).eq(EXT_INTERLOCK.iter().copied());
+    let part = |ins: &[u32]| match (ins[0] & 0xFFFF, ins.get(1), ins.get(2)) {
+        (17, Some(&CAP_PIXEL_INTERLOCK), _) | (16, _, Some(&EM_PIXEL_INTERLOCK_ORDERED)) | (OP_BEGIN_INTERLOCK | OP_END_INTERLOCK, ..) => true,
+        (10, ..) => named(ins),
+        _ => false,
+    };
+    if interlock || words.len() < 5 || !instructions(words).any(part) {
+        return None;
+    }
+    let mut out = words[..5].to_vec();
+    for ins in instructions(words).filter(|&ins| !part(ins)) {
         out.extend_from_slice(ins);
     }
     Some(out)
@@ -261,6 +301,33 @@ mod tests {
         only32.extend(mode(32));
         assert_eq!(fit_float_controls(&m, [false, true, false]), Some(only32));
         assert_eq!(fit_float_controls(&m, [false, false, true]), Some(m[..5].to_vec()));
+    }
+
+    #[test]
+    fn the_interlock_goes_where_the_device_has_none() {
+        let name: Vec<u32> = EXT_INTERLOCK.chunks(4).map(|c| c.iter().rev().fold(0, |w, &b| w << 8 | u32::from(b))).collect();
+        let mut ext = vec![(name.len() as u32 + 1) << 16 | 10];
+        ext.extend(&name);
+        let other = [3 << 16 | 10, u32::from_le_bytes(*b"SPV_"), u32::from_le_bytes(*b"x\0\0\0")];
+        let head = [0x0723_0203, 0x0001_0600, 0, 9, 0];
+        // capabilities, extensions, modes, then main: begin, a call, end
+        let plain = [vec![2 << 16 | 17, 1], other.to_vec(), vec![3 << 16 | 16, 4, 7], vec![4 << 16 | 57, 2, 5, 3], vec![1 << 16 | 253]];
+        let locked = [
+            plain[0].clone(),
+            vec![2 << 16 | 17, CAP_PIXEL_INTERLOCK],
+            plain[1].clone(),
+            ext,
+            plain[2].clone(),
+            vec![3 << 16 | 16, 4, EM_PIXEL_INTERLOCK_ORDERED],
+            vec![1 << 16 | OP_BEGIN_INTERLOCK],
+            plain[3].clone(),
+            vec![1 << 16 | OP_END_INTERLOCK],
+            plain[4].clone(),
+        ];
+        let module = |parts: &[Vec<u32>]| [&head[..], &parts.concat()].concat();
+        assert_eq!(fit_interlock(&module(&locked), true), None);
+        assert_eq!(fit_interlock(&module(&locked), false), Some(module(&plain)));
+        assert_eq!(fit_interlock(&module(&plain), false), None);
     }
 
     fn nvidia() -> Limits {

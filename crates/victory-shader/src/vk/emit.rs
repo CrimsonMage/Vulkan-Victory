@@ -562,26 +562,11 @@ impl<'a> Emit<'a> {
             _ => (en::EXEC_GL_COMPUTE, "main"),
         };
         let interface = self.interface.clone();
+        let ordered = self.frag && self.iface.ordered;
+        let fid = if ordered { self.interlocked(fid) } else { fid };
         self.m.entry_point(model, fid, name, &interface);
         match self.st.stage {
-            HwStage::Ps => {
-                self.m.execution_mode(fid, en::EM_ORIGIN_UPPER_LEFT, &[]);
-                let (depth, stencil) = (self.outputs.contains_key(&OUT_DEPTH), self.outputs.contains_key(&OUT_STENCIL));
-                if depth {
-                    self.m.execution_mode(fid, en::EM_DEPTH_REPLACING, &[]);
-                }
-                if stencil {
-                    self.m.execution_mode(fid, en::EM_STENCIL_REF_REPLACING, &[]);
-                }
-                // The console's depth and stencil tests (and writes) before
-                // the program (`Interface::early_depth`): a pixel they
-                // reject does not run, so nothing it would store lands,
-                // and a kill keeps the depth already written. Never for a
-                // program that gives the tests their depth or stencil.
-                if self.iface.early_depth && !depth && !stencil {
-                    self.m.execution_mode(fid, en::EM_EARLY_FRAGMENT_TESTS, &[]);
-                }
-            }
+            HwStage::Ps => self.pixel_modes(fid, ordered),
             HwStage::Cs => {
                 let [x, y, z] = self.st.local_size;
                 self.m.execution_mode(fid, en::EM_LOCAL_SIZE, &[x.max(1), y.max(1), z.max(1)]);
@@ -617,6 +602,57 @@ impl<'a> Emit<'a> {
 
     fn tree_root(&mut self) {
         self.tree(0);
+    }
+
+    /// A pixel program's execution modes.
+    fn pixel_modes(&mut self, fid: Id, ordered: bool) {
+        self.m.execution_mode(fid, en::EM_ORIGIN_UPPER_LEFT, &[]);
+        let (depth, stencil) = (self.outputs.contains_key(&OUT_DEPTH), self.outputs.contains_key(&OUT_STENCIL));
+        if depth {
+            self.m.execution_mode(fid, en::EM_DEPTH_REPLACING, &[]);
+        }
+        if stencil {
+            self.m.execution_mode(fid, en::EM_STENCIL_REF_REPLACING, &[]);
+        }
+        // The console's depth and stencil tests (and writes) before the
+        // program (`Interface::early_depth`): a pixel they reject does not
+        // run, so nothing it would store lands, and a kill keeps the depth
+        // already written. Never for a program that gives the tests their
+        // depth or stencil.
+        if self.iface.early_depth && !depth && !stencil {
+            self.m.execution_mode(fid, en::EM_EARLY_FRAGMENT_TESTS, &[]);
+        }
+        if ordered {
+            self.m.execution_mode(fid, en::EM_PIXEL_INTERLOCK_ORDERED_EXT, &[]);
+        }
+    }
+
+    /// The entry point of an ordered pixel program (`Interface::ordered`):
+    /// the program, `body`, called between the begin and the end of the
+    /// fragment shader interlock (`VK_EXT_fragment_shader_interlock`,
+    /// execution mode `PixelInterlockOrderedEXT`: the pixels of one place
+    /// run it one at a time, in the order of their primitives, as the
+    /// console's ordered section makes them). The interlock's rules ask for
+    /// one begin and one end, in the entry point, outside control flow, on
+    /// every path: the console's section lies behind the program's
+    /// branches (a wave with no pixel left skips it, and may leave from
+    /// inside it), so the whole program runs between them. That orders
+    /// more than the console does and nothing less.
+    fn interlocked(&mut self, body: Id) -> Id {
+        self.m.extension("SPV_EXT_fragment_shader_interlock");
+        self.m.capability(en::CAP_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT);
+        let void = self.t.void;
+        let fty = self.m.t_func(void);
+        let main = self.m.id();
+        self.m.op_to(op::FUNCTION, void, main, &[0, fty]);
+        let entry = self.m.id();
+        self.m.label(entry);
+        self.m.op_void(op::BEGIN_INVOCATION_INTERLOCK_EXT, &[]);
+        self.m.op(op::FUNCTION_CALL, void, &[body]);
+        self.m.op_void(op::END_INVOCATION_INTERLOCK_EXT, &[]);
+        self.m.op_void(op::RETURN, &[]);
+        self.m.op_void(op::FUNCTION_END, &[]);
+        main
     }
 }
 

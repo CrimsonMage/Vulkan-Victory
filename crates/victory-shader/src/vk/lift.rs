@@ -73,6 +73,10 @@ pub struct Interface {
     /// Pixel: the console tests depth and stencil before the program runs
     /// (`vk::early_depth`: the module declares `EarlyFragmentTests`).
     pub early_depth: bool,
+    /// Pixel: the program has an ordered section (the console's
+    /// primitive-ordered pixel shading, lift_scalar.rs `ordered_section`):
+    /// it runs inside the fragment shader interlock.
+    pub ordered: bool,
     /// Reads barycentrics or per-vertex values (fragmentShaderBarycentric).
     pub per_vertex: bool,
     /// Clip and cull distances (`PA_CL_VS_OUT_CNTL`): how many of each.
@@ -392,6 +396,7 @@ impl<'a> Lift<'a> {
             sections: Vec::new(),
         };
         l.sections = l.find_sections();
+        l.iface.ordered = native.stage == HwStage::Ps && scalar::ordered_section(p);
         l.iface.lds_dwords = match &native.io {
             StageIo::Cs(cs) => cs.lds_bytes() / 4,
             StageIo::Ms(ms) => ms.lds_bytes / 4,

@@ -162,7 +162,7 @@ fn bake_one(b: &Backend, hash: &str, file: &Path, name: String, owner: Owner) ->
         return (row(Status::Refused(format!("over the device: {why}")), false), false);
     }
     let d = &b.host.device;
-    let fitted = victory_vk::limits::fit_float_controls(&vs.spirv, b.host.caps.signed_zero_inf_nan);
+    let fitted = victory_vk::limits::fit(&vs.spirv, &b.host.caps);
     let code = fitted.as_deref().unwrap_or(&vs.spirv);
     // SAFETY: the translator's words, a SPIR-V module.
     let module = match unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None) } {

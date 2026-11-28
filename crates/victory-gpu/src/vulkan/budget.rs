@@ -266,7 +266,7 @@ pub(super) fn probe_spv(b: &Backend, dir: &std::path::Path) -> anyhow::Result<()
         };
         let before = now();
         let t = std::time::Instant::now();
-        let fitted = victory_vk::limits::fit_float_controls(&words, b.host.caps.signed_zero_inf_nan);
+        let fitted = victory_vk::limits::fit(&words, &b.host.caps);
         let code = fitted.as_deref().unwrap_or(&words);
         // SAFETY: a SPIR-V module from a file the user names.
         let module = unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None) }?;

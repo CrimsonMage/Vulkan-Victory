@@ -202,6 +202,51 @@ driver errors and no new crash, and the captures look no worse.
       the loop guard's store, all for the demote). Declaring the mode for
       them would be our choice, not the console's word: it would change
       nothing they write unless a draw uses alpha to coverage with them.
+  - **An ordered pixel section runs inside the fragment shader interlock.**
+    The console's primitive-ordered pixel shading (a pixel wave names its
+    packer in `HW_REG_POPS_PACKER`, sleeps until the waves holding earlier
+    primitives' samples of its pixels have left, `src_pops_exiting_wave_id`,
+    and ends with `s_sendmsg(MSG_ORDERED_PS_DONE)`): until now the wait was
+    skipped and nothing ordered ("overlapping pixels of one draw run in any
+    order"). Now such a program (`Interface::ordered`: it writes the packer
+    register) is a function its entry point calls between
+    `OpBeginInvocationInterlockEXT` and `OpEndInvocationInterlockEXT`,
+    execution mode `PixelInterlockOrderedEXT`
+    (`VK_EXT_fragment_shader_interlock`; theirs `ordered_section`: D3D12's
+    rasterizer ordered views, which wait at their first access).
+    - **The programs:** 10 in the pack, none in the used set, all
+      `PS_PedTexturedCutOutTint_Zero_*` (the hair cards that keep their
+      nearest layers), control word 0x10240 (bit 16, primitive ordered,
+      in these ten and no other).
+    - **The interlock's rules** (one begin and one end, in the entry
+      point, outside control flow, begin first, each on every path): all
+      ten have the same shape, one section between branches: a wave with
+      no pixel left leaves for `exp null` before the section, and one
+      does from inside it (a discard between the stores), before the
+      `done` message. A begin where the console's is would sit inside
+      those branches and its end would be skipped. So the whole program
+      is the section: the entry point is `begin; call; end; return` and
+      nothing else, in all ten. That orders more than the console does
+      (the shading before the section too) and nothing less; what it
+      costs on the card is not measured (the programs are in no scene
+      run so far).
+    - **Host:** `VK_EXT_fragment_shader_interlock` and
+      `fragmentShaderPixelInterlock` are enabled where the device has
+      them (`victory-vk/src/host.rs`, `Caps::pixel_interlock`; the RTX
+      5060 Ti does: `vulkaninfo`). Where not, the module is given
+      without its interlock (`limits::fit`, `fit_interlock`: the five
+      instructions left out), which is what every such program was
+      before. `docs/vulkan-abi.md` is not changed (its section 1 does
+      not list the extension yet).
+    - Proof: `an_ordered_section_runs_inside_the_interlock`
+      (oracle/nvidia.rs: theirs
+      `an_ordered_section_uses_rasterizer_ordered_views`, their program;
+      fails without the change), `the_interlock_goes_where_the_device_has_none`
+      (victory-vk); pack: exactly these 10 modules change (+30 words),
+      all pass `spirv-val`, their approximation is gone;
+      `shader-golden`: 0 of 1,527 changed; `cargo xwin check` of
+      `victory-vk` and `victory-gpu`. **Not run on the card.** Needs no
+      bake of a used program.
 
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels
