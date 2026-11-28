@@ -151,6 +151,35 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-28 (store staging, bench only): **a dispatch's store views
+  staged on the card (copy in, dispatch through a map with the views cut
+  out, copy out) take the two heavy passes from 18 and 10 ms to about
+  1.2 and 1.3; it costs small dispatches with large views more than it
+  saves.** Branch `store-stage`; bench only (`passbench`,
+  `STAGE=<address>:<bytes>,...` with `MEM=import`), nothing built in the
+  host, no game run.
+  | pass | views staged | in place (imported) | staged | title memory after |
+  |---|---|---|---|---|
+  | `CS_Primary_GatherCopy` | 1 view, 6.00 MiB | 21 to 42 ms | **1.15 to 1.18** | same hash |
+  | ray binning `..._WithFar` | 2 views, 5.42 MiB | 5 to 17, mostly 15 | **1.30 to 1.34** | same hash, the same 2 pages changed |
+  | `CS_InterpolateStrands` (3,104 invocations) | 1 view, 45 MiB | 0.81 to 0.88 | 7.35 | same hash |
+  | `CSComputeSkinningDefaultVelocity` (1,440) | 1 view, 12 MiB | 0.08 to 0.22 | 2.07 to 2.22 | same hash |
+  - The cost is the copies: about 0.16 ms a MiB of view, both ways
+    together, plus 0.1 to 0.2 ms. In place a store-heavy program costs
+    about 100 to 250 ns an invocation. So a floor: stage only where the
+    dispatch's invocations times 100 ns exceed the views' MiB times 0.16
+    ms (the two heavy passes do, by 15 times; the skinning and strands
+    dispatches do not, by 10 to 25 times). Both heavy passes are
+    indirect dispatches: their size is in title memory at record time
+    (the capture's value was the game's), not known for certain.
+  - **A cut must be a whole view, to the byte.** With the ray binning's
+    first view staged 4 bytes short (0x8000 of 0x8004) the program's
+    store past the piece was lost: one page fewer changed, another hash.
+    A second view of the same size starts 12 bytes after the first one
+    ends: views lie that close.
+  - Not done: the coverage over the used compute programs, the host
+    build, the game run.
+
 - 2026-11-28 (store memory, facts): **the largest store target is a
   region the title asked for write-combined; the CPU all but never
   touches what the card stores; neither simple design can be built
