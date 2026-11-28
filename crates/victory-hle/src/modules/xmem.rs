@@ -110,6 +110,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // (the title's 23 calls never do); replace that part of the
     // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    asked(base, size, kind, flags, protect);
     if placeholder && kind & MEM_REPLACE_PLACEHOLDER != 0 {
         // Part of a placeholder the title split: it stays one.
         return base;
@@ -163,6 +164,27 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     }
     at
+}
+
+/// Diagnostics: what the title asked a virtual allocation with, before
+/// the console's bits are dropped (the first 4,096 calls; a title makes a
+/// few hundred): the protection with its write-combine (0x400), no-cache
+/// (0x200) and GPU bits, the XMem flags, and whether the address is its
+/// choice.
+fn asked(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32) {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    if cfg!(feature = "diagnostics") && CALLS.fetch_add(1, Ordering::Relaxed) < 4096 {
+        tracing::info!(
+            at = format_args!("{base:p}"),
+            address = if base.is_null() { "ours" } else { "the title's" },
+            size = format_args!("{size:#x}"),
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            protect = format_args!("{protect:#x}"),
+            write_combined = protect & 0x400 != 0,
+            "XMemVirtualAlloc: as the title asked"
+        );
+    }
 }
 
 /// How memory is reserved, as (kind, bytes); always at an address of our

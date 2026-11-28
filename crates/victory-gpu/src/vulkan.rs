@@ -63,6 +63,7 @@ mod writes;
 
 pub use paging::{GpuPage, title_pages_aliased};
 pub(crate) use paging::title_memory_written;
+pub(crate) use census::host_reads as census_host_reads;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1019,6 +1020,9 @@ fn read_pages(b: &Backend, at: u64, len: u64, whole: u64, strict: bool) -> anyho
         use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let mut copied = 0;
+        if let Some((cpu, _)) = cpu {
+            census::host_reads(cpu as u64, n);
+        }
         // SAFETY: the destination is `n` bytes of `out`; the kernel checks the source.
         let ok = cpu.is_some_and(|(cpu, _)| unsafe { ReadProcessMemory(GetCurrentProcess(), cpu as *const _, out.as_mut_ptr().add(done as usize).cast(), n as usize, &mut copied) } != 0);
         anyhow::ensure!(ok || !strict, "title memory at {here:#x} is not readable");

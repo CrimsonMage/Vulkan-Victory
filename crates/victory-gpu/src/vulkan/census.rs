@@ -5,9 +5,25 @@
 //! `write-census.txt` in the capture folder lists every page that changed
 //! (`<range start> <page> <mask>`: bit k set when it changed between
 //! presents k and k + 1), and a line a range is logged.
+//!
+//! **The touch probe** follows for as many presents again: the pages that
+//! changed in the window and lie under an unordered-access view (what the
+//! card may store into) are made inaccessible at each present. The CPU's
+//! first read or write of such a page in a frame faults, is counted (by
+//! kind, and whether the instruction is victory's own) and lets the page
+//! go until the next present; the host's own guarded reads let pages go
+//! beforehand ([`host_reads`]). A page that changed over a frame without a
+//! CPU write is one the card stored into. `touch-census.txt` lists each
+//! probed page (`<range start> <page> <read faults> <write faults> <of
+//! them victory's> <frames changed> <frames changed with no CPU write>`),
+//! and a line a range is logged. Faults between a page's hash and its
+//! re-arming at a present are missed, and a page whose protection write
+//! tracking changes meanwhile may be given back writable once: the frames
+//! of the probe are not to be judged as pictures.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::{Backend, lock, memory};
@@ -89,6 +105,9 @@ pub(super) fn frame(b: &Backend, frame: u64) {
         return;
     }
     let Some((first, frames)) = window() else { return };
+    if frame > first + frames && frame <= first + 2 * frames {
+        probe_frame(frame == first + 2 * frames, frames);
+    }
     if frame < first || frame > first + frames {
         return;
     }
@@ -124,6 +143,7 @@ pub(super) fn frame(b: &Backend, frame: u64) {
     if frame < first + frames {
         return;
     }
+    probe_start(st);
     let all = (1u32 << frames) - 1;
     let mut text = Vec::new();
     for (at, (len, _, masks)) in &st.ranges {
@@ -144,4 +164,290 @@ pub(super) fn frame(b: &Backend, frame: u64) {
         let _ = std::fs::write(folder.join("buffer-views.txt"), text);
     }
     *guard = None;
+}
+
+// ---------------------------------------------------------------------------
+// The touch probe
+
+const ARMED: u32 = 1 << 31;
+
+struct Probe {
+    /// (page, the start of its range), by page.
+    pages: Vec<(u64, u64)>,
+    /// [`ARMED`] and the protection to give back.
+    state: Vec<AtomicU32>,
+    reads: Vec<AtomicU32>,
+    writes: Vec<AtomicU32>,
+    /// Faults whose instruction lies in victory's image, and pages the
+    /// host's guarded reads let go.
+    ours: Vec<AtomicU32>,
+    /// The CPU wrote the page since the last present.
+    wrote: Vec<AtomicBool>,
+    /// Presents at which the page had changed; of those, without a CPU
+    /// write in between.
+    changed: Vec<AtomicU32>,
+    card: Vec<AtomicU32>,
+    last: Mutex<Vec<u64>>,
+    /// victory's own image.
+    image: (usize, usize),
+}
+
+static PROBE: OnceLock<Probe> = OnceLock::new();
+
+fn counters(n: usize) -> Vec<AtomicU32> {
+    (0..n).map(|_| AtomicU32::new(0)).collect()
+}
+
+/// victory's image in memory: (start, end).
+fn own_image() -> (usize, usize) {
+    // SAFETY: the process's own module; its headers are mapped.
+    unsafe {
+        let base = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) as usize;
+        if base == 0 {
+            return (0, 0);
+        }
+        let pe = (base as *const u8).add(0x3c).cast::<u32>().read_unaligned() as usize;
+        let size = (base as *const u8).add(pe + 0x50).cast::<u32>().read_unaligned() as usize;
+        (base, base + size)
+    }
+}
+
+fn hash_at(page: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut buf = [0u8; SMALL];
+    let mut copied = 0;
+    // SAFETY: the kernel checks the source; the destination is ours.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), page as *const _, buf.as_mut_ptr().cast(), SMALL, &mut copied) } != 0;
+    ok.then(|| hash(&buf))
+}
+
+/// Protects `page` as `protection`; what it was.
+fn protect(page: u64, protection: u32) -> Option<u32> {
+    let mut old = 0;
+    // SAFETY: a page of title memory; a failure changes nothing.
+    (unsafe { windows_sys::Win32::System::Memory::VirtualProtect(page as *const _, SMALL, protection, &mut old) } != 0).then_some(old)
+}
+
+/// Arms page `i`: inaccessible, to be given back as it was.
+fn arm(p: &Probe, i: usize) {
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    let before = p.state[i].load(Ordering::Relaxed) & !ARMED;
+    p.state[i].store(ARMED | before, Ordering::SeqCst);
+    match protect(p.pages[i].0, PAGE_NOACCESS) {
+        // someone set another protection meanwhile: that one is given back
+        Some(now) if now != PAGE_NOACCESS && now != before => {
+            let _ = p.state[i].compare_exchange(ARMED | before, ARMED | (now & 0xfff), Ordering::SeqCst, Ordering::SeqCst);
+        }
+        Some(_) => {}
+        None => p.state[i].store(before, Ordering::SeqCst),
+    }
+}
+
+/// Lets page `i` go if it is armed; whether it was.
+fn let_go(p: &Probe, i: usize) -> bool {
+    let s = p.state[i].fetch_and(!ARMED, Ordering::SeqCst);
+    if s & ARMED != 0 {
+        protect(p.pages[i].0, s & 0xfff);
+    }
+    s & ARMED != 0
+}
+
+/// The census is over: the pages it saw change under unordered-access
+/// views are probed from here.
+fn probe_start(st: &State) {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    // the views' spans, merged
+    let mut spans: Vec<(u64, u64)> = lock(&VIEWS).keys().filter(|k| k.0 == 2).map(|k| (k.1, k.1 + k.2)).collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let under = |page: u64| {
+        let i = merged.partition_point(|m| m.0 < page + SMALL as u64);
+        i > 0 && merged[i - 1].1 > page
+    };
+    let mut pages: Vec<(u64, u64)> = Vec::new();
+    for (at, (_, _, masks)) in &st.ranges {
+        pages.extend(masks.iter().enumerate().filter(|(_, m)| **m != 0).map(|(i, _)| (at + (i * SMALL) as u64, *at)).filter(|p| under(p.0)));
+    }
+    pages.sort_unstable();
+    let n = pages.len();
+    let last: Vec<u64> = pages.iter().map(|p| hash_at(p.0).unwrap_or(0)).collect();
+    let probe = Probe {
+        pages,
+        state: (0..n).map(|_| AtomicU32::new(PAGE_READWRITE)).collect(),
+        reads: counters(n),
+        writes: counters(n),
+        ours: counters(n),
+        wrote: (0..n).map(|_| AtomicBool::new(false)).collect(),
+        changed: counters(n),
+        card: counters(n),
+        last: Mutex::new(last),
+        image: own_image(),
+    };
+    if PROBE.set(probe).is_err() {
+        return;
+    }
+    let p = PROBE.get().expect("set above");
+    // SAFETY: a handler of the process's own, never removed.
+    unsafe { AddVectoredExceptionHandler(1, Some(on_touch)) };
+    for i in 0..n {
+        arm(p, i);
+    }
+    tracing::info!(pages = n, mb = (n * SMALL) >> 20, views = merged.len(), "Vulkan: touch probe, the pages that changed under unordered-access views are inaccessible until touched");
+}
+
+/// At a present of the probe: each page's change is noted and the page
+/// armed again (`end`: let go for good, and the result told).
+fn probe_frame(end: bool, frames: u64) {
+    let Some(p) = PROBE.get() else { return };
+    let t = std::time::Instant::now();
+    let mut last = lock(&p.last);
+    for i in 0..p.pages.len() {
+        let_go(p, i);
+        if let Some(h) = hash_at(p.pages[i].0) {
+            if h != last[i] {
+                p.changed[i].fetch_add(1, Ordering::Relaxed);
+                if !p.wrote[i].load(Ordering::Relaxed) {
+                    p.card[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            last[i] = h;
+        }
+        p.wrote[i].store(false, Ordering::Relaxed);
+        if !end {
+            arm(p, i);
+        }
+    }
+    tracing::info!(ms = t.elapsed().as_millis() as u64, end, "Vulkan: touch probe, a present");
+    if end {
+        probe_tell(p, frames);
+    }
+}
+
+fn probe_tell(p: &Probe, frames: u64) {
+    #[derive(Default)]
+    struct Sum {
+        pages: u64,
+        read: u64,
+        written: u64,
+        read_faults: u64,
+        write_faults: u64,
+        ours: u64,
+        card: u64,
+        card_read: u64,
+        card_untouched: u64,
+        card_frames: u64,
+    }
+    let get = |v: &[AtomicU32], i: usize| u64::from(v[i].load(Ordering::Relaxed));
+    let mut by: BTreeMap<u64, Sum> = BTreeMap::new();
+    let mut text = Vec::new();
+    for (i, &(page, range)) in p.pages.iter().enumerate() {
+        let (r, w, o, c, k) = (get(&p.reads, i), get(&p.writes, i), get(&p.ours, i), get(&p.changed, i), get(&p.card, i));
+        let s = by.entry(range).or_default();
+        s.pages += 1;
+        s.read += u64::from(r != 0);
+        s.written += u64::from(w != 0);
+        s.read_faults += r;
+        s.write_faults += w;
+        s.ours += o;
+        s.card += u64::from(k != 0);
+        s.card_read += u64::from(k != 0 && r != 0);
+        s.card_untouched += u64::from(k != 0 && r == 0 && w == 0);
+        s.card_frames += k;
+        let _ = writeln!(text, "{range:x} {page:x} {r} {w} {o} {c} {k}");
+    }
+    for (range, s) in &by {
+        tracing::info!(
+            range = format_args!("{range:#x}"),
+            pages = s.pages,
+            cpu_read_pages = s.read,
+            cpu_written_pages = s.written,
+            read_faults_a_frame = format_args!("{:.0}", s.read_faults as f64 / frames as f64),
+            write_faults_a_frame = format_args!("{:.0}", s.write_faults as f64 / frames as f64),
+            of_them_victorys = s.ours,
+            card_stored_pages = s.card,
+            card_stored_a_frame = format_args!("{:.0}", s.card_frames as f64 / frames as f64),
+            card_stored_and_cpu_read = s.card_read,
+            card_stored_cpu_never_touched = s.card_untouched,
+            "Vulkan: touch probe, a range"
+        );
+    }
+    if let Some(folder) = crate::capture::folder() {
+        let _ = std::fs::write(folder.join("touch-census.txt"), text);
+    }
+}
+
+/// The host is about to read `[at, at + len)` of title memory through the
+/// kernel (which fails on an inaccessible page instead of faulting): the
+/// probed pages there are let go, counted as victory's reads.
+pub(crate) fn host_reads(at: u64, len: u64) {
+    let Some(p) = PROBE.get() else { return };
+    let first = p.pages.partition_point(|q| q.0 + (SMALL as u64) <= at);
+    for i in first..p.pages.len() {
+        if p.pages[i].0 >= at + len {
+            break;
+        }
+        if let_go(p, i) {
+            p.reads[i].fetch_add(1, Ordering::Relaxed);
+            p.ours[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether `page` takes a read (or a `write`) as it is protected now.
+fn takes(page: u64, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery};
+    // SAFETY: plain query of a page.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(page as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return false;
+    }
+    let writable = m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY) != 0;
+    m.Protect != 0 && m.Protect & PAGE_NOACCESS == 0 && (!write || writable)
+}
+
+/// The first touch of probed page `i` since the last present, by the
+/// instruction at `ip`.
+fn touched(p: &Probe, i: usize, write: bool, ip: usize) {
+    if write {
+        p.writes[i].fetch_add(1, Ordering::Relaxed);
+        p.wrote[i].store(true, Ordering::Relaxed);
+    } else {
+        p.reads[i].fetch_add(1, Ordering::Relaxed);
+    }
+    if ip >= p.image.0 && ip < p.image.1 {
+        p.ours[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An access violation: if it is the first touch of a probed page since
+/// the last present, it is counted and the page let go.
+unsafe extern "system" fn on_touch(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH};
+    // SAFETY: the system passes the exception being dispatched.
+    let r = unsafe { &*(*info).ExceptionRecord };
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let Some(p) = PROBE.get() else { return EXCEPTION_CONTINUE_SEARCH };
+    let (write, at) = (r.ExceptionInformation[0] == 1, r.ExceptionInformation[1] as u64);
+    let page = at & !(SMALL as u64 - 1);
+    let Ok(i) = p.pages.binary_search_by_key(&page, |q| q.0) else { return EXCEPTION_CONTINUE_SEARCH };
+    let s = p.state[i].fetch_and(!ARMED, Ordering::SeqCst);
+    if s & ARMED != 0 {
+        touched(p, i, write, r.ExceptionAddress as usize);
+        protect(page, s & 0xfff);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Another thread let the page go a moment ago: the access is tried
+    // again if the page now takes it; else the fault is someone else's.
+    if takes(page, write) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH }
 }

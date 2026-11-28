@@ -44,6 +44,7 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `dst.len()`
     // bytes; the kernel checks the source.
+    crate::vulkan::census_host_reads(src as u64, dst.len() as u64);
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.as_mut_ptr().cast(), dst.len(), &mut done) != 0 }
 }
 

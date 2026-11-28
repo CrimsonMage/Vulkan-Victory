@@ -758,6 +758,7 @@ fn read_own(at: u64, out: &mut [u8]) -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut copied = 0;
     // SAFETY: the destination is `out`; the kernel checks the source.
+    super::census::host_reads(at as u64, out.len() as u64);
     unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, out.as_mut_ptr().cast(), out.len(), &mut copied) != 0 }
 }
 

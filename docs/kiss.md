@@ -151,6 +151,77 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-28 (store memory, facts): **the largest store target is a
+  region the title asked for write-combined; the CPU all but never
+  touches what the card stores; neither simple design can be built
+  under Proton as the memory map stands. Nothing built: the facts, what
+  stops each design, and the diagnostics.** Branch `store-memory`, run
+  sm1 (the exe of this branch, the bake of `batch-2026-11-27g`).
+  - **How the title asked** (`xmem.rs` now logs each `XMemVirtualAlloc`
+    before the console's bits are dropped; diagnostics builds): the
+    1,277 MiB region at 0x989400000 with protection **0x2404
+    (write-combined, GPU-visible)**, flags 0x283, reserved and committed
+    in one call, at an address of our choice (below 2^40 by its flags).
+    The 1,162 MiB region at 0x940a00000 with 0x22004 (cached), flags
+    0x183. The 185 MiB region at 0x56a0000 reserved without access
+    (flags 0x7: 32-bit graphics memory). A second write-combined
+    reservation of 1,790 MiB (0x2404, flags 0x23, 64 KiB pages for
+    physical pages). The ranges at 0xad5740000 (79 MiB) and 0xaf27c0000
+    (348 MiB) are no `XMemVirtualAlloc` regions: blocks of the title's
+    own allocator, imported as loose memory.
+  - **What the card stores into and whether the CPU touches it**
+    (`VICTORY_VK_WRITE_CENSUS=1900,6`, now followed by a touch probe over
+    six more presents: the 17,836 pages (69 MiB) that changed in the
+    census and lie under an unordered-access view are inaccessible at
+    each present, the CPU's first touch of each a frame is counted; a
+    page that changed over a frame with no CPU write is the card's):
+    | range | pages probed | card-stored (a frame) | of them never touched by the CPU | of them read by the CPU | CPU write faults a frame |
+    |---|---|---|---|---|---|
+    | 0x989400000 (write-combined region) | 5,433 | 4,979 (3,438) | 4,891 | 4 | 84 |
+    | 0xad5740000 (loose, 79 MiB) | 2,934 | 2,855 (2,146) | 2,855 | 0 | 0 |
+    | 0xaf27c0000 (loose arena, 348 MiB) | 2,696 | 2,617 (1,940) | 2,617 | 0 | 0 |
+    | 0x56a0000 (heap and arena, 185 MiB) | 6,608 | 1,007 (328) | 352 | 338 | 987 |
+    | 0x940a00000 (cached region) | 164 | 162 (43) | 0 | 162 | 2 |
+    None of the faults was victory's own. The card-stored pages lie in
+    tens of clusters (32 in the write-combined region over 1,210 MiB, 24
+    in the arena, 5 in the 79 MiB range). The probe's presents took 27
+    to 83 ms; the run went on to its end. **What the census cannot see**:
+    a store of the value already there (`CS_Primary_GatherCopy` rewrites
+    the same 1.2 MB each frame, so its target is not among the probed
+    pages).
+  - **What the CPU pays for memory of each kind** (scratch `passbench
+    cpu`, 64 MiB through the driver's mapping): cached host memory fill
+    16.4 GiB/s, read 17.4 GiB/s, a scattered dword read 6 ns;
+    write-combined host memory (type 2) fill 16.3 GiB/s, **read 101
+    MiB/s**, scattered read 92 ns; mappable card memory (type 4) fill 6.5
+    GiB/s, read 12 MiB/s, scattered read 906 ns.
+  - **Write-combined host memory as the title's memory (1.85 ms for the
+    pass that takes 18 in the game): stopped.** A process cannot make its
+    own pages write-combined; the memory would have to be the driver's,
+    mapped. (1) The mapping's address is the driver's: placed mapping
+    (`VK_EXT_map_memory_placed`) is not exposed under Proton (the host's
+    own start-up line says so), and the region must lie below 2^40. (2)
+    Wine does not know such pages: `VirtualProtect` (write tracking),
+    `VirtualQuery` and the guarded reads through the kernel would fail
+    on them. (3) victory itself reads that region (texture fills) at
+    what would be 101 MiB/s.
+  - **Card memory for the store targets (0.10 ms): not buildable as a
+    small change.** (1) A range of the map cannot be cut inside a
+    resource and the map holds 64 ranges, 58 in use: three cut-outs at
+    most, against tens of clusters. (2) The whole write-combined region
+    on the card does not fit: the card peaks at 6.7 of 8 GiB in the
+    scene. (3) What would fit is the region as a paged card view like
+    the pool's (card pages bound on use under the pool's ceiling, RAM
+    the home of what the CPU writes, the card the home of what lies
+    under unordered-access views, copied back when the CPU touches it:
+    2 read faults a frame in that region). Write tracking is built
+    around xmem's views of physical pages; a region needs its own path,
+    and the 84 pages a frame both sides write need their bytes told
+    apart (by the views' bounds). That is the build this entry
+    recommends; it was not started.
+  - Scratch: `capture/sm1/touch-census.txt` and `write-census.txt`,
+    `card/out/sm1-plain.log`, `card/out/run40.txt` (the CPU's costs).
+
 - 2026-11-28 (compute bench): **compute's time is the programs' stores
   into title memory: it is cached system RAM, and a scattered store of
   the card into such memory costs about 20 times one into write-combined
