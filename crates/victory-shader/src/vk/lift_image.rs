@@ -342,14 +342,29 @@ impl Lift<'_> {
         let args = std::mem::take(&mut m.args);
         let op = Op::Image { kind: ImageKind::Load { mip }, class: m.class, sampler: Sampler::None, flags: m.flags };
         let r = self.emit(op, Ty::vec(S::U32, 4), args);
-        let vals: Vec<V> = (0..4).filter(|c| m.dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
+        let mut vals: Vec<V> = (0..4).filter(|c| m.dmask >> c & 1 != 0).map(|c| self.extract(r, c)).collect();
+        if m.d16 {
+            // a float view's texel as f16, an integer view's low 16 bits
+            let int = self.int_view(m);
+            for x in &mut vals {
+                let f = self.f32v(*x);
+                let h = self.spv(op::F_CONVERT, Ty::F16, &[f]);
+                let h = self.spv(op::BITCAST, Ty::U16, &[h]);
+                let h = self.spv(op::U_CONVERT, Ty::U32, &[h]);
+                *x = self.spv(op::SELECT, Ty::U32, &[int, *x, h]);
+            }
+        }
         self.write_result(m.inst, m.dreg, &vals, m.d16)
     }
 
+    /// Whether the T#'s view is of integers (word 7 bit 24).
+    fn int_view(&mut self, m: &Mimg) -> V {
+        let (k24, z) = (self.k32(1 << 24), self.k32(0));
+        let bit = self.spv(op::BITWISE_AND, Ty::U32, &[m.tw, k24]);
+        self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[bit, z])
+    }
+
     fn image_store(&mut self, m: &mut Mimg) -> Res<()> {
-        if m.d16 {
-            return Err(unsupported(m.inst.machine.offset, "a d16 image store"));
-        }
         let mip = self.image_texel(m)?;
         let mut vals = Vec::new();
         let mut j = 0u8;
@@ -358,8 +373,7 @@ impl Lift<'_> {
                 vals.push(self.k32(0));
                 continue;
             }
-            let x = self.opnd_dw(m.inst, &m.data, j, false)?;
-            vals.push(self.u32v(x));
+            vals.push(if m.d16 { self.d16_datum(m, j)? } else { self.datum(m, j)? });
             j += 1;
         }
         let v = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 4), &vals);
@@ -368,6 +382,27 @@ impl Lift<'_> {
         let op = Op::Image { kind: ImageKind::Store { mip }, class: m.class, sampler: Sampler::None, flags: m.flags };
         self.emit(op, Ty::VOID, args);
         Ok(())
+    }
+
+    /// Data dword `j` of an image store.
+    fn datum(&mut self, m: &Mimg, j: u8) -> Res<V> {
+        let x = self.opnd_dw(m.inst, &m.data, j, false)?;
+        Ok(self.u32v(x))
+    }
+
+    /// Component `j` of a store with 16-bit data (d16): two a dword, low
+    /// half first, as image results with d16 arrive ([`Self::write_result`]).
+    /// A float view's is an f16 (stored as its f32), an integer view's
+    /// (T# word 7 bit 24) the 16 bits.
+    fn d16_datum(&mut self, m: &Mimg, j: u8) -> Res<V> {
+        let x = self.datum(m, j / 2)?;
+        let high = j % 2 == 1;
+        let f = self.half_f32(x, high);
+        let f = self.u32v(f);
+        let (o, w) = (self.k32(if high { 16 } else { 0 }), self.k32(16));
+        let i = self.spv(op::BIT_FIELD_U_EXTRACT, Ty::U32, &[x, o, w]);
+        let int = self.int_view(m);
+        Ok(self.spv(op::SELECT, Ty::U32, &[int, i, f]))
     }
 
     /// An image atomic. Two data dwords (four for cmpswap) are one 64-bit

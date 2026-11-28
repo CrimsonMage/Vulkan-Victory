@@ -321,9 +321,23 @@ fn to_f(s: S, x: u64) -> f64 {
     }
 }
 
+/// `x` as an f32 rounded to odd: where it is not exact, the f32 next to
+/// it toward zero with its low bit set, so that rounding the result again
+/// (to f16) rounds as rounding `x` once does. (Through the nearest f32 a
+/// fused f16 multiply-add whose exact result lies just beside a tie came
+/// out on the tie: `oracle/packed.rs`.)
+fn f32_to_odd(x: f64) -> f32 {
+    let f = x as f32;
+    if f64::from(f) == x || !f.is_finite() || x.is_nan() {
+        return f;
+    }
+    let toward_zero = if f64::from(f).abs() > x.abs() { f.to_bits() - 1 } else { f.to_bits() };
+    f32::from_bits(toward_zero | 1)
+}
+
 fn from_f(s: S, x: f64) -> u64 {
     match s {
-        S::F16 => u64::from(f32_to_f16(x as f32)),
+        S::F16 => u64::from(f32_to_f16(f32_to_odd(x))),
         S::F64 => x.to_bits(),
         _ => u64::from(card_f32((x as f32).to_bits())),
     }
@@ -715,6 +729,12 @@ impl<'a> Machine<'a> {
                 typed_pack(a as u32, [x[0] as u32, x[1] as u32, x[2] as u32, x[3] as u32], self.arg(n, 2, l)[0] != 0)
             }
             Helper::CodeTable(k) => [u64::from(self.f.tables.dword(k, a as u32)), 0, 0, 0],
+            Helper::Dot4 => {
+                let (x, y) = (self.arg(n, 1, l)[0] as u32, self.arg(n, 2, l)[0] as u32);
+                let byte = |w: u32, i: u32| i32::from((w >> (8 * i)) as u8 as i8);
+                let sum = (0..4).fold(a as u32, |s, i| s.wrapping_add((byte(x, i) * byte(y, i)) as u32));
+                [u64::from(sum), 0, 0, 0]
+            }
             Helper::BvhRay => return Err(format!("helper {h:?}")),
         })
     }

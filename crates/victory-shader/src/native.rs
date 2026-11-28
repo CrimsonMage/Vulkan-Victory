@@ -1,4 +1,5 @@
-//! Native GFX10 programs that the console compiler stores in a `DXIL` part.
+//! Native GFX10 programs that the console compiler stores in a `DXIL` part
+//! (below), or another compiler in an `ACCC` part (`native/fspx.rs`).
 //!
 //! An `XDAT` index after the program header lists blobs stored around the
 //! bitcode; one or more of them hold native programs, zlib-packed (a vertex
@@ -72,6 +73,8 @@
 
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
+
+mod fspx;
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -414,8 +417,12 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
+/// (an `FSPX` payload, [`fspx`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.starts_with(fspx::MAGIC) {
+        return Ok(vec![fspx::program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }

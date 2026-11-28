@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use victory_shader::{Container, FourCC, HwStage};
+use victory_shader::{Container, HwStage};
 
 use crate::shader::{MAX_FILE, Source, sources};
 
@@ -108,7 +108,7 @@ fn translate(source: &Source, path: &Path, seen: &Mutex<HashSet<blake3::Hash>>, 
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
-    let Some(dxil) = Container::parse(&bytes).ok().and_then(|c| c.part(FourCC::DXIL).map(|p| p.data)) else {
+    let Some(dxil) = Container::parse(&bytes).ok().and_then(|c| c.code_part().map(|p| p.data)) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     // Containers that differ only around the code are translated once.

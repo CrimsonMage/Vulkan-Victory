@@ -133,8 +133,8 @@ fn signature(part: &[u8]) -> Result<Vec<SigRow>, ShaderError> {
 /// The vertex, pixel, compute or mesh program of a container.
 pub fn native(container: &[u8]) -> Result<(Container<'_>, NativeProgram), ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c.part(FourCC::DXIL).ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = c.code_part().ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part.data)?
         .into_iter()
         .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
         .ok_or(ShaderError::Unsupported { offset: 0, what: "a container without a vertex, pixel, compute or mesh program" })?;
@@ -186,7 +186,7 @@ pub fn translate_with(container: &[u8], semantics: &Semantics) -> Result<VkShade
         locs: locations(&user, &locs),
         mesh,
         mesh_split: None,
-        loop_limit: loop_limit(native.stage),
+        loop_limit: loop_limit(native.stage, c.part(FourCC::DXIL).is_none()),
         guard_id: guard_id(container),
         no_sel: Default::default(),
     };
@@ -330,8 +330,14 @@ pub fn host_threads(native: &NativeProgram) -> u32 {
 /// make a GPU timeout by themselves (a culling dispatch of thousands of
 /// waves whose loops each ran to 2^16 took a large part of the ~2 s
 /// limit), far above what a loop of the title runs.
-fn loop_limit(_stage: HwStage) -> u32 {
-    1 << 14
+///
+/// A program of another compiler (`other`: an `ACCC` container, the
+/// FidelityFX upscaler's passes) bounds its own waits: a pass spins on
+/// flags the passes before it set, 2^16 looks at most, and then goes on
+/// with its work. Ending such an invocation sooner would drop the work,
+/// so its limit lies above a few of those waits in a row.
+fn loop_limit(_stage: HwStage, other: bool) -> u32 {
+    if other { 1 << 18 } else { 1 << 14 }
 }
 
 /// FNV-1a of the container: the program's id in the guard buffer.

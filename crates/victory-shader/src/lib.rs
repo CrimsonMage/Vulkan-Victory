@@ -6,7 +6,9 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general:
 //! decoded ([`gfx10`], [`native`]), lifted into SSA ([`ir`], [`spill`],
-//! [`io`]) and emitted as SPIR-V for the Vulkan host ([`vk`]).
+//! [`io`]) and emitted as SPIR-V for the Vulkan host ([`vk`]). A container
+//! of another compiler has its GFX10 code in an `ACCC` part instead (AMD's
+//! FidelityFX upscaler; `native/fspx.rs`) and goes the same way.
 
 pub mod dxbc;
 pub mod dxil;
@@ -22,7 +24,7 @@ pub mod vk;
 #[allow(dead_code)]
 pub mod wave;
 
-pub use dxbc::{Container, FourCC, Part};
+pub use dxbc::{Container, FourCC, Part, containers};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,

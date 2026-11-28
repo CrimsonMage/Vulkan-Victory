@@ -187,6 +187,25 @@ fn dword0(native: &NativeProgram, s0: u32, s1: u32) -> Result<u32, String> {
 
 // ---- emit/wave64_tests.rs ----
 
+/// Ours: AMD's compute compiler keeps numbers in vcc_lo and vcc_hi and
+/// moves a pair in with `s_mov_b64` (the FidelityFX upscaler's network
+/// passes: two words of a V#, weights). In a wave of 64 that is the move
+/// of a lane mask too; a pair of numbers stays the two numbers in every
+/// thread (read as a mask's dwords each half had its own ballot of them).
+#[test]
+fn a_pair_of_numbers_moved_into_vcc_stays_numbers() {
+    let mut body = vec![
+        sop1(0x04, 106, 0),    // s_mov_b64 vcc, s[0:1]
+        vop1(0x01, 0, 106),    // v_mov_b32 v0, vcc_lo
+        vop2(0x25, 0, 107, 0), // v_add_nc_u32 v0, vcc_hi, v0
+    ];
+    body.extend(STORE_V0);
+    let p = native(&body);
+    for (s0, s1) in [(5u32, 7u32), (0xFFFF_FFFF, 2), (0x8000_0001, 0x7FFF_FFFF), (0, 0)] {
+        assert_eq!(dword0(&p, s0, s1), Ok(s0.wrapping_add(s1)), "s0={s0:#x} s1={s1:#x}");
+    }
+}
+
 /// The console's 16-bit float addition on normal numbers and zero (theirs).
 fn add16(a: u16, b: u16) -> u16 {
     let wide = |h: u16| if h == 0 { 0.0 } else { f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13) };

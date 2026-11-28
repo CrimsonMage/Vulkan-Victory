@@ -128,7 +128,6 @@ fn normalized_codes_truncate_back_to_themselves() {
 }
 
 #[test]
-#[ignore = "not in the pack's programs: the translator refuses the opcode (v_pk_add_u16)"]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
     // The same GFX10 source field (248) has a different bit pattern for a
