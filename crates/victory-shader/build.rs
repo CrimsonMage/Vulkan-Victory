@@ -5,9 +5,10 @@
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 //!
 //! Only what can change an emitted module or its interface counts: the
-//! files of `fingerprint.rs` (the interpreter, the oracle tests) and every
-//! `#[cfg(test)]` item are left out, so test and offline-tool edits keep
-//! the cache. (Examples and xtask are outside `src` anyway.)
+//! files of `fingerprint.rs` (the interpreter, the oracle tests, the views
+//! reflection) with the lines that declare them, and every `#[cfg(test)]`
+//! item are left out, so test and offline-tool edits keep the cache.
+//! (Examples and xtask are outside `src` anyway.)
 
 use std::path::{Path, PathBuf};
 
@@ -79,7 +80,9 @@ fn main() {
         if FINGERPRINT_EXCLUDE.iter().any(|x| rel == *x || rel.starts_with(&format!("{x}/"))) {
             continue;
         }
-        let text = without_tests(&String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default())).into_bytes();
+        let text = without_tests(&String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()));
+        let left_out = |line: &str| FINGERPRINT_EXCLUDE_LINES.iter().any(|(file, x)| rel == *file && line == *x);
+        let text = text.lines().filter(|l| !left_out(l)).flat_map(|l| [l, "\n"]).collect::<String>().into_bytes();
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
         fnv(&mut state, &text);

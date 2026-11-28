@@ -57,10 +57,11 @@ const SCRATCH: u64 = 256 << 10;
 const SPARE: u64 = 32 << 20;
 
 /// A command buffer's scratch: card memory its commands write and read
-/// (bounded indirect records). The buffers are the timeline's, lent to
-/// one recording at a time and handed back once its command buffer has
-/// run: the card holds what the recordings in flight use, not the most
-/// each command buffer ever used (vk103: 478 MiB and growing).
+/// (bounded indirect records, the store views a dispatch has staged).
+/// The buffers are the timeline's, lent to one recording at a time and
+/// handed back once its command buffer has run: the card holds what the
+/// recordings in flight use, not the most each command buffer ever used
+/// (vk103: 478 MiB and growing).
 #[derive(Default)]
 struct Scratch {
     /// The last one is being filled.
@@ -695,6 +696,7 @@ impl Timeline {
         }
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::INDIRECT_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
         Buffer::new(host, bytes.next_power_of_two().max(SCRATCH), usage, Place::Scratch).ok()
     }

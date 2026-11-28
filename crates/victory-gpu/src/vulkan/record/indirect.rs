@@ -63,6 +63,27 @@ pub(super) fn text() -> String {
     )
 }
 
+/// The work groups of a dispatch execution's records as title memory
+/// holds them now (0: not read).
+fn groups_now(spec: &Spec) -> u64 {
+    let mut count = [0xffu8; 4];
+    if let Some(at) = spec.count
+        && !crate::host::read_into(at as *const u8, &mut count)
+    {
+        return 0;
+    }
+    let mut sum = 0u64;
+    for k in 0..u64::from(spec.max.min(MOST_DISPATCHES).min(u32::from_le_bytes(count))) {
+        let mut record = [0u8; 12];
+        if !crate::host::read_into((spec.src + k * u64::from(spec.stride)) as *const u8, &mut record) {
+            break;
+        }
+        let w = |i: usize| u64::from(u32::from_le_bytes([record[4 * i], record[4 * i + 1], record[4 * i + 2], record[4 * i + 3]]));
+        sum = sum.saturating_add(w(0).saturating_mul(w(1)).saturating_mul(w(2)));
+    }
+    sum
+}
+
 /// One execution, as the title asked for it.
 #[derive(Clone, Copy)]
 struct Spec {
@@ -301,7 +322,7 @@ impl Rec {
         let size = 4 * spec.words;
         match spec.kind {
             DISPATCH => {
-                self.dispatch_indirect(b, buffer, at, spec.max);
+                self.dispatch_indirect(b, buffer, at, &spec);
                 self.watch_cull(b, None, Some((spec.src, spec.count)));
                 // The captured program ends here (left open, the next
                 // program's push and dispatch lines went into its capture);
@@ -504,11 +525,15 @@ impl Rec {
     }
 
     /// One `vkCmdDispatchIndirect` a record (records past the count were
-    /// bounded to no groups).
-    fn dispatch_indirect(&mut self, b: &'static Backend, buffer: vk::Buffer, at: u64, max: u32) {
-        let Some(cmd) = self.prepare_dispatch(b) else {
+    /// bounded to no groups). Store staging goes by the work groups the
+    /// title's records hold now and held of late (the card may still be
+    /// writing them).
+    fn dispatch_indirect(&mut self, b: &'static Backend, buffer: vk::Buffer, at: u64, spec: &Spec) {
+        let max = spec.max;
+        let Some((cmd, stage)) = self.prepare_dispatch(b) else {
             return;
         };
+        let staged = self.stage_stores(b, cmd, &stage, stage.indirect_groups(groups_now(spec)));
         // SAFETY: outside rendering, in our command buffer.
         let watched = if super::super::watch::on() { unsafe { super::super::watch::read(b, cmd, None) } } else { Vec::new() };
         // SAFETY: outside rendering; no statistics query of the list's is
@@ -525,6 +550,7 @@ impl Rec {
         }
         // SAFETY: as above.
         unsafe { super::super::gputime::dispatched(b, cmd, counted) };
+        self.unstage(b, cmd, &staged);
         self.watched_dispatch(b, cmd, &watched, "dispatch indirect");
         self.ambient(b, cmd);
         super::STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

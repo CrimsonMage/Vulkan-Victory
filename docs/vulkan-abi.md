@@ -548,6 +548,16 @@ pub struct VkShader {
 }
 ```
 
+`vk::views` reads from a container's thread program how the program
+reaches title memory: the buffer views it loads and stores through, each
+by the place of its V# (a push dword's address plus a constant), whether
+its stores through a view are scattered, and whether it stores or loads
+in a way that is not found. The host stages stores by it
+(`docs/vulkan-host.md`, "Store staging") and keeps it beside the
+translations; it is no part of `VkShader`, the kept translation or the
+translation key. `cargo xtask shader-views --pack <pack>` prints it for
+the used compute programs.
+
 `vk::report` (an opt-in for tools) translates a container and adds the
 opcodes its code uses and the opcode a refusal stops at. `cargo xtask
 translation-index --pack <pack>` runs it over a whole dump and writes

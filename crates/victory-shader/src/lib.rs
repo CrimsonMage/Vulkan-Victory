@@ -75,5 +75,9 @@ mod fingerprint_tests {
         for x in FINGERPRINT_EXCLUDE {
             assert!(src.join(x).exists(), "{x} is in fingerprint.rs but not in src");
         }
+        for (file, line) in FINGERPRINT_EXCLUDE_LINES {
+            let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
+            assert!(text.lines().any(|l| l == *line), "{file} has no line `{line}` (fingerprint.rs)");
+        }
     }
 }

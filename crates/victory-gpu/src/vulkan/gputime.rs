@@ -25,6 +25,13 @@
 //! window is several presents and the sums are divided by their number.
 //! Lists that run on other queues at the same time blur the split a
 //! little; it is meant to show where seconds go, not microseconds.
+//!
+//! The dispatches' **runs** are told too: stretches of the card's order
+//! with nothing but dispatches (no draw, no copy or clear of the title's,
+//! no list's end between them), and for the families with most dispatches
+//! how many runs hold them. That is what staging a store view over
+//! several dispatches could span (`record/staging.rs` stages one dispatch
+//! at a time).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -45,6 +52,8 @@ const COUNTED: u32 = 1 << 16;
 static COUNT_POOL: OnceLock<Option<vk::QueryPool>> = OnceLock::new();
 static COUNT_NEXT: AtomicU32 = AtomicU32::new(0);
 static COUNTS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+/// The programs dispatched in the window (the names their marks carry).
+static DISPATCHED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 // The program the recording thread marked last (lists are recorded side
 // by side, each by one thread).
 thread_local! {
@@ -128,6 +137,9 @@ pub(super) unsafe fn dispatching(b: &Backend, cmd: vk::CommandBuffer) -> Option<
 /// # Safety
 /// Recording into `cmd`, outside rendering; `slot` from [`dispatching`].
 pub(super) unsafe fn dispatched(b: &Backend, cmd: vk::CommandBuffer, slot: Option<u32>) {
+    if within(super::present::FRAME.load(Ordering::Relaxed)) {
+        LAST.with(|l| lock(&DISPATCHED).get_or_insert_default().insert(l.borrow().clone()));
+    }
     if let (Some(n), Some(pool)) = (slot, count_pool(b)) {
         // SAFETY: as the caller says.
         unsafe { b.host.device.cmd_end_query(cmd, pool, n) };
@@ -206,6 +218,53 @@ fn sums(at: &[(f64, &str)], key: impl Fn(&str) -> String) -> Vec<(String, f64, u
     top
 }
 
+/// Tells the runs of dispatches in `at` (the marks in the card's order):
+/// a mark of a dispatched program goes on the run, a dispatch's end and
+/// the staging of its store views leave it open, any other mark ends it.
+fn tell_runs(at: &[(f64, &str)], frames: u64) {
+    let dispatched = lock(&DISPATCHED).take().unwrap_or_default();
+    let mut runs: Vec<Vec<String>> = vec![Vec::new()];
+    let mut staged = false;
+    for &(_, name) in at {
+        let open = name.starts_with("after: ") || name.starts_with("host: store views") || name == "host: after store views";
+        if dispatched.contains(name) {
+            // a staged dispatch's program is marked again behind its copies
+            if !std::mem::take(&mut staged) {
+                runs.last_mut().expect("a run").push(family(name));
+            }
+        } else if !open && runs.last().is_some_and(|r| !r.is_empty()) {
+            runs.push(Vec::new());
+        }
+        staged = name == "host: store views to the card";
+    }
+    runs.retain(|r| !r.is_empty());
+    let dispatches: usize = runs.iter().map(Vec::len).sum();
+    let mut by: HashMap<&str, (usize, usize)> = HashMap::new();
+    for run in &runs {
+        let mut seen: Vec<&str> = Vec::new();
+        for f in run {
+            by.entry(f).or_default().0 += 1;
+            if !seen.contains(&f.as_str()) {
+                seen.push(f);
+                by.entry(f).or_default().1 += 1;
+            }
+        }
+    }
+    let per = |n: usize| format!("{:.1}", n as f64 / frames as f64);
+    tracing::info!(
+        dispatches_a_frame = per(dispatches),
+        runs_a_frame = per(runs.len()),
+        longest = runs.iter().map(Vec::len).max().unwrap_or(0),
+        of_one_dispatch_a_frame = per(runs.iter().filter(|r| r.len() == 1).count()),
+        "Vulkan: runs of dispatches (nothing but dispatches between a run's first and last, in the card's order)"
+    );
+    let mut top: Vec<(&str, (usize, usize))> = by.into_iter().collect();
+    top.sort_by_key(|f| std::cmp::Reverse(f.1.0));
+    for (name, (n, in_runs)) in top.into_iter().take(24) {
+        tracing::info!(dispatches_a_frame = per(n), runs_a_frame = per(in_runs), family = name, "Vulkan: a family's dispatches and the runs that hold them");
+    }
+}
+
 /// The counted dispatches' invocations and their number, by program.
 fn work(b: &Backend) -> HashMap<String, (u64, u32)> {
     let mut work: HashMap<String, (u64, u32)> = HashMap::new();
@@ -253,6 +312,7 @@ pub(super) fn tell(b: &Backend, frame: u64) {
         ms_a_frame = format_args!("{:.1}", total / a_frame),
         "Vulkan: the card's time by program follows (ms a frame over the frames timed)"
     );
+    tell_runs(&at, frames);
     let work = work(b);
     let worked = |name: &str| work.get(name).copied().unwrap_or_default();
     for (name, t, binds) in sums(&at, family).into_iter().take(40) {

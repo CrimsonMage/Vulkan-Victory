@@ -709,6 +709,28 @@ fn map_block(b: &Backend, (zero, sink): (u64, u64)) -> (u64, Vec<u8>) {
     (m.map.generation, m.map.block(zero, sink, tables::address(b)))
 }
 
+/// The memory map as it is now (regions wanted imported first), to make
+/// a dispatch's own map of (`record/staging.rs`).
+fn map_now(b: &Backend) -> MemoryMap {
+    let mut m = memory(b);
+    if m.import_regions(&b.host) {
+        m.rebuild_map();
+    }
+    m.map.clone()
+}
+
+/// The buffer and offset of title memory `[title, title + len)` where it
+/// is system RAM imported as one buffer (not the pool's GPU view: that is
+/// card memory).
+fn imported_over(b: &Backend, title: u64, len: u64) -> Option<(vk::Buffer, u64)> {
+    let m = memory(b);
+    if len == 0 || m.pools.iter().any(|p| p.contains(title)) {
+        return None;
+    }
+    let (buffer, offset) = m.buffer_of(title)?;
+    (m.buffer_of(title + len - 1) == Some((buffer, offset + len - 1))).then_some((buffer, offset))
+}
+
 /// The map's generation now (regions wanted imported first).
 fn map_generation(b: &Backend) -> u64 {
     let mut m = memory(b);

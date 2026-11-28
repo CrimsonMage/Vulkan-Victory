@@ -2045,6 +2045,90 @@ system RAM runs at 12 GiB/s. The numbers and the other passes are in
 are 3 to 13 ms of a 22 to 27 ms lighting pass in `tracebench`; the rest is
 not found.
 
+### Store staging (2026-11-28, branch `store-stage-host`)
+
+A compute program's scattered stores into title memory are what compute
+costs ("Where title memory lives", above). For a dispatch that scatters
+enough, the views it scatters stores over lie in card memory for the
+dispatch (`vulkan/record/staging.rs`; the numbers are in `docs/kiss.md`,
+decisions log, 2026-11-28):
+
+1. **Copy in.** Each such view gets a place in a piece of the command
+   buffer's scratch (`victory_vk::timeline`, one piece a command buffer,
+   used by one dispatch after the other), and its bytes are copied there
+   from their home, with 16 bytes behind them.
+2. **A map of its own.** The dispatch runs with a memory map in which
+   exactly the view's bytes lie in the piece: the range that held them is
+   cut around them (`MemoryMap::cut`). The block comes from 1,024 blocks
+   kept for such maps beside the generations' 256 (`descriptors.rs`).
+3. **Copy back** the view's bytes (not the 16 behind them), and the
+   command buffer's map is bound again.
+
+**What tells the views.** The translator reads them from a program's
+thread program (`victory_shader::vk::views`): each V# the program loads
+or stores through, where the V# lies (a descriptor table's address in the
+push constants plus a constant), whether its stores are scattered, and
+whether the program reaches memory in a way that is not found (a
+descriptor index it reads from memory, a store at a computed address).
+The module is not touched and the translation key does not change (the
+file is left out of the fingerprint). The kept translation holds only
+the module, so the views are kept beside it, a line a container
+(`views-<key>.txt`), written by `cargo xtask shader-views --pack <pack>
+--golden <cache>/stage-names.txt --out <cache>/views-<key>.txt` or by the
+stage worker that first misses a container.
+
+- **Not in the game process, if it can be helped.** Run ss1 made the
+  thread program again for every compute stage as it was made (about a
+  thousand, while the title loaded): the title's own blocks ended up in
+  121 imports instead of 41, the map was full (64 ranges, 4,846 ranges
+  refused), and two thirds of the indirect executions found their
+  records in no range. With the file, a run reads no container.
+
+**What is staged** (a dispatch at a time; everything else stays in place
+as before):
+
+- **Only a program whose stores and views are all found.** A V# must lie
+  whole in one range of the map (ABI section 4), so a view that reaches
+  into a cut without lying inside it would read zeros and drop its
+  stores: every view of the program is held against every cut, and a
+  program with a view the host cannot find is left alone (named once in
+  the log with the reason; `programs_not_found` in the 10 s line).
+- **Only views with scattered stores**: the offset of a store comes from
+  what the invocation read where others read something else (memory at a
+  place of its own, an image), not from its place in the dispatch or its
+  turn at a shared counter. Run ss2 staged every store view: 95 MiB
+  copied a frame, 22 ms of copies.
+- **The floor**: invocations times 100 ns must exceed the view's MiB
+  times 0.24 ms plus 0.1 ms. An indirect dispatch goes by the work
+  groups its records hold when it is recorded.
+- **The largest views first**, as the map has ranges left (a cut takes up
+  to two), each with its home in one imported buffer (the pool's GPU view
+  is card memory already).
+- A cut is the whole view, to the byte; the piece keeps the view's place
+  in a 16-byte line.
+
+**What it relies on.**
+
+- The title's tables hold at record time the V#s the card reads when
+  the list runs (the host reads them when it records the dispatch). A
+  title that changed a table after recording a dispatch and before its
+  list ran is not covered: the view would be cut where it lay before.
+- Between the copies a view's home is stale. Nothing else of the command
+  buffer runs then; a list of another queue at that time had no order
+  with the dispatch before either. The CPU's stores into the same pages
+  are not touched: only the view's bytes come back.
+- A program with loads at computed addresses (a ray-tracing structure's
+  nodes) is staged: each such access is translated on its own. A node
+  that straddled the edge of a store view would read zeros (a node must
+  lie in one range); the 16 bytes behind a view cover plain loads.
+
+**Diagnostics.** The 10 s line `store staging` (dispatches and views
+staged, bytes, and what stayed in place by reason), in diagnostics builds
+the programs staged most; `VICTORY_VK_GPU_TIME` marks the copies (`host:
+store views to the card`, `host: store views back`) and tells the runs of
+dispatches (stretches of the card's order with nothing but dispatches),
+which is what staging a view over several dispatches could span.
+
 ## 6. Proposals for `docs/vulkan-abi.md` (from the host)
 
 1. **The memory map holds up to 64 ranges, sorted by `title_start`; the

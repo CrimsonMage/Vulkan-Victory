@@ -17,7 +17,7 @@ pub struct Range {
     pub device_base: u64,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct MemoryMap {
     ranges: Vec<Range>,
     /// Bumped at every change: a block written for an older generation is
@@ -85,6 +85,29 @@ impl MemoryMap {
             out.push(r);
         }
         out
+    }
+
+    /// Shows `size` bytes from `title_start` on at `device_base` instead:
+    /// the range that holds them is cut around them (into up to three),
+    /// so they must lie in one range, and the map must have room for the
+    /// pieces.
+    pub fn cut(&mut self, title_start: u64, size: u64, device_base: u64) -> Result<()> {
+        ensure!(size > 0, "an empty cut");
+        let end = title_start + size;
+        let whole = self.range_of(title_start).filter(|r| end <= r.title_start + r.title_size);
+        let Some(whole) = whole else { bail!("no range holds {title_start:#x}+{size:#x}") };
+        let whole_end = whole.title_start + whole.title_size;
+        let pieces = 1 + usize::from(whole.title_start < title_start) + usize::from(end < whole_end);
+        ensure!(self.ranges.len() - 1 + pieces <= MAX_RANGES, "the memory map is full ({MAX_RANGES} ranges)");
+        self.remove(whole.title_start);
+        if whole.title_start < title_start {
+            self.insert(Range { title_size: title_start - whole.title_start, ..whole })?;
+        }
+        self.insert(Range { title_start, title_size: size, device_base })?;
+        if end < whole_end {
+            self.insert(Range { title_start: end, title_size: whole_end - end, device_base: whole.device_base + (end - whole.title_start) })?;
+        }
+        Ok(())
     }
 
     /// Removes the range that starts at `title_start`.
@@ -158,6 +181,34 @@ mod tests {
         assert_eq!(m.device(0x10), None);
         m.remove(0x1000).unwrap();
         assert_eq!(m.device(0x1004), None);
+    }
+
+    #[test]
+    fn cut_inside_at_an_edge_and_refused() {
+        let mut m = MemoryMap::default();
+        m.insert(r(0x1000, 0x3000, 0x10_0000)).unwrap();
+        m.cut(0x2000, 0x100, 0x50_0000).unwrap();
+        assert_eq!(m.ranges(), [r(0x1000, 0x1000, 0x10_0000), r(0x2000, 0x100, 0x50_0000), r(0x2100, 0x1f00, 0x10_1100)]);
+        assert_eq!(m.device(0x1fff), Some(0x10_0fff));
+        assert_eq!(m.device(0x20ff), Some(0x50_00ff));
+        assert_eq!(m.device(0x2100), Some(0x10_1100));
+        // at a range's start: two pieces
+        m.cut(0x1000, 0x10, 0x60_0000).unwrap();
+        assert_eq!(m.ranges().len(), 4);
+        assert_eq!(m.device(0x1010), Some(0x10_0010));
+        // over two ranges, and in none
+        assert!(m.cut(0x1ff0, 0x20, 0).is_err());
+        assert!(m.cut(0x8000, 0x10, 0).is_err());
+        assert_eq!(m.ranges().len(), 4);
+        // no room for the pieces: nothing changes
+        let mut full = MemoryMap::default();
+        for k in 0..MAX_RANGES as u64 {
+            full.insert(r(k << 16, 0x1000, k << 32)).unwrap();
+        }
+        assert!(full.cut(0x10, 0x10, 0).is_err());
+        assert_eq!(full.device(0x10), Some(0x10));
+        full.cut(0, 0x1000, 0x70_0000).unwrap();
+        assert_eq!(full.device(0x10), Some(0x70_0010));
     }
 
     #[test]

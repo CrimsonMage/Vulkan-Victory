@@ -24,6 +24,7 @@ pub mod spirv;
 pub mod tir;
 pub mod uniform;
 pub mod usage;
+pub mod views;
 
 use std::collections::HashMap;
 

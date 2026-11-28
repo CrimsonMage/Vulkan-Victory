@@ -186,6 +186,44 @@ pub fn run(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, halves:
     Ok(())
 }
 
+/// How a container's compute program reaches title memory: the
+/// container's hash as the stage cache names it (32 hex digits) and its
+/// views' line (`victory_shader::vk::views`); empty for another stage or
+/// a refused program.
+fn views_text(container: &[u8]) -> String {
+    let Ok((f, _, native)) = thread_ir(container) else { return String::new() };
+    if native.stage != victory_shader::HwStage::Cs {
+        return String::new();
+    }
+    format!("{} {}", &blake3::hash(container).to_hex()[..32], victory_shader::vk::views::views(&f).line())
+}
+
+/// Prints, for each compute program of the golden file, the views it
+/// stores and loads through (`victory_shader::vk::views`: hash, the
+/// views' line, name), and how many programs the host can stage. With
+/// `out`: the lines as the host keeps them beside its translations
+/// (`views-<key>.txt`; the game's log names the folder and the key).
+pub fn views(pack: &Path, golden: &Path, out: Option<&Path>, jobs: usize) -> Result<()> {
+    let list = std::fs::read_to_string(golden).with_context(|| format!("reading {}", golden.display()))?;
+    let hashes = list.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_whitespace().next());
+    let wanted: HashSet<String> = hashes.map(|h| h.chars().take(16).collect()).collect();
+    let (found, _) = collect(pack, &wanted, jobs, views_text)?;
+    let compute: Vec<(&str, &str)> = found.values().filter(|(text, _)| !text.is_empty()).map(|(text, name)| (text.as_str(), name.as_str())).collect();
+    for (text, name) in &compute {
+        println!("{text} {name}");
+    }
+    let parsed: Vec<_> = compute.iter().filter_map(|(text, _)| victory_shader::vk::views::Views::parse(text.split_once(' ')?.1)).collect();
+    let storing = parsed.iter().filter(|v| v.other_stores || v.stores().next().is_some()).count();
+    let staged = parsed.iter().filter(|v| v.resolved() && v.stores().next().is_some()).count();
+    println!("{} compute programs, {storing} store into title memory, {staged} of them through views found whole", compute.len());
+    if let Some(out) = out {
+        let text: String = compute.iter().map(|(text, _)| format!("{text}\n")).collect();
+        std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
+}
+
 /// What a whole group of a program does with the inputs of `seed`, run as
 /// console waves or as the host subgroups the card runs (`upper_first`: the
 /// upper half of each wave64 before the lower between their meetings):

@@ -261,6 +261,40 @@ enum State {
 }
 
 /// A stage translated and compiled, as draws link it.
+/// How a compute program stores into title memory, for store staging
+/// (`record/staging.rs`).
+pub(crate) enum Stores {
+    /// Through no buffer view (or no compute program).
+    None,
+    /// Through views the host finds when a dispatch is recorded.
+    Views(victory_shader::vk::views::Views),
+    /// In a way the host does not follow, and why.
+    Unfound(&'static str),
+}
+
+/// [`Stores`] of a compute program: its views as kept beside the
+/// translations (`stage_cache::views`), else read from its container now
+/// (the thread program made again) and kept.
+fn stores_of(shader: &Shader) -> Stores {
+    let views = super::stage_cache::views(&shader.full).or_else(|| {
+        VIEWS_READ.fetch_add(1, Ordering::Relaxed);
+        let views = std::panic::catch_unwind(|| victory_shader::vk::views::of(shader.container())).ok()?.ok()?;
+        super::stage_cache::note_views(&shader.full, &views);
+        Some(views)
+    });
+    match views {
+        Some(v) if v.other_stores => Stores::Unfound("it stores through a view or an address found at run time"),
+        Some(v) if v.stores().next().is_none() => Stores::None,
+        Some(v) if v.other_views => Stores::Unfound("it loads through a view found at run time"),
+        Some(v) => Stores::Views(v),
+        None => Stores::Unfound("its views were not read"),
+    }
+}
+
+/// Compute programs whose views no file held: read from their containers
+/// by the stage workers in this run.
+pub(crate) static VIEWS_READ: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct Stage {
     pub(crate) stage: HwStage,
     #[allow(dead_code)] // kept while the part lives
@@ -286,9 +320,28 @@ pub(crate) struct Stage {
     pub(crate) guard_id: u32,
     /// Mesh: host groups per console group (ABI v4 section 6), 1 otherwise.
     pub(crate) mesh_parts: u32,
+    /// Compute: invocations a work group, and how the program stores into
+    /// title memory.
+    pub(crate) threads: u32,
+    pub(crate) stores: Stores,
+    /// The work groups its indirect dispatches were last taken to have
+    /// ([`Stage::indirect_groups`]).
+    held_groups: AtomicU64,
 }
 
 impl Stage {
+    /// The work groups an indirect dispatch of the program is taken to
+    /// have when its records hold `now`: the most of late, falling an
+    /// eighth a dispatch. The records are read while the card may be
+    /// writing them (cleared, counted up again): one reading in five of
+    /// the heaviest pass was too low to stage it (runs ss3 and ss5).
+    pub(crate) fn indirect_groups(&self, now: u64) -> u64 {
+        let held = self.held_groups.load(Ordering::Relaxed);
+        let groups = now.max(held - held / 8);
+        self.held_groups.store(groups, Ordering::Relaxed);
+        groups
+    }
+
     /// The pre-rasterisation part that draws rectangle lists (console
     /// topology 17): this vertex program, then the rectangle geometry
     /// stage. Made once, on the recording thread (a small compile).
@@ -741,6 +794,9 @@ fn make(b: &Backend, shader: &Shader) -> State {
         words: vs.spirv.len(),
         guard_id: vs.guard_id,
         mesh_parts: vs.mesh_parts.max(1),
+        threads: vs.local_size.iter().product(),
+        stores: if vs.stage == HwStage::Cs { stores_of(shader) } else { Stores::None },
+        held_groups: AtomicU64::new(0),
     }))
 }
 

@@ -57,6 +57,10 @@ const IMAGE_SLOTS: u32 = 1 << 20;
 const KEPT: usize = 1 << 16;
 /// Map blocks kept (one per generation, reused round).
 const MAPS: u64 = 256;
+/// Map blocks after them for the maps of single dispatches (store
+/// staging, `record/staging.rs`), reused round: a command buffer has long
+/// run when its block comes up again (a frame stages a few dispatches).
+const STAGED_MAPS: u64 = 1024;
 const MAP_BLOCK: u64 = 4096;
 
 pub(crate) struct Heaps {
@@ -103,6 +107,7 @@ struct State {
     /// Map generation and the block it went into.
     map: Option<(u64, u64)>,
     map_round: u64,
+    staged_round: u64,
     immediate: usize,
 }
 
@@ -177,7 +182,7 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
     let map_at = layout.set_bytes[0].next_multiple_of(align);
     let resource = Buffer::new(
         &b.host,
-        map_at + MAPS * map_stride,
+        map_at + (MAPS + STAGED_MAPS) * map_stride,
         vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT,
         Place::Upload,
     )?;
@@ -187,7 +192,7 @@ fn make(b: &'static Backend) -> anyhow::Result<Heaps> {
         vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
         Place::Upload,
     )?;
-    let maps = Buffer::new(&b.host, MAPS * MAP_BLOCK, vk::BufferUsageFlags::UNIFORM_BUFFER, Place::Upload)?;
+    let maps = Buffer::new(&b.host, (MAPS + STAGED_MAPS) * MAP_BLOCK, vk::BufferUsageFlags::UNIFORM_BUFFER, Place::Upload)?;
     let zero_sink = Buffer::new(
         &b.host,
         64 << 10,
@@ -585,10 +590,27 @@ impl Heaps {
         }
         let at = s.map_round % MAPS;
         s.map_round += 1;
+        s.map = Some((generation, at));
+        self.write_map(b, at, block)
+    }
+
+    /// The set-3 offset of the descriptor of `block`, a map made for one
+    /// dispatch: written into the next of the blocks kept for those.
+    pub(crate) fn staged_map_offset(&self, b: &Backend, block: &[u8]) -> u64 {
+        let mut s = lock(&self.state);
+        let at = MAPS + s.staged_round % STAGED_MAPS;
+        s.staged_round += 1;
+        self.write_map(b, at, block)
+    }
+
+    /// Writes `block` into map block `at` and its descriptor; the
+    /// descriptor's set-3 offset.
+    fn write_map(&self, b: &Backend, at: u64, block: &[u8]) -> u64 {
         let Some(db) = b.host.descriptor_buffer.as_ref() else { return 0 };
         let len = block.len().min(MAP_BLOCK as usize);
-        // SAFETY: the block lies inside the mapped map buffer; a block is
-        // reused only 256 generations later.
+        // SAFETY: the block lies inside the mapped map buffer, written
+        // under the state's lock; a block is reused only 256 generations
+        // (1,024 staged dispatches) later.
         unsafe {
             std::ptr::copy_nonoverlapping(block.as_ptr(), self.maps.mapped.add((at * MAP_BLOCK) as usize), len);
             let info = vk::DescriptorAddressInfoEXT::default()
@@ -603,7 +625,6 @@ impl Heaps {
                 out,
             );
         }
-        s.map = Some((generation, at));
         self.map_at + at * self.map_stride
     }
 

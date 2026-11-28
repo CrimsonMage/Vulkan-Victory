@@ -95,6 +95,26 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         jobs: usize,
     },
+    /// Print how each compute program of the shader golden file reaches
+    /// title memory: the buffer views it stores and loads through
+    /// (`victory_shader::vk::views`, what the host stages stores by).
+    ShaderViews {
+        /// The title's shader pack, or a directory of its files.
+        #[arg(long)]
+        pack: PathBuf,
+        /// The golden file (default: docs/shader-golden.txt), or any file
+        /// with a program's hash first on each line.
+        #[arg(long)]
+        golden: Option<PathBuf>,
+        /// Also write the lines as the host keeps them beside its
+        /// translations: `views-<key>.txt` in the stage cache's folder
+        /// (the game's log names the folder and the key).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Worker threads.
+        #[arg(long, default_value_t = 3)]
+        jobs: usize,
+    },
     /// Write one container of the pack (by hash) to a file, for
     /// `examples/replay`.
     ShaderExtract {
@@ -134,6 +154,7 @@ fn main() -> Result<()> {
             let golden = golden.unwrap_or_else(|| root.join("docs/shader-golden.txt"));
             shader_golden(&pack, &golden, list.as_deref(), bless, halves, jobs)
         }
+        Cmd::ShaderViews { pack, golden, out, jobs } => shader_views(&pack, &golden.unwrap_or_else(|| root.join("docs/shader-golden.txt")), out.as_deref(), jobs),
         Cmd::ShaderExtract { pack, hash, out } => shader_extract(&pack, &hash, &out),
         Cmd::InstallHooks => {
             let status = Command::new("git")
@@ -166,6 +187,16 @@ fn shader_golden(pack: &Path, golden: &Path, list: Option<&Path>, bless: bool, h
 #[cfg(feature = "index")]
 fn shader_extract(pack: &Path, hash: &str, out: &Path) -> Result<()> {
     golden::extract(pack, hash, out)
+}
+
+#[cfg(feature = "index")]
+fn shader_views(pack: &Path, golden: &Path, out: Option<&Path>, jobs: usize) -> Result<()> {
+    golden::views(pack, golden, out, jobs)
+}
+
+#[cfg(not(feature = "index"))]
+fn shader_views(_pack: &Path, _golden: &Path, _out: Option<&Path>, _jobs: usize) -> Result<()> {
+    with_translator()
 }
 
 #[cfg(not(feature = "index"))]

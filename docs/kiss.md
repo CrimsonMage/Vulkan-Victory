@@ -151,6 +151,129 @@ driver errors and no new crash, and the captures look no worse.
 
 ## Decisions log
 
+- 2026-11-28 (store staging in the host): **the store views a dispatch
+  scatters over run on the card: 6.2 fps (5.2), card 156 ms a frame
+  (181); the two heavy passes 17.7 and 10.2 ms to under 0.5 each, the
+  copies cost 13 ms a frame, 5 of them for programs that gain nothing.**
+  Branch `store-stage-host`; no translator change that reaches a module
+  (the translation key is the same, nothing baked). How it works:
+  `docs/vulkan-host.md`, "Store staging".
+  | run (the test scene, `VICTORY_VK_GPU_TIME=1900,6`) | frames in 10 s | direct queue busy, ms a frame | card by the marks | staged a frame | copies |
+  |---|---|---|---|---|---|
+  | bh1 (the batch, old marks) | 52 to 53 | 181 to 183 | 180.4 | | |
+  | bh2 (the same code, today's marks: the baseline) | 49 to 54, mostly 52 | 181.6 | 181.4 | | |
+  | ss2, ss3 (every store view staged) | 58 to 60 | 154 to 156 | 161.4, 165.1 | 123 dispatches, 95 MiB | 22.4 ms |
+  | ss4 (views with scattered stores only) | 61 to 62 | 151.4 | 159.1 | 73, 64 MiB | 15.2 |
+  | ss5 (a shared counter is no scatter; 0.24 ms a MiB) | 60 to 63 | 151.6 | 164.3 | 62, 50 MiB | 11.5 |
+  | **ss6 (indirect sizes held; as committed)** | **61 to 63** | **147.9** | **156.5** | 78, 52 MiB | 13.1 |
+  No hang, no guard hit, no error in ss2 to ss6; the picture as bh1's
+  (capture ss6 frame 3510 beside bh1 frame 3210, by eye). Card memory
+  peaks at 6,798 MiB (bh1 6,728; the scratch 167 MiB against 41), RSS
+  at 16.5 GiB (bh1 15.7; ss4 15.3, ss5 16.9: it moves that much from
+  run to run).
+  - **By program** (ms a frame, bh2 against ss6, the same marks):
+    | program | in place | staged | MiB copied a frame |
+    |---|---|---|---|
+    | `CS_Primary_GatherCopy` | 17.65 | under 0.45 | 6.0 |
+    | ray binning `..._WithFar` | 10.22 | under 0.45 | 8.4 |
+    | `CS_ScreenProbes_EvaluateRayRequests_RayBinning` | 3.05 | under 0.45 | under 0.6 |
+    | `CS_GenerateShadowMasks_Checkerboard_NoHair` | 2.23 | 1.20 | 2.0 |
+    | `CS_Primary_RegisterAllocationRequests` | 1.15 | 1.04 | 0.6 |
+    | about ten more (`CS_RaytraceShadows_Mixed` 5.3 MiB, `CS_GenerateShaderBins_Tiled` 3.9, `CS_GenerateShadowMasks_HairOnly` 3.3, `CS_ScreenProbes_GenerateShaderBins` 3.0, `CS_ScreenProbes_GenerateRayBins` 3.0, `CS_RayPrePass_Alpha` 2.6, ...) | under 0.57 each | the same | about 25 together |
+    The copies are now the largest item of compute: 9.1 ms back, 4.1 ms
+    in (0.24 ms a MiB both ways in the game; the bench had 0.16). About
+    3.5 ms of them carry the two heavy passes; **about 5 ms a frame go to
+    programs that were cheap in place**: their stores are scattered by
+    the program's shape and still cost little. Nothing the host knows
+    when it records tells them from the heavy ones (invocations: the
+    shadow masks have 460,000 and 920,000, the two heavy passes 189,000
+    and 161,000; view sizes: 2 to 6 MiB all). The families that are not
+    staged move by a millisecond either way between runs.
+  - **What tells a program's views** (fact a): `victory_shader::vk::views`
+    reads them from the thread program: each V# by its place (a table's
+    address in the push constants plus a constant; also a table's place
+    in its heap, two push dwords added), loads and stores through it,
+    whether the stores are scattered (the offset comes from a load at a
+    place of the invocation's own or from an image; not from the
+    invocation's ids or its turn at a shared counter), and whether
+    anything is not found. `vk/views.rs` and the line that declares it
+    are left out of the translation fingerprint (`fingerprint.rs`), so
+    the key and the kept translations stay (source hash and key the
+    same before and after; golden: 1,527 programs, 0 changed). The
+    views are kept beside the translations (`views-<key>.txt`), written
+    by `cargo xtask shader-views --out` (8 s for the used set) or by a
+    stage worker at a miss.
+  - **They must not be read in the game process as a matter of course**
+    (run ss1): the thread program made again for each of 1,068 compute
+    stages while the title loaded left the title's own blocks in 121
+    imports instead of 41; the map was full, 4,846 ranges were refused,
+    6.5 of 9.1 million indirect executions found their records in no
+    range. (What ss1 showed as 68 frames in 10 s was a frame with two
+    thirds of its indirect draws missing.)
+  - **Coverage** (fact b). Of the 1,068 used compute programs 609 store
+    into title memory; 274 through views all found (236 of them through
+    at most three store views, 38 through four or more; 122 with a
+    scattered store view); 334 find a view at run time (a descriptor
+    index read from a buffer: every skinning, cloth and strand program),
+    1 stores at a computed address. By bh1's card time (the 92 ms of
+    compute among the 40 largest families): found 42.3 ms (the two heavy
+    passes 28.5 of it; at most three store views: 9.0), not found 46.8,
+    no stores into title memory 3.1. The heavy passes' views (capture
+    cm-a): `CS_Primary_GatherCopy` 4 store views (6.00 MiB, 16, 16 and
+    8 KiB), the ray binning 6 (5.39, 1.80, 0.90, 0.16, 0.16 and 0.03
+    MiB; the bench: the 5.39 alone takes it from 15 to 1.5 ms, the 0.03
+    alone does nothing, the largest three 1.7). Hence the largest views
+    first, as many as the map has ranges for (42 to 48 of 64 in use):
+    no view was left out for ranges in ss4 to ss6 (in ss2 and ss3 about
+    a hundred times a run, one program's). The log names 297 programs
+    once with why their stores stay in place: 280 load through a view
+    found at run time, 15 store through one, 2 have a view reaching
+    into a store view.
+  - **A list's dispatches** (fact c, runs ss3 and ss6; `VICTORY_VK_GPU_TIME`
+    now tells it): 3,740 dispatches a frame lie in 95 to 99 runs with
+    nothing but dispatches between them (the longest 768 to 869; 13 a
+    frame are one dispatch alone).
+    | family | dispatches a frame | runs that hold them | store views |
+    |---|---|---|---|
+    | `CS_InterpolateStrands` | 206 | 4 | not found (one 45 MiB view in the capture) |
+    | `CS_PedStandardSkinning_8` | 204 | 2 | not found |
+    | `CS_SolvePerVertConstraint` | 69 | 4 | not found |
+    | `CS_WavePerSplineConstraint_32` | 67 | 4 | not found |
+    | `CSComputeSkinningDefaultVelocity` | 40 | 6 | not found (one 12 MiB view in the capture) |
+    | `CS_ZeroOperation` (found, stores in order) | 291 | 2.5 | 1 |
+    So the many small dispatches do come in long runs, and a view kept
+    staged over a run would be copied once a run. **Not built, and the
+    count of distinct store views a run is not known**: all five
+    families pick their views by an index they read from a buffer, so
+    the host would first have to follow such an index when it records
+    (the views' reflection would carry the expression), and every other
+    command of the list would have to end the run. What a run could
+    win at most is these families' 22 ms (bh2) less its copies (the
+    strands' one view alone is 45 MiB: 11 ms a copy pair).
+  - **Staging is a dispatch at a time**, by these rules: a program
+    whose stores and views are all found; a view with scattered stores;
+    invocations times 100 ns above the view's MiB times 0.24 ms plus
+    0.1 ms; no other view of the program reaching into it; its home one
+    imported buffer; the map with two ranges to spare. An indirect
+    dispatch goes by the most work groups its records held of late: read
+    as they are when it is recorded, one reading in five of the heaviest
+    pass was too low (the card clears and counts them up while the next
+    frame is recorded; ss3 and ss5 lost 3.6 and 7.7 ms a frame to it).
+  - **Not explained**: why a scattered store into system RAM costs the
+    two heavy passes 100 ns an invocation and ten other scattering
+    programs next to nothing.
+  - **Next, if wanted** (not built): (1) let the card tell which
+    programs gain: time a program's first dispatches in place and
+    staged (two timestamps each) and keep what is faster; it would give
+    back the 5 ms and make the floor a measured one. (2) The skinning,
+    cloth and strand families (22 ms) need run-time descriptor indices
+    followed and staging over a run, or the paged card view of the
+    write-combined region (the entry of 2026-11-28, store memory).
+  - Scratch: `scratch-agent/ssh/` (the logs `bh2.log`, `ss1.log` to
+    `ss6.log`, `views-all5.txt`: every used compute program's views,
+    `bench-binning.txt`), the executables `scratch-agent/card/ss1.exe`
+    to `ss6.exe`, the captures `capture/ss1` to `ss6` and `bh2`.
+
 - 2026-11-28 (store staging, bench only): **a dispatch's store views
   staged on the card (copy in, dispatch through a map with the views cut
   out, copy out) take the two heavy passes from 18 and 10 ms to about

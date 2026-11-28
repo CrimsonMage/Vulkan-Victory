@@ -46,6 +46,7 @@ mod copy;
 mod indirect;
 mod link;
 mod query;
+mod staging;
 mod state;
 mod trail;
 pub(crate) mod upscale;
@@ -163,6 +164,9 @@ pub(crate) struct Rec {
     watched: Vec<(usize, u64)>,
     /// Bounded indirect records in the command buffer's scratch.
     indirect: indirect::Windows,
+    /// The piece of the command buffer's scratch that dispatches stage
+    /// store views in, and its bytes (`record/staging.rs`).
+    staging: Option<(victory_vk::timeline::ScratchRange, u64)>,
     /// Diagnostics: the last push constants, and the last draw's vertex
     /// attributes and buffers found.
     last_push: [u32; 64],
@@ -222,6 +226,7 @@ impl Default for Rec {
             attached: Vec::new(),
             watched: Vec::new(),
             indirect: indirect::Windows::default(),
+            staging: None,
             last_push: [0; 64],
             last_inputs: (0, 0),
             last_user: String::new(),
@@ -335,6 +340,7 @@ impl Rec {
             self.state_set = None;
             self.pushed = false;
             self.indirect.clear();
+            self.staging = None;
             self.planes_synced.clear();
         }
         self.cmd.as_ref().map(|r| r.cmd)
@@ -1000,10 +1006,11 @@ impl Rec {
     }
 
     pub(crate) fn dispatch(&mut self, b: &'static Backend, x: u32, y: u32, z: u32) {
-        if let Some(cmd) = self.prepare_dispatch(b) {
+        if let Some((cmd, stage)) = self.prepare_dispatch(b) {
             let mut lap = super::Lap::start(57);
             self.watch_cull(b, Some([x, y, z]), None);
             lap.next();
+            let staged = self.stage_stores(b, cmd, &stage, u64::from(x) * u64::from(y) * u64::from(z));
             // SAFETY: outside rendering, in our command buffer.
             let watched = if super::watch::on() { unsafe { super::watch::read(b, cmd, None) } } else { Vec::new() };
             // SAFETY: outside rendering, the pipeline bound; no statistics
@@ -1013,6 +1020,7 @@ impl Rec {
                 b.host.device.cmd_dispatch(cmd, x, y, z);
                 super::gputime::dispatched(b, cmd, counted);
             }
+            self.unstage(b, cmd, &staged);
             self.watched_dispatch(b, cmd, &watched, &format!("dispatch {x}x{y}x{z}"));
             self.ambient(b, cmd);
             lap.next();
@@ -1053,8 +1061,9 @@ impl Rec {
     }
 
     /// Everything a dispatch needs bound; `None` (counted) if it is
-    /// skipped. What it writes may be indirect records: no window holds.
-    fn prepare_dispatch(&mut self, b: &'static Backend) -> Option<vk::CommandBuffer> {
+    /// skipped: the command buffer and the program's stage. What it writes
+    /// may be indirect records: no window holds.
+    fn prepare_dispatch(&mut self, b: &'static Backend) -> Option<(vk::CommandBuffer, Arc<Stage>)> {
         let mut lap = super::Lap::start(48);
         let Some((shaders, _)) = crate::pipeline::parts(self.pipeline) else {
             skipped(false);
@@ -1137,7 +1146,7 @@ impl Rec {
             self.push(b, cmd, &[&stage], true);
             lap.next();
         }
-        Some(cmd)
+        Some((cmd, stage))
     }
 
 }
@@ -1290,4 +1299,5 @@ pub(crate) fn report() {
         gpu_counted_buffers = super::gpu_stats::SUMS[4].load(Ordering::Relaxed),
         "Vulkan: draws recorded"
     );
+    staging::report();
 }
