@@ -624,7 +624,9 @@ impl<'a> Machine<'a> {
                 if pred[l] && matches!(kind, ImageKind::Store { .. }) {
                     self.image_stores.push((l, args.clone()));
                 }
-                if matches!(kind, ImageKind::Store { .. }) && !pred[l] {
+                // (a store or an atomic of a lane outside its guard does
+                // not happen)
+                if matches!(kind, ImageKind::Store { .. } | ImageKind::Atomic(_)) && !pred[l] {
                     [0; 4]
                 } else {
                     self.images.as_mut().map_or([0; 4], |im| im.image(*kind, *class, *sampler, *flags, &args, l))

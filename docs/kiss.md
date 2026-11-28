@@ -300,6 +300,22 @@ driver errors and no new crash, and the captures look no worse.
       ends before every LDS access, also where the meeting goes); all pass
       `spirv-val`. **Needs the bake:** the 97 used compute and mesh
       programs.
+  - **Their tests, as oracle tests** (`vk/oracle/nvidia.rs`, through the
+    interpreter; they ran them on a D3D12 device):
+    `typed_d16_table_uav_roundtrip_uint_sint_and_float` and
+    `some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on` pass as
+    they are. `a_counter_texture_is_set_by_a_store_of_one_channel`: ours
+    refused a `d16` image store; now the 16-bit channels are widened by
+    the image's kind (the T#'s INTEGER bit: the integer as it is, else
+    the half as a float; no program of the pack has such a store, so no
+    module changes: it is the upscaler's). The interpreter ran an image
+    atomic of a lane outside its guard; no more.
+    `immediate_sampler_chosen_by_control_flow` is there and ignored: it
+    fails (also when both arms move the same sampler): an S# that is not
+    four constants where it is used is read as a heap sampler, slot 0.
+    Open; the fix is a sampler slot chosen by a phi of the immediates'
+    slots. Not ported: what their tests say of their own lowering (which
+    root views it asks for, the stores its tracing cannot type).
 
 - 2026-11-27 (streamed textures): **a texture the title places lives
   while one of the title's descriptor slots names it, and has the levels

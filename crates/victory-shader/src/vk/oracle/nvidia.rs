@@ -4,14 +4,24 @@
 //! interpreter and the module's own words. The programs are theirs (kept as
 //! written); they ran them on a D3D12 device. Each test names the test of
 //! theirs it is.
+//!
+//! Not ported, of the tests asked for: the shape checks of
+//! `typed_d16_table_uav_roundtrip_uint_sint_and_float` and
+//! `typed_non_d16_table_load_preserves_integer_bits` (which root views
+//! their lowering asks for: `SLOT_TABLE_STRIDES`; ours reads the format
+//! from the V#), and the refusals of
+//! `a_counter_texture_is_set_by_a_store_of_one_channel` (a store whose view
+//! their tracing cannot type; ours reads the type from the T#).
 
 #![allow(clippy::all)]
 
-use super::wave64::{native_of, run_group, stores};
+use super::wave64::{dword0, native as wave64_native, native_of, run_group, stores};
 use super::*;
 use crate::native::NativeProgram;
+use crate::vk::interp::Images;
 use crate::vk::meetings;
 use crate::vk::spirv::en;
+use crate::vk::tir::{ImageClass, ImageKind, Sampler};
 
 const TABLE: u64 = 0x1000;
 
@@ -301,4 +311,284 @@ fn a_read_after_the_waves_adds_sees_them_all() {
     // does not
     assert_eq!(meetings_of(&native), [meetings::READ]);
     assert_eq!(run_group(&native, [0; 4], 4 * 64, 0), Ok(vec![128; 4 * 64]));
+}
+
+/// Theirs: `some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on`.
+/// "Some lane is left" of a mask operation as a number: an upscaler's
+/// programs wait for other groups in a loop that ends when every lane saw
+/// its flag, or after enough rounds: both tests become -1 or 0 and SCC of
+/// `timeout | ~waiting` ends it.
+#[test]
+fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
+    let native = wave64_native(&[
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x7D84_0200, // v_cmp_eq_u32 vcc, s0, v1
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0x8592_80C1, // s_cselect_b64 s[18:19], -1, 0
+        0xBF09_8501, // s_cmp_ge_u32 s1, 5
+        0x8594_80C1, // s_cselect_b64 s[20:21], -1, 0
+        0x8B92_1214, // s_orn2_b64 s[18:19], s[20:21], s[18:19]
+        0x8506_8081, // s_cselect_b32 s6, 1, 0
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0xE070_0000,
+        0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
+    ]);
+    // (lane s0 waits, if there is one; s1 rounds)
+    for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
+        assert_eq!(dword0(&native, wait, rounds), Ok(done), "lane {wait} after {rounds} rounds");
+    }
+}
+
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen` (theirs).
+const fn mubuf_idxen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [0x38 << 26 | (op as u32) << 18 | 1 << 13, 0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32]
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], byte_offset` (theirs).
+const fn s_load_dwordx4_off(dst: u8, base: u8, byte_offset: u32) -> [u32; 2] {
+    [0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1), (125 << 25) | (byte_offset & 0x1F_FFFF)]
+}
+
+/// Their `build_table_typed_cs`: a compute program of 4 threads whose
+/// descriptors live in a table at s4.
+fn table_typed_cs(body: &[u32]) -> NativeProgram {
+    let mut words = vec![s_mov_b32(5, 0x80)]; // s5 = 0
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 0 }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [4, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A V# of `records` elements of `stride` bytes in GFX10 buffer `format`
+/// at `base` (`docs/vulkan-abi.md` section 4; format 0, stride 0: raw).
+fn vsharp(base: u32, stride: u32, records: u32, format: u32) -> [u32; 4] {
+    [base, stride << 16, records, 0x3000_0FAC | format << 12]
+}
+
+/// Runs a table program over `views` (the table's entries, 32 bytes each,
+/// from entry `first` on) and `data` at the first view's base; the memory
+/// afterwards.
+fn run_table(native: &NativeProgram, first: u32, views: &[[u32; 4]], data: &[u32]) -> Memory {
+    let (f, _) = crate::vk::thread_ir_native(native).expect("translation");
+    let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+    for (k, v) in views.iter().enumerate() {
+        mem.put(TABLE + 32 * (u64::from(first) + k as u64), v);
+    }
+    mem.put(u64::from(views[0][0]), data);
+    let mut m = Machine::new(&f, 32, mem);
+    m.push[8] = TABLE as u32 + 32 * first;
+    assert_eq!(m.run(), Stop::Returned);
+    m.mem
+}
+
+fn dwords(mem: &Memory, base: u32, n: u32) -> Vec<u32> {
+    (0..u64::from(n)).map(|i| mem.dwords.get(&(u64::from(base) + 4 * i)).copied().unwrap_or(0)).collect()
+}
+
+/// Theirs: `typed_d16_table_uav_roundtrip_uint_sint_and_float`.
+/// `compute_graph_ops` (facial lip-sync and the wrapped submesh solver)
+/// reads and writes FP16 bit patterns of `R16G16B16A16_UINT` views with
+/// `buffer_load_format_d16_xyzw` and `buffer_store_format_d16_xyzw`: the
+/// halves come through as they are for UINT, SINT and FLOAT views, at any
+/// place of the table.
+#[test]
+fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
+    let mut body = Vec::new();
+    // s[8:11] = table[0] (src typed UAV), s[12:15] = table[1] (dst typed UAV),
+    // s[16:19] = table[2] (raw UAV dump of loaded v[2:3]).
+    body.extend_from_slice(&s_load_dwordx4_off(8, 4, 0));
+    body.extend_from_slice(&s_load_dwordx4_off(12, 4, 32));
+    body.extend_from_slice(&s_load_dwordx4_off(16, 4, 64));
+    // buffer_load_format_d16_xyzw v[2:3], v0, s[8:11], 0 idxen (op 0x83)
+    body.extend_from_slice(&mubuf_idxen(0x83, 2, 0, 8));
+    // buffer_store_format_d16_xyzw v[2:3], v0, s[12:15], 0 idxen (op 0x87)
+    body.extend_from_slice(&mubuf_idxen(0x87, 2, 0, 12));
+    // v4 = v0 << 3 (byte offset = thread * 8)
+    body.push(0x3408_0083); // v_lshlrev_b32 v4, 3, v0
+    // buffer_store_dwordx2 v[2:3], v4, s[16:19], 0 offen (op 0x1D, offen bit 12)
+    body.extend_from_slice(&[0x38 << 26 | 0x1D << 18 | 1 << 12, 0x80 << 24 | (16u32 >> 2) << 16 | (2u32 << 8) | 4u32]);
+    let native = table_typed_cs(&body);
+    // 4 elements x 4 u16 channels = 8 u32 dwords.
+    // Includes FP16 subnormal (0x0001), -0.0 (0x8000), 1.0 (0x3C00), -1.0 (0xBC00),
+    // NaN (0x7E00), max u16 (0xFFFF), and arbitrary patterns.
+    let uint_bits: [u32; 8] = [0x3C00_0001, 0x7E00_BC00, 0xFFFF_8000, 0xABCD_1234, 0x0002_0000, 0x7BFF_FBFF, 0xDEAD_BEEF, 0xCAFE_BABE];
+    let sint_bits: [u32; 8] = [0xFFFF_8000, 0x7FFF_0001, 0xC000_0000, 0x8001_7FFE, 0xFFFF_FFFF, 0x0000_0000, 0xFEDC_BA98, 0x7654_3210];
+    // Normal finite FP16 values that round-trip cleanly through f32.
+    let float_bits: [u32; 8] = [0x4000_3C00, 0x3800_BC00, 0xC200_3400, 0x4500_0000, 0x3E00_BE00, 0x4400_C400, 0x3C00_0000, 0x4200_C000];
+    // (GFX10 buffer formats 69, 70, 71: 16_16_16_16 UINT, SINT, FLOAT)
+    let cases = [
+        ("R16G16B16A16_UINT @0", 69, &uint_bits, 0u32),
+        ("R16G16B16A16_UINT @3 (dynamic offset)", 69, &uint_bits, 3),
+        ("R16G16B16A16_SINT @0", 70, &sint_bits, 0),
+        ("R16G16B16A16_FLOAT @0", 71, &float_bits, 0),
+    ];
+    let (src, dst, raw) = (0x2000, 0x3000, 0x4000);
+    for (label, format, input, first) in cases {
+        let views = [vsharp(src, 8, 4, format), vsharp(dst, 8, 4, format), vsharp(raw, 0, 64, 0)];
+        let mem = run_table(&native, first, &views, input);
+        assert_eq!(dwords(&mem, raw, 8), input, "{label}: buffer_load_format_d16_xyzw mismatch");
+        assert_eq!(dwords(&mem, dst, 8), input, "{label}: buffer_store_format_d16_xyzw mismatch");
+    }
+}
+
+/// Their size tests' program frame: the table at s[2:3], its raw UAV's
+/// descriptor (entry 2) in s[20:23]; a wave32 compute program of one thread
+/// with the table of views at s0.
+fn one_thread_cs(words: &[u32]) -> NativeProgram {
+    let param = |root, user_data| RootParam { root, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data, slot: user_data };
+    let mut code = vec![
+        0xBE82_0300u32, // s_mov_b32 s2, s0
+        0xBE83_0380,    // s_mov_b32 s3, 0
+        0xF408_0501,    // s_load_dwordx4 s[20:23], s[2:3], 64
+        0xFA00_0040,
+    ];
+    code.extend_from_slice(words);
+    code.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![param(RootType::Table, 0), param(RootType::Constants, 1)],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1, 1, 1] }),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// One texel of an unsigned counter texture: atomics add to it and give
+/// the old value, a store sets it (the data is the last operand).
+struct Counter<'a>(&'a std::cell::Cell<u64>);
+
+impl Images for Counter<'_> {
+    fn image(&mut self, kind: ImageKind, _: ImageClass, _: Sampler, _: u16, args: &[[u64; 4]], _: usize) -> [u64; 4] {
+        let (old, data) = (self.0.get(), args[args.len() - 1][0]);
+        match kind {
+            ImageKind::Atomic(_) => self.0.set(old + data),
+            ImageKind::Store { .. } => self.0.set(data),
+            _ => {}
+        }
+        [old, 0, 0, 0]
+    }
+}
+
+/// Theirs: `a_counter_texture_is_set_by_a_store_of_one_channel`. An
+/// upscaler counts its groups in a texture with atomics and sets the
+/// counter back with a store of one channel, 16 bits wide (`d16`) or not.
+#[test]
+fn a_counter_texture_is_set_by_a_store_of_one_channel() {
+    // image_store v3, v[0:1], s[8:15] dmask:0x1 2D, with and without d16
+    for store in [[0xF020_1108u32, 0x0002_0300], [0xF020_1108, 0x8002_0300]] {
+        let native = one_thread_cs(&[
+            0xF40C_0201, // s_load_dwordx8 s[8:15], s[2:3], 0
+            0xFA00_0000,
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0283, // v_mov_b32 v2, 3
+            0xF044_3108, // image_atomic_add v2, v[0:1], s[8:15] dmask:0x1 2D glc
+            0x0002_0200,
+            0x7E06_0289, // v_mov_b32 v3, 9
+            store[0],
+            store[1],
+            0x7E08_0281, // v_mov_b32 v4, 1
+            0xF044_3108, // image_atomic_add v4, v[0:1], s[8:15] dmask:0x1 2D glc
+            0x0002_0400,
+        ]);
+        let (f, _) = crate::vk::thread_ir_native(&native).unwrap_or_else(|e| panic!("store {:#x}: {e}", store[1]));
+        let texel = std::cell::Cell::new(0);
+        let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+        // an unsigned storage view in slot 1: INTEGER and STORAGE (word 7)
+        mem.put(TABLE, &tsharp(1 | 1 << 24 | 1 << 25));
+        mem.put(TABLE + 64, &vsharp(0x2000, 0, 64, 0));
+        let mut m = Machine::new(&f, 32, mem);
+        m.push[4] = TABLE as u32;
+        m.images = Some(Box::new(Counter(&texel)));
+        assert_eq!(m.run(), Stop::Returned);
+        drop(m);
+        assert_eq!(texel.get(), 10, "store {:#x}", store[1]);
+    }
+}
+
+/// Every sample answers with word 2 of the immediate sampler it was made
+/// with (0xFFFF_FFFF for a sampler from the heap).
+struct WhichSampler(Vec<[u32; 4]>);
+
+impl Images for WhichSampler {
+    fn image(&mut self, _: ImageKind, _: ImageClass, sampler: Sampler, _: u16, _: &[[u64; 4]], _: usize) -> [u64; 4] {
+        let word = match sampler {
+            Sampler::Static(n) => self.0[n as usize][2],
+            _ => u32::MAX,
+        };
+        [u64::from(word), 0, 0, 0]
+    }
+}
+
+/// Theirs: `immediate_sampler_chosen_by_control_flow`: two immediate
+/// sampler descriptors moved into s[16:19] by the arms of a scalar branch;
+/// the sample after the join uses the one its arm chose. Ours takes an S#
+/// that is not four constants for a heap sampler and samples with slot 0
+/// of the sampler heap (`docs/opcode-audit.md`, open).
+#[test]
+#[ignore = "open: an S# chosen between immediate samplers by a branch is read as a heap sampler"]
+fn immediate_sampler_chosen_by_control_flow() {
+    let s_mov_lit = |dst: u8, lit: u32| [0xBE80_03FF | (dst as u32) << 16, lit];
+    let s_load_x8 = |dst: u8, base: u8| [0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25];
+    // image_sample_lz v4, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    let image_sample_lz: [u32; 2] = [
+        0x3C << 26 | 0x21 << 18 | 1 << 8 | 1 << 3, // dmask=1, dim=2D(1)
+        (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | 2,
+    ];
+    // buffer_store_dword v4, off, s[20:23], 0
+    let buf_store: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | (20u32 >> 2) << 16 | 4 << 8];
+    // Two distinct valid immediate sampler descriptors (different wrap/filter bits).
+    let samp_a: [u32; 4] = [0x0000_0092, 0x00C0_0000, 0x1850_0000, 0];
+    let samp_b: [u32; 4] = [0x0000_0092, 0x00C0_0000, 0x1850_0001, 0];
+    for (case_name, alt) in [("same_sampler", samp_a), ("different_samplers", samp_b)] {
+        let mut words = Vec::new();
+        words.extend_from_slice(&s_load_x8(8, 2)); // s[8:15] = texture SRV (offset 0)
+        // v2 = 0.5, v3 = 0.5 (sample coordinates).
+        words.push(0x7E00_02F0 | (2 << 17)); // v_mov_b32 v2, 0.5
+        words.push(0x7E00_02F0 | (3 << 17)); // v_mov_b32 v3, 0.5
+        words.push(0xBF00_8001); // s_cmp_eq_u32 s1, 0 (const 128)
+        let br_else = words.len();
+        words.push(0); // placeholder s_cbranch_scc0
+        // then arm: load samp_a into s[16:19]
+        for (i, &w) in samp_a.iter().enumerate() {
+            words.extend_from_slice(&s_mov_lit(16 + i as u8, w));
+        }
+        let br_join = words.len();
+        words.push(0); // placeholder s_branch
+        let else_pc = words.len();
+        // else arm: load alt into s[16:19]
+        for (i, &w) in alt.iter().enumerate() {
+            words.extend_from_slice(&s_mov_lit(16 + i as u8, w));
+        }
+        let join_pc = words.len();
+        words[br_else] = 0xBF84_0000 | ((else_pc - br_else - 1) as u32 & 0xFFFF);
+        words[br_join] = 0xBF82_0000 | ((join_pc - br_join - 1) as u32 & 0xFFFF);
+        words.extend_from_slice(&image_sample_lz);
+        words.extend_from_slice(&buf_store);
+        let native = one_thread_cs(&words);
+        let (f, iface) = crate::vk::thread_ir_native(&native).unwrap_or_else(|e| panic!("{case_name}: {e}"));
+        for (branch, chosen) in [(0u32, samp_a), (1, alt)] {
+            let mut mem = Memory { range: (0, 1 << 32), ..Default::default() };
+            mem.put(TABLE, &tsharp(1));
+            mem.put(TABLE + 64, &vsharp(0x2000, 0, 64, 0));
+            let mut m = Machine::new(&f, 32, mem);
+            m.push[4] = TABLE as u32;
+            m.push[5] = branch;
+            m.images = Some(Box::new(WhichSampler(iface.samplers.clone())));
+            assert_eq!(m.run(), Stop::Returned);
+            assert_eq!(m.mem.dwords.get(&0x2000).copied(), Some(chosen[2]), "{case_name} branch={branch}");
+        }
+    }
 }

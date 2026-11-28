@@ -346,11 +346,20 @@ impl Lift<'_> {
         self.write_result(m.inst, m.dreg, &vals, m.d16)
     }
 
+    /// The texel's channels from the data registers; with `d16` two
+    /// 16-bit channels per register, which the console widens by the
+    /// image's format: a float image's are halves, an integer image's (T#
+    /// word 7's INTEGER bit) the 16 bits as they are (trustno1-coder/
+    /// VIctory-NVIDIA `a_counter_texture_is_set_by_a_store_of_one_channel`:
+    /// an upscaler sets its group counter so). (A signed format wider than
+    /// 16 bits would take the sign: the T# does not say signed.)
     fn image_store(&mut self, m: &mut Mimg) -> Res<()> {
-        if m.d16 {
-            return Err(unsupported(m.inst.machine.offset, "a d16 image store"));
-        }
         let mip = self.image_texel(m)?;
+        let integer = m.d16.then(|| {
+            let (bit, z) = (self.k32(1 << 24), self.k32(0));
+            let x = self.spv(op::BITWISE_AND, Ty::U32, &[m.tw, bit]);
+            self.spv(op::I_NOT_EQUAL, Ty::BOOL, &[x, z])
+        });
         let mut vals = Vec::new();
         let mut j = 0u8;
         for c in 0..4 {
@@ -358,8 +367,12 @@ impl Lift<'_> {
                 vals.push(self.k32(0));
                 continue;
             }
-            let x = self.opnd_dw(m.inst, &m.data, j, false)?;
-            vals.push(self.u32v(x));
+            let x = self.opnd_dw(m.inst, &m.data, if m.d16 { j / 2 } else { j }, false)?;
+            let x = self.u32v(x);
+            vals.push(match integer {
+                Some(int) => self.half_texel(x, j % 2 == 1, int),
+                None => x,
+            });
             j += 1;
         }
         let v = self.spv(op::COMPOSITE_CONSTRUCT, Ty::vec(S::U32, 4), &vals);
@@ -368,6 +381,17 @@ impl Lift<'_> {
         let op = Op::Image { kind: ImageKind::Store { mip }, class: m.class, sampler: Sampler::None, flags: m.flags };
         self.emit(op, Ty::VOID, args);
         Ok(())
+    }
+
+    /// A 16-bit channel of a `d16` store (the low or `high` half of `x`)
+    /// as the texel's 32 bits: the integer, or the half as a float.
+    fn half_texel(&mut self, x: V, high: bool, integer: V) -> V {
+        let f = self.half_f32(x, high);
+        let f = self.u32v(f);
+        let (sh, mask) = (self.k32(if high { 16 } else { 0 }), self.k32(0xFFFF));
+        let h = self.spv(op::SHIFT_RIGHT_LOGICAL, Ty::U32, &[x, sh]);
+        let h = self.spv(op::BITWISE_AND, Ty::U32, &[h, mask]);
+        self.spv(op::SELECT, Ty::U32, &[integer, h, f])
     }
 
     /// An image atomic. Two data dwords (four for cmpswap) are one 64-bit
